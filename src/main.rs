@@ -45,6 +45,11 @@ struct Cli {
     #[arg(long = "dmin-rect", value_parser = parse_rect, value_name = "X,Y,WIDTH,HEIGHT")]
     dmin_rect: Option<Rect>,
 
+    /// Fixed D-min medians R,G,B (linear [0,1]); bypass crop measurement.
+    /// Example: --dmin-fixed 0.635294,0.635294,0.623529
+    #[arg(long = "dmin-fixed", value_parser = parse_dmin_fixed, value_name = "R,G,B")]
+    dmin_fixed: Option<(f32, f32, f32)>,
+
     /// Output TIFF format: 32f (float, max data) or 16 (integer, display/print)
     ///
     /// 32f = 32-bit float, no clamping or quantization. Best for archival.
@@ -117,6 +122,22 @@ fn parse_rect(s: &str) -> Result<Rect, String> {
     Ok(Rect { x, y, width, height })
 }
 
+/// Parse fixed D-min medians: "r,g,b" in linear [0,1].
+fn parse_dmin_fixed(s: &str) -> Result<(f32, f32, f32), String> {
+    let parts: Vec<_> = s.split(',').collect();
+    if parts.len() != 3 {
+        return Err("expected R,G,B".to_string());
+    }
+
+    let parse_f32 = |p: &str| p.trim().parse::<f32>().map_err(|e| e.to_string());
+
+    let r = parse_f32(parts[0])?;
+    let g = parse_f32(parts[1])?;
+    let b = parse_f32(parts[2])?;
+
+    Ok((r, g, b))
+}
+
 /// Parse curve gamma: float in 0.5..=5.0.
 fn parse_curve_gamma(s: &str) -> Result<f32, String> {
     let g: f32 = s.trim().parse().map_err(|_| "curve-gamma must be a number".to_string())?;
@@ -145,6 +166,7 @@ fn main() -> anyhow::Result<()> {
     println!("Input directory:  {}", cli.input_dir.display());
     println!("Output directory: {}", cli.output_dir.display());
     println!("D-min rect:       {:?}", cli.dmin_rect);
+    println!("D-min fixed:      {:?}", cli.dmin_fixed);
     println!("Output format:    {:?}", cli.format);
     println!("Write EXR:        {}", cli.write_exr);
     println!("Invert (neg→pos): {}", if cli.no_curve { format!("{}", !cli.no_invert) } else { "via curve (log domain)".to_string() });
@@ -200,8 +222,14 @@ fn main() -> anyhow::Result<()> {
             _ => continue,
         };
 
-        // D-min neutralization (sample unexposed border, divide by median R/G/B)
-        if let Some(rect) = cli.dmin_rect {
+        // D-min neutralization: either fixed medians or sampled from a crop.
+        if let Some((r, g, b)) = cli.dmin_fixed {
+            dmin::neutralize_with_medians(&mut image, r, g, b)?;
+            println!(
+                "D-min applied with fixed medians R={:.6} G={:.6} B={:.6}",
+                r, g, b
+            );
+        } else if let Some(rect) = cli.dmin_rect {
             dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
             println!("D-min neutralized with rect {:?}", rect);
         }

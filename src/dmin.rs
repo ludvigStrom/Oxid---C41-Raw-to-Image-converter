@@ -77,6 +77,32 @@ pub fn neutralize(
     let med_g = median_f32(&g_vals);
     let med_b = median_f32(&b_vals);
 
+    // Print D-min medians so they can be measured once and hard-coded later if desired.
+    println!(
+        "D-min medians (linear [0,1]): R={:.6} G={:.6} B={:.6}",
+        med_r, med_g, med_b
+    );
+
+    neutralize_with_medians(image, med_r, med_g, med_b)
+}
+
+/// Neutralize D-min using fixed medians (e.g. previously measured once).
+pub fn neutralize_with_medians(
+    image: &mut ndarray::Array3<f32>,
+    med_r: f32,
+    med_g: f32,
+    med_b: f32,
+) -> Result<()> {
+    let (_h, _w, c) = image.dim();
+    if c != 3 {
+        bail!("D-min expects RGB image (3 channels), got {}", c);
+    }
+
+    println!(
+        "D-min (fixed medians, linear [0,1]): R={:.6} G={:.6} B={:.6}",
+        med_r, med_g, med_b
+    );
+
     let div_r = if med_r > 0.0 { med_r } else { 1.0 };
     let div_g = if med_g > 0.0 { med_g } else { 1.0 };
     let div_b = if med_b > 0.0 { med_b } else { 1.0 };
