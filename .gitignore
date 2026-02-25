@@ -1,0 +1,18 @@
+# Build
+/target/
+Cargo.lock
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test / output assets — do not commit large binaries
+*.arw
+*.tiff
+*.tif
+
+# macOS
+.DS_Store

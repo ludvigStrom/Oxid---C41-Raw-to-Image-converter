@@ -1,0 +1,23 @@
+[package]
+name = "c41_raw_tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# LibRaw bindings: safe wrapper crate, links to system libraw
+libraw-rs = "0.0.4"
+
+# N-dimensional arrays, used for the image volume
+ndarray = { version = "0.17.2", features = ["rayon"] }
+
+# Parallelism for batch processing (used later in the pipeline)
+rayon = "1.10.0"
+
+# CLI argument parsing
+clap = { version = "4.5.4", features = ["derive"] }
+
+# For future 16-bit TIFF export
+tiff = "0.11.0"
+
+# Simple error handling for the CLI and I/O
+anyhow = "1.0"
