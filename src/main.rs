@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 
+mod curve;
 mod demosaic;
 mod dmin;
+mod inversion;
 mod raw_reader;
 mod tiff_export;
 
@@ -46,6 +48,14 @@ struct Cli {
     /// 16  = 16-bit integer, clamp to [0,1]. Smaller, widely compatible.
     #[arg(long = "format", default_value = "32f", value_parser = parse_format, value_name = "32f|16")]
     format: tiff_export::TiffFormat,
+
+    /// Skip negative→positive inversion (output stays as negative after D-min)
+    #[arg(long = "no-invert", action = clap::ArgAction::SetTrue)]
+    no_invert: bool,
+
+    /// Skip universal tone curve (output stays linear; use --format for float/16 export)
+    #[arg(long = "no-curve", action = clap::ArgAction::SetTrue)]
+    no_curve: bool,
 }
 
 /// Parse a rectangle of the form "x,y,width,height".
@@ -89,6 +99,11 @@ fn main() -> anyhow::Result<()> {
     println!("Output directory: {}", cli.output_dir.display());
     println!("D-min rect:       {:?}", cli.dmin_rect);
     println!("Output format:    {:?}", cli.format);
+    println!("Invert (neg→pos): {}", !cli.no_invert);
+    println!("Tone curve:      {}", !cli.no_curve);
+
+    // One LUT for all images when curve is enabled
+    let lut = (!cli.no_curve).then(|| curve::generate_16bit_lut(curve::DEFAULT_STEEPNESS));
 
     // Iterate over input directory, picking up .arw files
     let entries = fs::read_dir(&cli.input_dir)
@@ -130,14 +145,27 @@ fn main() -> anyhow::Result<()> {
             println!("D-min neutralized with rect {:?}", rect);
         }
 
-        // Uncompressed TIFF export (32-bit float or 16-bit)
+        // Inversion: negative → positive (1.0 - input)
+        if !cli.no_invert {
+            inversion::invert(&mut image);
+            println!("Inverted (negative → positive)");
+        }
+
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("image");
         let out_path = cli.output_dir.join(format!("{}.tiff", stem));
-        tiff_export::write_tiff(&image, &out_path, cli.format)?;
-        println!("Wrote {}", out_path.display());
+
+        // Tone curve (LUT) → u16, or direct f32/16 export
+        if let Some(ref lut) = lut {
+            let image_u16 = curve::apply_curve_and_quantize(&image, lut);
+            tiff_export::write_tiff_u16(&image_u16, &out_path)?;
+            println!("Applied tone curve, wrote {}", out_path.display());
+        } else {
+            tiff_export::write_tiff(&image, &out_path, cli.format)?;
+            println!("Wrote {}", out_path.display());
+        }
     }
 
     Ok(())

@@ -76,3 +76,31 @@ pub fn write_tiff(image: &Array3<f32>, path: &Path, format: TiffFormat) -> Resul
     Ok(())
 }
 
+/// Write an already-quantized 16-bit RGB image (e.g. after tone curve LUT) as uncompressed TIFF.
+pub fn write_tiff_u16(image: &Array3<u16>, path: &Path) -> Result<()> {
+    let (height, width, c) = image.dim();
+    if c != 3 {
+        bail!("TIFF export expects RGB (3 channels), got {}", c);
+    }
+
+    let width_u = u32::try_from(width).context("Image width too large for TIFF")?;
+    let height_u = u32::try_from(height).context("Image height too large for TIFF")?;
+
+    let mut buf: Vec<u16> = Vec::with_capacity(height * width * 3);
+    for row in image.axis_iter(ndarray::Axis(0)) {
+        for pixel in row.axis_iter(ndarray::Axis(0)) {
+            buf.push(pixel[0]);
+            buf.push(pixel[1]);
+            buf.push(pixel[2]);
+        }
+    }
+
+    let file = File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
+    let writer = BufWriter::new(file);
+    let mut tiff = TiffEncoder::new(writer).with_context(|| "Failed to create TIFF encoder")?;
+    tiff.write_image::<RGB16>(width_u, height_u, &buf)
+        .with_context(|| format!("Failed to write 16-bit TIFF to {}", path.display()))?;
+
+    Ok(())
+}
+

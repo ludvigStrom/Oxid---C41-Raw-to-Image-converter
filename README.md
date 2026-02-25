@@ -67,6 +67,8 @@ Output is always **uncompressed** TIFF. You choose the sample format:
 | `--output-dir` | `-o` | Directory for TIFF output. Created if missing. |
 | `--dmin-rect` | — | D-min crop as `X,Y,WIDTH,HEIGHT` (pixels). Optional. Example: `50,50,200,200`. |
 | `--format` | — | `32f` (float, default) or `16` (integer). See “Output format” above. |
+| `--no-invert` | — | Skip negative→positive inversion; output stays as negative (after D-min). |
+| `--no-curve` | — | Skip universal tone curve; output stays linear (use with `--format` for 32f/16). |
 
 Output filenames are derived from the input: e.g. `frame_001.arw` → `frame_001.tiff` in the output directory.
 
@@ -79,12 +81,9 @@ Order of operations:
 1. **Linear extraction** — LibRaw decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
 2. **Demosaic** — Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
 3. **D-min neutralization** (optional) — If `--dmin-rect` is set, the median R, G, and B in that rectangle are computed. The entire image is then divided by these three values (per channel). Use a region on the unexposed film border.
-4. **TIFF export** — Uncompressed RGB TIFF. By default **32-bit float** (no clamping/quantization). Option `--format 16` writes 16-bit integer (clamp to [0,1], scale to 0–65535).
-
-Planned (not yet implemented):
-
-- **Inversion** — `output = 1.0 - input` for negative→positive.
-- **Universal tone curve** — 1D LUT or spline (e.g. RA-4 / Cineon-style) for viewable contrast.
+4. **Inversion** (default on) — `output = 1.0 - input` per channel (negative→positive). Use `--no-invert` to keep the negative.
+5. **Tone curve** (default on) — 65 536-entry 1D LUT (sigmoid S-curve: toe, midtones, shoulder). Applied in parallel; output is 16-bit TIFF. Use `--no-curve` to skip and export linear (32f or 16 via `--format`).
+6. **TIFF export** — Uncompressed RGB TIFF. With curve: 16-bit from LUT. Without curve: **32-bit float** (default) or **16-bit** via `--format`.
 
 ---
 
@@ -96,7 +95,9 @@ Planned (not yet implemented):
 | `src/raw_reader.rs` | Load `.arw` via LibRaw raw decode → `Array3<f32>` (H×W×1). |
 | `src/demosaic.rs` | Bayer→RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
 | `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place. |
-| `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32-bit float (default) or 16-bit integer from f32 image. |
+| `src/inversion.rs` | Negative→positive: in-place `1.0 - x` per channel. |
+| `src/curve.rs` | Universal tone curve: 65 536-entry LUT (sigmoid S-curve), parallel apply, f32→u16. |
+| `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32f/16 from f32, or u16 (after curve) via `write_tiff_u16`. |
 
 Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`.
 
