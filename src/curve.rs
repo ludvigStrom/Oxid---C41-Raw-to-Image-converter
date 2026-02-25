@@ -63,8 +63,16 @@ pub fn generate_16bit_lut(offset: f32, gamma: f32, pivot: f32) -> Vec<u16> {
 
 /// Apply the tone curve via LUT and quantize to u16 in one pass (parallel).
 ///
+/// `white_point` is a normalized code value in [0, 1] that should map to display
+/// white after the curve. For example, 190/255 ≈ 0.745 will scale the output so
+/// that 0.745 becomes pure white, effectively \"pulling\" the white point in.
+///
 /// Values below 0 or above 1 are clamped to the first/last LUT index.
-pub fn apply_curve_and_quantize(image: &Array3<f32>, lut: &[u16]) -> Array3<u16> {
+pub fn apply_curve_and_quantize(
+    image: &Array3<f32>,
+    lut: &[u16],
+    white_point: f32,
+) -> Array3<u16> {
     assert_eq!(lut.len(), LUT_LEN, "LUT must have 65536 entries");
 
     let mut out = Array3::<u16>::zeros(image.dim());
@@ -75,6 +83,61 @@ pub fn apply_curve_and_quantize(image: &Array3<f32>, lut: &[u16]) -> Array3<u16>
         let idx = idx.min(65535);
         *o = lut[idx];
     });
+
+    // Optional white-point scaling: map `white_point` (normalized) to display white.
+    let wp = white_point.clamp(1e-6, 1.0);
+    if (wp - 1.0).abs() > f32::EPSILON {
+        let inv_wp = 1.0 / wp;
+
+        // Scale in-place. Integer arithmetic is fine here; we stay in u16 domain.
+        Zip::from(out.view_mut()).par_for_each(|o| {
+            let normalized = *o as f32 / 65535.0;
+            let scaled = (normalized * inv_wp).min(1.0);
+            *o = (scaled * 65535.0).round() as u16;
+        });
+    }
+
+    // Simple 256-bin histogram (8-bit view of the u16 output), printed for inspection.
+    let mut hist = [0u64; 256];
+    for v in out.iter() {
+        let bin = (*v as usize) >> 8;
+        hist[bin] += 1;
+    }
+    let total: u64 = hist.iter().sum();
+    if total > 0 {
+        let mut min_bin = 0usize;
+        while min_bin < 256 && hist[min_bin] == 0 {
+            min_bin += 1;
+        }
+        let mut max_bin = 255usize;
+        while max_bin > 0 && hist[max_bin] == 0 {
+            max_bin -= 1;
+        }
+
+        let mut cum = 0u64;
+        let mut p50 = 0usize;
+        let mut p90 = 0usize;
+        let mut p99 = 0usize;
+        for (i, &count) in hist.iter().enumerate() {
+            cum += count;
+            let frac = cum as f64 / total as f64;
+            if p50 == 0 && frac >= 0.50 {
+                p50 = i;
+            }
+            if p90 == 0 && frac >= 0.90 {
+                p90 = i;
+            }
+            if p99 == 0 && frac >= 0.99 {
+                p99 = i;
+                break;
+            }
+        }
+
+        println!(
+            "Histogram (8-bit bins of u16 output): min={} p50={} p90={} p99={} max={}",
+            min_bin, p50, p90, p99, max_bin
+        );
+    }
 
     out
 }

@@ -24,3 +24,6 @@ anyhow = "1.0"
 
 # PNG (and other raster) ingestion for development
 image = "0.25"
+
+# OpenEXR (EXR) output
+exr = "1.74"

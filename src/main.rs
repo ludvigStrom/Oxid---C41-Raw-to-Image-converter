@@ -8,6 +8,7 @@ use ndarray;
 mod curve;
 mod demosaic;
 mod dmin;
+mod exr_export;
 mod inversion;
 mod png_reader;
 mod raw_reader;
@@ -51,6 +52,11 @@ struct Cli {
     #[arg(long = "format", default_value = "32f", value_parser = parse_format, value_name = "32f|16")]
     format: tiff_export::TiffFormat,
 
+    /// Also write an OpenEXR (.exr) file alongside the TIFF.
+    /// Uses 32-bit float RGB in [0, 1].
+    #[arg(long = "write-exr", action = clap::ArgAction::SetTrue)]
+    write_exr: bool,
+
     /// Skip negative→positive inversion (output stays as negative after D-min)
     #[arg(long = "no-invert", action = clap::ArgAction::SetTrue)]
     no_invert: bool,
@@ -83,6 +89,11 @@ struct Cli {
     /// Half-saturation exposure for RA-4 S-curve. Default 3.0.
     #[arg(long = "curve-pivot", default_value = "3.0", value_name = "N")]
     curve_pivot: f32,
+
+    /// Normalized code that should map to display white after the curve (0–1).
+    /// Example: 0.745 ≈ 190/255. Default 1.0 (no additional scaling).
+    #[arg(long = "curve-white", default_value = "1.0", value_name = "N")]
+    curve_white: f32,
 }
 
 /// Parse a rectangle of the form "x,y,width,height".
@@ -135,10 +146,17 @@ fn main() -> anyhow::Result<()> {
     println!("Output directory: {}", cli.output_dir.display());
     println!("D-min rect:       {:?}", cli.dmin_rect);
     println!("Output format:    {:?}", cli.format);
+    println!("Write EXR:        {}", cli.write_exr);
     println!("Invert (neg→pos): {}", if cli.no_curve { format!("{}", !cli.no_invert) } else { "via curve (log domain)".to_string() });
     println!("WB gains:         R={} G={} B={}", cli.wb_r, cli.wb_g, cli.wb_b);
-    println!("Print curve:     {} (offset={}, gamma={}, pivot={})",
-        !cli.no_curve, cli.curve_offset, cli.curve_gamma, cli.curve_pivot);
+    println!(
+        "Print curve:     {} (offset={}, gamma={}, pivot={}, white={})",
+        !cli.no_curve,
+        cli.curve_offset,
+        cli.curve_gamma,
+        cli.curve_pivot,
+        cli.curve_white
+    );
 
     // One LUT for all images when curve is enabled. The curve handles inversion in log/density domain.
     let lut = (!cli.no_curve).then(|| curve::generate_16bit_lut(cli.curve_offset, cli.curve_gamma, cli.curve_pivot));
@@ -201,13 +219,19 @@ fn main() -> anyhow::Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("image");
         let out_path = cli.output_dir.join(format!("{}.tiff", stem));
+        let exr_path = cli.output_dir.join(format!("{}.exr", stem));
 
         if let Some(ref lut) = lut {
             // Physical print curve: inversion is implicit in the density domain.
             // Do NOT apply the linear 1.0 - input here.
-            let image_u16 = curve::apply_curve_and_quantize(&image, lut);
+            let image_u16 = curve::apply_curve_and_quantize(&image, lut, cli.curve_white);
             tiff_export::write_tiff_u16(&image_u16, &out_path)?;
             println!("Applied print film curve, wrote {}", out_path.display());
+
+            if cli.write_exr {
+                exr_export::write_exr_u16(&image_u16, &exr_path)?;
+                println!("Also wrote EXR {}", exr_path.display());
+            }
         } else {
             // No curve: optionally apply the simple linear inversion for quick preview
             if !cli.no_invert {
@@ -216,6 +240,11 @@ fn main() -> anyhow::Result<()> {
             }
             tiff_export::write_tiff(&image, &out_path, cli.format)?;
             println!("Wrote {}", out_path.display());
+
+            if cli.write_exr {
+                exr_export::write_exr_f32(&image, &exr_path)?;
+                println!("Also wrote EXR {}", exr_path.display());
+            }
         }
     }
 

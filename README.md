@@ -8,7 +8,7 @@ A high-performance, command-line RAW image processor for **C-41 color negative f
 
 ## Why log-density, not linear inversion?
 
-Film dye density is logarithmic. A simple `1.0 - input` inversion in linear space produces flat results with color cast. Instead, this tool converts transmittance to optical density (`D = -log10(T)`), inverts in the density domain, and applies an RA-4 paper S-curve (Michaelis-Menten). This models a physical darkroom enlarger and produces accurate film-like tonality.
+Film dye density is logarithmic. A simple `1.0 - input` inversion in linear space produces flat results with color cast. Instead, this tool converts transmittance to optical density (`D = -log10(T)`), inverts in the density domain, and applies an RA-4 paper S-curve (Michaelis-Menten). This models a physical darkroom enlarger and produces accurate tonality.
 
 ---
 
@@ -34,17 +34,21 @@ Run with required input and output directories:
 cargo run --release -- --input-dir /path/to/arw/folder --output-dir /path/to/output
 ```
 
-Full example with D-min and curve tuning:
+Full example with D-min, white balance, and curve tuning:
 
 ```bash
 cargo run --release -- \
   -i "test files/png" \
   -o "test files/png/output" \
   --dmin-rect 35,15,20,20 \
-  --curve-offset 1.0 \
+  --wb-r 1.15 --wb-g 0.88 \
+  --curve-offset 0.0 \
   --curve-gamma 2.5 \
-  --curve-pivot 0.18
+  --curve-pivot 3.0 \
+  --curve-white 0.745
 ```
+
+`--curve-white 0.745` (190/255) pulls the white point in so highlights don’t blow; a 256-bin histogram summary is printed after the curve for inspection.
 
 ---
 
@@ -71,9 +75,15 @@ When the print curve is active (default), output is always 16-bit (the LUT produ
 | `--format` | -- | `32f` (float, default) or `16` (integer). Only used with `--no-curve`. |
 | `--no-invert` | -- | Skip linear `1-x` inversion (only applies with `--no-curve`; the print curve inverts in log domain). |
 | `--no-curve` | -- | Skip physical print curve; output stays as linear transmittance. |
-| `--curve-offset` | -- | Print exposure bias (enlarger bulb). Default 1.0. Higher = brighter print. |
+| `--wb-r` | -- | Red channel gain (after D-min). Default 1.0. Compensates narrowband LED imbalance. |
+| `--wb-g` | -- | Green channel gain (after D-min). Default 1.0. |
+| `--wb-b` | -- | Blue channel gain (after D-min). Default 1.0. |
+| `--curve-offset` | -- | Print exposure bias (log-domain shift). Default 0.0. Higher = brighter print. |
 | `--curve-gamma` | -- | Paper grade / contrast. Default 2.5. Higher = harder paper. Range 0.5-5.0. |
-| `--curve-pivot` | -- | Mid-gray pivot for the RA-4 S-curve. Default 0.18. Lower = brighter midtones. |
+| `--curve-pivot` | -- | Half-saturation exposure for RA-4 S-curve. Default 3.0. |
+| `--curve-white` | -- | Normalized code that maps to display white (0–1). Default 1.0. Use e.g. 0.745 (190/255) to pull white in. |
+
+When the print curve is used, a **histogram summary** (min, p50, p90, p99, max in 8-bit bins of the u16 output) is printed to the console for tuning.
 
 Output filenames are derived from the input stem: e.g. `frame_001.arw` or `frame_001.png` -> `frame_001.tiff`.
 
@@ -87,13 +97,14 @@ Order of operations:
 2. **Demosaic** (ARW only) -- Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
    *PNG input skips 1-2: loaded as RGB and normalized to [0, 1].*
 3. **D-min neutralization** (optional) -- If `--dmin-rect` is set, the median R, G, B in that rectangle are computed. The entire image is divided by those values per channel. After this, data represents **linear transmittance**.
-4. **Physical print film curve** (default on) -- 65 536-entry 1D LUT:
+4. **White balance gains** (optional) -- Per-channel multipliers `--wb-r`, `--wb-g`, `--wb-b` (default 1.0). Applied after D-min; compensates narrowband LED intensity imbalance (e.g. increase red, decrease green). Same gains can be reused for a given light source.
+5. **Physical print film curve** (default on) -- 65 536-entry 1D LUT:
    - `D = -log10(T)` -- optical density of the negative
-   - `logE = -D + offset` -- inversion happens here, in the physically correct log domain
+   - `logE = D + offset` -- density as print exposure (inversion in log domain)
    - `E = 10^logE` -- back to linear exposure
    - `out = E^g / (E^g + pivot^g)` -- RA-4 paper S-curve (Michaelis-Menten)
-   Parameters map to darkroom controls: `--curve-offset` (bulb), `--curve-gamma` (paper grade), `--curve-pivot` (mid-gray).
-5. **Fallback** (`--no-curve`) -- When the curve is off, optionally apply linear `1-x` inversion (`--no-invert` to skip). Export as 32-bit float (default) or 16-bit via `--format`.
+   Parameters: `--curve-offset`, `--curve-gamma`, `--curve-pivot`. Then **white point**: if `--curve-white` &lt; 1, output is scaled so that value maps to display white (e.g. 0.745 for 190/255). A **histogram summary** (min, p50, p90, p99, max) is printed for the final u16 image.
+6. **Fallback** (`--no-curve`) -- When the curve is off, optionally apply linear `1-x` inversion (`--no-invert` to skip). Export as 32-bit float (default) or 16-bit via `--format`.
 
 ---
 
