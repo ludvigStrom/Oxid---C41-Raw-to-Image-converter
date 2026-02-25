@@ -34,14 +34,28 @@ Run with required input and output directories:
 cargo run --release -- --input-dir /path/to/arw/folder --output-dir /path/to/output
 ```
 
-Optional D-min region (unexposed film border) for neutralization:
+Optional D-min region (unexposed film border) and 16-bit output for display:
 
 ```bash
 cargo run --release -- \
   --input-dir "test files/raw" \
   --output-dir "test files/raw/output" \
-  --dmin-rect 0,0,200,200
+  --dmin-rect 0,0,200,200 \
+  --format 16
 ```
+
+---
+
+## Output format: keeping as much data as possible
+
+Output is always **uncompressed** TIFF. You choose the sample format:
+
+| Format | Flag | What it does | Use when |
+|--------|------|----------------|----------|
+| **32-bit float** | `--format 32f` (default) | Writes f32 directly. No clamping, no quantization. Values &gt;1 (e.g. after D-min) are preserved. | Archival, further linear processing, or when you want to keep the full pipeline result. |
+| **16-bit integer** | `--format 16` | Clamps to [0, 1], then scales to 0–65535. Values &gt;1 are clipped; precision in shadows is reduced. | Viewing, printing, or when you need maximum compatibility with other software. |
+
+**Recommendation:** Use the default `32f` to preserve all data. Use `16` only when you need a smaller file or 16-bit-only workflows.
 
 ---
 
@@ -50,8 +64,9 @@ cargo run --release -- \
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--input-dir` | `-i` | Directory containing Sony `.arw` files. Only `.arw` is processed. |
-| `--output-dir` | `-o` | Directory for 16-bit TIFF output. Created if missing. |
+| `--output-dir` | `-o` | Directory for TIFF output. Created if missing. |
 | `--dmin-rect` | — | D-min crop as `X,Y,WIDTH,HEIGHT` (pixels). Optional. Example: `50,50,200,200`. |
+| `--format` | — | `32f` (float, default) or `16` (integer). See “Output format” above. |
 
 Output filenames are derived from the input: e.g. `frame_001.arw` → `frame_001.tiff` in the output directory.
 
@@ -64,7 +79,7 @@ Order of operations:
 1. **Linear extraction** — LibRaw decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
 2. **Demosaic** — Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
 3. **D-min neutralization** (optional) — If `--dmin-rect` is set, the median R, G, and B in that rectangle are computed. The entire image is then divided by these three values (per channel). Use a region on the unexposed film border.
-4. **TIFF export** — f32 RGB `[0, 1]` is scaled to 16-bit (0–65535) and written as **uncompressed** RGB TIFF.
+4. **TIFF export** — Uncompressed RGB TIFF. By default **32-bit float** (no clamping/quantization). Option `--format 16` writes 16-bit integer (clamp to [0,1], scale to 0–65535).
 
 Planned (not yet implemented):
 
@@ -81,7 +96,7 @@ Planned (not yet implemented):
 | `src/raw_reader.rs` | Load `.arw` via LibRaw raw decode → `Array3<f32>` (H×W×1). |
 | `src/demosaic.rs` | Bayer→RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
 | `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place. |
-| `src/tiff_export.rs` | Write 16-bit uncompressed RGB TIFF from f32 image. |
+| `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32-bit float (default) or 16-bit integer from f32 image. |
 
 Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`.
 

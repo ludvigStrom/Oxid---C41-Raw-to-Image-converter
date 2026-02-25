@@ -39,6 +39,13 @@ struct Cli {
     /// Example: --dmin-rect 50,50,200,200
     #[arg(long = "dmin-rect", value_parser = parse_rect, value_name = "X,Y,WIDTH,HEIGHT")]
     dmin_rect: Option<Rect>,
+
+    /// Output TIFF format: 32f (float, max data) or 16 (integer, display/print)
+    ///
+    /// 32f = 32-bit float, no clamping or quantization. Best for archival.
+    /// 16  = 16-bit integer, clamp to [0,1]. Smaller, widely compatible.
+    #[arg(long = "format", default_value = "32f", value_parser = parse_format, value_name = "32f|16")]
+    format: tiff_export::TiffFormat,
 }
 
 /// Parse a rectangle of the form "x,y,width,height".
@@ -62,6 +69,15 @@ fn parse_rect(s: &str) -> Result<Rect, String> {
     Ok(Rect { x, y, width, height })
 }
 
+/// Parse output format: 32f or 16.
+fn parse_format(s: &str) -> Result<tiff_export::TiffFormat, String> {
+    match s.trim().to_lowercase().as_str() {
+        "32f" | "32" | "float" => Ok(tiff_export::TiffFormat::Float32),
+        "16" | "u16" => Ok(tiff_export::TiffFormat::U16),
+        _ => Err("format must be 32f (float) or 16 (integer)".to_string()),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -72,6 +88,7 @@ fn main() -> anyhow::Result<()> {
     println!("Input directory:  {}", cli.input_dir.display());
     println!("Output directory: {}", cli.output_dir.display());
     println!("D-min rect:       {:?}", cli.dmin_rect);
+    println!("Output format:    {:?}", cli.format);
 
     // Iterate over input directory, picking up .arw files
     let entries = fs::read_dir(&cli.input_dir)
@@ -113,13 +130,13 @@ fn main() -> anyhow::Result<()> {
             println!("D-min neutralized with rect {:?}", rect);
         }
 
-        // 16-bit uncompressed TIFF export
+        // Uncompressed TIFF export (32-bit float or 16-bit)
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("image");
         let out_path = cli.output_dir.join(format!("{}.tiff", stem));
-        tiff_export::write_rgb16_tiff(&image, &out_path)?;
+        tiff_export::write_tiff(&image, &out_path, cli.format)?;
         println!("Wrote {}", out_path.display());
     }
 
