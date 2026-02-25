@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
+use ndarray;
 
 mod curve;
 mod demosaic;
@@ -58,6 +59,18 @@ struct Cli {
     /// When skipped, --no-invert controls whether 1.0-input is applied.
     #[arg(long = "no-curve", action = clap::ArgAction::SetTrue)]
     no_curve: bool,
+
+    /// Red channel gain multiplier (applied after D-min, before curve). Default 1.0.
+    #[arg(long = "wb-r", default_value = "1.0", value_name = "N")]
+    wb_r: f32,
+
+    /// Green channel gain multiplier (applied after D-min, before curve). Default 1.0.
+    #[arg(long = "wb-g", default_value = "1.0", value_name = "N")]
+    wb_g: f32,
+
+    /// Blue channel gain multiplier (applied after D-min, before curve). Default 1.0.
+    #[arg(long = "wb-b", default_value = "1.0", value_name = "N")]
+    wb_b: f32,
 
     /// Print exposure offset (log-domain shift). Higher = brighter print. Default 0.0.
     #[arg(long = "curve-offset", default_value = "0.0", value_name = "N")]
@@ -123,6 +136,7 @@ fn main() -> anyhow::Result<()> {
     println!("D-min rect:       {:?}", cli.dmin_rect);
     println!("Output format:    {:?}", cli.format);
     println!("Invert (neg→pos): {}", if cli.no_curve { format!("{}", !cli.no_invert) } else { "via curve (log domain)".to_string() });
+    println!("WB gains:         R={} G={} B={}", cli.wb_r, cli.wb_g, cli.wb_b);
     println!("Print curve:     {} (offset={}, gamma={}, pivot={})",
         !cli.no_curve, cli.curve_offset, cli.curve_gamma, cli.curve_pivot);
 
@@ -172,6 +186,14 @@ fn main() -> anyhow::Result<()> {
         if let Some(rect) = cli.dmin_rect {
             dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
             println!("D-min neutralized with rect {:?}", rect);
+        }
+
+        // Per-channel white balance gains (compensate narrowband LED imbalance)
+        if cli.wb_r != 1.0 || cli.wb_g != 1.0 || cli.wb_b != 1.0 {
+            image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * cli.wb_r);
+            image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * cli.wb_g);
+            image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * cli.wb_b);
+            println!("Applied WB gains: R={} G={} B={}", cli.wb_r, cli.wb_g, cli.wb_b);
         }
 
         let stem = path
