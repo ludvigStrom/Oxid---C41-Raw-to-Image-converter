@@ -27,3 +27,16 @@ image = "0.25"
 
 # OpenEXR (EXR) output
 exr = "1.74"
+
+# GUI (optional binary)
+eframe = { version = "0.29", optional = true }
+rfd = { version = "0.15", optional = true }
+
+[features]
+default = []
+gui = ["eframe", "rfd"]
+
+[[bin]]
+name = "c41-gui"
+path = "src/bin/c41_gui.rs"
+required-features = ["gui"]

@@ -50,6 +50,16 @@ cargo run --release -- \
 
 `--curve-white 0.745` (190/255) pulls the white point in so highlights don’t blow; a 256-bin histogram summary is printed after the curve for inspection.
 
+### Minimal GUI
+
+A small desktop UI lets you pick files, set all parameters with sliders and checkboxes, choose an output folder, and run Convert:
+
+```bash
+cargo run --release --bin c41-gui --features gui
+```
+
+You need to enable the `gui` feature (adds `eframe` and `rfd`). Same pipeline as the CLI; outputs go to the folder you select.
+
 ---
 
 ## Output format: keeping as much data as possible
@@ -116,7 +126,9 @@ Order of operations:
 
 | Path | Role |
 |------|------|
-| `src/main.rs` | CLI (clap), directory iteration, pipeline orchestration. |
+| `src/lib.rs` | Shared pipeline: `PipelineOptions`, `process_files()`. Used by CLI and GUI. |
+| `src/main.rs` | CLI (clap), directory iteration, calls lib. |
+| `src/bin/c41_gui.rs` | Minimal GUI (egui/eframe): file picker, sliders/checkboxes, Convert. Requires `--features gui`. |
 | `src/raw_reader.rs` | Load `.arw` via LibRaw raw decode -> `Array3<f32>` (HxWx1). |
 | `src/png_reader.rs` | Load `.png` (or other image crate formats) -> RGB `Array3<f32>` (HxWx3); any size. |
 | `src/demosaic.rs` | Bayer->RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
