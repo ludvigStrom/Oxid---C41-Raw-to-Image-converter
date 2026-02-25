@@ -1,14 +1,14 @@
 # c41-raw-tool
 
-A high-performance, command-line RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline is strictly linear: no auto white balance, no hidden base curves, and no complex color science—only explicit mathematical steps suitable for scientific and repeatable workflows.
+A high-performance, command-line RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically accurate log-density math: no auto white balance, no hidden base curves, and no complex color science -- only explicit mathematical steps suitable for scientific and repeatable workflows.
 
-**Target camera:** Sony a7R II (42MP uncompressed `.arw`).
+**Target camera:** Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
 
 ---
 
-## Why linear-only?
+## Why log-density, not linear inversion?
 
-With narrowband RGB illumination, the cyan, magenta, and yellow dye layers are physically separated with minimal crosstalk. The goal is to preserve that separation and work in sensor/linear space until you choose explicit steps (D-min, inversion, tone curve). This tool does not apply camera profiles, creative color grading, or “smart” corrections.
+Film dye density is logarithmic. A simple `1.0 - input` inversion in linear space produces flat results with color cast. Instead, this tool converts transmittance to optical density (`D = -log10(T)`), inverts in the density domain, and applies an RA-4 paper S-curve (Michaelis-Menten). This models a physical darkroom enlarger and produces accurate film-like tonality.
 
 ---
 
@@ -34,28 +34,30 @@ Run with required input and output directories:
 cargo run --release -- --input-dir /path/to/arw/folder --output-dir /path/to/output
 ```
 
-Optional D-min region (unexposed film border) and 16-bit output for display:
+Full example with D-min and curve tuning:
 
 ```bash
 cargo run --release -- \
-  --input-dir "test files/raw" \
-  --output-dir "test files/raw/output" \
-  --dmin-rect 0,0,200,200 \
-  --format 16
+  -i "test files/png" \
+  -o "test files/png/output" \
+  --dmin-rect 35,15,20,20 \
+  --curve-offset 1.0 \
+  --curve-gamma 2.5 \
+  --curve-pivot 0.18
 ```
 
 ---
 
 ## Output format: keeping as much data as possible
 
-Output is always **uncompressed** TIFF. You choose the sample format:
+Output is always **uncompressed** TIFF. You choose the sample format (applies when `--no-curve`):
 
 | Format | Flag | What it does | Use when |
 |--------|------|----------------|----------|
-| **32-bit float** | `--format 32f` (default) | Writes f32 directly. No clamping, no quantization. Values &gt;1 (e.g. after D-min) are preserved. | Archival, further linear processing, or when you want to keep the full pipeline result. |
-| **16-bit integer** | `--format 16` | Clamps to [0, 1], then scales to 0–65535. Values &gt;1 are clipped; precision in shadows is reduced. | Viewing, printing, or when you need maximum compatibility with other software. |
+| **32-bit float** | `--format 32f` (default) | Writes f32 directly. No clamping, no quantization. | Archival, further linear processing. |
+| **16-bit integer** | `--format 16` | Clamps to [0, 1], scales to 0-65535. | Viewing, printing, compatibility. |
 
-**Recommendation:** Use the default `32f` to preserve all data. Use `16` only when you need a smaller file or 16-bit-only workflows.
+When the print curve is active (default), output is always 16-bit (the LUT produces u16).
 
 ---
 
@@ -63,14 +65,17 @@ Output is always **uncompressed** TIFF. You choose the sample format:
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--input-dir` | `-i` | Directory containing Sony `.arw` files. Only `.arw` is processed. |
+| `--input-dir` | `-i` | Directory containing `.arw` (RAW) and/or `.png` files. Other extensions are ignored. |
 | `--output-dir` | `-o` | Directory for TIFF output. Created if missing. |
-| `--dmin-rect` | — | D-min crop as `X,Y,WIDTH,HEIGHT` (pixels). Optional. Example: `50,50,200,200`. |
-| `--format` | — | `32f` (float, default) or `16` (integer). See “Output format” above. |
-| `--no-invert` | — | Skip negative→positive inversion; output stays as negative (after D-min). |
-| `--no-curve` | — | Skip universal tone curve; output stays linear (use with `--format` for 32f/16). |
+| `--dmin-rect` | -- | D-min crop as `X,Y,WIDTH,HEIGHT` (pixels). Optional. Example: `35,15,20,20`. |
+| `--format` | -- | `32f` (float, default) or `16` (integer). Only used with `--no-curve`. |
+| `--no-invert` | -- | Skip linear `1-x` inversion (only applies with `--no-curve`; the print curve inverts in log domain). |
+| `--no-curve` | -- | Skip physical print curve; output stays as linear transmittance. |
+| `--curve-offset` | -- | Print exposure bias (enlarger bulb). Default 1.0. Higher = brighter print. |
+| `--curve-gamma` | -- | Paper grade / contrast. Default 2.5. Higher = harder paper. Range 0.5-5.0. |
+| `--curve-pivot` | -- | Mid-gray pivot for the RA-4 S-curve. Default 0.18. Lower = brighter midtones. |
 
-Output filenames are derived from the input: e.g. `frame_001.arw` → `frame_001.tiff` in the output directory.
+Output filenames are derived from the input stem: e.g. `frame_001.arw` or `frame_001.png` -> `frame_001.tiff`.
 
 ---
 
@@ -78,12 +83,17 @@ Output filenames are derived from the input: e.g. `frame_001.arw` → `frame_001
 
 Order of operations:
 
-1. **Linear extraction** — LibRaw decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
-2. **Demosaic** — Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
-3. **D-min neutralization** (optional) — If `--dmin-rect` is set, the median R, G, and B in that rectangle are computed. The entire image is then divided by these three values (per channel). Use a region on the unexposed film border.
-4. **Inversion** (default on) — `output = 1.0 - input` per channel (negative→positive). Use `--no-invert` to keep the negative.
-5. **Tone curve** (default on) — 65 536-entry 1D LUT (sigmoid S-curve: toe, midtones, shoulder). Applied in parallel; output is 16-bit TIFF. Use `--no-curve` to skip and export linear (32f or 16 via `--format`).
-6. **TIFF export** — Uncompressed RGB TIFF. With curve: 16-bit from LUT. Without curve: **32-bit float** (default) or **16-bit** via `--format`.
+1. **Linear extraction** (ARW only) -- LibRaw decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
+2. **Demosaic** (ARW only) -- Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
+   *PNG input skips 1-2: loaded as RGB and normalized to [0, 1].*
+3. **D-min neutralization** (optional) -- If `--dmin-rect` is set, the median R, G, B in that rectangle are computed. The entire image is divided by those values per channel. After this, data represents **linear transmittance**.
+4. **Physical print film curve** (default on) -- 65 536-entry 1D LUT:
+   - `D = -log10(T)` -- optical density of the negative
+   - `logE = -D + offset` -- inversion happens here, in the physically correct log domain
+   - `E = 10^logE` -- back to linear exposure
+   - `out = E^g / (E^g + pivot^g)` -- RA-4 paper S-curve (Michaelis-Menten)
+   Parameters map to darkroom controls: `--curve-offset` (bulb), `--curve-gamma` (paper grade), `--curve-pivot` (mid-gray).
+5. **Fallback** (`--no-curve`) -- When the curve is off, optionally apply linear `1-x` inversion (`--no-invert` to skip). Export as 32-bit float (default) or 16-bit via `--format`.
 
 ---
 
@@ -92,14 +102,15 @@ Order of operations:
 | Path | Role |
 |------|------|
 | `src/main.rs` | CLI (clap), directory iteration, pipeline orchestration. |
-| `src/raw_reader.rs` | Load `.arw` via LibRaw raw decode → `Array3<f32>` (H×W×1). |
-| `src/demosaic.rs` | Bayer→RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
+| `src/raw_reader.rs` | Load `.arw` via LibRaw raw decode -> `Array3<f32>` (HxWx1). |
+| `src/png_reader.rs` | Load `.png` (or other image crate formats) -> RGB `Array3<f32>` (HxWx3); any size. |
+| `src/demosaic.rs` | Bayer->RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
 | `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place. |
-| `src/inversion.rs` | Negative→positive: in-place `1.0 - x` per channel. |
-| `src/curve.rs` | Universal tone curve: 65 536-entry LUT (sigmoid S-curve), parallel apply, f32→u16. |
+| `src/inversion.rs` | Simple linear inversion (`1-x`); used only with `--no-curve`. |
+| `src/curve.rs` | Physical Cineon/RA-4 print emulation: log-density inversion + Michaelis-Menten S-curve, 65 536-entry LUT, parallel apply. |
 | `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32f/16 from f32, or u16 (after curve) via `write_tiff_u16`. |
 
-Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`.
+Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`, `image` (PNG/raster ingestion).
 
 ---
 

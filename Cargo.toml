@@ -21,3 +21,6 @@ tiff = "0.11.0"
 
 # Simple error handling for the CLI and I/O
 anyhow = "1.0"
+
+# PNG (and other raster) ingestion for development
+image = "0.25"

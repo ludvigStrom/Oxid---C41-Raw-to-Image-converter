@@ -8,6 +8,7 @@ mod curve;
 mod demosaic;
 mod dmin;
 mod inversion;
+mod png_reader;
 mod raw_reader;
 mod tiff_export;
 
@@ -28,7 +29,7 @@ pub struct Rect {
     long_about = None
 )]
 struct Cli {
-    /// Input directory containing Sony .ARW files
+    /// Input directory containing .ARW (RAW) and/or .png files
     #[arg(short = 'i', long = "input-dir")]
     input_dir: PathBuf,
 
@@ -53,9 +54,22 @@ struct Cli {
     #[arg(long = "no-invert", action = clap::ArgAction::SetTrue)]
     no_invert: bool,
 
-    /// Skip universal tone curve (output stays linear; use --format for float/16 export)
+    /// Skip physical print curve (output stays as linear transmittance; use --format for float/16 export).
+    /// When skipped, --no-invert controls whether 1.0-input is applied.
     #[arg(long = "no-curve", action = clap::ArgAction::SetTrue)]
     no_curve: bool,
+
+    /// Print exposure offset (log-domain shift). Higher = brighter print. Default 0.0.
+    #[arg(long = "curve-offset", default_value = "0.0", value_name = "N")]
+    curve_offset: f32,
+
+    /// Paper grade / contrast gamma. Higher = harder paper. Default 2.5.
+    #[arg(long = "curve-gamma", default_value = "2.5", value_parser = parse_curve_gamma, value_name = "N")]
+    curve_gamma: f32,
+
+    /// Half-saturation exposure for RA-4 S-curve. Default 3.0.
+    #[arg(long = "curve-pivot", default_value = "3.0", value_name = "N")]
+    curve_pivot: f32,
 }
 
 /// Parse a rectangle of the form "x,y,width,height".
@@ -79,6 +93,15 @@ fn parse_rect(s: &str) -> Result<Rect, String> {
     Ok(Rect { x, y, width, height })
 }
 
+/// Parse curve gamma: float in 0.5..=5.0.
+fn parse_curve_gamma(s: &str) -> Result<f32, String> {
+    let g: f32 = s.trim().parse().map_err(|_| "curve-gamma must be a number".to_string())?;
+    if !(0.5..=5.0).contains(&g) {
+        return Err("curve-gamma must be between 0.5 and 5.0".to_string());
+    }
+    Ok(g)
+}
+
 /// Parse output format: 32f or 16.
 fn parse_format(s: &str) -> Result<tiff_export::TiffFormat, String> {
     match s.trim().to_lowercase().as_str() {
@@ -99,13 +122,14 @@ fn main() -> anyhow::Result<()> {
     println!("Output directory: {}", cli.output_dir.display());
     println!("D-min rect:       {:?}", cli.dmin_rect);
     println!("Output format:    {:?}", cli.format);
-    println!("Invert (neg→pos): {}", !cli.no_invert);
-    println!("Tone curve:      {}", !cli.no_curve);
+    println!("Invert (neg→pos): {}", if cli.no_curve { format!("{}", !cli.no_invert) } else { "via curve (log domain)".to_string() });
+    println!("Print curve:     {} (offset={}, gamma={}, pivot={})",
+        !cli.no_curve, cli.curve_offset, cli.curve_gamma, cli.curve_pivot);
 
-    // One LUT for all images when curve is enabled
-    let lut = (!cli.no_curve).then(|| curve::generate_16bit_lut(curve::DEFAULT_STEEPNESS));
+    // One LUT for all images when curve is enabled. The curve handles inversion in log/density domain.
+    let lut = (!cli.no_curve).then(|| curve::generate_16bit_lut(cli.curve_offset, cli.curve_gamma, cli.curve_pivot));
 
-    // Iterate over input directory, picking up .arw files
+    // Iterate over input directory: .arw (RAW) and .png
     let entries = fs::read_dir(&cli.input_dir)
         .with_context(|| format!("Failed to read input directory {}", cli.input_dir.display()))?;
 
@@ -123,32 +147,31 @@ fn main() -> anyhow::Result<()> {
             .map(|s| s.to_lowercase())
             .unwrap_or_default();
 
-        if ext != "arw" {
-            continue;
-        }
-
-        println!("\nLoading RAW file: {}", path.display());
-
-        // Load raw Bayer into (H, W, 1)
-        let bayer = raw_reader::load_raw_as_ndarray(&path)?;
-        let (h, w, c) = bayer.dim();
-        println!("Loaded RAW: height={}, width={}, channels={}", h, w, c);
-
-        // Demosaic to linear RGB (H, W, 3) — Sony a7R II = RGGB
-        let mut image = demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?;
-        let (h, w, c) = image.dim();
-        println!("Demosaiced to RGB: height={}, width={}, channels={}", h, w, c);
+        let mut image = match ext.as_str() {
+            "arw" => {
+                println!("\nLoading RAW file: {}", path.display());
+                let bayer = raw_reader::load_raw_as_ndarray(&path)?;
+                let (h, w, c) = bayer.dim();
+                println!("Loaded RAW: height={}, width={}, channels={}", h, w, c);
+                let rgb = demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?;
+                let (h, w, c) = rgb.dim();
+                println!("Demosaiced to RGB: height={}, width={}, channels={}", h, w, c);
+                rgb
+            }
+            "png" => {
+                println!("\nLoading PNG: {}", path.display());
+                let rgb = png_reader::load_png_as_ndarray(&path)?;
+                let (h, w, c) = rgb.dim();
+                println!("Loaded PNG: height={}, width={}, channels={}", h, w, c);
+                rgb
+            }
+            _ => continue,
+        };
 
         // D-min neutralization (sample unexposed border, divide by median R/G/B)
         if let Some(rect) = cli.dmin_rect {
             dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
             println!("D-min neutralized with rect {:?}", rect);
-        }
-
-        // Inversion: negative → positive (1.0 - input)
-        if !cli.no_invert {
-            inversion::invert(&mut image);
-            println!("Inverted (negative → positive)");
         }
 
         let stem = path
@@ -157,12 +180,18 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or("image");
         let out_path = cli.output_dir.join(format!("{}.tiff", stem));
 
-        // Tone curve (LUT) → u16, or direct f32/16 export
         if let Some(ref lut) = lut {
+            // Physical print curve: inversion is implicit in the density domain.
+            // Do NOT apply the linear 1.0 - input here.
             let image_u16 = curve::apply_curve_and_quantize(&image, lut);
             tiff_export::write_tiff_u16(&image_u16, &out_path)?;
-            println!("Applied tone curve, wrote {}", out_path.display());
+            println!("Applied print film curve, wrote {}", out_path.display());
         } else {
+            // No curve: optionally apply the simple linear inversion for quick preview
+            if !cli.no_invert {
+                inversion::invert(&mut image);
+                println!("Inverted (linear 1.0 - input)");
+            }
             tiff_export::write_tiff(&image, &out_path, cli.format)?;
             println!("Wrote {}", out_path.display());
         }
