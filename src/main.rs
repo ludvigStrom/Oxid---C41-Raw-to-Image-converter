@@ -5,7 +5,9 @@ use anyhow::Context;
 use clap::Parser;
 
 mod demosaic;
+mod dmin;
 mod raw_reader;
+mod tiff_export;
 
 /// Rectangle for D-min sampling (in pixel coordinates).
 #[derive(Debug, Clone, Copy)]
@@ -101,15 +103,24 @@ fn main() -> anyhow::Result<()> {
         println!("Loaded RAW: height={}, width={}, channels={}", h, w, c);
 
         // Demosaic to linear RGB (H, W, 3) — Sony a7R II = RGGB
-        let image = demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?;
+        let mut image = demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?;
         let (h, w, c) = image.dim();
         println!("Demosaiced to RGB: height={}, width={}, channels={}", h, w, c);
 
-        // Future steps:
-        // - D-min sampling using cli.dmin_rect
-        // - Inversion
-        // - Universal tone curve
-        // - 16-bit TIFF export to cli.output_dir
+        // D-min neutralization (sample unexposed border, divide by median R/G/B)
+        if let Some(rect) = cli.dmin_rect {
+            dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+            println!("D-min neutralized with rect {:?}", rect);
+        }
+
+        // 16-bit uncompressed TIFF export
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("image");
+        let out_path = cli.output_dir.join(format!("{}.tiff", stem));
+        tiff_export::write_rgb16_tiff(&image, &out_path)?;
+        println!("Wrote {}", out_path.display());
     }
 
     Ok(())
