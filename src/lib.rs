@@ -18,7 +18,7 @@ pub mod tiff_export;
 pub use tiff_export::TiffFormat;
 
 /// Rectangle for D-min sampling (pixel coordinates).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
