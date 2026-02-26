@@ -271,6 +271,8 @@ pub fn process_files(
     output_dir: &Path,
     options: &PipelineOptions,
 ) -> anyhow::Result<()> {
+    let has_real_idt = options.use_acescg && options.idt_matrix != aces::IDT_IDENTITY;
+
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory {}", output_dir.display()))?;
 
@@ -309,7 +311,7 @@ pub fn process_files(
             None
         };
 
-    if options.use_acescg {
+    if has_real_idt {
         if let Some(ref mut flat) = flat_field_map {
             aces::apply_idt(flat, &options.idt_matrix);
         }
@@ -333,7 +335,7 @@ pub fn process_files(
         };
 
         // Optional IDT: convert linear camera RGB to ACEScg before D-min / flat-field and WB.
-        if options.use_acescg {
+        if has_real_idt {
             aces::apply_idt(&mut image, &options.idt_matrix);
         }
 
@@ -366,7 +368,7 @@ pub fn process_files(
         let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
 
         // Optional ACES2065-1 branch: export linear ACES2065-1 EXR alongside display output.
-        if options.use_acescg && options.export_aces_exr {
+        if has_real_idt && options.export_aces_exr {
             let mut aces2065 = image.clone();
             aces::linear_acescg_to_aces2065_1(&mut aces2065);
             exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
@@ -375,8 +377,9 @@ pub fn process_files(
         if let Some(ref pipeline) = curve_pipeline {
             let mut image_u16 =
                 curve::apply_curve_pipeline(&image, pipeline, options.curve_white, true);
-            // When using ACEScg, convert curve output to linear sRGB so TIFF/EXR/JPEG are sRGB.
-            if options.use_acescg {
+            // When using ACEScg with a non-identity IDT, convert curve output to linear sRGB
+            // so TIFF/EXR/JPEG are in sRGB primaries.
+            if has_real_idt {
                 aces::convert_u16_linear_acescg_to_linear_srgb(&mut image_u16);
             }
             tiff_export::write_tiff_u16(&image_u16, &out_path)?;
@@ -396,7 +399,7 @@ pub fn process_files(
                 img.save(&jpg_path)?;
             }
         } else {
-            if options.use_acescg {
+            if has_real_idt {
                 aces::linear_acescg_to_linear_srgb(&mut image);
             }
             if !options.no_invert {
@@ -432,6 +435,8 @@ pub fn process_one_to_preview(
     max_width: u32,
     max_height: u32,
 ) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    let has_real_idt = options.use_acescg && options.idt_matrix != aces::IDT_IDENTITY;
+
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -449,7 +454,7 @@ pub fn process_one_to_preview(
     };
 
     // Optional IDT for preview: keep the same space as batch processing.
-    if options.use_acescg {
+    if has_real_idt {
         aces::apply_idt(&mut image, &options.idt_matrix);
     }
 
@@ -457,7 +462,7 @@ pub fn process_one_to_preview(
     if options.apply_dmin {
         if let Some(ref flat_path) = options.flat_field_path {
             let mut flat_map = load_flat_field_map(flat_path)?;
-            if options.use_acescg {
+            if has_real_idt {
                 aces::apply_idt(&mut flat_map, &options.idt_matrix);
             }
             apply_flat_field_division(&mut image, &flat_map);
@@ -495,7 +500,7 @@ pub fn process_one_to_preview(
                 [0.0, 0.0, 1.0],
             ]
         };
-        let m = if options.use_acescg {
+        let m = if has_real_idt {
             aces::convert_density_matrix_to_acescg(base, &options.idt_matrix)
         } else {
             base
@@ -503,7 +508,7 @@ pub fn process_one_to_preview(
         let matrix = curve::DensityMatrix { m };
         let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true);
         let mut u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
-        if options.use_acescg {
+        if has_real_idt {
             aces::convert_u16_linear_acescg_to_linear_srgb(&mut u16_img);
         }
         u16_img
@@ -511,7 +516,7 @@ pub fn process_one_to_preview(
             .map(|v| ((*v as u32) >> 8).min(255) as u8)
             .collect()
     } else {
-        if options.use_acescg {
+        if has_real_idt {
             aces::linear_acescg_to_linear_srgb(&mut image);
         }
         if !options.no_invert {
