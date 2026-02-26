@@ -373,8 +373,12 @@ pub fn process_files(
         }
 
         if let Some(ref pipeline) = curve_pipeline {
-            let image_u16 =
+            let mut image_u16 =
                 curve::apply_curve_pipeline(&image, pipeline, options.curve_white, true);
+            // When using ACEScg, convert curve output to linear sRGB so TIFF/EXR/JPEG are sRGB.
+            if options.use_acescg {
+                aces::convert_u16_linear_acescg_to_linear_srgb(&mut image_u16);
+            }
             tiff_export::write_tiff_u16(&image_u16, &out_path)?;
             if options.write_exr {
                 exr_export::write_exr_u16(&image_u16, &exr_path)?;
@@ -392,6 +396,9 @@ pub fn process_files(
                 img.save(&jpg_path)?;
             }
         } else {
+            if options.use_acescg {
+                aces::linear_acescg_to_linear_srgb(&mut image);
+            }
             if !options.no_invert {
                 inversion::invert(&mut image);
             }
@@ -495,12 +502,18 @@ pub fn process_one_to_preview(
         };
         let matrix = curve::DensityMatrix { m };
         let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true);
-        let u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
+        let mut u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
+        if options.use_acescg {
+            aces::convert_u16_linear_acescg_to_linear_srgb(&mut u16_img);
+        }
         u16_img
             .iter()
             .map(|v| ((*v as u32) >> 8).min(255) as u8)
             .collect()
     } else {
+        if options.use_acescg {
+            aces::linear_acescg_to_linear_srgb(&mut image);
+        }
         if !options.no_invert {
             inversion::invert(&mut image);
         }

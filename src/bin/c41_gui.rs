@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use c41_raw_tool::{
     blur_flat_field,
@@ -26,7 +27,7 @@ use eframe::egui;
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
 const BOTTOM_PANEL_HEIGHT: f32 = 120.0;
-const RIGHT_PANEL_WIDTH: f32 = 280.0;
+const RIGHT_PANEL_WIDTH: f32 = 330.0;
 
 fn main() -> eframe::Result<()> {
     eframe::run_native(
@@ -93,6 +94,7 @@ struct C41Gui {
     output_dir: Option<PathBuf>,
     status: String,
     preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, Vec<u8>)>>>,
+    preview_started_at: Option<Instant>,
     mode: UIMode,
     calibration_overlay: CalibrationOverlay,
     calibration_result: Option<([[f32; 3]; 3], f32)>, // (matrix, mse)
@@ -113,6 +115,7 @@ impl Default for C41Gui {
             output_dir: None,
             status: String::new(),
             preview_receiver: None,
+            preview_started_at: None,
             mode: UIMode::Process,
             calibration_overlay: CalibrationOverlay::default(),
             calibration_result: None,
@@ -314,6 +317,7 @@ impl C41Gui {
         options.flat_field_path = self.flat_field_path.clone();
         let (tx, rx) = mpsc::channel();
         self.preview_receiver = Some(rx);
+        self.preview_started_at = Some(Instant::now());
         thread::spawn(move || {
             let res = process_one_to_preview(
                 &path,
@@ -335,6 +339,7 @@ impl eframe::App for C41Gui {
             match rx.try_recv() {
                 Ok(Ok((idx, w, h, rgb))) => {
                     self.preview_receiver = None;
+                    self.preview_started_at = None;
                     if idx < self.images.len() {
                         let size = [w as usize, h as usize];
                         let mut r_hist = [0u32; 256];
@@ -366,11 +371,13 @@ impl eframe::App for C41Gui {
                 }
                 Ok(Err(e)) => {
                     self.preview_receiver = None;
+                    self.preview_started_at = None;
                     self.status = format!("Preview error: {}", e);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.preview_receiver = None;
+                    self.preview_started_at = None;
                 }
             }
         }
@@ -1078,7 +1085,14 @@ impl eframe::App for C41Gui {
 
         // ---- Central panel: preview + histogram ----
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.preview_receiver.is_some() {
+            let has_inflight = self.preview_receiver.is_some();
+            let show_loader = has_inflight
+                && self
+                    .preview_started_at
+                    .map(|t| t.elapsed() >= Duration::from_millis(250))
+                    .unwrap_or(true);
+
+            if show_loader {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 2.0 - 40.0);
                     ui.spinner();
