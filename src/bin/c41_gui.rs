@@ -27,6 +27,7 @@ struct ImageEntry {
     options: PipelineOptions,
     preview_texture: Option<egui::TextureHandle>,
     preview_hash: u64,
+    histogram: Option<[u32; 256]>,
 }
 
 struct C41Gui {
@@ -120,9 +121,19 @@ impl eframe::App for C41Gui {
                     self.preview_receiver = None;
                     if idx < self.images.len() {
                         let size = [w as usize, h as usize];
+                        let mut hist = [0u32; 256];
                         let pixels: Vec<egui::Color32> = rgb
                             .chunks_exact(3)
-                            .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                            .map(|c| {
+                                // simple luma for histogram
+                                let r = c[0] as f32;
+                                let g = c[1] as f32;
+                                let b = c[2] as f32;
+                                let l = (0.2126 * r + 0.7152 * g + 0.0722 * b)
+                                    .clamp(0.0, 255.0) as u8;
+                                hist[l as usize] += 1;
+                                egui::Color32::from_rgb(c[0], c[1], c[2])
+                            })
                             .collect();
                         let image = egui::ColorImage { size, pixels };
                         let tex = ctx.load_texture(
@@ -133,6 +144,7 @@ impl eframe::App for C41Gui {
                         let hash = options_hash_for(&self.images[idx].path, &self.images[idx].options);
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_hash = hash;
+                        self.images[idx].histogram = Some(hist);
                     }
                 }
                 Ok(Err(e)) => {
@@ -181,6 +193,7 @@ impl eframe::App for C41Gui {
                                             options: default_options(),
                                             preview_texture: None,
                                             preview_hash: 0,
+                                            histogram: None,
                                         });
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);
@@ -404,11 +417,11 @@ impl eframe::App for C41Gui {
                 }
             });
 
-        // ---- Central panel: preview ----
+        // ---- Central panel: preview + histogram ----
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.preview_receiver.is_some() {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() / 2.0 - 20.0);
+                    ui.add_space(ui.available_height() / 2.0 - 40.0);
                     ui.spinner();
                     ui.label("Loading preview…");
                 });
@@ -418,9 +431,52 @@ impl eframe::App for C41Gui {
                         let size = tex.size();
                         let (w, h) = (size[0] as f32, size[1] as f32);
                         let available = ui.available_rect_before_wrap();
-                        let scale = (available.width() / w).min(available.height() / h).min(1.0);
+                        let scale = (available.width() / w).min((available.height() - 80.0) / h).min(1.0);
                         let display_size = egui::vec2(w * scale, h * scale);
                         ui.image((tex.id(), display_size));
+                        ui.add_space(8.0);
+                        if let Some(hist) = &self.images[idx].histogram {
+                            // Histogram aligned to bottom of the central panel.
+                            let available = ui.available_rect_before_wrap();
+                            let h_hist = 72.0;
+                            let rect = egui::Rect::from_min_max(
+                                egui::pos2(available.left(), available.bottom() - h_hist),
+                                egui::pos2(available.right(), available.bottom()),
+                            );
+                            let painter = ui.painter_at(rect);
+
+                            let max = hist.iter().copied().max().unwrap_or(1) as f32;
+                            let w_bin = rect.width() / 256.0;
+                            let bar_color = egui::Color32::from_rgba_premultiplied(0, 0, 0, 220);
+
+                            for (i, &count) in hist.iter().enumerate() {
+                                if count == 0 {
+                                    continue;
+                                }
+                                let x0 = rect.left() + i as f32 * w_bin;
+                                let x1 = x0 + w_bin.max(1.0);
+                                let h_norm = (count as f32 / max).clamp(0.0, 1.0);
+                                let y1 = rect.bottom();
+                                let y0 = rect.bottom() - rect.height() * h_norm;
+                                let r = egui::Rect::from_min_max(
+                                    egui::pos2(x0, y0),
+                                    egui::pos2(x1, y1),
+                                );
+                                painter.rect_filled(r, 0.0, bar_color);
+                            }
+
+                            // Axes: X (bottom) and Y (left), in black.
+                            let axis_color = egui::Color32::BLACK;
+                            let stroke = egui::Stroke::new(1.0, axis_color);
+                            painter.line_segment(
+                                [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.bottom())],
+                                stroke,
+                            );
+                            painter.line_segment(
+                                [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.left(), rect.top())],
+                                stroke,
+                            );
+                        }
                         return;
                     }
                 }
