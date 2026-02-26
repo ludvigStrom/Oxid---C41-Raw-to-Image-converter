@@ -1,0 +1,5 @@
+# Append this to Cargo.toml when building on Windows (after running patch-libraw-windows.ps1).
+# Then: cargo clean && cargo build --release
+
+[patch.crates-io]
+libraw-rs-sys = { path = "vendor/libraw-rs-sys" }

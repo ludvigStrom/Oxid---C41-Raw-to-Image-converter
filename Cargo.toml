@@ -47,3 +47,9 @@ gui = ["eframe", "rfd"]
 name = "c41-gui"
 path = "src/bin/c41_gui.rs"
 required-features = ["gui"]
+
+# Use patched libraw-rs-sys: fixes -pthread, -static, dllimport (C2491), /EHsc on MSVC.
+# Create vendor/ with: .\scripts\patch-libraw-windows.ps1
+# On non-Windows the same patched build.rs works (the MSVC block is runtime-gated).
+[patch.crates-io]
+libraw-rs-sys = { path = "vendor/libraw-rs-sys" }

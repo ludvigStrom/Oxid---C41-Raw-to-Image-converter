@@ -18,7 +18,64 @@ Film dye density is logarithmic. A simple `1.0 - input` inversion in linear spac
 - **LibRaw** (used for raw decoding)
   - **macOS:** `brew install libraw`
   - **Debian/Ubuntu:** `sudo apt-get install libraw-dev`
-  - **Windows** just give up... package managing sucks on windows.
+  - **Windows:** see [Building on Windows](#building-on-windows) below (build script + one-time patch).
+
+---
+
+## Building on Windows
+
+LibRaw is built from source by the `libraw-rs-sys` crate. On MSVC that fails without patches: the crate passes `-pthread` (unsupported), and the C API is declared `dllimport` so defining it in a static build causes C2491. This project fixes that with a one-time patch and a build script that helps with linking.
+
+1. **One-time patch (required)**  
+   From the project root, run (PowerShell):
+   ```powershell
+   .\scripts\patch-libraw-windows.ps1
+   ```
+   That creates `vendor/libraw-rs-sys` from the Cargo registry and patches `build.rs` to:
+   - use `-pthread` only on Unix (not MSVC),
+   - define `LIBRAW_BUILDLIB` and add `/EHsc` on MSVC (fixes C2491 and C++ exception semantics).
+
+2. **Use the patched crate**  
+   Append the contents of `scripts/cargo-patch-windows.toml` to your `Cargo.toml` (the `[patch.crates-io]` block).
+
+3. **Clean and build**
+   ```powershell
+   cargo clean
+   cargo build --release
+   ```
+
+4. **Optional: vcpkg for LibRaw dependencies**  
+   The vendored LibRaw may need zlib, lcms2, and jasper. If you use [vcpkg](https://vcpkg.io/):
+   ```powershell
+   vcpkg install libraw
+   vcpkg integrate install
+   ```
+   Set `VCPKG_ROOT` if vcpkg is not on `%USERPROFILE%\vcpkg`. The project `build.rs` will then add the right link search paths and link libs.
+
+   Alternatively, set `LIBRAW_DIR` to the root of a directory that contains `lib` (or `x64-windows\lib`) with the required libraries.
+
+5. **Cargo in PATH (PowerShell)**  
+   If `cargo` is not recognized in PowerShell, add it for the current session:
+   ```powershell
+   $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
+   ```
+   Then run the build. That only affects the current window.
+
+   **So it works every time**, either:
+   - **One-time per session** (in any new PowerShell): run the line above, then your build/run commands.
+   - **Permanent:** add Cargo to your user PATH:
+     - Win+R → `rundll32 sysdm.cpl,EditEnvironmentVariables`
+     - Under “User variables” select **Path** → Edit → New → add: `C:\Users\<YourUsername>\.cargo\bin`
+     - OK out, then open a **new** PowerShell.
+
+   **Run the GUI:**
+   ```powershell
+   .\target\release\c41-gui.exe
+   ```
+   Or from the project root (with PATH set as above):
+   ```powershell
+   cargo run --release --bin c41-gui --features gui
+   ```
 
 ---
 
