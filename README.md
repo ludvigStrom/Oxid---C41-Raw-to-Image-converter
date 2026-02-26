@@ -2,7 +2,7 @@
 
 A high-performance, command-line RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically accurate log-density math: no auto white balance, no hidden base curves, and no complex color science -- only explicit mathematical steps suitable for scientific and repeatable workflows.
 
-**Target camera:** Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
+**Target cameras:** Any LibRaw-supported Bayer RAW (Sony, Nikon, Canon, etc.). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
 
 ---
 
@@ -79,7 +79,7 @@ When the print curve is active (default), output is always 16-bit (the LUT produ
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--input-dir` | `-i` | Directory containing `.arw` (RAW) and/or `.png` files. Other extensions are ignored. |
+| `--input-dir` | `-i` | Directory containing RAW files (`.arw`, `.nef`, `.nrw`, `.cr2`, `.cr3`, `.crw`, `.dng`, `.raf`, `.orf`, `.rw2`) and/or `.png` files. Others are ignored. |
 | `--output-dir` | `-o` | Directory for TIFF output. Created if missing. |
 | `--dmin-rect` | -- | D-min crop as `X,Y,WIDTH,HEIGHT` (pixels). Optional. Example: `35,15,20,20`. |
 | `--dmin-fixed` | -- | Fixed D-min medians `R,G,B` in linear [0,1]. Bypasses crop measurement. Example: `0.635294,0.635294,0.623529`. |
@@ -105,8 +105,8 @@ Output filenames are derived from the input stem: e.g. `frame_001.arw` or `frame
 
 Order of operations:
 
-1. **Linear extraction** (ARW only) -- LibRaw decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
-2. **Demosaic** (ARW only) -- Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
+1. **Linear extraction** (RAW only) -- LibRaw decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
+2. **Demosaic** (RAW only) -- Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
    *PNG input skips 1-2: loaded as RGB and normalized to [0, 1].*
 3. **D-min neutralization** (optional) -- Either:
    - If `--dmin-fixed` is set, use those fixed medians R,G,B (previously measured once) and divide the entire image per channel, **or**
@@ -129,7 +129,7 @@ Order of operations:
 | `src/lib.rs` | Shared pipeline: `PipelineOptions`, `process_files()`. Used by CLI and GUI. |
 | `src/main.rs` | CLI (clap), directory iteration, calls lib. |
 | `src/bin/c41_gui.rs` | Minimal GUI (egui/eframe): file picker, sliders/checkboxes, Convert. Requires `--features gui`. |
-| `src/raw_reader.rs` | Load `.arw` via LibRaw raw decode -> `Array3<f32>` (HxWx1). |
+| `src/raw_reader.rs` | Load RAW via LibRaw (`.arw`, `.nef`, `.nrw`, `.cr2`, `.cr3`, `.crw`, `.dng`, `.raf`, `.orf`, `.rw2`) -> `Array3<f32>` (HxWx1) Bayer. |
 | `src/png_reader.rs` | Load `.png` (or other image crate formats) -> RGB `Array3<f32>` (HxWx3); any size. |
 | `src/demosaic.rs` | Bayer->RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
 | `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place; supports fixed medians via `--dmin-fixed`. |

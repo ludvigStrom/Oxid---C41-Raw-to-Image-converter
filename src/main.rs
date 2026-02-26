@@ -124,7 +124,10 @@ fn main() -> anyhow::Result<()> {
         .filter(|p| p.is_file())
         .filter(|p| {
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-            ext.eq_ignore_ascii_case("arw") || ext.eq_ignore_ascii_case("png")
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" | "png"
+            )
         })
         .collect();
 

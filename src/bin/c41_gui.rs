@@ -222,7 +222,10 @@ impl eframe::App for C41Gui {
                 ui.horizontal(|ui| {
                     if ui.button("Add image…").clicked() {
                         if let Some(paths) = rfd::FileDialog::new()
-                            .add_filter("ARW & PNG", &["arw", "png"])
+                            .add_filter(
+                                "RAW & PNG",
+                                &["arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf", "orf", "rw2", "png"],
+                            )
                             .pick_files()
                         {
                             for p in paths {

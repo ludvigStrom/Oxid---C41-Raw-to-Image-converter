@@ -116,7 +116,8 @@ pub fn process_files(
             .unwrap_or_default();
 
         let mut image = match ext.as_str() {
-            "arw" => {
+            // RAW formats handled by LibRaw; we assume a Bayer sensor and RGGB for now.
+            "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
                 let bayer = raw_reader::load_raw_as_ndarray(path)?;
                 demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?
             }
@@ -178,7 +179,7 @@ pub fn process_one_to_preview(
         .unwrap_or_default();
 
     let mut image = match ext.as_str() {
-        "arw" => {
+        "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
             let bayer = raw_reader::load_raw_as_ndarray(path)?;
             let small_bayer = downsample_bayer_for_preview(&bayer, max_width);
             demosaic::demosaic_bilinear(&small_bayer, demosaic::BayerPattern::Rggb)?
