@@ -189,20 +189,4 @@ See repository for license information. LibRaw is used under its own license (e.
 
 - **Highlight handling**: `--curve-white` currently acts as a scalar white-point control. A future enhancement could add an optional soft‑clip or smooth highlight roll‑off just before 16‑bit quantization for even more graceful specular handling.
 
-- **Color space
-The Verdict: A Hybrid Approach
-To get the best of both worlds, you should treat ACES purely as a highly accurate mathematical container, bypassing its display rendering entirely.
-
-Your updated pipeline would look like this:
-
-LibRaw -> Linear camera RGB.
-
-IDT Matrix -> Convert linear camera RGB to ACEScg.
-
-Flat-field / D-min -> Applied in ACEScg.
-
-Log-Density Matrix -> Calculated in ACEScg.
-
-EXR Branch -> Export raw ACES2065-1 EXR here (for VFX/Archival).
-
-Your Custom RA-4 Curve -> Applied directly to the ACEScg data, mapping it directly to standard display RGB (bypassing the ACES RRT/ODT completely).
+- **ACES hybrid** — Implemented. Use **Use ACEScg** (GUI) or `--use-acescg` (CLI); optional `--export-aces-exr` and `--idt-matrix`. See "ACES hybrid (optional)" above and `colorSpaceUpdate.md`.
