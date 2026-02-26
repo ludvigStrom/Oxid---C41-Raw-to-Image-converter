@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use image::{imageops::FilterType, imageops::resize, RgbImage};
 use ndarray;
 
 pub mod curve;
@@ -111,7 +112,7 @@ pub fn process_files(
         let exr_path = output_dir.join(format!("{}.exr", stem));
 
         if let Some(ref lut) = lut {
-            let image_u16 = curve::apply_curve_and_quantize(&image, lut, options.curve_white);
+            let image_u16 = curve::apply_curve_and_quantize(&image, lut, options.curve_white, true);
             tiff_export::write_tiff_u16(&image_u16, &out_path)?;
             if options.write_exr {
                 exr_export::write_exr_u16(&image_u16, &exr_path)?;
@@ -128,4 +129,75 @@ pub fn process_files(
     }
 
     Ok(())
+}
+
+/// Process a single image in memory and return RGB u8 pixels scaled to fit within
+/// `max_width` x `max_height` (aspect ratio preserved). For GUI preview.
+pub fn process_one_to_preview(
+    path: &Path,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+
+    let mut image = match ext.as_str() {
+        "arw" => {
+            let bayer = raw_reader::load_raw_as_ndarray(path)?;
+            demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?
+        }
+        "png" => png_reader::load_png_as_ndarray(path)?,
+        _ => anyhow::bail!("Unsupported extension for preview"),
+    };
+
+    if let Some((r, g, b)) = options.dmin_fixed {
+        dmin::neutralize_with_medians(&mut image, r, g, b)?;
+    } else if let Some(rect) = options.dmin_rect {
+        dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+    }
+
+    if options.wb_r != 1.0 || options.wb_g != 1.0 || options.wb_b != 1.0 {
+        image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * options.wb_r);
+        image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * options.wb_g);
+        image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * options.wb_b);
+    }
+
+    let (h, w, _) = image.dim();
+    let w = w as u32;
+    let h = h as u32;
+
+    let rgb_u8: Vec<u8> = if !options.no_curve {
+        let lut = curve::generate_16bit_lut(
+            options.curve_offset,
+            options.curve_gamma,
+            options.curve_pivot,
+        );
+        let u16_img = curve::apply_curve_and_quantize(&image, &lut, options.curve_white, false);
+        u16_img
+            .iter()
+            .map(|v| ((*v as u32) >> 8).min(255) as u8)
+            .collect()
+    } else {
+        if !options.no_invert {
+            inversion::invert(&mut image);
+        }
+        image
+            .iter()
+            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect()
+    };
+
+    let img = RgbImage::from_raw(w, h, rgb_u8).ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
+
+    let scale = (max_width as f32 / w as f32).min(max_height as f32 / h as f32).min(1.0);
+    let new_w = (w as f32 * scale).round().max(1.0) as u32;
+    let new_h = (h as f32 * scale).round().max(1.0) as u32;
+
+    let resized = resize(&img, new_w, new_h, FilterType::Triangle);
+    let out = resized.into_raw();
+    Ok((new_w, new_h, out))
 }

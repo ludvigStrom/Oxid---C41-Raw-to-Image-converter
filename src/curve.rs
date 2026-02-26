@@ -64,14 +64,14 @@ pub fn generate_16bit_lut(offset: f32, gamma: f32, pivot: f32) -> Vec<u16> {
 /// Apply the tone curve via LUT and quantize to u16 in one pass (parallel).
 ///
 /// `white_point` is a normalized code value in [0, 1] that should map to display
-/// white after the curve. For example, 190/255 ≈ 0.745 will scale the output so
-/// that 0.745 becomes pure white, effectively \"pulling\" the white point in.
+/// white. If `print_histogram` is true, a 256-bin summary is printed to stdout.
 ///
 /// Values below 0 or above 1 are clamped to the first/last LUT index.
 pub fn apply_curve_and_quantize(
     image: &Array3<f32>,
     lut: &[u16],
     white_point: f32,
+    print_histogram: bool,
 ) -> Array3<u16> {
     assert_eq!(lut.len(), LUT_LEN, "LUT must have 65536 entries");
 
@@ -97,14 +97,15 @@ pub fn apply_curve_and_quantize(
         });
     }
 
-    // Simple 256-bin histogram (8-bit view of the u16 output), printed for inspection.
-    let mut hist = [0u64; 256];
-    for v in out.iter() {
-        let bin = (*v as usize) >> 8;
-        hist[bin] += 1;
-    }
-    let total: u64 = hist.iter().sum();
-    if total > 0 {
+    // Optional 256-bin histogram (8-bit view of the u16 output), printed for inspection.
+    if print_histogram {
+        let mut hist = [0u64; 256];
+        for v in out.iter() {
+            let bin = (*v as usize) >> 8;
+            hist[bin] += 1;
+        }
+        let total: u64 = hist.iter().sum();
+        if total > 0 {
         let mut min_bin = 0usize;
         while min_bin < 256 && hist[min_bin] == 0 {
             min_bin += 1;
@@ -137,6 +138,7 @@ pub fn apply_curve_and_quantize(
             "Histogram (8-bit bins of u16 output): min={} p50={} p90={} p99={} max={}",
             min_bin, p50, p90, p99, max_bin
         );
+        }
     }
 
     out
