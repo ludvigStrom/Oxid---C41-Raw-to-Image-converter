@@ -31,9 +31,20 @@ const BOTTOM_PANEL_HEIGHT: f32 = 120.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
 
 fn main() -> eframe::Result<()> {
+    let mut native_options = eframe::NativeOptions::default();
+    // macOS: content extends under title bar; title bar transparent so we draw dark bar in egui
+    #[cfg(target_os = "macos")]
+    {
+        native_options.viewport = native_options
+            .viewport
+            .clone()
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false); // hide OS title so only our white title in the dark bar shows
+    }
     eframe::run_native(
         "C-41 RAW Tool",
-        eframe::NativeOptions::default(),
+        native_options,
         Box::new(|cc| {
             let mut visuals = egui::Visuals::dark();
             visuals.window_fill = egui::Color32::from_gray(35);
@@ -349,6 +360,35 @@ impl C41Gui {
 
 impl eframe::App for C41Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply dark theme every frame so it sticks (some backends reset after creation)
+        let mut style = (*ctx.style()).clone();
+        style.visuals = egui::Visuals::dark();
+        style.visuals.window_fill = egui::Color32::from_gray(35);
+        style.visuals.panel_fill = egui::Color32::from_gray(30);
+        style.visuals.override_text_color = Some(egui::Color32::from_gray(240));
+        style.visuals.selection.bg_fill = egui::Color32::from_gray(70); // selected tabs/items: gray instead of blue
+        ctx.set_style(style);
+
+        // Dark title bar; on macOS OS title is hidden so we draw the app name here (white)
+        egui::TopBottomPanel::top("dark_title_bar")
+            .exact_height(28.0)
+            .frame(egui::Frame::none().fill(egui::Color32::from_gray(30)))
+            .show(ctx, |ui| {
+                #[cfg(target_os = "macos")]
+                {
+                    ui.with_layout(
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new("C-41 RAW Tool")
+                                    .color(egui::Color32::from_gray(240))
+                                    .size(14.0),
+                            );
+                        },
+                    );
+                }
+            });
+
         // Poll preview worker
         if let Some(rx) = self.preview_receiver.as_ref() {
             match rx.try_recv() {
@@ -494,6 +534,7 @@ impl eframe::App for C41Gui {
             .show(ctx, |ui| {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
+                    ui.add_space(10.0);
                     ui.selectable_value(&mut self.mode, UIMode::Process, "Process");
                     ui.selectable_value(&mut self.mode, UIMode::Calibrate, "Color calibration");
                     ui.selectable_value(
@@ -501,10 +542,14 @@ impl eframe::App for C41Gui {
                         UIMode::LuminanceCalibrate,
                         "Luminance calibration",
                     );
+                    ui.add_space(10.0);
                 });
                 ui.separator();
                 ui.add_space(4.0);
 
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
                 match self.mode {
                     UIMode::Process => {
                         ui.heading("Image Settings");
@@ -1204,6 +1249,9 @@ impl eframe::App for C41Gui {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(&self.status).small());
                 }
+                    });
+                    ui.add_space(10.0);
+                });
             });
 
         // ---- Central panel: preview + histogram ----
