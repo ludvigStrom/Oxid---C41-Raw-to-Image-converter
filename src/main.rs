@@ -70,6 +70,10 @@ struct Cli {
         default_value = "1,0,0,0,1,0,0,0,1"
     )]
     density_matrix: [f32; 9],
+
+    /// Flat-field reference: path to a RAW file of an unexposed, developed frame (same film stock) for luminance calibration.
+    #[arg(long = "flat-field", value_name = "PATH")]
+    flat_field: Option<PathBuf>,
 }
 
 fn parse_rect(s: &str) -> Result<Rect, String> {
@@ -145,6 +149,7 @@ fn main() -> anyhow::Result<()> {
         !cli.no_curve, cli.curve_offset, cli.curve_gamma, cli.curve_pivot, cli.curve_white
     );
     println!("Density matrix:  {:?}", cli.density_matrix);
+    println!("Flat field:      {:?}", cli.flat_field);
 
     let paths: Vec<PathBuf> = fs::read_dir(&cli.input_dir)
         .with_context(|| format!("Failed to read input directory {}", cli.input_dir.display()))?
@@ -182,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             [cli.density_matrix[3], cli.density_matrix[4], cli.density_matrix[5]],
             [cli.density_matrix[6], cli.density_matrix[7], cli.density_matrix[8]],
         ],
+        flat_field_path: cli.flat_field,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

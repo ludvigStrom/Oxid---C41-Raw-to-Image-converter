@@ -7,13 +7,16 @@ use std::sync::mpsc;
 use std::thread;
 
 use c41_raw_tool::{
+    blur_flat_field,
     calibration,
     demosaic,
     dmin,
+    load_flat_field_linear,
     png_reader,
     process_files,
     process_one_to_preview,
     raw_reader,
+    tiff_export,
     PipelineOptions,
     Rect,
     TiffFormat,
@@ -55,6 +58,7 @@ enum ExportFormat {
 enum UIMode {
     Process,
     Calibrate,
+    LuminanceCalibrate,
 }
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
@@ -96,6 +100,9 @@ struct C41Gui {
     calibration_light_source: String,
     calibration_profiles: Vec<(PathBuf, calibration::CalibrationProfile)>,
     selected_profile_idx: Option<usize>,
+    /// Luminance calibration: path and linearized flat-field image (RAW → demosaic only).
+    flat_field_path: Option<PathBuf>,
+    flat_field_image: Option<ndarray::Array3<f32>>,
 }
 
 impl Default for C41Gui {
@@ -113,6 +120,8 @@ impl Default for C41Gui {
             calibration_light_source: String::new(),
             calibration_profiles: Vec::new(),
             selected_profile_idx: None,
+            flat_field_path: None,
+            flat_field_image: None,
         }
     }
 }
@@ -248,6 +257,7 @@ fn default_options() -> PipelineOptions {
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 1.0],
         ],
+        flat_field_path: None,
     }
 }
 
@@ -274,6 +284,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
             v.to_bits().hash(&mut h);
         }
     }
+    opts.flat_field_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
     h.finish()
 }
 
@@ -283,7 +294,8 @@ impl C41Gui {
             return;
         }
         let path = self.images[index].path.clone();
-        let options = self.images[index].options.clone();
+        let mut options = self.images[index].options.clone();
+        options.flat_field_path = self.flat_field_path.clone();
         let (tx, rx) = mpsc::channel();
         self.preview_receiver = Some(rx);
         thread::spawn(move || {
@@ -443,7 +455,12 @@ impl eframe::App for C41Gui {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.mode, UIMode::Process, "Process");
-                    ui.selectable_value(&mut self.mode, UIMode::Calibrate, "Calibrate");
+                    ui.selectable_value(&mut self.mode, UIMode::Calibrate, "Color calibration");
+                    ui.selectable_value(
+                        &mut self.mode,
+                        UIMode::LuminanceCalibrate,
+                        "Luminance calibration",
+                    );
                 });
                 ui.separator();
                 ui.add_space(4.0);
@@ -453,7 +470,10 @@ impl eframe::App for C41Gui {
                         ui.heading("Image Settings");
                     }
                     UIMode::Calibrate => {
-                        ui.heading("Calibration");
+                        ui.heading("Color calibration");
+                    }
+                    UIMode::LuminanceCalibrate => {
+                        ui.heading("Luminance calibration");
                     }
                 }
                 ui.add_space(4.0);
@@ -489,96 +509,145 @@ impl eframe::App for C41Gui {
                 );
                 ui.add_space(4.0);
 
-                ui.collapsing("D-min", |ui| {
-                    let mut use_fixed = opts.dmin_fixed.is_some();
-                    ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
-                    if use_fixed {
-                        if opts.dmin_fixed.is_none() {
-                            opts.dmin_fixed = Some((0.635294, 0.635294, 0.623529));
+                // D-min, White balance, and Print curve apply only to normal processing.
+                // In Luminance calibration we only load a reference frame (raw → demosaic → blur); no conversion settings.
+                if self.mode != UIMode::LuminanceCalibrate {
+                    ui.collapsing("D-min", |ui| {
+                        // Option 1: classic D-min (fixed or crop) when no flat-field override is set.
+                        let mut use_fixed = opts.dmin_fixed.is_some();
+                        ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
+                        if use_fixed {
+                            if opts.dmin_fixed.is_none() {
+                                opts.dmin_fixed = Some((0.635294, 0.635294, 0.623529));
+                            }
+                            let (mut r, mut g, mut b) = opts.dmin_fixed.unwrap();
+                            ui.horizontal(|ui| {
+                                ui.label("R");
+                                ui.add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.01));
+                                ui.label("G");
+                                ui.add(egui::DragValue::new(&mut g).range(0.0..=1.0).speed(0.01));
+                                ui.label("B");
+                                ui.add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.01));
+                            });
+                            opts.dmin_fixed = Some((r, g, b));
+                            opts.dmin_rect = None;
+                        } else {
+                            if opts.dmin_rect.is_none() {
+                                opts.dmin_rect = Some(Rect {
+                                    x: 35,
+                                    y: 15,
+                                    width: 20,
+                                    height: 20,
+                                });
+                            }
+                            if let Some(rect) = opts.dmin_rect.as_mut() {
+                                ui.horizontal(|ui| {
+                                    ui.label("x,y,w,h");
+                                    ui.add(egui::DragValue::new(&mut rect.x).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.y).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.width).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.height).speed(1));
+                                });
+                            }
+                            opts.dmin_fixed = None;
                         }
-                        let (mut r, mut g, mut b) = opts.dmin_fixed.unwrap();
+
+                        ui.separator();
+                        ui.label("Flat-field override (luminance calibration)");
+                        ui.horizontal(|ui| {
+                            if ui.button("Load flat-field map…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Flat field",
+                                        &[
+                                            "tif", "tiff", // 32f TIFF profiles
+                                            "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf",
+                                            "orf", "rw2", // RAW empty-frame
+                                            "png",
+                                        ],
+                                    )
+                                    .pick_file()
+                                {
+                                    self.flat_field_path = Some(path.clone());
+                                    // When flat-field is active, disable per-image D-min.
+                                    opts.dmin_fixed = None;
+                                    opts.dmin_rect = None;
+                                    self.status = format!(
+                                        "Using flat-field map from {} (overrides D-min).",
+                                        path.display()
+                                    );
+                                }
+                            }
+
+                            if self.flat_field_path.is_some()
+                                && ui.button("Clear flat-field override").clicked()
+                            {
+                                self.flat_field_path = None;
+                                self.status =
+                                    "Flat-field override cleared; D-min settings are active again."
+                                        .to_string();
+                            }
+                        });
+                        if let Some(ref p) = self.flat_field_path {
+                            ui.label(
+                                egui::RichText::new(format!("Flat-field: {}", p.display())).small(),
+                            );
+                        } else {
+                            ui.label(egui::RichText::new("No flat-field override set.").small());
+                        }
+                    });
+
+                    ui.collapsing("White balance", |ui| {
                         ui.horizontal(|ui| {
                             ui.label("R");
-                            ui.add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.01));
+                            ui.add(egui::Slider::new(&mut opts.wb_r, 0.5..=2.0));
+                        });
+                        ui.horizontal(|ui| {
                             ui.label("G");
-                            ui.add(egui::DragValue::new(&mut g).range(0.0..=1.0).speed(0.01));
+                            ui.add(egui::Slider::new(&mut opts.wb_g, 0.5..=2.0));
+                        });
+                        ui.horizontal(|ui| {
                             ui.label("B");
-                            ui.add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.01));
+                            ui.add(egui::Slider::new(&mut opts.wb_b, 0.5..=2.0));
                         });
-                        opts.dmin_fixed = Some((r, g, b));
-                        opts.dmin_rect = None;
-                    } else {
-                        if opts.dmin_rect.is_none() {
-                            opts.dmin_rect = Some(Rect {
-                                x: 35,
-                                y: 15,
-                                width: 20,
-                                height: 20,
-                            });
-                        }
-                        if let Some(rect) = opts.dmin_rect.as_mut() {
+                    });
+
+                    ui.collapsing("Print curve", |ui| {
+                        let mut apply_curve = !opts.no_curve;
+                        ui.checkbox(&mut apply_curve, "Apply curve");
+                        opts.no_curve = !apply_curve;
+                        if apply_curve {
                             ui.horizontal(|ui| {
-                                ui.label("x,y,w,h");
-                                ui.add(egui::DragValue::new(&mut rect.x).speed(1));
-                                ui.add(egui::DragValue::new(&mut rect.y).speed(1));
-                                ui.add(egui::DragValue::new(&mut rect.width).speed(1));
-                                ui.add(egui::DragValue::new(&mut rect.height).speed(1));
+                                ui.label("Offset");
+                                ui.add(
+                                    egui::DragValue::new(&mut opts.curve_offset)
+                                        .range(-2.0..=2.0)
+                                        .speed(0.05),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Gamma");
+                                ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Pivot");
+                                ui.add(
+                                    egui::DragValue::new(&mut opts.curve_pivot)
+                                        .range(0.1..=10.0)
+                                        .speed(0.1),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("White");
+                                ui.add(egui::Slider::new(&mut opts.curve_white, 0.3..=1.0));
                             });
                         }
-                        opts.dmin_fixed = None;
-                    }
-                });
-
-                ui.collapsing("White balance", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("R");
-                        ui.add(egui::Slider::new(&mut opts.wb_r, 0.5..=2.0));
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("G");
-                        ui.add(egui::Slider::new(&mut opts.wb_g, 0.5..=2.0));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("B");
-                        ui.add(egui::Slider::new(&mut opts.wb_b, 0.5..=2.0));
-                    });
-                });
-
-                ui.collapsing("Print curve", |ui| {
-                    let mut apply_curve = !opts.no_curve;
-                    ui.checkbox(&mut apply_curve, "Apply curve");
-                    opts.no_curve = !apply_curve;
-                    if apply_curve {
-                        ui.horizontal(|ui| {
-                            ui.label("Offset");
-                            ui.add(
-                                egui::DragValue::new(&mut opts.curve_offset)
-                                    .range(-2.0..=2.0)
-                                    .speed(0.05),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Gamma");
-                            ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Pivot");
-                            ui.add(
-                                egui::DragValue::new(&mut opts.curve_pivot)
-                                    .range(0.1..=10.0)
-                                    .speed(0.1),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("White");
-                            ui.add(egui::Slider::new(&mut opts.curve_white, 0.3..=1.0));
-                        });
-                    }
-                });
+                }
 
                 if self.mode == UIMode::Calibrate {
                     ui.separator();
-                    ui.heading("Solve calibration");
+                    ui.heading("Solve color calibration");
                     ui.add_space(4.0);
 
                     if ui.button("Solve 3×3 matrix from chart").clicked() {
@@ -607,17 +676,17 @@ impl eframe::App for C41Gui {
                                         self.calibration_result = Some((m, mse));
                                         opts.density_matrix = m;
                                         self.status = format!(
-                                            "Solved calibration matrix (MSE {:.6}) applied to this image.",
+                                            "Solved color calibration matrix (MSE {:.6}) applied to this image.",
                                             mse
                                         );
                                     }
                                     None => {
-                                        self.status = "Calibration failed: singular system".to_string();
+                                        self.status = "Color calibration failed: singular system".to_string();
                                     }
                                 }
                             }
                             Err(e) => {
-                                self.status = format!("Calibration error: {}", e);
+                                self.status = format!("Color calibration error: {}", e);
                             }
                         }
                     }
@@ -648,7 +717,7 @@ impl eframe::App for C41Gui {
                         ui.label("Light source notes");
                         ui.text_edit_singleline(&mut self.calibration_light_source);
 
-                        if ui.button("Save calibration profile…").clicked() {
+                        if ui.button("Save color calibration profile…").clicked() {
                             let dmin_snapshot = calibration_opts_snapshot.dmin_fixed;
                             let name = if self.calibration_profile_name.trim().is_empty() {
                                 "profile".to_string()
@@ -676,11 +745,11 @@ impl eframe::App for C41Gui {
                                 match calibration::save_profile_to_path(&profile, &path) {
                                     Ok(()) => {
                                         self.status =
-                                            format!("Saved calibration profile to {}", path.display());
+                                            format!("Saved color calibration profile to {}", path.display());
                                     }
                                     Err(e) => {
                                         self.status =
-                                            format!("Failed to save calibration profile: {}", e);
+                                            format!("Failed to save color calibration profile: {}", e);
                                     }
                                 }
                             }
@@ -689,7 +758,7 @@ impl eframe::App for C41Gui {
                 }
 
                 if self.mode == UIMode::Process {
-                    ui.collapsing("Calibration profile", |ui| {
+                    ui.collapsing("Color calibration profile", |ui| {
                         if ui.button("Refresh profiles").clicked() {
                             let base_dir = std::env::current_dir()
                                 .unwrap_or_else(|_| PathBuf::from("."))
@@ -699,14 +768,14 @@ impl eframe::App for C41Gui {
                                     self.calibration_profiles = list;
                                     self.selected_profile_idx = None;
                                     self.status = format!(
-                                        "Loaded {} calibration profile(s) from {}",
+                                        "Loaded {} color calibration profile(s) from {}",
                                         self.calibration_profiles.len(),
                                         base_dir.display()
                                     );
                                 }
                                 Err(e) => {
                                     self.status = format!(
-                                        "Failed to load profiles from {}: {}",
+                                        "Failed to load color calibration profiles from {}: {}",
                                         base_dir.display(),
                                         e
                                     );
@@ -715,7 +784,7 @@ impl eframe::App for C41Gui {
                         }
 
                         if self.calibration_profiles.is_empty() {
-                            ui.label("No profiles loaded. Click 'Refresh profiles' to scan the profiles/ folder.");
+                            ui.label("No color calibration profiles loaded. Click 'Refresh profiles' to scan the profiles/ folder.");
                         } else {
                             let mut current_idx = self.selected_profile_idx.unwrap_or(usize::MAX);
                             let selected_label = if let Some(i) = self.selected_profile_idx {
@@ -766,10 +835,90 @@ impl eframe::App for C41Gui {
                                     opts.dmin_rect = None;
                                 }
                                 self.status = format!(
-                                    "Applied calibration profile '{}' to current image.",
+                                    "Applied color calibration profile '{}' to current image.",
                                     profile.name
                                 );
                             }
+                        }
+                    });
+                }
+
+                if self.mode == UIMode::LuminanceCalibrate {
+                    ui.collapsing("Flat field (luminance calibration)", |ui| {
+                        ui.label("Reference frame: unexposed, developed RAW from the same roll.");
+                        if ui.button("Load Reference Frame…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter(
+                                    "RAW",
+                                    &[
+                                        "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf", "orf", "rw2",
+                                    ],
+                                )
+                                .pick_file()
+                            {
+                                match load_flat_field_linear(&path) {
+                                    Ok(arr) => {
+                                        // Heavy blur to remove grain/dust, keep only luminance falloff.
+                                        let radius = 60.0_f32;
+                                        let blurred = blur_flat_field(&arr, radius);
+                                        let (h, w, c) = blurred.dim();
+                                        self.flat_field_path = Some(path.clone());
+                                        self.flat_field_image = Some(blurred);
+                                        self.status = format!(
+                                            "Loaded and blurred flat-field {}×{} ({} ch), radius {:.1} from {}",
+                                            h,
+                                            w,
+                                            c,
+                                            radius,
+                                            path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.flat_field_path = None;
+                                        self.flat_field_image = None;
+                                        self.status = format!("Failed to load flat-field: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(ref p) = self.flat_field_path {
+                            ui.label(egui::RichText::new(p.display().to_string()).small());
+                            if let Some(ref arr) = self.flat_field_image {
+                                let (h, w, _) = arr.dim();
+                                ui.label(format!("Linearized: {}×{} RGB", h, w));
+                                if ui.button("Save blurred flat-field as 32f TIFF…").clicked() {
+                                    let default_name = p
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .map(|s| format!("{}_flat_field.tiff", s))
+                                        .unwrap_or_else(|| "flat_field.tiff".to_string());
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .set_file_name(default_name)
+                                        .save_file()
+                                    {
+                                        match tiff_export::write_tiff(
+                                            arr,
+                                            &path,
+                                            TiffFormat::Float32,
+                                        ) {
+                                            Ok(()) => {
+                                                self.status = format!(
+                                                    "Saved blurred flat-field to {}",
+                                                    path.display()
+                                                );
+                                            }
+                                            Err(e) => {
+                                                self.status = format!(
+                                                    "Failed to save flat-field TIFF: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.label("No reference frame loaded.");
                         }
                     });
                 }
@@ -866,7 +1015,9 @@ impl eframe::App for C41Gui {
                             err = Some(anyhow::anyhow!("DNG export is not implemented yet"));
                             break;
                         }
-                        if let Err(e) = process_files(&[img.path.clone()], &output_dir, &img.options) {
+                        let mut opts = img.options.clone();
+                        opts.flat_field_path = self.flat_field_path.clone();
+                        if let Err(e) = process_files(&[img.path.clone()], &output_dir, &opts) {
                             err = Some(e);
                             break;
                         }

@@ -3,7 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use image::{imageops::FilterType, imageops::resize, RgbImage};
+use image::{
+    imageops::{self, FilterType},
+    Rgb, Rgb32FImage, RgbImage,
+};
 use ndarray::{self, Array3};
 
 pub mod curve;
@@ -45,6 +48,8 @@ pub struct PipelineOptions {
     pub curve_pivot: f32,
     pub curve_white: f32,
     pub density_matrix: [[f32; 3]; 3],
+    /// Path to a RAW flat-field (unexposed) frame for luminance calibration. Optional.
+    pub flat_field_path: Option<PathBuf>,
 }
 
 impl Default for PipelineOptions {
@@ -69,6 +74,142 @@ impl Default for PipelineOptions {
                 [0.0, 1.0, 0.0],
                 [0.0, 0.0, 1.0],
             ],
+            flat_field_path: None,
+        }
+    }
+}
+
+/// Load a RAW flat-field frame through Step 1 (LibRaw) and Step 2 (Demosaic) only.
+/// Returns linear RGB transmittance as `Array3<f32>` (H, W, 3). No D-min, no curve.
+/// Use for luminance (flat-field) calibration reference.
+pub fn load_flat_field_linear(path: &Path) -> anyhow::Result<Array3<f32>> {
+    let bayer = raw_reader::load_raw_as_ndarray(path)?;
+    demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)
+}
+
+/// Apply a heavy Gaussian blur to a linear RGB flat-field image to remove film grain and dust,
+/// leaving only low-frequency luminance falloff (light source + lens vignetting).
+///
+/// Input and output are `(height, width, 3)` arrays in linear [0, 1] space.
+pub fn blur_flat_field(input: &Array3<f32>, radius: f32) -> Array3<f32> {
+    let (h, w, c) = input.dim();
+    assert_eq!(
+        c, 3,
+        "blur_flat_field expects a 3-channel RGB flat-field image"
+    );
+
+    let mut img = Rgb32FImage::new(w as u32, h as u32);
+    for y in 0..h {
+        for x in 0..w {
+            let r = input[(y, x, 0)];
+            let g = input[(y, x, 1)];
+            let b = input[(y, x, 2)];
+            img.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+        }
+    }
+
+    let blurred = imageops::blur(&img, radius);
+
+    let mut out = Array3::<f32>::zeros((h, w, 3));
+    for (x, y, pixel) in blurred.enumerate_pixels() {
+        let [r, g, b] = pixel.0;
+        let yi = y as usize;
+        let xi = x as usize;
+        out[(yi, xi, 0)] = r;
+        out[(yi, xi, 1)] = g;
+        out[(yi, xi, 2)] = b;
+    }
+
+    out
+}
+
+/// Load a flat-field map from an image file (e.g. 32f TIFF saved from the GUI).
+/// Interprets the data as linear RGB in [0, 1] (or higher).
+fn load_flat_field_from_image(path: &Path) -> anyhow::Result<Array3<f32>> {
+    let img = image::open(path)?;
+    let rgb = img.to_rgb32f();
+    let (w, h) = rgb.dimensions();
+    let mut out = Array3::<f32>::zeros((h as usize, w as usize, 3));
+    for (x, y, pixel) in rgb.enumerate_pixels() {
+        let [r, g, b] = pixel.0;
+        let yi = y as usize;
+        let xi = x as usize;
+        out[(yi, xi, 0)] = r;
+        out[(yi, xi, 1)] = g;
+        out[(yi, xi, 2)] = b;
+    }
+    Ok(out)
+}
+
+/// Load or reconstruct a flat-field map for the pipeline.
+/// - RAW inputs are linearized + heavily blurred
+/// - Image inputs (TIFF/PNG/etc.) are treated as already-linear maps (no extra blur)
+fn load_flat_field_map(path: &Path) -> anyhow::Result<Array3<f32>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+
+    match ext.as_str() {
+        // RAW formats -> linearize then blur to remove grain/dust.
+        "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
+            let linear = load_flat_field_linear(path)?;
+            Ok(blur_flat_field(&linear, 60.0))
+        }
+        // Everything else is treated as an already-prepared map (e.g. 32f TIFF).
+        _ => load_flat_field_from_image(path),
+    }
+}
+
+/// Resize a blurred flat-field to match the target image dimensions (height, width, 3).
+fn resize_flat_field(flat: &Array3<f32>, height: usize, width: usize) -> Array3<f32> {
+    let (fh, fw, fc) = flat.dim();
+    assert_eq!(fc, 3, "resize_flat_field expects 3-channel input");
+    if fh == height && fw == width {
+        return flat.clone();
+    }
+
+    let mut img = Rgb32FImage::new(fw as u32, fh as u32);
+    for y in 0..fh {
+        for x in 0..fw {
+            let r = flat[(y, x, 0)];
+            let g = flat[(y, x, 1)];
+            let b = flat[(y, x, 2)];
+            img.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+        }
+    }
+
+    let resized = imageops::resize(&img, width as u32, height as u32, FilterType::Triangle);
+
+    let mut out = Array3::<f32>::zeros((height, width, 3));
+    for (x, y, pixel) in resized.enumerate_pixels() {
+        let [r, g, b] = pixel.0;
+        let yi = y as usize;
+        let xi = x as usize;
+        out[(yi, xi, 0)] = r;
+        out[(yi, xi, 1)] = g;
+        out[(yi, xi, 2)] = b;
+    }
+
+    out
+}
+
+/// Apply pixel-by-pixel flat-field division:
+/// T_out(x, y) = T_in(x, y) / T_flat_blurred(x, y), with safe division.
+fn apply_flat_field_division(image: &mut Array3<f32>, flat_blurred: &Array3<f32>) {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3, "apply_flat_field_division expects 3-channel image");
+
+    let flat_resampled = resize_flat_field(flat_blurred, h, w);
+    let eps = 1.0e-6_f32;
+
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..3 {
+                let denom = flat_resampled[(y, x, ch)].max(eps);
+                image[(y, x, ch)] /= denom;
+            }
         }
     }
 }
@@ -127,6 +268,13 @@ pub fn process_files(
         curve::CurvePipeline::new(params, matrix, 4.0, true)
     });
 
+    // Optional flat-field: load map once, then reuse for all images in this batch.
+    let flat_field_map: Option<Array3<f32>> = if let Some(ref flat_path) = options.flat_field_path {
+        Some(load_flat_field_map(flat_path)?)
+    } else {
+        None
+    };
+
     for path in paths {
         let ext = path
             .extension()
@@ -144,7 +292,10 @@ pub fn process_files(
             _ => continue,
         };
 
-        if let Some((r, g, b)) = options.dmin_fixed {
+        // Step 3: either flat-field division (if provided) or classic D-min neutralization.
+        if let Some(ref flat) = flat_field_map {
+            apply_flat_field_division(&mut image, flat);
+        } else if let Some((r, g, b)) = options.dmin_fixed {
             dmin::neutralize_with_medians(&mut image, r, g, b)?;
         } else if let Some(rect) = options.dmin_rect {
             dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
@@ -232,7 +383,11 @@ pub fn process_one_to_preview(
         _ => anyhow::bail!("Unsupported extension for preview"),
     };
 
-    if let Some((r, g, b)) = options.dmin_fixed {
+    // Step 3 for preview: flat-field if provided, else D-min.
+    if let Some(ref flat_path) = options.flat_field_path {
+        let flat_map = load_flat_field_map(flat_path)?;
+        apply_flat_field_division(&mut image, &flat_map);
+    } else if let Some((r, g, b)) = options.dmin_fixed {
         dmin::neutralize_with_medians(&mut image, r, g, b)?;
     } else if let Some(rect) = options.dmin_rect {
         dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
@@ -279,7 +434,7 @@ pub fn process_one_to_preview(
     let new_w = (w as f32 * scale).round().max(1.0) as u32;
     let new_h = (h as f32 * scale).round().max(1.0) as u32;
 
-    let resized = resize(&img, new_w, new_h, FilterType::Triangle);
+    let resized = imageops::resize(&img, new_w, new_h, FilterType::Triangle);
     let out = resized.into_raw();
     Ok((new_w, new_h, out))
 }
