@@ -9,6 +9,7 @@ use image::{
 };
 use ndarray::{self, Array3};
 
+pub mod aces;
 pub mod curve;
 pub mod demosaic;
 pub mod dmin;
@@ -56,6 +57,12 @@ pub struct PipelineOptions {
     pub density_matrix: [[f32; 3]; 3],
     /// Path to a RAW flat-field (unexposed) frame for luminance calibration. Optional.
     pub flat_field_path: Option<PathBuf>,
+    /// When true, apply IDT and run pipeline in ACEScg; when false, keep current camera-linear behavior.
+    pub use_acescg: bool,
+    /// 3×3 IDT matrix (camera linear RGB → ACEScg). Identity when not using ACEScg.
+    pub idt_matrix: [[f32; 3]; 3],
+    /// When true (and use_acescg), also write a linear ACES2065-1 EXR alongside display output.
+    pub export_aces_exr: bool,
 }
 
 impl Default for PipelineOptions {
@@ -84,6 +91,9 @@ impl Default for PipelineOptions {
                 [0.0, 0.0, 1.0],
             ],
             flat_field_path: None,
+            use_acescg: false,
+            idt_matrix: aces::IDT_IDENTITY,
+            export_aces_exr: false,
         }
     }
 }
@@ -286,11 +296,20 @@ pub fn process_files(
     });
 
     // Optional flat-field: load map once, then reuse for all images in this batch.
-    let flat_field_map: Option<Array3<f32>> = if let Some(ref flat_path) = options.flat_field_path {
-        Some(load_flat_field_map(flat_path)?)
-    } else {
-        None
-    };
+    // When running in ACEScg mode, convert the flat-field map with the same IDT so that
+    // flat-field division happens in the same space as the main image.
+    let mut flat_field_map: Option<Array3<f32>> =
+        if let Some(ref flat_path) = options.flat_field_path {
+            Some(load_flat_field_map(flat_path)?)
+        } else {
+            None
+        };
+
+    if options.use_acescg {
+        if let Some(ref mut flat) = flat_field_map {
+            aces::apply_idt(flat, &options.idt_matrix);
+        }
+    }
 
     for path in paths {
         let ext = path
@@ -308,6 +327,11 @@ pub fn process_files(
             "png" => png_reader::load_png_as_ndarray(path)?,
             _ => continue,
         };
+
+        // Optional IDT: convert linear camera RGB to ACEScg before D-min / flat-field and WB.
+        if options.use_acescg {
+            aces::apply_idt(&mut image, &options.idt_matrix);
+        }
 
         // Step 3: D-min / flat-field (skipped if apply_dmin is false).
         if options.apply_dmin {
@@ -335,6 +359,14 @@ pub fn process_files(
             .unwrap_or("image");
         let out_path = output_dir.join(format!("{}.tiff", stem));
         let exr_path = output_dir.join(format!("{}.exr", stem));
+        let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
+
+        // Optional ACES2065-1 branch: export linear ACES2065-1 EXR alongside display output.
+        if options.use_acescg && options.export_aces_exr {
+            let mut aces2065 = image.clone();
+            aces::linear_acescg_to_aces2065_1(&mut aces2065);
+            exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
+        }
 
         if let Some(ref pipeline) = curve_pipeline {
             let image_u16 =
@@ -405,10 +437,18 @@ pub fn process_one_to_preview(
         _ => anyhow::bail!("Unsupported extension for preview"),
     };
 
+    // Optional IDT for preview: keep the same space as batch processing.
+    if options.use_acescg {
+        aces::apply_idt(&mut image, &options.idt_matrix);
+    }
+
     // Step 3 for preview: D-min / flat-field (skipped if apply_dmin is false).
     if options.apply_dmin {
         if let Some(ref flat_path) = options.flat_field_path {
-            let flat_map = load_flat_field_map(flat_path)?;
+            let mut flat_map = load_flat_field_map(flat_path)?;
+            if options.use_acescg {
+                aces::apply_idt(&mut flat_map, &options.idt_matrix);
+            }
             apply_flat_field_division(&mut image, &flat_map);
         } else if let Some((r, g, b)) = options.dmin_fixed {
             dmin::neutralize_with_medians(&mut image, r, g, b)?;

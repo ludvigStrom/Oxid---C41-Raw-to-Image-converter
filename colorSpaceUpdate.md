@@ -93,22 +93,22 @@ Check off each step as you complete it. Phases can be done in order; within a ph
 
 ### Phase 1: ACES and IDT modules
 
-- [ ] **1.1** Add `src/aces.rs` (or `src/color_space/aces.rs`): define ACEScg ↔ ACES2065-1 3×3 matrix (AP1 linear → AP0 linear; constants from ACES docs). Expose e.g. `linear_acescg_to_aces2065_1(image: &mut Array3<f32>)` or a function that returns a new array.
-- [ ] **1.2** Add IDT support: new module or section in lib (e.g. `src/idt.rs` or in `src/aces.rs`): 3×3 matrix type, default identity. Expose e.g. `apply_idt(image: &mut Array3<f32>, matrix: &[[f32;3];3])`.
-- [ ] **1.3** Add `PipelineOptions` fields: `use_acescg: bool` (default false for backward compat), `idt_matrix: [[f32;3];3]` (default identity), `export_aces_exr: bool`. Ensure CLI and GUI can set these (or add in a later phase).
+- [x] **1.1** Add `src/aces.rs` (or `src/color_space/aces.rs`): define ACEScg ↔ ACES2065-1 3×3 matrix (AP1 linear → AP0 linear; constants from ACES docs). Expose e.g. `linear_acescg_to_aces2065_1(image: &mut Array3<f32>)` or a function that returns a new array.
+- [x] **1.2** Add IDT support: new module or section in lib (e.g. `src/idt.rs` or in `src/aces.rs`): 3×3 matrix type, default identity. Expose e.g. `apply_idt(image: &mut Array3<f32>, matrix: &[[f32;3];3])`.
+- [x] **1.3** Add `PipelineOptions` fields: `use_acescg: bool` (default false for backward compat), `idt_matrix: [[f32;3];3]` (default identity), `export_aces_exr: bool`. Ensure CLI and GUI can set these (or add in a later phase).
 
 ### Phase 2: Pipeline integration (lib.rs)
 
-- [ ] **2.1** In `process_files`, after demosaic: if `use_acescg`, apply IDT to convert linear camera RGB → ACEScg. Then run D-min/flat-field and WB as today (now in ACEScg).
-- [ ] **2.2** Add EXR branch: if `export_aces_exr`, take the image after WB (linear ACEScg), convert to ACES2065-1, write to e.g. `{stem}_aces2065-1.exr` (or a dedicated path). Do not apply curve to this branch.
-- [ ] **2.3** Keep existing curve path: input is still "linear transmittance" (now in ACEScg when `use_acescg`); curve output remains display RGB. TIFF/EXR (display) unchanged.
-- [ ] **2.4** In `process_one_to_preview`, apply the same logic: optional IDT → ACEScg, then D-min/flat, WB, then curve for preview (no ACES EXR branch needed for preview).
+- [x] **2.1** In `process_files`, after demosaic: if `use_acescg`, apply IDT to convert linear camera RGB → ACEScg. Then run D-min/flat-field and WB as today (now in ACEScg).
+- [x] **2.2** Add EXR branch: if `export_aces_exr`, take the image after WB (linear ACEScg), convert to ACES2065-1, write to e.g. `{stem}_aces2065-1.exr` (or a dedicated path). Do not apply curve to this branch.
+- [x] **2.3** Keep existing curve path: input is still "linear transmittance" (now in ACEScg when `use_acescg`); curve output remains display RGB. TIFF/EXR (display) unchanged.
+- [x] **2.4** In `process_one_to_preview`, apply the same logic: optional IDT → ACEScg, then D-min/flat, WB, then curve for preview (no ACES EXR branch needed for preview).
 
 ### Phase 3: EXR and options
 
-- [ ] **3.1** In `src/exr_export.rs`, add a path or helper to write ACES2065-1 EXR (same f32 write as today; optionally set color space in EXR metadata if the `exr` crate supports it).
-- [ ] **3.2** CLI: add `--use-acescg`, `--idt-matrix` (9 floats or path to file), `--export-aces-exr`. Parse and pass into `PipelineOptions`.
-- [ ] **3.3** GUI: add checkboxes "Use ACEScg" and "Export ACES2065-1 EXR"; optional IDT matrix load or 9 inputs. Wire to `PipelineOptions` and refresh preview when toggled.
+- [x] **3.1** In `src/exr_export.rs`, add a path or helper to write ACES2065-1 EXR (same f32 write as today; optionally set color space in EXR metadata if the `exr` crate supports it).
+- [x] **3.2** CLI: add `--use-acescg`, `--idt-matrix` (9 floats or path to file), `--export-aces-exr`. Parse and pass into `PipelineOptions`.
+- [x] **3.3** GUI: add checkboxes "Use ACEScg" and "Export ACES2065-1 EXR"; optional IDT matrix load or 9 inputs. Wire to `PipelineOptions` and refresh preview when toggled.
 
 ### Phase 4: Calibration and docs
 

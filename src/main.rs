@@ -74,6 +74,23 @@ struct Cli {
     /// Flat-field reference: path to a RAW file of an unexposed, developed frame (same film stock) for luminance calibration.
     #[arg(long = "flat-field", value_name = "PATH")]
     flat_field: Option<PathBuf>,
+
+    /// Run pipeline in ACEScg: apply IDT (camera linear → ACEScg), then D-min/WB/curve in ACEScg.
+    #[arg(long = "use-acescg", action = clap::ArgAction::SetTrue)]
+    use_acescg: bool,
+
+    /// 3×3 IDT matrix (row-major), 9 comma-separated values. Used when --use-acescg. Default: identity.
+    #[arg(
+        long = "idt-matrix",
+        value_parser = parse_density_matrix,
+        value_name = "M00,M01,M02,M10,M11,M12,M20,M21,M22",
+        default_value = "1,0,0,0,1,0,0,0,1"
+    )]
+    idt_matrix: [f32; 9],
+
+    /// When using --use-acescg, also write linear ACES2065-1 EXR (e.g. image_aces2065-1.exr) for VFX/archival.
+    #[arg(long = "export-aces-exr", action = clap::ArgAction::SetTrue)]
+    export_aces_exr: bool,
 }
 
 fn parse_rect(s: &str) -> Result<Rect, String> {
@@ -150,6 +167,10 @@ fn main() -> anyhow::Result<()> {
     );
     println!("Density matrix:  {:?}", cli.density_matrix);
     println!("Flat field:      {:?}", cli.flat_field);
+    println!("Use ACEScg:      {}", cli.use_acescg);
+    if cli.use_acescg {
+        println!("Export ACES2065-1 EXR: {}", cli.export_aces_exr);
+    }
 
     let paths: Vec<PathBuf> = fs::read_dir(&cli.input_dir)
         .with_context(|| format!("Failed to read input directory {}", cli.input_dir.display()))?
@@ -191,6 +212,13 @@ fn main() -> anyhow::Result<()> {
             [cli.density_matrix[6], cli.density_matrix[7], cli.density_matrix[8]],
         ],
         flat_field_path: cli.flat_field,
+        use_acescg: cli.use_acescg,
+        idt_matrix: [
+            [cli.idt_matrix[0], cli.idt_matrix[1], cli.idt_matrix[2]],
+            [cli.idt_matrix[3], cli.idt_matrix[4], cli.idt_matrix[5]],
+            [cli.idt_matrix[6], cli.idt_matrix[7], cli.idt_matrix[8]],
+        ],
+        export_aces_exr: cli.export_aces_exr,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

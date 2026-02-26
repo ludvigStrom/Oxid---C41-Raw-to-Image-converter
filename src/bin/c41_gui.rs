@@ -261,6 +261,9 @@ fn default_options() -> PipelineOptions {
             [0.0, 0.0, 1.0],
         ],
         flat_field_path: None,
+        use_acescg: false,
+        idt_matrix: c41_raw_tool::aces::IDT_IDENTITY,
+        export_aces_exr: false,
     }
 }
 
@@ -291,6 +294,13 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
         }
     }
     opts.flat_field_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
+    opts.use_acescg.hash(&mut h);
+    opts.export_aces_exr.hash(&mut h);
+    for row in &opts.idt_matrix {
+        for v in row {
+            v.to_bits().hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -622,6 +632,22 @@ impl eframe::App for C41Gui {
                             ui.add(egui::Slider::new(&mut opts.wb_b, 0.5..=2.0));
                         });
                     });
+                    }
+
+                    // ACES: run pipeline in ACEScg and optionally export ACES2065-1 EXR.
+                    ui.checkbox(&mut opts.use_acescg, "Use ACEScg");
+                    if opts.use_acescg {
+                        ui.checkbox(&mut opts.export_aces_exr, "Export ACES2065-1 EXR");
+                        ui.collapsing("IDT matrix (camera → ACEScg)", |ui| {
+                            let m = &mut opts.idt_matrix;
+                            ui.horizontal(|ui| {
+                                for row in 0..3 {
+                                    for col in 0..3 {
+                                        ui.add(egui::DragValue::new(&mut m[row][col]).speed(0.05));
+                                    }
+                                }
+                            });
+                        });
                     }
 
                     let mut apply_curve = !opts.no_curve;
