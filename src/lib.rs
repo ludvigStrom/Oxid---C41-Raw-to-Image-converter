@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use image::{imageops::FilterType, imageops::resize, RgbImage};
-use ndarray;
+use ndarray::{self, Array3};
 
 pub mod curve;
 pub mod demosaic;
@@ -62,6 +62,38 @@ impl Default for PipelineOptions {
             curve_white: 1.0,
         }
     }
+}
+
+fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f32> {
+    let (h, w, c) = bayer.dim();
+    assert_eq!(c, 1, "Expected single-channel Bayer for preview");
+
+    let w_u32 = w as u32;
+    if w_u32 <= max_width {
+        return bayer.clone();
+    }
+
+    let mut factor = (w_u32 as f32 / max_width as f32).ceil() as usize;
+    if factor < 1 {
+        factor = 1;
+    }
+    if factor % 2 != 0 {
+        factor += 1;
+    }
+
+    let new_w = w / factor;
+    let new_h = h / factor;
+    let mut out = Array3::<f32>::zeros((new_h, new_w, 1));
+
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let src_y = y * factor;
+            let src_x = x * factor;
+            out[(y, x, 0)] = bayer[(src_y, src_x, 0)];
+        }
+    }
+
+    out
 }
 
 /// Process a list of input files and write TIFF (and optionally EXR) to `output_dir`.
@@ -148,7 +180,8 @@ pub fn process_one_to_preview(
     let mut image = match ext.as_str() {
         "arw" => {
             let bayer = raw_reader::load_raw_as_ndarray(path)?;
-            demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?
+            let small_bayer = downsample_bayer_for_preview(&bayer, max_width);
+            demosaic::demosaic_bilinear(&small_bayer, demosaic::BayerPattern::Rggb)?
         }
         "png" => png_reader::load_png_as_ndarray(path)?,
         _ => anyhow::bail!("Unsupported extension for preview"),

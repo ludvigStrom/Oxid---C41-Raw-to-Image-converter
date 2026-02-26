@@ -98,11 +98,6 @@ pub fn neutralize_with_medians(
         bail!("D-min expects RGB image (3 channels), got {}", c);
     }
 
-    println!(
-        "D-min (fixed medians, linear [0,1]): R={:.6} G={:.6} B={:.6}",
-        med_r, med_g, med_b
-    );
-
     let div_r = if med_r > 0.0 { med_r } else { 1.0 };
     let div_g = if med_g > 0.0 { med_g } else { 1.0 };
     let div_b = if med_b > 0.0 { med_b } else { 1.0 };

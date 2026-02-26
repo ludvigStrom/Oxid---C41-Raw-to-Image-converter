@@ -7,7 +7,7 @@ use std::thread;
 use c41_raw_tool::{process_files, process_one_to_preview, PipelineOptions, Rect, TiffFormat};
 use eframe::egui;
 
-const PREVIEW_MAX_WIDTH: u32 = 1600;
+const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
 const BOTTOM_PANEL_HEIGHT: f32 = 100.0;
 const RIGHT_PANEL_WIDTH: f32 = 280.0;
@@ -58,9 +58,10 @@ impl Default for C41Gui {
             selected_index: None,
             output_dir: None,
             use_fixed_dmin: true,
-            dmin_r: 0.635294,
-            dmin_g: 0.635294,
-            dmin_b: 0.623529,
+            // Defaults tuned for ARW D-min (measured once via CLI)
+            dmin_r: 0.016297,
+            dmin_g: 0.031067,
+            dmin_b: 0.026215,
             dmin_x: 35,
             dmin_y: 15,
             dmin_w: 20,
@@ -147,7 +148,7 @@ impl C41Gui {
     fn request_preview(&mut self, path: PathBuf, options: PipelineOptions, ctx: &egui::Context) {
         let (tx, rx) = mpsc::channel();
         self.preview_receiver = Some(rx);
-        self.preview_texture = None;
+        // Keep previous texture visible until new one is ready to avoid flash
         thread::spawn(move || {
             let result = process_one_to_preview(
                 &path,
