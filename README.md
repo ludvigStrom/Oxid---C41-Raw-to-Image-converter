@@ -172,7 +172,7 @@ TODO 2.3: Patch Bounding Boxes. Calculate a small, fixed-size bounding box (e.g.
 
 Phase 3: Data Extraction & Pipeline TapYou need to run the image through your pipeline, but stop halfway. The math must be done on the neutralized data.
 TODO 3.1: D-min & Linearize. Run the RAW image through 
-Step 1 (LibRaw), 
+Step 1 (LibRaw) (if raw not png), 
 Step 2 (Demosaic), and 
 Step 3 (D-min neutralization). 
 

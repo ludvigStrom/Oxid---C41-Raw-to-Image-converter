@@ -40,12 +40,46 @@ enum ExportFormat {
     Exr,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UIMode {
+    Process,
+    Calibrate,
+}
+
+/// Calibration overlay state: 4 anchor points in normalized image space.
+///
+/// Corner order: [top-left, top-right, bottom-left, bottom-right], each in
+/// normalized coordinates (0..1) relative to the underlying image / preview.
+#[derive(Clone, Copy, Debug)]
+struct CalibrationOverlay {
+    corners: [egui::Pos2; 4],
+    /// Half-size of patch bounding boxes as a fraction of the preview height.
+    bbox_half_height_frac: f32,
+}
+
+impl Default for CalibrationOverlay {
+    fn default() -> Self {
+        Self {
+            corners: [
+                egui::pos2(0.20, 0.20), // top-left
+                egui::pos2(0.80, 0.20), // top-right
+                egui::pos2(0.20, 0.80), // bottom-left
+                egui::pos2(0.80, 0.80), // bottom-right
+            ],
+            // Roughly 10 px on a ~400px tall preview; scaled with preview height.
+            bbox_half_height_frac: 10.0 / 400.0,
+        }
+    }
+}
+
 struct C41Gui {
     images: Vec<ImageEntry>,
     selected_index: Option<usize>,
     output_dir: Option<PathBuf>,
     status: String,
     preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, Vec<u8>)>>>,
+    mode: UIMode,
+    calibration_overlay: CalibrationOverlay,
 }
 
 impl Default for C41Gui {
@@ -56,6 +90,8 @@ impl Default for C41Gui {
             output_dir: None,
             status: String::new(),
             preview_receiver: None,
+            mode: UIMode::Process,
+            calibration_overlay: CalibrationOverlay::default(),
         }
     }
 }
@@ -269,12 +305,26 @@ impl eframe::App for C41Gui {
                 });
             });
 
-        // ---- Right panel: per-image settings + export ----
+        // ---- Right panel: mode toggle + per-image settings / calibration ----
         egui::SidePanel::right("settings_panel")
             .resizable(false)
             .exact_width(RIGHT_PANEL_WIDTH)
             .show(ctx, |ui| {
-                ui.heading("Image Settings");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.mode, UIMode::Process, "Process");
+                    ui.selectable_value(&mut self.mode, UIMode::Calibrate, "Calibrate");
+                });
+                ui.separator();
+                ui.add_space(4.0);
+
+                match self.mode {
+                    UIMode::Process => {
+                        ui.heading("Image Settings");
+                    }
+                    UIMode::Calibrate => {
+                        ui.heading("Calibration");
+                    }
+                }
                 ui.add_space(4.0);
 
                 let Some(idx) = self.selected_index else {
@@ -306,6 +356,8 @@ impl eframe::App for C41Gui {
                 );
                 ui.add_space(4.0);
 
+                // In calibrate mode we will later specialize this panel for
+                // chart setup; for now we reuse the same controls.
                 ui.collapsing("D-min", |ui| {
                     let mut use_fixed = opts.dmin_fixed.is_some();
                     ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
@@ -519,7 +571,104 @@ impl eframe::App for C41Gui {
                         let available = ui.available_rect_before_wrap();
                         let scale = (available.width() / w).min((available.height() - 80.0) / h).min(1.0);
                         let display_size = egui::vec2(w * scale, h * scale);
-                        ui.image((tex.id(), display_size));
+                        let image_resp = ui.image((tex.id(), display_size));
+                        let image_rect = image_resp.rect;
+
+                        // In Calibrate mode, draw and allow interaction with the
+                        // 4-point overlay and the interpolated 24 patch boxes.
+                        if self.mode == UIMode::Calibrate {
+                            let mut corners = self.calibration_overlay.corners;
+                            let handle_radius = 6.0;
+                            let handle_size = egui::vec2(handle_radius * 2.0, handle_radius * 2.0);
+                            let painter = ui.painter_at(image_rect);
+
+                            // Helper to map normalized (0..1) coords to screen space inside image_rect.
+                            let to_screen = |p: egui::Pos2| -> egui::Pos2 {
+                                egui::pos2(
+                                    image_rect.left() + p.x * image_rect.width(),
+                                    image_rect.top() + p.y * image_rect.height(),
+                                )
+                            };
+
+                            // Draw and update draggable corner handles.
+                            for i in 0..4 {
+                                let mut screen_pos = to_screen(corners[i]);
+                                let handle_rect =
+                                    egui::Rect::from_center_size(screen_pos, handle_size);
+                                let id = ui.make_persistent_id(("calib_corner", i));
+                                let resp =
+                                    ui.interact(handle_rect, id, egui::Sense::click_and_drag());
+                                if resp.dragged() {
+                                    let delta = resp.drag_delta();
+                                    screen_pos.x += delta.x;
+                                    screen_pos.y += delta.y;
+                                    // Clamp to image rectangle.
+                                    screen_pos.x =
+                                        screen_pos.x.clamp(image_rect.left(), image_rect.right());
+                                    screen_pos.y =
+                                        screen_pos.y.clamp(image_rect.top(), image_rect.bottom());
+                                    // Convert back to normalized coordinates.
+                                    let nx =
+                                        (screen_pos.x - image_rect.left()) / image_rect.width();
+                                    let ny =
+                                        (screen_pos.y - image_rect.top()) / image_rect.height();
+                                    corners[i] = egui::pos2(
+                                        nx.clamp(0.0, 1.0),
+                                        ny.clamp(0.0, 1.0),
+                                    );
+                                }
+
+                                painter.circle_filled(
+                                    screen_pos,
+                                    handle_radius,
+                                    egui::Color32::YELLOW,
+                                );
+                            }
+
+                            // Persist any updated corner positions.
+                            self.calibration_overlay.corners = corners;
+
+                            // Interpolate a 6×4 grid of patch centers between the 4 corners.
+                            // Corner layout: 0=TL, 1=TR, 2=BL, 3=BR.
+                            let tl = to_screen(corners[0]);
+                            let tr = to_screen(corners[1]);
+                            let bl = to_screen(corners[2]);
+                            let br = to_screen(corners[3]);
+
+                            let rows = 4usize;
+                            let cols = 6usize;
+                            let bbox_half_h =
+                                self.calibration_overlay.bbox_half_height_frac * image_rect.height();
+                            let bbox_half_w = bbox_half_h; // keep boxes square
+
+                            for row in 0..rows {
+                                let v = if rows > 1 {
+                                    row as f32 / (rows as f32 - 1.0)
+                                } else {
+                                    0.0
+                                };
+                                let left = tl.lerp(bl, v);
+                                let right = tr.lerp(br, v);
+
+                                for col in 0..cols {
+                                    let u = if cols > 1 {
+                                        col as f32 / (cols as f32 - 1.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    let center = left.lerp(right, u);
+                                    let rect = egui::Rect::from_center_size(
+                                        center,
+                                        egui::vec2(bbox_half_w * 2.0, bbox_half_h * 2.0),
+                                    );
+                                    painter.rect_stroke(
+                                        rect,
+                                        0.0,
+                                        egui::Stroke::new(1.0, egui::Color32::LIGHT_GREEN),
+                                    );
+                                }
+                            }
+                        }
                         ui.add_space(8.0);
                         if let Some((r_hist, g_hist, b_hist)) = &self.images[idx].histogram {
                             // Histogram aligned to bottom of the central panel.

@@ -9,6 +9,7 @@ use ndarray::{self, Array3};
 pub mod curve;
 pub mod demosaic;
 pub mod dmin;
+pub mod calibration;
 pub mod exr_export;
 pub mod inversion;
 pub mod png_reader;
