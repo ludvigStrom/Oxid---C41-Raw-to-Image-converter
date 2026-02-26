@@ -31,17 +31,18 @@ const BOTTOM_PANEL_HEIGHT: f32 = 120.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
 
 fn main() -> eframe::Result<()> {
-    let mut native_options = eframe::NativeOptions::default();
-    // macOS: content extends under title bar; title bar transparent so we draw dark bar in egui
-    #[cfg(target_os = "macos")]
-    {
-        native_options.viewport = native_options
+    let native_options = if cfg!(target_os = "macos") {
+        let mut o = eframe::NativeOptions::default();
+        o.viewport = o
             .viewport
             .clone()
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false); // hide OS title so only our white title in the dark bar shows
-    }
+        o
+    } else {
+        eframe::NativeOptions::default()
+    };
     eframe::run_native(
         "C-41 RAW Tool",
         native_options,
@@ -373,10 +374,10 @@ impl eframe::App for C41Gui {
         egui::TopBottomPanel::top("dark_title_bar")
             .exact_height(28.0)
             .frame(egui::Frame::none().fill(egui::Color32::from_gray(30)))
-            .show(ctx, |ui| {
+            .show(ctx, |_ui| {
                 #[cfg(target_os = "macos")]
                 {
-                    ui.with_layout(
+                    _ui.with_layout(
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
                             ui.label(
