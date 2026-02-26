@@ -94,6 +94,8 @@ struct C41Gui {
     calibration_result: Option<([[f32; 3]; 3], f32)>, // (matrix, mse)
     calibration_profile_name: String,
     calibration_light_source: String,
+    calibration_profiles: Vec<(PathBuf, calibration::CalibrationProfile)>,
+    selected_profile_idx: Option<usize>,
 }
 
 impl Default for C41Gui {
@@ -109,6 +111,8 @@ impl Default for C41Gui {
             calibration_result: None,
             calibration_profile_name: String::new(),
             calibration_light_source: String::new(),
+            calibration_profiles: Vec::new(),
+            selected_profile_idx: None,
         }
     }
 }
@@ -485,8 +489,6 @@ impl eframe::App for C41Gui {
                 );
                 ui.add_space(4.0);
 
-                // In calibrate mode we will later specialize this panel for
-                // chart setup; for now we reuse the same controls.
                 ui.collapsing("D-min", |ui| {
                     let mut use_fixed = opts.dmin_fixed.is_some();
                     ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
@@ -684,6 +686,92 @@ impl eframe::App for C41Gui {
                             }
                         }
                     }
+                }
+
+                if self.mode == UIMode::Process {
+                    ui.collapsing("Calibration profile", |ui| {
+                        if ui.button("Refresh profiles").clicked() {
+                            let base_dir = std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join("profiles");
+                            match calibration::load_profiles_from_dir(&base_dir) {
+                                Ok(list) => {
+                                    self.calibration_profiles = list;
+                                    self.selected_profile_idx = None;
+                                    self.status = format!(
+                                        "Loaded {} calibration profile(s) from {}",
+                                        self.calibration_profiles.len(),
+                                        base_dir.display()
+                                    );
+                                }
+                                Err(e) => {
+                                    self.status = format!(
+                                        "Failed to load profiles from {}: {}",
+                                        base_dir.display(),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
+                        if self.calibration_profiles.is_empty() {
+                            ui.label("No profiles loaded. Click 'Refresh profiles' to scan the profiles/ folder.");
+                        } else {
+                            let mut current_idx = self.selected_profile_idx.unwrap_or(usize::MAX);
+                            let selected_label = if let Some(i) = self.selected_profile_idx {
+                                if let Some((_, p)) = self.calibration_profiles.get(i) {
+                                    p.name.as_str()
+                                } else {
+                                    "None"
+                                }
+                            } else {
+                                "None"
+                            };
+
+                            egui::ComboBox::from_label("Profile")
+                                .selected_text(selected_label)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_profile_idx.is_none(),
+                                            "None",
+                                        )
+                                        .clicked()
+                                    {
+                                        current_idx = usize::MAX;
+                                    }
+                                    for (i, (_, profile)) in
+                                        self.calibration_profiles.iter().enumerate()
+                                    {
+                                        let is_selected = self.selected_profile_idx == Some(i);
+                                        if ui
+                                            .selectable_label(is_selected, &profile.name)
+                                            .clicked()
+                                        {
+                                            current_idx = i;
+                                        }
+                                    }
+                                });
+
+                            // Apply selection to current image options.
+                            if current_idx == usize::MAX {
+                                self.selected_profile_idx = None;
+                            } else if let Some((_, profile)) =
+                                self.calibration_profiles.get(current_idx).cloned()
+                            {
+                                self.selected_profile_idx = Some(current_idx);
+                                opts.density_matrix = profile.matrix;
+                                if let Some(dmin) = profile.dmin_medians {
+                                    opts.dmin_fixed = Some(dmin);
+                                    opts.dmin_rect = None;
+                                }
+                                self.status = format!(
+                                    "Applied calibration profile '{}' to current image.",
+                                    profile.name
+                                );
+                            }
+                        }
+                    });
                 }
 
                 ui.separator();

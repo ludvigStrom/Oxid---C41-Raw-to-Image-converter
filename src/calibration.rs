@@ -1,20 +1,58 @@
 //! Calibration utilities and reference data (e.g. ColorChecker Classic).
 //!
-//! NOTE: The reference values below are placeholders and should be replaced
-//! with measured or published linear RGB values for the chart.
+//! Reference values below use the manufacturer's sRGB patch colors for the
+//! ColorChecker Classic, converted to linear RGB at runtime before going to
+//! density.
 
 use nalgebra::DMatrix;
 use serde::{Deserialize, Serialize};
 
 use crate::curve;
 
-/// Reference linear RGB values for the 24 patches of a ColorChecker Classic.
+/// Manufacturer sRGB patch colors for ColorChecker Classic (24 patches).
 ///
 /// Order is row-major (4 rows × 6 columns), each element is `[R, G, B]` in
-/// linear [0, 1] for the chosen working space / illuminant.
-pub const COLORCHECKER_CLASSIC_LINEAR_RGB: [[f32; 3]; 24] = [
-    [0.0, 0.0, 0.0]; 24
+/// 8-bit sRGB. These are converted to linear RGB on the fly.
+pub const COLORCHECKER_CLASSIC_SRGB_8BIT: [[u8; 3]; 24] = [
+    // Row 1: natural colors
+    [0x73, 0x52, 0x44], // Dark skin
+    [0xc2, 0x96, 0x82], // Light skin
+    [0x62, 0x7a, 0x9d], // Blue sky
+    [0x57, 0x6c, 0x43], // Foliage
+    [0x85, 0x80, 0xb1], // Blue flower
+    [0x67, 0xbd, 0xaa], // Bluish green
+    // Row 2: miscellaneous colors
+    [0xd6, 0x7e, 0x2c], // Orange
+    [0x50, 0x5b, 0xa6], // Purplish blue
+    [0xc1, 0x5a, 0x63], // Moderate red
+    [0x5e, 0x3c, 0x6c], // Purple
+    [0x9d, 0xbc, 0x40], // Yellow green
+    [0xe0, 0xa3, 0x2e], // Orange yellow
+    // Row 3: primary / secondary
+    [0x38, 0x3d, 0x96], // Blue
+    [0x46, 0x94, 0x49], // Green
+    [0xaf, 0x36, 0x3c], // Red
+    [0xe7, 0xc7, 0x1f], // Yellow
+    [0xbb, 0x56, 0x95], // Magenta
+    [0x08, 0x85, 0xa1], // Cyan
+    // Row 4: grayscale
+    [0xf3, 0xf3, 0xf3], // White
+    [0xc8, 0xc8, 0xc8], // Neutral 8
+    [0xa0, 0xa0, 0xa0], // Neutral 6.5
+    [0x7a, 0x7a, 0x7a], // Neutral 5
+    [0x55, 0x55, 0x55], // Neutral 3.5
+    [0x34, 0x34, 0x34], // Black
 ];
+
+#[inline]
+fn srgb8_to_linear(c: u8) -> f32 {
+    let v = c as f32 / 255.0;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
 
 /// Serializable calibration profile: 3×3 density matrix + metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,10 +79,17 @@ pub fn linear_to_density_24(patches_linear: [[f32; 3]; 24]) -> [[f32; 3]; 24] {
     out
 }
 
-/// Convert the hardcoded ColorChecker reference linear RGB values into
-/// density space (24×3).
+/// Convert the hardcoded ColorChecker reference patch sRGB values into
+/// density space (24×3), via sRGB → linear → density.
 pub fn reference_density_24() -> [[f32; 3]; 24] {
-    linear_to_density_24(COLORCHECKER_CLASSIC_LINEAR_RGB)
+    let mut out = [[0.0_f32; 3]; 24];
+    for i in 0..24 {
+        for c in 0..3 {
+            let lin = srgb8_to_linear(COLORCHECKER_CLASSIC_SRGB_8BIT[i][c]);
+            out[i][c] = curve::transmittance_to_density(lin, 1e-6);
+        }
+    }
+    out
 }
 
 /// Solve for the 3×3 density-domain calibration matrix `M` that best maps
@@ -108,5 +153,39 @@ pub fn save_profile_to_path(
     let json = serde_json::to_string_pretty(profile)?;
     std::fs::write(path, json)?;
     Ok(())
+}
+
+/// Load all `.json` calibration profiles from a directory.
+///
+/// Returns a vector of `(path, profile)`; files that fail to parse are skipped.
+pub fn load_profiles_from_dir(
+    dir: &std::path::Path,
+) -> anyhow::Result<Vec<(std::path::PathBuf, CalibrationProfile)>> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        match serde_json::from_str::<CalibrationProfile>(&text) {
+            Ok(profile) => out.push((path, profile)),
+            Err(_) => continue,
+        }
+    }
+    Ok(out)
 }
 
