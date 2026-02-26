@@ -28,6 +28,15 @@ struct ImageEntry {
     preview_texture: Option<egui::TextureHandle>,
     preview_hash: u64,
     histogram: Option<[u32; 256]>,
+    export_format: ExportFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportFormat {
+    Tiff16,
+    Tiff32,
+    Dng,
+    Exr,
 }
 
 struct C41Gui {
@@ -53,9 +62,10 @@ impl Default for C41Gui {
 fn default_options() -> PipelineOptions {
     PipelineOptions {
         dmin_rect: None,
-        dmin_fixed: Some((0.016297, 0.031067, 0.026215)),
+        dmin_fixed: Some((0.635294, 0.635294, 0.623529)),
         format: TiffFormat::Float32,
         write_exr: false,
+        write_jpeg: false,
         no_invert: false,
         no_curve: false,
         wb_r: 1.15,
@@ -194,6 +204,7 @@ impl eframe::App for C41Gui {
                                             preview_texture: None,
                                             preview_hash: 0,
                                             histogram: None,
+                                            export_format: ExportFormat::Tiff16,
                                         });
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);
@@ -206,36 +217,6 @@ impl eframe::App for C41Gui {
 
                         ui.separator();
 
-                        let out_label = self
-                            .output_dir
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "No output folder".to_string());
-                        if ui.button("Output folder…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.output_dir = Some(path);
-                            }
-                        }
-                        ui.label(egui::RichText::new(out_label).small());
-
-                        ui.separator();
-
-                        let ready = !self.images.is_empty() && self.output_dir.is_some();
-                        if ui.add_enabled(ready, egui::Button::new("Convert all")).clicked() {
-                            let output_dir = self.output_dir.clone().unwrap();
-                            let mut err: Option<anyhow::Error> = None;
-                            for img in &self.images {
-                                if let Err(e) = process_files(&[img.path.clone()], &output_dir, &img.options) {
-                                    err = Some(e);
-                                    break;
-                                }
-                            }
-                            self.status = if let Some(e) = err {
-                                format!("Error: {}", e)
-                            } else {
-                                "Done.".to_string()
-                            };
-                        }
                     });
 
                     ui.add_space(4.0);
@@ -276,12 +257,12 @@ impl eframe::App for C41Gui {
                 });
             });
 
-        // ---- Right panel: per-image settings ----
+        // ---- Right panel: per-image settings + export ----
         egui::SidePanel::right("settings_panel")
             .resizable(false)
             .exact_width(RIGHT_PANEL_WIDTH)
             .show(ctx, |ui| {
-                ui.heading("Settings");
+                ui.heading("Image Settings");
                 ui.add_space(4.0);
 
                 let Some(idx) = self.selected_index else {
@@ -318,7 +299,7 @@ impl eframe::App for C41Gui {
                     ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
                     if use_fixed {
                         if opts.dmin_fixed.is_none() {
-                            opts.dmin_fixed = Some((0.016297, 0.031067, 0.026215));
+                            opts.dmin_fixed = Some((0.635294, 0.635294, 0.623529));
                         }
                         let (mut r, mut g, mut b) = opts.dmin_fixed.unwrap();
                         ui.horizontal(|ui| {
@@ -397,19 +378,112 @@ impl eframe::App for C41Gui {
                             ui.label("White");
                             ui.add(egui::Slider::new(&mut opts.curve_white, 0.3..=1.0));
                         });
-                    } else {
-                        ui.checkbox(&mut opts.no_invert, "Invert (1-x)");
-                        let mut is_float = matches!(opts.format, TiffFormat::Float32);
-                        ui.checkbox(&mut is_float, "32-bit float (else 16-bit)");
-                        opts.format = if is_float {
-                            TiffFormat::Float32
-                        } else {
-                            TiffFormat::U16
-                        };
                     }
                 });
 
-                ui.checkbox(&mut opts.write_exr, "Also write EXR");
+                ui.separator();
+                ui.heading("Export");
+                ui.add_space(4.0);
+
+                // Per-image export options
+                let label = match entry.export_format {
+                    ExportFormat::Tiff16 => "TIFF 16‑bit",
+                    ExportFormat::Tiff32 => "TIFF 32‑bit float",
+                    ExportFormat::Dng => "DNG (not yet implemented)",
+                    ExportFormat::Exr => "EXR (32‑bit float)",
+                };
+                egui::ComboBox::from_label("Output format")
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Tiff16), "TIFF 16‑bit")
+                            .clicked()
+                        {
+                            entry.export_format = ExportFormat::Tiff16;
+                        }
+                        if ui
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Tiff32), "TIFF 32‑bit float")
+                            .clicked()
+                        {
+                            entry.export_format = ExportFormat::Tiff32;
+                        }
+                        if ui
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Dng), "DNG")
+                            .clicked()
+                        {
+                            entry.export_format = ExportFormat::Dng;
+                        }
+                        if ui
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Exr), "EXR (32‑bit float)")
+                            .clicked()
+                        {
+                            entry.export_format = ExportFormat::Exr;
+                        }
+                    });
+
+                // Keep PipelineOptions.format in sync for TIFF exports
+                match entry.export_format {
+                    ExportFormat::Tiff16 => {
+                        opts.format = TiffFormat::U16;
+                        opts.write_exr = false;
+                    }
+                    ExportFormat::Tiff32 => {
+                        opts.format = TiffFormat::Float32;
+                        opts.write_exr = false;
+                    }
+                    ExportFormat::Exr => {
+                        opts.format = TiffFormat::Float32;
+                        opts.write_exr = true;
+                    }
+                    ExportFormat::Dng => { /* pipeline uses TIFF; DNG is placeholder */ }
+                }
+
+                if opts.no_curve {
+                    ui.checkbox(&mut opts.no_invert, "Invert (1-x)");
+                } else {
+                    ui.label("Inversion handled by print curve.");
+                }
+
+                ui.checkbox(&mut opts.write_jpeg, "Also export JPG");
+
+                ui.add_space(8.0);
+
+                // Global export: output folder + convert all
+                ui.separator();
+                ui.label(egui::RichText::new("Batch export").strong());
+
+                let out_label = self
+                    .output_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "No output folder".to_string());
+                if ui.button("Output folder…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.output_dir = Some(path);
+                    }
+                }
+                ui.label(egui::RichText::new(out_label).small());
+
+                let ready = !self.images.is_empty() && self.output_dir.is_some();
+                if ui.add_enabled(ready, egui::Button::new("Convert all")).clicked() {
+                    let output_dir = self.output_dir.clone().unwrap();
+                    let mut err: Option<anyhow::Error> = None;
+                    for img in &self.images {
+                        if matches!(img.export_format, ExportFormat::Dng) {
+                            err = Some(anyhow::anyhow!("DNG export is not implemented yet"));
+                            break;
+                        }
+                        if let Err(e) = process_files(&[img.path.clone()], &output_dir, &img.options) {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    self.status = if let Some(e) = err {
+                        format!("Error: {}", e)
+                    } else {
+                        "Done.".to_string()
+                    };
+                }
 
                 if !self.status.is_empty() {
                     ui.add_space(4.0);

@@ -33,6 +33,7 @@ pub struct PipelineOptions {
     pub dmin_fixed: Option<(f32, f32, f32)>,
     pub format: TiffFormat,
     pub write_exr: bool,
+    pub write_jpeg: bool,
     pub no_invert: bool,
     pub no_curve: bool,
     pub wb_r: f32,
@@ -51,6 +52,7 @@ impl Default for PipelineOptions {
             dmin_fixed: None,
             format: TiffFormat::Float32,
             write_exr: false,
+            write_jpeg: false,
             no_invert: false,
             no_curve: false,
             wb_r: 1.0,
@@ -150,6 +152,18 @@ pub fn process_files(
             if options.write_exr {
                 exr_export::write_exr_u16(&image_u16, &exr_path)?;
             }
+            if options.write_jpeg {
+                // JPEG is 8-bit; down-quantize from u16.
+                let jpg_path = output_dir.join(format!("{}.jpg", stem));
+                let (height, width, _) = image_u16.dim();
+                let mut buf = Vec::with_capacity(height * width * 3);
+                for chunk in image_u16.iter() {
+                    buf.push((*chunk >> 8) as u8);
+                }
+                let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                img.save(&jpg_path)?;
+            }
         } else {
             if !options.no_invert {
                 inversion::invert(&mut image);
@@ -157,6 +171,18 @@ pub fn process_files(
             tiff_export::write_tiff(&image, &out_path, options.format)?;
             if options.write_exr {
                 exr_export::write_exr_f32(&image, &exr_path)?;
+            }
+            if options.write_jpeg {
+                let jpg_path = output_dir.join(format!("{}.jpg", stem));
+                let (height, width, _) = image.dim();
+                let mut buf = Vec::with_capacity(height * width * 3);
+                for v in image.iter() {
+                    let x = v.clamp(0.0, 1.0);
+                    buf.push((x * 255.0).round() as u8);
+                }
+                let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                img.save(&jpg_path)?;
             }
         }
     }
