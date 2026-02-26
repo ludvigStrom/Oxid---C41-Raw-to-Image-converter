@@ -76,12 +76,12 @@ pub fn neutralize(
     let med_r = median_f32(&r_vals);
     let med_g = median_f32(&g_vals);
     let med_b = median_f32(&b_vals);
-
+/*
     // Print D-min medians so they can be measured once and hard-coded later if desired.
     println!(
         "D-min medians (linear [0,1]): R={:.6} G={:.6} B={:.6}",
         med_r, med_g, med_b
-    );
+    );*/
 
     neutralize_with_medians(image, med_r, med_g, med_b)
 }

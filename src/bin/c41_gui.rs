@@ -34,7 +34,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "C-41 RAW Tool",
         eframe::NativeOptions::default(),
-        Box::new(|_| Ok(Box::new(C41Gui::default()))),
+        Box::new(|cc| {
+            let mut visuals = egui::Visuals::dark();
+            visuals.window_fill = egui::Color32::from_gray(35);
+            visuals.panel_fill = egui::Color32::from_gray(30);
+            visuals.override_text_color = Some(egui::Color32::from_gray(240));
+            cc.egui_ctx.set_visuals(visuals);
+            Ok(Box::new(C41Gui::default()))
+        }),
     )
 }
 
@@ -407,6 +414,7 @@ impl eframe::App for C41Gui {
             .min_height(BOTTOM_PANEL_HEIGHT)
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("Add image…").clicked() {
                             if let Some(paths) = rfd::FileDialog::new()
@@ -484,6 +492,7 @@ impl eframe::App for C41Gui {
             .resizable(false)
             .exact_width(RIGHT_PANEL_WIDTH)
             .show(ctx, |ui| {
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.mode, UIMode::Process, "Process");
                     ui.selectable_value(&mut self.mode, UIMode::Calibrate, "Color calibration");
@@ -1066,23 +1075,23 @@ impl eframe::App for C41Gui {
 
                 // Per-image export options
                 let label = match entry.export_format {
-                    ExportFormat::Tiff16 => "TIFF 16‑bit",
-                    ExportFormat::Tiff32 => "TIFF 32‑bit float",
+                    ExportFormat::Tiff16 => "TIFF 16-bit",
+                    ExportFormat::Tiff32 => "TIFF 32-bit float",
                     ExportFormat::Dng => "DNG (not yet implemented)",
-                    ExportFormat::Exr => "EXR (32‑bit float)",
-                    ExportFormat::ExrAces2065 => "TIFF 16‑bit + EXR ACES2065-1",
+                    ExportFormat::Exr => "EXR (32-bit float)",
+                    ExportFormat::ExrAces2065 => "TIFF 16-bit + EXR ACES2065-1",
                 };
                 egui::ComboBox::from_label("Output format")
                     .selected_text(label)
                     .show_ui(ui, |ui| {
                         if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Tiff16), "TIFF 16‑bit")
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Tiff16), "TIFF 16-bit")
                             .clicked()
                         {
                             entry.export_format = ExportFormat::Tiff16;
                         }
                         if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Tiff32), "TIFF 32‑bit float")
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Tiff32), "TIFF 32-bit float")
                             .clicked()
                         {
                             entry.export_format = ExportFormat::Tiff32;
@@ -1094,7 +1103,7 @@ impl eframe::App for C41Gui {
                             entry.export_format = ExportFormat::Dng;
                         }
                         if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Exr), "EXR (32‑bit float)")
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Exr), "EXR (32-bit float)")
                             .clicked()
                         {
                             entry.export_format = ExportFormat::Exr;
@@ -1104,7 +1113,7 @@ impl eframe::App for C41Gui {
                         if ui
                             .add_enabled(
                                 opts.use_acescg,
-                                egui::SelectableLabel::new(aces_selected, "TIFF 16‑bit + EXR ACES2065-1"),
+                                egui::SelectableLabel::new(aces_selected, "TIFF 16-bit + EXR ACES2065-1"),
                             )
                             .clicked()
                         {
@@ -1218,9 +1227,16 @@ impl eframe::App for C41Gui {
                         let size = tex.size();
                         let (w, h) = (size[0] as f32, size[1] as f32);
                         let available = ui.available_rect_before_wrap();
-                        let scale = (available.width() / w).min((available.height() - 80.0) / h).min(1.0);
+                        let area_for_image = available.height() - 80.0; // leave room for histogram
+                        let scale = (available.width() / w).min(area_for_image / h).min(1.0);
                         let display_size = egui::vec2(w * scale, h * scale);
-                        let image_resp = ui.image((tex.id(), display_size));
+                        let margin_x = (available.width() - display_size.x) / 2.0;
+                        let margin_y = (area_for_image - display_size.y) / 2.0;
+                        ui.add_space(margin_y);
+                        let image_resp = ui.horizontal(|ui| {
+                            ui.add_space(margin_x);
+                            ui.image((tex.id(), display_size))
+                        }).inner;
                         let image_rect = image_resp.rect;
 
                         // In Calibrate mode, draw and allow interaction with the
@@ -1379,8 +1395,8 @@ impl eframe::App for C41Gui {
                                 draw_channel(b_hist[i], egui::Color32::BLUE, &painter);
                             }
 
-                            // Axes: X (bottom) and Y (left), in black.
-                            let axis_color = egui::Color32::BLACK;
+                            // Axes: X (bottom) and Y (left).
+                            let axis_color = egui::Color32::from_gray(100);
                             let stroke = egui::Stroke::new(1.0, axis_color);
                             painter.line_segment(
                                 [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.bottom())],
