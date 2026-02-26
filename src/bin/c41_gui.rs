@@ -2,11 +2,22 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-use c41_raw_tool::{process_files, process_one_to_preview, PipelineOptions, Rect, TiffFormat};
+use c41_raw_tool::{
+    calibration,
+    demosaic,
+    dmin,
+    png_reader,
+    process_files,
+    process_one_to_preview,
+    raw_reader,
+    PipelineOptions,
+    Rect,
+    TiffFormat,
+};
 use eframe::egui;
 
 const PREVIEW_MAX_WIDTH: u32 = 1920;
@@ -80,6 +91,9 @@ struct C41Gui {
     preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, Vec<u8>)>>>,
     mode: UIMode,
     calibration_overlay: CalibrationOverlay,
+    calibration_result: Option<([[f32; 3]; 3], f32)>, // (matrix, mse)
+    calibration_profile_name: String,
+    calibration_light_source: String,
 }
 
 impl Default for C41Gui {
@@ -92,8 +106,121 @@ impl Default for C41Gui {
             preview_receiver: None,
             mode: UIMode::Process,
             calibration_overlay: CalibrationOverlay::default(),
+            calibration_result: None,
+            calibration_profile_name: String::new(),
+            calibration_light_source: String::new(),
         }
     }
+}
+
+fn load_linear_transmittance_for_calibration(
+    path: &Path,
+    opts: &PipelineOptions,
+) -> anyhow::Result<ndarray::Array3<f32>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+
+    let mut image = match ext.as_str() {
+        // RAW formats handled by LibRaw; assume Bayer sensor and RGGB.
+        "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
+            let bayer = raw_reader::load_raw_as_ndarray(path)?;
+            demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?
+        }
+        "png" => png_reader::load_png_as_ndarray(path)?,
+        _ => anyhow::bail!("Unsupported extension for calibration"),
+    };
+
+    if let Some((r, g, b)) = opts.dmin_fixed {
+        dmin::neutralize_with_medians(&mut image, r, g, b)?;
+    } else if let Some(rect) = opts.dmin_rect {
+        dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+    }
+
+    Ok(image)
+}
+
+fn compute_patch_centers_normalized(
+    corners: [egui::Pos2; 4],
+) -> [[f32; 2]; 24] {
+    let mut centers = [[0.0_f32; 2]; 24];
+    let rows = 4usize;
+    let cols = 6usize;
+
+    for row in 0..rows {
+        let v = if rows > 1 {
+            row as f32 / (rows as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let left = corners[0].lerp(corners[2], v);
+        let right = corners[1].lerp(corners[3], v);
+
+        for col in 0..cols {
+            let u = if cols > 1 {
+                col as f32 / (cols as f32 - 1.0)
+            } else {
+                0.0
+            };
+            let center = left.lerp(right, u);
+            let idx = row * cols + col;
+            centers[idx][0] = center.x;
+            centers[idx][1] = center.y;
+        }
+    }
+
+    centers
+}
+
+fn sample_patch_medians(
+    image: &ndarray::Array3<f32>,
+    centers_norm: &[[f32; 2]; 24],
+    bbox_half_size_px: f32,
+) -> [[f32; 3]; 24] {
+    use std::cmp::{max, min};
+
+    let (h, w, _) = image.dim();
+    let mut out = [[0.0_f32; 3]; 24];
+
+    for (i, center) in centers_norm.iter().enumerate() {
+        let cx = center[0].clamp(0.0, 1.0) * (w as f32 - 1.0);
+        let cy = center[1].clamp(0.0, 1.0) * (h as f32 - 1.0);
+
+        let half = bbox_half_size_px;
+        let x_min = max(0, (cx - half).floor() as isize) as usize;
+        let y_min = max(0, (cy - half).floor() as isize) as usize;
+        let x_max = min(w.saturating_sub(1), (cx + half).ceil().max(0.0) as usize);
+        let y_max = min(h.saturating_sub(1), (cy + half).ceil().max(0.0) as usize);
+
+        let mut r_vals = Vec::new();
+        let mut g_vals = Vec::new();
+        let mut b_vals = Vec::new();
+
+        for y in y_min..=y_max {
+            for x in x_min..=x_max {
+                let r = image[(y, x, 0)];
+                let g = image[(y, x, 1)];
+                let b = image[(y, x, 2)];
+                r_vals.push(r);
+                g_vals.push(g);
+                b_vals.push(b);
+            }
+        }
+
+        if !r_vals.is_empty() {
+            r_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            g_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            b_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mid = r_vals.len() / 2;
+            out[i][0] = r_vals[mid];
+            out[i][1] = g_vals[mid];
+            out[i][2] = b_vals[mid];
+        }
+    }
+
+    out
 }
 
 fn default_options() -> PipelineOptions {
@@ -342,6 +469,8 @@ impl eframe::App for C41Gui {
                 }
 
                 let entry = &mut self.images[idx];
+                // Snapshot of options for calibration tap (avoids borrow issues).
+                let calibration_opts_snapshot = entry.options.clone();
                 let opts = &mut entry.options;
 
                 ui.label(
@@ -444,6 +573,118 @@ impl eframe::App for C41Gui {
                         });
                     }
                 });
+
+                if self.mode == UIMode::Calibrate {
+                    ui.separator();
+                    ui.heading("Solve calibration");
+                    ui.add_space(4.0);
+
+                    if ui.button("Solve 3×3 matrix from chart").clicked() {
+                        let path = entry.path.clone();
+                        let opts_clone = calibration_opts_snapshot.clone();
+                        match load_linear_transmittance_for_calibration(&path, &opts_clone) {
+                            Ok(image_lin) => {
+                                // Step 3.2: sample 24 patches (medians) from linear transmittance.
+                                let centers_norm =
+                                    compute_patch_centers_normalized(self.calibration_overlay.corners);
+                                let patches_linear =
+                                    sample_patch_medians(&image_lin, &centers_norm, 5.0);
+
+                                // Step 3.3: convert to density.
+                                let measured_density =
+                                    calibration::linear_to_density_24(patches_linear);
+                                let reference_density =
+                                    calibration::reference_density_24();
+
+                                // Phase 4: OLS solver.
+                                match calibration::solve_density_matrix_ols(
+                                    measured_density,
+                                    reference_density,
+                                ) {
+                                    Some((m, mse)) => {
+                                        self.calibration_result = Some((m, mse));
+                                        opts.density_matrix = m;
+                                        self.status = format!(
+                                            "Solved calibration matrix (MSE {:.6}) applied to this image.",
+                                            mse
+                                        );
+                                    }
+                                    None => {
+                                        self.status = "Calibration failed: singular system".to_string();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.status = format!("Calibration error: {}", e);
+                            }
+                        }
+                    }
+
+                    if let Some((m, mse)) = self.calibration_result {
+                        ui.add_space(4.0);
+                        ui.label(format!("MSE: {:.6}", mse));
+                        ui.monospace(format!(
+                            "Matrix:\n[{:.6}, {:.6}, {:.6}]\n[{:.6}, {:.6}, {:.6}]\n[{:.6}, {:.6}, {:.6}]",
+                            m[0][0], m[0][1], m[0][2],
+                            m[1][0], m[1][1], m[1][2],
+                            m[2][0], m[2][1], m[2][2],
+                        ));
+
+                        ui.add_space(4.0);
+                        ui.label("Profile name / film stock");
+                        if self.calibration_profile_name.is_empty() {
+                            if let Some(stem) = entry
+                                .path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                            {
+                                self.calibration_profile_name = stem.to_string();
+                            }
+                        }
+                        ui.text_edit_singleline(&mut self.calibration_profile_name);
+
+                        ui.label("Light source notes");
+                        ui.text_edit_singleline(&mut self.calibration_light_source);
+
+                        if ui.button("Save calibration profile…").clicked() {
+                            let dmin_snapshot = calibration_opts_snapshot.dmin_fixed;
+                            let name = if self.calibration_profile_name.trim().is_empty() {
+                                "profile".to_string()
+                            } else {
+                                self.calibration_profile_name.trim().to_string()
+                            };
+
+                            let profile = calibration::CalibrationProfile {
+                                name: name.clone(),
+                                light_source: self.calibration_light_source.clone(),
+                                matrix: m,
+                                dmin_medians: dmin_snapshot,
+                            };
+
+                            let base_dir = std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join("profiles");
+                            let _ = std::fs::create_dir_all(&base_dir);
+
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_directory(&base_dir)
+                                .set_file_name(&(name.clone() + ".json"))
+                                .save_file()
+                            {
+                                match calibration::save_profile_to_path(&profile, &path) {
+                                    Ok(()) => {
+                                        self.status =
+                                            format!("Saved calibration profile to {}", path.display());
+                                    }
+                                    Err(e) => {
+                                        self.status =
+                                            format!("Failed to save calibration profile: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 ui.separator();
                 ui.heading("Export");
