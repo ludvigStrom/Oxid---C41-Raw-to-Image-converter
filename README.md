@@ -171,6 +171,7 @@ With **Use ACEScg** (GUI) or `--use-acescg` (CLI), the pipeline treats ACES as a
 | `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place; supports fixed medians via `--dmin-fixed`. |
 | `src/inversion.rs` | Simple linear inversion (`1-x`); used only with `--no-curve`. |
 | `src/curve.rs` | Physical Cineon/RA-4 print emulation: multi-stage pipeline (T → density → 3×3 density matrix → RA-4 S-curve) using high-resolution LUTs and rayon-parallel apply. |
+| `src/aces.rs` | ACES: IDT (camera → ACEScg), ACEScg ↔ ACES2065-1 matrix, and density-matrix conversion for ACEScg. |
 | `src/calibration.rs` | Color calibration: ColorChecker reference densities, OLS solver for 3×3 matrix, JSON profile load/save. |
 | `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32f/16 from f32, or u16 (after curve) via `write_tiff_u16`. |
 | `src/exr_export.rs` | Write RGB OpenEXR: f32 or normalized u16 to EXR via `--write-exr`. |
