@@ -152,22 +152,8 @@ See repository for license information. LibRaw is used under its own license (e.
 
 ##TODO 
 
-### Calibration
-Step 1: Data Ingestion (CLI arguments)
+TODO calibration 
 
-The tool should accept two CSV files via clap:
-
---measured: A CSV of 24 rows containing the linear RGB Transmittance values of the scanned ColorChecker patches (after D-min neutralization).
-
---reference: A CSV of 24 rows containing the linear RGB values of the reference target.
-
-Step 2: Log-Density ConversionConvert both the Measured ($X$) and Reference ($Y$) linear data arrays into logarithmic optical density using:$D = -\log_{10}(T)$Clamp or handle values $T \le 0$ to prevent math errors.You should now have two $24 \times 3$ matrices in density space.
-
-Step 3: The Least Squares SolverCalculate the $3 \times 3$ transformation matrix ($M$) that maps the Measured density ($X$) to the Reference density ($Y$).Implement the standard Ordinary Least Squares equation:$$M = (X^T X)^{-1} X^T Y$$(Where $X^T$ is the transpose of $X$, and $X^T X$ is a $3 \times 3$ matrix that must be inverted).
-
-Step 4: OutputPrint the resulting $3 \times 3$ matrix to the console in a format that can be directly copied into the main c41-raw-tool CLI (e.g., a comma-separated string of 9 floats).Calculate and print the Mean Squared Error (MSE) between $X \times M$ and $Y$ to give the user a confidence metric on the calibration quality.
-
-TODO calibration 2
 Phase 1: GUI Updates (The Calibration Tab)You need a dedicated workspace in your GUI so the user isn't accidentally trying to process standard photos with calibration tools.
 
 TODO 1.1: Mode Toggle. Add a segmented button or tab system at the top of the UI to switch between [ Process Mode ] and [ Calibrate Mode ].
@@ -196,14 +182,15 @@ TODO 3.2: Sample the Patches. For each of the 24 bounding boxes, calculate the m
 
 TODO 3.3: Convert to Density. Convert these 24 median RGB values into Optical Density: $D = -\log_{10}(T)$. Store this as your Measured_X array ($24 \times 3$). Convert your hardcoded reference values into density to create your Reference_Y array.
 
-Phase 4: The Least Squares SolverTODO 
-4.1: Include a Linear Algebra Crate. Add ndarray-linalg or nalgebra to your Cargo.toml.
+Phase 4: The Least Squares Solver 
+TODO 4.1: Include a Linear Algebra Crate. Add ndarray-linalg or nalgebra to your Cargo.toml.
 
 TODO 4.2: Implement OLS. Write a function that computes the Ordinary Least Squares equation:$$M = (X^T X)^{-1} X^T Y$$(This calculates the $3 \times 3$ matrix $M$ that best maps the measured density $X$ to the reference density $Y$).
 
 TODO 4.3: Calculate Error. Compute the Mean Squared Error (MSE) of the result to display in the UI. If the MSE is huge, the user probably put the grid on upside down!
 
-Phase 5: JSON Export & Profile ManagementTODO 5.1: Define the Schema. Create a Rust struct that derives serde::Serialize and serde::Deserialize. It should include:Profile Name / Film Stock (String)Light Source Notes (String)Matrix (9 floats)Optional: The D-min RGB medians used during calibration (useful for consistency).
+Phase 5: JSON Export & Profile Management
+TODO 5.1: Define the Schema. Create a Rust struct that derives serde::Serialize and serde::Deserialize. It should include:Profile Name / Film Stock (String)Light Source Notes (String)Matrix (9 floats)Optional: The D-min RGB medians used during calibration (useful for consistency).
 
 TODO 5.2: Save to Disk. Add a "Save Calibration Profile" button in the UI that writes this struct to a .json file in a dedicated profiles/ folder.
 
@@ -212,3 +199,6 @@ Phase 6: Integrating with Process Mode
 TODO 6.1: Profile Dropdown. In your main [ Process Mode ] UI, add a dropdown that reads the profiles/ directory and lets the user select a saved JSON calibration.
 
 TODO 6.2: Pipeline Update. Update src/curve.rs (as discussed previously) to split the 1D LUT. Apply the log-conversion, multiply the array by the loaded $3 \times 3$ matrix, and then apply the RA-4 curve.
+
+Flat field (Empty frame calibration)
+Phase 1: Ingesting the Flat-Field (The Empty Frame)You need to allow the user to load a master reference frame that represents the specific light source and film stock's base.TODO 1.1: CLI / GUI Input. Add a --flat-field argument to your CLI and a "Load Reference Frame" file picker in your UI. This should accept a RAW file of an unexposed, developed frame from the same roll of film (or at least the same film stock).TODO 1.2: Initial Linearization. When a flat-field RAW is loaded, run it through Step 1 (LibRaw extraction) and Step 2 (Demosaic) so you have an Array3<f32> representing linear transmittance.Phase 2: The Grain-Busting Blur (Crucial)To isolate the luminance falloff of the "Big scanlight" without capturing the microscopic film grain, you must aggressively low-pass filter (blur) the flat-field image.TODO 2.1: Implement a Fast Blur. Write or import a function to apply a heavy Gaussian blur to the flat-field Array3<f32>. Since ndarray doesn't have built-in blurring, you can temporarily convert it to an image::Rgb32FImage, use the image crate's image::imageops::blur, and convert it back.TODO 2.2: Extreme Radius. The blur radius needs to be massive (e.g., 50+ pixels) to completely obliterate film grain and dust, leaving only the smooth, low-frequency gradients of the LED light falloff and lens vignetting.Phase 3: Pixel-by-Pixel DivisionThis replaces your current Step 3 (D-min neutralization) when a flat-field is provided.TODO 3.1: The Flat-Field Division. Instead of dividing by a single scalar value, divide your actual image array by your blurred flat-field array, pixel-by-pixel, channel-by-channel:$$T_{out}(x, y) = \frac{T_{in}(x, y)}{T_{flat\_blurred}(x, y)}$$TODO 3.2: Safe Division Check. Ensure you handle cases where $T_{flat\_blurred} \le 0$ to avoid divide-by-zero errors or NaNs (though a properly exposed light source should never be zero). Clamp the denominator to a very small positive number if necessary.TODO 3.3: Normalization Verification. After this division, the darkest parts of the film (the orange mask/film base) will mathematically resolve to exactly 1.0 transmittance across the entire frame, completely erasing the light source's luminance variations.Phase 4: Workflow and Batch OptimizationTODO 4.1: Caching the Flat-Field. Blurring a 42MP image is computationally expensive. When the user loads a flat-field frame, process and blur it once, keep the Array3<f32> in memory, and reuse it for every frame in the batch (or every frame exported from the GUI).TODO 4.2: Save as Profile (Optional). Allow the user to save the processed, blurred flat-field as a raw binary file or 32-bit float TIFF so they don't have to re-process the empty frame every time they use that specific camera/lens/light setup.
