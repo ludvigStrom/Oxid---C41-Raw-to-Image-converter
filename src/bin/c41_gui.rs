@@ -27,7 +27,8 @@ struct ImageEntry {
     options: PipelineOptions,
     preview_texture: Option<egui::TextureHandle>,
     preview_hash: u64,
-    histogram: Option<[u32; 256]>,
+    // Per-channel histograms (R, G, B) over 0–255
+    histogram: Option<([u32; 256], [u32; 256], [u32; 256])>,
     export_format: ExportFormat,
 }
 
@@ -131,17 +132,18 @@ impl eframe::App for C41Gui {
                     self.preview_receiver = None;
                     if idx < self.images.len() {
                         let size = [w as usize, h as usize];
-                        let mut hist = [0u32; 256];
+                        let mut r_hist = [0u32; 256];
+                        let mut g_hist = [0u32; 256];
+                        let mut b_hist = [0u32; 256];
                         let pixels: Vec<egui::Color32> = rgb
                             .chunks_exact(3)
                             .map(|c| {
-                                // simple luma for histogram
-                                let r = c[0] as f32;
-                                let g = c[1] as f32;
-                                let b = c[2] as f32;
-                                let l = (0.2126 * r + 0.7152 * g + 0.0722 * b)
-                                    .clamp(0.0, 255.0) as u8;
-                                hist[l as usize] += 1;
+                                let r = c[0] as usize;
+                                let g = c[1] as usize;
+                                let b = c[2] as usize;
+                                r_hist[r] += 1;
+                                g_hist[g] += 1;
+                                b_hist[b] += 1;
                                 egui::Color32::from_rgb(c[0], c[1], c[2])
                             })
                             .collect();
@@ -154,7 +156,7 @@ impl eframe::App for C41Gui {
                         let hash = options_hash_for(&self.images[idx].path, &self.images[idx].options);
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_hash = hash;
-                        self.images[idx].histogram = Some(hist);
+                        self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
                     }
                 }
                 Ok(Err(e)) => {
@@ -509,7 +511,7 @@ impl eframe::App for C41Gui {
                         let display_size = egui::vec2(w * scale, h * scale);
                         ui.image((tex.id(), display_size));
                         ui.add_space(8.0);
-                        if let Some(hist) = &self.images[idx].histogram {
+                        if let Some((r_hist, g_hist, b_hist)) = &self.images[idx].histogram {
                             // Histogram aligned to bottom of the central panel.
                             let available = ui.available_rect_before_wrap();
                             let h_hist = 72.0;
@@ -519,25 +521,56 @@ impl eframe::App for C41Gui {
                             );
                             let painter = ui.painter_at(rect);
 
-                            let max = hist.iter().copied().max().unwrap_or(1) as f32;
+                            let max_r = r_hist.iter().copied().max().unwrap_or(1) as f32;
+                            let max_g = g_hist.iter().copied().max().unwrap_or(1) as f32;
+                            let max_b = b_hist.iter().copied().max().unwrap_or(1) as f32;
+                            let max_total = r_hist
+                                .iter()
+                                .zip(g_hist.iter())
+                                .zip(b_hist.iter())
+                                .map(|((&r, &g), &b)| r + g + b)
+                                .max()
+                                .unwrap_or(1) as f32;
+                            let max_all = max_r.max(max_g).max(max_b).max(max_total).max(1.0);
                             let w_bin = rect.width() / 256.0;
-                            let bar_color = egui::Color32::from_rgba_premultiplied(0, 0, 0, 220);
 
-                            for (i, &count) in hist.iter().enumerate() {
-                                if count == 0 {
-                                    continue;
+                            // Draw combined + channel histograms as vertical lines.
+                            for i in 0..256 {
+                                let x = rect.left() + (i as f32 + 0.5) * w_bin;
+                                let y_base = rect.bottom();
+
+                                let draw_channel = |count: u32, color: egui::Color32, painter: &egui::Painter| {
+                                    if count == 0 {
+                                        return;
+                                    }
+                                    let h_norm = (count as f32 / max_all).clamp(0.0, 1.0);
+                                    let y_top = y_base - rect.height() * h_norm;
+                                    painter.line_segment(
+                                        [egui::pos2(x, y_base), egui::pos2(x, y_top)],
+                                        egui::Stroke::new(1.0, color),
+                                    );
+                                };
+
+                                // Combined (R+G+B) in gray, drawn first.
+                                let total = r_hist[i] + g_hist[i] + b_hist[i];
+                                if total > 0 {
+                                    let h_norm = (total as f32 / max_all).clamp(0.0, 1.0);
+                                    let y_top = y_base - rect.height() * h_norm;
+                                    painter.line_segment(
+                                        [egui::pos2(x, y_base), egui::pos2(x, y_top)],
+                                        egui::Stroke::new(
+                                            2.0,
+                                            egui::Color32::from_rgba_premultiplied(200, 200, 200, 220),
+                                        ),
+                                    );
                                 }
-                                let x0 = rect.left() + i as f32 * w_bin;
-                                let x1 = x0 + w_bin.max(1.0);
-                                let h_norm = (count as f32 / max).clamp(0.0, 1.0);
-                                let y1 = rect.bottom();
-                                let y0 = rect.bottom() - rect.height() * h_norm;
-                                let r = egui::Rect::from_min_max(
-                                    egui::pos2(x0, y0),
-                                    egui::pos2(x1, y1),
-                                );
-                                painter.rect_filled(r, 0.0, bar_color);
+
+                                // Individual channels on top.
+                                draw_channel(r_hist[i], egui::Color32::RED, &painter);
+                                draw_channel(g_hist[i], egui::Color32::GREEN, &painter);
+                                draw_channel(b_hist[i], egui::Color32::BLUE, &painter);
                             }
+                        }
 
                             // Axes: X (bottom) and Y (left), in black.
                             let axis_color = egui::Color32::BLACK;
