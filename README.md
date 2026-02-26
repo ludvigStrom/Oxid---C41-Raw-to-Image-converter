@@ -1,6 +1,6 @@
 # c41-raw-tool
 
-A high-performance, command-line and GUI RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically accurate log-density math: no auto white balance, no hidden base curves, and no complex color science -- only explicit mathematical steps suitable for scientific and repeatable workflows.
+A high-performance, command-line and GUI RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically accurate log-density math: no auto white balance, no hidden base curves only explicit mathematical steps suitable for scientific and repeatable workflows. Internally it uses ACEScg color space. 
 
 **Target cameras:** Any LibRaw-supported Bayer RAW (Sony, Nikon, Canon, etc.). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
 
