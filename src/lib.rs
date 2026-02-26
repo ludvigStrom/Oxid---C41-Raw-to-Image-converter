@@ -43,6 +43,7 @@ pub struct PipelineOptions {
     pub curve_gamma: f32,
     pub curve_pivot: f32,
     pub curve_white: f32,
+    pub density_matrix: [[f32; 3]; 3],
 }
 
 impl Default for PipelineOptions {
@@ -62,6 +63,11 @@ impl Default for PipelineOptions {
             curve_gamma: 2.5,
             curve_pivot: 3.0,
             curve_white: 1.0,
+            density_matrix: [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
         }
     }
 }
@@ -107,8 +113,18 @@ pub fn process_files(
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory {}", output_dir.display()))?;
 
-    let lut = (!options.no_curve)
-        .then(|| curve::generate_16bit_lut(options.curve_offset, options.curve_gamma, options.curve_pivot));
+    let curve_pipeline = (!options.no_curve).then(|| {
+        let params = curve::PrintCurveParams {
+            offset: options.curve_offset,
+            gamma: options.curve_gamma,
+            pivot: options.curve_pivot,
+        };
+        let matrix = curve::DensityMatrix {
+            m: options.density_matrix,
+        };
+        // Typical RA-4 densities fall within ~[0, 3.0–4.0]; keep a sensible default.
+        curve::CurvePipeline::new(params, matrix, 4.0, true)
+    });
 
     for path in paths {
         let ext = path
@@ -146,8 +162,9 @@ pub fn process_files(
         let out_path = output_dir.join(format!("{}.tiff", stem));
         let exr_path = output_dir.join(format!("{}.exr", stem));
 
-        if let Some(ref lut) = lut {
-            let image_u16 = curve::apply_curve_and_quantize(&image, lut, options.curve_white, true);
+        if let Some(ref pipeline) = curve_pipeline {
+            let image_u16 =
+                curve::apply_curve_pipeline(&image, pipeline, options.curve_white, true);
             tiff_export::write_tiff_u16(&image_u16, &out_path)?;
             if options.write_exr {
                 exr_export::write_exr_u16(&image_u16, &exr_path)?;
@@ -231,12 +248,16 @@ pub fn process_one_to_preview(
     let h = h as u32;
 
     let rgb_u8: Vec<u8> = if !options.no_curve {
-        let lut = curve::generate_16bit_lut(
-            options.curve_offset,
-            options.curve_gamma,
-            options.curve_pivot,
-        );
-        let u16_img = curve::apply_curve_and_quantize(&image, &lut, options.curve_white, false);
+        let params = curve::PrintCurveParams {
+            offset: options.curve_offset,
+            gamma: options.curve_gamma,
+            pivot: options.curve_pivot,
+        };
+        let matrix = curve::DensityMatrix {
+            m: options.density_matrix,
+        };
+        let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true);
+        let u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
         u16_img
             .iter()
             .map(|v| ((*v as u32) >> 8).min(255) as u8)

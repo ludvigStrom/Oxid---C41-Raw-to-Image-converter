@@ -10,7 +10,8 @@
 //!   gamma  — paper grade / contrast
 //!   pivot  — mid-gray pivot for the S-curve
 
-use ndarray::{Array3, Zip};
+use ndarray::{Array3, Axis, Zip};
+use ndarray::parallel::prelude::*;
 
 const LUT_LEN: usize = 65_536;
 const THRESHOLD: f32 = 1e-6;
@@ -138,6 +139,247 @@ pub fn apply_curve_and_quantize(
             "Histogram (8-bit bins of u16 output): min={} p50={} p90={} p99={} max={}",
             min_bin, p50, p90, p99, max_bin
         );
+        }
+    }
+
+    out
+}
+
+/// Parameters for the RA-4 paper S-curve.
+#[derive(Debug, Clone, Copy)]
+pub struct PrintCurveParams {
+    pub offset: f32,
+    pub gamma: f32,
+    pub pivot: f32,
+}
+
+/// 3×3 density-domain calibration matrix (row-major).
+#[derive(Debug, Clone, Copy)]
+pub struct DensityMatrix {
+    pub m: [[f32; 3]; 3],
+}
+
+/// Precomputed data for the multi-stage curve pipeline.
+#[derive(Debug)]
+pub struct CurvePipeline {
+    pub t_to_d_lut: Vec<f32>,   // optional (can be empty to use direct log10)
+    pub d_to_u16_lut: Vec<u16>, // required
+    pub d_max: f32,
+    pub params: PrintCurveParams,
+    pub matrix: DensityMatrix,
+}
+
+impl CurvePipeline {
+    /// Construct a new curve pipeline.
+    ///
+    /// * `d_max` is the maximum density represented by the `d_to_u16_lut` (values above clamp).
+    /// * If `use_t_to_d_lut` is false, transmittance → density uses direct log10 at runtime.
+    pub fn new(
+        params: PrintCurveParams,
+        matrix: DensityMatrix,
+        d_max: f32,
+        use_t_to_d_lut: bool,
+    ) -> Self {
+        let t_to_d_lut = if use_t_to_d_lut {
+            build_t_to_density_lut(THRESHOLD)
+        } else {
+            Vec::new()
+        };
+        let d_to_u16_lut = build_density_to_ra4_lut(params, d_max);
+
+        Self {
+            t_to_d_lut,
+            d_to_u16_lut,
+            d_max,
+            params,
+            matrix,
+        }
+    }
+}
+
+/// Step 1: Transmittance → Density (scalar).
+#[inline]
+pub fn transmittance_to_density(t: f32, t_threshold: f32) -> f32 {
+    let t = t.clamp(t_threshold, 1.0);
+    -t.log10()
+}
+
+/// Step 2: Apply 3×3 density-domain matrix to a single RGB triplet.
+#[inline]
+pub fn apply_density_matrix_pixel(d_in: [f32; 3], matrix: &DensityMatrix) -> [f32; 3] {
+    let m = &matrix.m;
+    let r = d_in[0];
+    let g = d_in[1];
+    let b = d_in[2];
+
+    [
+        m[0][0] * r + m[0][1] * g + m[0][2] * b,
+        m[1][0] * r + m[1][1] * g + m[1][2] * b,
+        m[2][0] * r + m[2][1] * g + m[2][2] * b,
+    ]
+}
+
+/// Step 3: Density → RA-4 output for a single channel.
+#[inline]
+pub fn density_to_ra4(density: f32, params: &PrintCurveParams) -> f32 {
+    let density = density.max(0.0);
+    let log_exposure = density + params.offset;
+    let linear_exposure = (10.0f32).powf(log_exposure);
+
+    let eg = linear_exposure.powf(params.gamma);
+    let pg = params.pivot.powf(params.gamma);
+    let out = eg / (eg + pg);
+
+    out.clamp(0.0, 1.0)
+}
+
+/// LUT for Step 1: transmittance → density.
+pub fn build_t_to_density_lut(t_threshold: f32) -> Vec<f32> {
+    (0..LUT_LEN)
+        .map(|i| {
+            let t = i as f32 / 65535.0;
+            transmittance_to_density(t, t_threshold)
+        })
+        .collect()
+}
+
+/// LUT for Step 3: density → RA-4 quantized u16, over [0, d_max].
+pub fn build_density_to_ra4_lut(params: PrintCurveParams, d_max: f32) -> Vec<u16> {
+    (0..LUT_LEN)
+        .map(|i| {
+            let d = (i as f32 / 65535.0) * d_max;
+            let y = density_to_ra4(d, &params);
+            (y * 65535.0).round() as u16
+        })
+        .collect()
+}
+
+#[inline]
+fn sample_t_to_density(t: f32, pipeline: &CurvePipeline) -> f32 {
+    if pipeline.t_to_d_lut.is_empty() {
+        transmittance_to_density(t, THRESHOLD)
+    } else {
+        let x = t.clamp(0.0, 1.0);
+        let idx = (x * 65535.0).round() as usize;
+        let idx = idx.min(65535);
+        pipeline.t_to_d_lut[idx]
+    }
+}
+
+#[inline]
+fn sample_density_to_u16(d: f32, pipeline: &CurvePipeline) -> u16 {
+    let d = d.clamp(0.0, pipeline.d_max);
+    let x = if pipeline.d_max > 0.0 {
+        d / pipeline.d_max
+    } else {
+        0.0
+    };
+    let idx = (x * 65535.0).round() as usize;
+    let idx = idx.min(65535);
+    pipeline.d_to_u16_lut[idx]
+}
+
+/// Apply the full multi-stage curve pipeline (T → D → matrix → RA-4) and quantize to u16.
+///
+/// `image` is linear transmittance [0, 1] with shape (H, W, 3).
+pub fn apply_curve_pipeline(
+    image: &Array3<f32>,
+    pipeline: &CurvePipeline,
+    white_point: f32,
+    print_histogram: bool,
+) -> Array3<u16> {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3, "Expected 3-channel RGB image");
+
+    let mut out = Array3::<u16>::zeros((h, w, c));
+
+    // Parallelize over rows; each row's pixels are independent.
+    out.axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .zip(image.axis_iter(Axis(0)))
+        .for_each(|(mut out_row, in_row)| {
+            let (row_w, row_c) = in_row.dim();
+            debug_assert_eq!(row_c, 3);
+
+            for x in 0..row_w {
+                let t_r = in_row[(x, 0)].clamp(0.0, 1.0);
+                let t_g = in_row[(x, 1)].clamp(0.0, 1.0);
+                let t_b = in_row[(x, 2)].clamp(0.0, 1.0);
+
+                // Step 1: T -> D
+                let d_in = [
+                    sample_t_to_density(t_r, pipeline),
+                    sample_t_to_density(t_g, pipeline),
+                    sample_t_to_density(t_b, pipeline),
+                ];
+
+                // Step 2: matrix in density domain
+                let d_out = apply_density_matrix_pixel(d_in, &pipeline.matrix);
+
+                // Step 3: D -> RA-4 via LUT
+                let y_r = sample_density_to_u16(d_out[0], pipeline);
+                let y_g = sample_density_to_u16(d_out[1], pipeline);
+                let y_b = sample_density_to_u16(d_out[2], pipeline);
+
+                out_row[(x, 0)] = y_r;
+                out_row[(x, 1)] = y_g;
+                out_row[(x, 2)] = y_b;
+            }
+        });
+
+    // Optional white-point scaling: map `white_point` (normalized) to display white.
+    let wp = white_point.clamp(1e-6, 1.0);
+    if (wp - 1.0).abs() > f32::EPSILON {
+        let inv_wp = 1.0 / wp;
+
+        Zip::from(out.view_mut()).par_for_each(|o| {
+            let normalized = *o as f32 / 65535.0;
+            let scaled = (normalized * inv_wp).min(1.0);
+            *o = (scaled * 65535.0).round() as u16;
+        });
+    }
+
+    // Optional 256-bin histogram (8-bit view of the u16 output), printed for inspection.
+    if print_histogram {
+        let mut hist = [0u64; 256];
+        for v in out.iter() {
+            let bin = (*v as usize) >> 8;
+            hist[bin] += 1;
+        }
+        let total: u64 = hist.iter().sum();
+        if total > 0 {
+            let mut min_bin = 0usize;
+            while min_bin < 256 && hist[min_bin] == 0 {
+                min_bin += 1;
+            }
+            let mut max_bin = 255usize;
+            while max_bin > 0 && hist[max_bin] == 0 {
+                max_bin -= 1;
+            }
+
+            let mut cum = 0u64;
+            let mut p50 = 0usize;
+            let mut p90 = 0usize;
+            let mut p99 = 0usize;
+            for (i, &count) in hist.iter().enumerate() {
+                cum += count;
+                let frac = cum as f64 / total as f64;
+                if p50 == 0 && frac >= 0.50 {
+                    p50 = i;
+                }
+                if p90 == 0 && frac >= 0.90 {
+                    p90 = i;
+                }
+                if p99 == 0 && frac >= 0.99 {
+                    p99 = i;
+                    break;
+                }
+            }
+
+            println!(
+                "Histogram (8-bit bins of u16 output): min={} p50={} p90={} p99={} max={}",
+                min_bin, p50, p90, p99, max_bin
+            );
         }
     }
 

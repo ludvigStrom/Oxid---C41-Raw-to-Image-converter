@@ -76,6 +76,11 @@ fn default_options() -> PipelineOptions {
         curve_gamma: 2.5,
         curve_pivot: 3.0,
         curve_white: 0.745,
+        density_matrix: [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
     }
 }
 
@@ -97,6 +102,11 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.curve_white.to_bits().hash(&mut h);
     (opts.format as u8).hash(&mut h);
     opts.write_exr.hash(&mut h);
+    for row in &opts.density_matrix {
+        for v in row {
+            v.to_bits().hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -570,7 +580,6 @@ impl eframe::App for C41Gui {
                                 draw_channel(g_hist[i], egui::Color32::GREEN, &painter);
                                 draw_channel(b_hist[i], egui::Color32::BLUE, &painter);
                             }
-                        }
 
                             // Axes: X (bottom) and Y (left), in black.
                             let axis_color = egui::Color32::BLACK;

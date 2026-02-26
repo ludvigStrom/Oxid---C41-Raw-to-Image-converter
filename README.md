@@ -18,6 +18,7 @@ Film dye density is logarithmic. A simple `1.0 - input` inversion in linear spac
 - **LibRaw** (used for raw decoding)
   - **macOS:** `brew install libraw`
   - **Debian/Ubuntu:** `sudo apt-get install libraw-dev`
+  - **Windows** just give up... package managing sucks on windows.
 
 ---
 
@@ -94,6 +95,7 @@ When the print curve is active (default), output is always 16-bit (the LUT produ
 | `--curve-pivot` | -- | Half-saturation exposure for RA-4 S-curve. Default 3.0. |
 | `--curve-white` | -- | Normalized code that maps to display white (0–1). Default 1.0. Use e.g. 0.745 (190/255) to pull white in. |
 | `--write-exr` | -- | Also write an OpenEXR `.exr` alongside the TIFF (RGB, 32-bit float in [0,1]). |
+| `--density-matrix` | -- | 3×3 density-domain calibration matrix in row-major order: `C00,C01,C02,C10,C11,C12,C20,C21,C22`. Defaults to identity (`1,0,0,0,1,0,0,0,1`). Used to remove dye crosstalk in the **density** domain before the RA-4 curve. |
 
 When the print curve is used, a **histogram summary** (min, p50, p90, p99, max in 8-bit bins of the u16 output) is printed to the console for tuning.
 
@@ -112,12 +114,13 @@ Order of operations:
    - If `--dmin-fixed` is set, use those fixed medians R,G,B (previously measured once) and divide the entire image per channel, **or**
    - If `--dmin-rect` is set, compute median R,G,B in that rectangle and divide the entire image per channel.\n   After this, data represents **linear transmittance**.
 4. **White balance gains** (optional) -- Per-channel multipliers `--wb-r`, `--wb-g`, `--wb-b` (default 1.0). Applied after D-min; compensates narrowband LED intensity imbalance (e.g. increase red, decrease green). Same gains can be reused for a given light source.
-5. **Physical print film curve** (default on) -- 65 536-entry 1D LUT:
-   - `D = -log10(T)` -- optical density of the negative
-   - `logE = D + offset` -- density as print exposure (inversion in log domain)
+5. **Density-domain calibration + physical print film curve** (default on) -- implemented as high-resolution 1D LUTs plus a 3×3 matrix:
+   - `D = -log10(T)` -- optical density of the negative (per channel), computed either directly or via a `T → D` LUT.
+   - **Density matrix:** `D_out = M · D_in` where `M` is a 3×3 matrix supplied via `--density-matrix`. This operates strictly in the density domain to remove dye crosstalk.
+   - `logE = D_out + offset` -- density as print exposure (inversion in log domain)
    - `E = 10^logE` -- back to linear exposure
-   - `out = E^g / (E^g + pivot^g)` -- RA-4 paper S-curve (Michaelis-Menten)
-   Parameters: `--curve-offset`, `--curve-gamma`, `--curve-pivot`. Then **white point**: if `--curve-white` < 1, output is scaled so that value maps to display white (e.g. 0.745 for 190/255). A **histogram summary** (min, p50, p90, p99, max) is printed for the final u16 image.
+   - `out = E^g / (E^g + pivot^g)` -- RA-4 paper S-curve (Michaelis-Menten), implemented as a dedicated `D → RA-4` LUT over a fixed density range.
+   Parameters: `--curve-offset`, `--curve-gamma`, `--curve-pivot`, `--density-matrix`. Then **white point**: if `--curve-white` < 1, output is scaled so that value maps to display white (e.g. 0.745 for 190/255). A **histogram summary** (min, p50, p90, p99, max) is printed for the final u16 image.
 6. **Fallback** (`--no-curve`) -- When the curve is off, optionally apply linear `1-x` inversion (`--no-invert` to skip). Export as 32-bit float (default) or 16-bit via `--format`.
 
 ---
@@ -134,7 +137,7 @@ Order of operations:
 | `src/demosaic.rs` | Bayer->RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
 | `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place; supports fixed medians via `--dmin-fixed`. |
 | `src/inversion.rs` | Simple linear inversion (`1-x`); used only with `--no-curve`. |
-| `src/curve.rs` | Physical Cineon/RA-4 print emulation: log-density inversion + Michaelis-Menten S-curve, 65 536-entry LUT, parallel apply. |
+| `src/curve.rs` | Physical Cineon/RA-4 print emulation: multi-stage pipeline (T → density → 3×3 density matrix → RA-4 S-curve) using high-resolution LUTs and rayon-parallel apply. |
 | `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32f/16 from f32, or u16 (after curve) via `write_tiff_u16`. |
 | `src/exr_export.rs` | Write RGB OpenEXR: f32 or normalized u16 to EXR via `--write-exr`. |
 
@@ -145,3 +148,67 @@ Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`
 ## License
 
 See repository for license information. LibRaw is used under its own license (e.g. LGPL/CDDL).
+
+
+##TODO 
+
+### Calibration
+Step 1: Data Ingestion (CLI arguments)
+
+The tool should accept two CSV files via clap:
+
+--measured: A CSV of 24 rows containing the linear RGB Transmittance values of the scanned ColorChecker patches (after D-min neutralization).
+
+--reference: A CSV of 24 rows containing the linear RGB values of the reference target.
+
+Step 2: Log-Density ConversionConvert both the Measured ($X$) and Reference ($Y$) linear data arrays into logarithmic optical density using:$D = -\log_{10}(T)$Clamp or handle values $T \le 0$ to prevent math errors.You should now have two $24 \times 3$ matrices in density space.
+
+Step 3: The Least Squares SolverCalculate the $3 \times 3$ transformation matrix ($M$) that maps the Measured density ($X$) to the Reference density ($Y$).Implement the standard Ordinary Least Squares equation:$$M = (X^T X)^{-1} X^T Y$$(Where $X^T$ is the transpose of $X$, and $X^T X$ is a $3 \times 3$ matrix that must be inverted).
+
+Step 4: OutputPrint the resulting $3 \times 3$ matrix to the console in a format that can be directly copied into the main c41-raw-tool CLI (e.g., a comma-separated string of 9 floats).Calculate and print the Mean Squared Error (MSE) between $X \times M$ and $Y$ to give the user a confidence metric on the calibration quality.
+
+TODO calibration 2
+Phase 1: GUI Updates (The Calibration Tab)You need a dedicated workspace in your GUI so the user isn't accidentally trying to process standard photos with calibration tools.
+
+TODO 1.1: Mode Toggle. Add a segmented button or tab system at the top of the UI to switch between [ Process Mode ] and [ Calibrate Mode ].
+
+TODO 1.2: Reference Data Setup. Hardcode the 24 linear RGB (or CIELAB converted to linear RGB) reference values of the ColorChecker Classic into your codebase as a constant $24 \times 3$ array.
+
+TODO 1.3: Image Canvas. In Calibrate Mode, render the loaded RAW image to an egui texture so the user can see what they are clicking on. (You can use a fast, low-res demosaic for the preview to keep the UI snappy).
+
+Phase 2: The Interactive 24-Patch GridDrawing 24 individual draggable squares is a UI nightmare. The standard way to do this is to draw a grid controlled by 4 corner points.
+
+TODO 2.1: 4-Point Draggable Overlay. Create 4 draggable anchor points in egui corresponding to the 4 corners of the ColorChecker.
+
+TODO 2.2: Grid Interpolation. Write a function that takes those 4 points and mathematically interpolates the center coordinates of the 24 patches (a $6 \times 4$ grid).
+
+TODO 2.3: Patch Bounding Boxes. Calculate a small, fixed-size bounding box (e.g., $10 \times 10$ pixels) around each of the 24 interpolated center points. Draw these boxes on the UI overlay so the user can verify they are only sampling pure color, not the black borders of the chart.
+
+Phase 3: Data Extraction & Pipeline TapYou need to run the image through your pipeline, but stop halfway. The math must be done on the neutralized data.
+TODO 3.1: D-min & Linearize. Run the RAW image through 
+Step 1 (LibRaw), 
+Step 2 (Demosaic), and 
+Step 3 (D-min neutralization). 
+
+You now have pure Linear Transmittance.
+
+TODO 3.2: Sample the Patches. For each of the 24 bounding boxes, calculate the median RGB values from the Linear Transmittance array.
+
+TODO 3.3: Convert to Density. Convert these 24 median RGB values into Optical Density: $D = -\log_{10}(T)$. Store this as your Measured_X array ($24 \times 3$). Convert your hardcoded reference values into density to create your Reference_Y array.
+
+Phase 4: The Least Squares SolverTODO 
+4.1: Include a Linear Algebra Crate. Add ndarray-linalg or nalgebra to your Cargo.toml.
+
+TODO 4.2: Implement OLS. Write a function that computes the Ordinary Least Squares equation:$$M = (X^T X)^{-1} X^T Y$$(This calculates the $3 \times 3$ matrix $M$ that best maps the measured density $X$ to the reference density $Y$).
+
+TODO 4.3: Calculate Error. Compute the Mean Squared Error (MSE) of the result to display in the UI. If the MSE is huge, the user probably put the grid on upside down!
+
+Phase 5: JSON Export & Profile ManagementTODO 5.1: Define the Schema. Create a Rust struct that derives serde::Serialize and serde::Deserialize. It should include:Profile Name / Film Stock (String)Light Source Notes (String)Matrix (9 floats)Optional: The D-min RGB medians used during calibration (useful for consistency).
+
+TODO 5.2: Save to Disk. Add a "Save Calibration Profile" button in the UI that writes this struct to a .json file in a dedicated profiles/ folder.
+
+Phase 6: Integrating with Process Mode
+
+TODO 6.1: Profile Dropdown. In your main [ Process Mode ] UI, add a dropdown that reads the profiles/ directory and lets the user select a saved JSON calibration.
+
+TODO 6.2: Pipeline Update. Update src/curve.rs (as discussed previously) to split the 1D LUT. Apply the log-conversion, multiply the array by the loaded $3 \times 3$ matrix, and then apply the RA-4 curve.

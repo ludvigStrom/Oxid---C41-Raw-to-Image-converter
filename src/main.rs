@@ -59,6 +59,17 @@ struct Cli {
     curve_pivot: f32,
     #[arg(long = "curve-white", default_value = "1.0")]
     curve_white: f32,
+
+    /// 3×3 density-domain calibration matrix (row-major), as 9 comma-separated values:
+    /// C00,C01,C02,C10,C11,C12,C20,C21,C22
+    /// Defaults to the identity matrix.
+    #[arg(
+        long = "density-matrix",
+        value_parser = parse_density_matrix,
+        value_name = "C00,C01,C02,C10,C11,C12,C20,C21,C22",
+        default_value = "1,0,0,0,1,0,0,0,1"
+    )]
+    density_matrix: [f32; 9],
 }
 
 fn parse_rect(s: &str) -> Result<Rect, String> {
@@ -102,6 +113,23 @@ fn parse_format(s: &str) -> Result<TiffFormat, String> {
     }
 }
 
+fn parse_density_matrix(s: &str) -> Result<[f32; 9], String> {
+    let parts: Vec<_> = s.split(',').collect();
+    if parts.len() != 9 {
+        return Err(
+            "expected 9 comma-separated values: C00,C01,C02,C10,C11,C12,C20,C21,C22".to_string(),
+        );
+    }
+    let mut vals = [0.0_f32; 9];
+    for (i, p) in parts.iter().enumerate() {
+        vals[i] = p
+            .trim()
+            .parse::<f32>()
+            .map_err(|e| format!("invalid float at position {}: {}", i, e))?;
+    }
+    Ok(vals)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -116,6 +144,7 @@ fn main() -> anyhow::Result<()> {
         "Print curve:      {} (offset={}, gamma={}, pivot={}, white={})",
         !cli.no_curve, cli.curve_offset, cli.curve_gamma, cli.curve_pivot, cli.curve_white
     );
+    println!("Density matrix:  {:?}", cli.density_matrix);
 
     let paths: Vec<PathBuf> = fs::read_dir(&cli.input_dir)
         .with_context(|| format!("Failed to read input directory {}", cli.input_dir.display()))?
@@ -138,6 +167,7 @@ fn main() -> anyhow::Result<()> {
         dmin_fixed: cli.dmin_fixed,
         format: cli.format,
         write_exr: cli.write_exr,
+        write_jpeg: false,
         no_invert: cli.no_invert,
         no_curve: cli.no_curve,
         wb_r: cli.wb_r,
@@ -147,6 +177,11 @@ fn main() -> anyhow::Result<()> {
         curve_gamma: cli.curve_gamma,
         curve_pivot: cli.curve_pivot,
         curve_white: cli.curve_white,
+        density_matrix: [
+            [cli.density_matrix[0], cli.density_matrix[1], cli.density_matrix[2]],
+            [cli.density_matrix[3], cli.density_matrix[4], cli.density_matrix[5]],
+            [cli.density_matrix[6], cli.density_matrix[7], cli.density_matrix[8]],
+        ],
     };
 
     process_files(&paths, &cli.output_dir, &options)?;
