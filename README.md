@@ -175,3 +175,11 @@ Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`
 ## License
 
 See repository for license information. LibRaw is used under its own license (e.g. LGPL/CDDL).
+﻿
+---
+
+## Future work (ideas)
+
+- **Color space / ICC profiles**: Today the tool operates in an implicit RGB working space and writes untagged TIFF/EXR. A possible extension is to define an explicit working space (e.g. sRGB, ProPhoto) and embed ICC profiles into TIFFs for stricter color management across viewers.
+
+- **Highlight handling**: `--curve-white` currently acts as a scalar white-point control. A future enhancement could add an optional soft‑clip or smooth highlight roll‑off just before 16‑bit quantization for even more graceful specular handling.

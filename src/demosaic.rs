@@ -1,6 +1,11 @@
-//! Linear bilinear demosaic: Bayer (H, W, 1) → RGB (H, W, 3).
+//! Demosaicing: Bayer (H, W, 1) → RGB (H, W, 3).
 //!
-//! Purely linear interpolation; no edge-aware or iterative methods.
+//! This module provides:
+//! - `demosaic_bilinear`: simple bilinear interpolation (reference / fallback).
+//! - `demosaic_edge_aware`: a lightweight edge-aware variant that preserves grain
+//!   and reduces zippering by adapting green-channel interpolation to local
+//!   gradients (Hamilton–Adams style) while keeping everything strictly linear.
+//!
 //! Sony a7R II uses RGGB (red at top-left of 2×2 Bayer block).
 
 use anyhow::{bail, Result};
@@ -22,10 +27,11 @@ pub enum BayerPattern {
     Bggr,
 }
 
-/// Demosaic a single-channel Bayer image into linear RGB (H, W, 3).
+/// Demosaic a single-channel Bayer image into linear RGB (H, W, 3) using
+/// plain bilinear interpolation. Kept as a reference implementation and
+/// fallback for non-RGGB patterns.
 ///
 /// Input must be shape (H, W, 1). Output is (H, W, 3) with channels in R, G, B order.
-/// Uses bilinear interpolation only; no gamma or non-linear filtering.
 pub fn demosaic_bilinear(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
     let (height, width, c) = bayer.dim();
     if c != 1 {
@@ -44,6 +50,49 @@ pub fn demosaic_bilinear(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<A
             let r = sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::R);
             let g = sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::G);
             let b = sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::B);
+            let base = y * width * 3 + x * 3;
+            unsafe {
+                *ptr.add(base) = r;
+                *ptr.add(base + 1) = g;
+                *ptr.add(base + 2) = b;
+            }
+        }
+    });
+
+    Ok(rgb)
+}
+
+/// Demosaic a Bayer image using a simple edge-aware scheme:
+///
+/// - For RGGB, the green channel at R/B sites is interpolated directionally
+///   based on local gradients (horizontal vs vertical), which greatly reduces
+///   zippering along edges while keeping math linear.
+/// - Red/blue at all sites still use bilinear interpolation.
+/// - For non-RGGB patterns we currently fall back to `demosaic_bilinear`.
+pub fn demosaic_edge_aware(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
+    // For now, only RGGB gets the edge-aware green treatment.
+    if !matches!(pattern, BayerPattern::Rggb) {
+        return demosaic_bilinear(bayer, pattern);
+    }
+
+    let (height, width, c) = bayer.dim();
+    if c != 1 {
+        bail!("Demosaic expects (H, W, 1), got channels {}", c);
+    }
+
+    let bayer_2d = bayer.slice(ndarray::s![.., .., 0]); // (H, W)
+
+    let mut rgb = Array3::<f32>::zeros((height, width, 3));
+    let ptr_base = rgb.as_mut_ptr() as usize;
+
+    (0..height).into_par_iter().for_each(|y| {
+        let ptr = ptr_base as *mut f32;
+        for x in 0..width {
+            let r =
+                sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::R);
+            let g = sample_channel_edge_aware_rggb_g(&bayer_2d, y, x, height, width);
+            let b =
+                sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::B);
             let base = y * width * 3 + x * 3;
             unsafe {
                 *ptr.add(base) = r;
@@ -78,6 +127,61 @@ fn sample_channel_bilinear(
         BayerPattern::Grbg => sample_grbg(bayer, y, x, h, w, channel),
         BayerPattern::Gbrg => sample_gbrg(bayer, y, x, h, w, channel),
         BayerPattern::Bggr => sample_bggr(bayer, y, x, h, w, channel),
+    }
+}
+
+/// Edge-aware interpolation of the green channel for RGGB Bayer at (y, x).
+///
+/// At R/B sites (even+even or odd+odd), choose between horizontal and vertical
+/// interpolation based on local gradients (Hamilton–Adams style). At native G
+/// sites, just return the observed value.
+fn sample_channel_edge_aware_rggb_g(
+    bayer: &ArrayView2<f32>,
+    y: usize,
+    x: usize,
+    h: usize,
+    w: usize,
+) -> f32 {
+    let y_i = y as i32;
+    let x_i = x as i32;
+    let h_u = h as usize;
+    let w_u = w as usize;
+
+    // In RGGB, G is at (even, odd) and (odd, even): parity (y + x) % 2 == 1.
+    if (y + x) % 2 == 1 {
+        return bayer[[y, x]];
+    }
+
+    // Clamp helpers for neighbors.
+    let s = |yy: i32, xx: i32| {
+        let (yyc, xyc) = clamp(yy, xx, h_u, w_u);
+        bayer[[yyc, xyc]]
+    };
+
+    // First-order gradients (difference of neighbors).
+    let gh = (s(y_i, x_i - 1) - s(y_i, x_i + 1)).abs();
+    let gv = (s(y_i - 1, x_i) - s(y_i + 1, x_i)).abs();
+
+    // Second-order term (Laplacian-like) to stabilize interpolation.
+    let lh = (2.0 * s(y_i, x_i) - s(y_i, x_i - 2) - s(y_i, x_i + 2)).abs();
+    let lv = (2.0 * s(y_i, x_i) - s(y_i - 2, x_i) - s(y_i + 2, x_i)).abs();
+
+    let dh = gh + lh;
+    let dv = gv + lv;
+
+    if dh < dv {
+        // Prefer horizontal interpolation.
+        0.5 * (s(y_i, x_i - 1) + s(y_i, x_i + 1))
+    } else if dv < dh {
+        // Prefer vertical interpolation.
+        0.5 * (s(y_i - 1, x_i) + s(y_i + 1, x_i))
+    } else {
+        // Isotropic case: average of both directions.
+        0.25
+            * (s(y_i, x_i - 1)
+                + s(y_i, x_i + 1)
+                + s(y_i - 1, x_i)
+                + s(y_i + 1, x_i))
     }
 }
 

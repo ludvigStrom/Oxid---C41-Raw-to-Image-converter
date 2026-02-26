@@ -170,6 +170,7 @@ fn main() -> anyhow::Result<()> {
     let options = PipelineOptions {
         apply_dmin: true,
         apply_white_balance: true,
+        apply_color_profile: true,
         dmin_rect: cli.dmin_rect,
         dmin_fixed: cli.dmin_fixed,
         format: cli.format,
