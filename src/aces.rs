@@ -3,8 +3,53 @@
 //! ACEScg uses AP1 primaries (linear); ACES2065-1 uses AP0 primaries (linear).
 //! Matrix constants from ACES documentation (ACEScg specification, TRA_2).
 
-use ndarray::Array3;
+use std::path::Path;
+
 use nalgebra::Matrix3;
+use ndarray::Array3;
+use serde::{Deserialize, Serialize};
+
+/// Camera IDT profile: name and 3×3 matrix (linear camera RGB → ACEScg).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdtProfile {
+    /// Display name, e.g. "Sony A7R II".
+    pub name: String,
+    /// 3×3 row-major matrix (camera linear → ACEScg).
+    pub matrix: [[f32; 3]; 3],
+}
+
+/// Load all `.json` IDT profiles from a directory (e.g. `camera_idt/`).
+/// Returns `(path, profile)`; files that fail to parse are skipped.
+pub fn load_idt_profiles_from_dir(
+    dir: &Path,
+) -> anyhow::Result<Vec<(std::path::PathBuf, IdtProfile)>> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        match serde_json::from_str::<IdtProfile>(&text) {
+            Ok(profile) => out.push((path, profile)),
+            Err(_) => continue,
+        }
+    }
+    Ok(out)
+}
 
 /// 3×3 identity matrix for IDT (no color transform).
 pub const IDT_IDENTITY: [[f32; 3]; 3] = [

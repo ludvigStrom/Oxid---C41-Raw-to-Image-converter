@@ -248,7 +248,20 @@ pub fn build_density_to_ra4_lut(params: PrintCurveParams, d_max: f32) -> Vec<u16
     (0..LUT_LEN)
         .map(|i| {
             let d = (i as f32 / 65535.0) * d_max;
-            let y = density_to_ra4(d, &params);
+            let mut y = density_to_ra4(d, &params);
+
+            // Soft highlight shoulder: gently compress values near white before 16-bit
+            // quantization to avoid harsh clipping in very bright regions (clouds, speculars).
+            // Below `shoulder_start` the curve is unchanged; above it we remap into [0,1]
+            // and apply a smooth roll-off.
+            const SHOULDER_START: f32 = 0.85;
+            if y > SHOULDER_START {
+                let t = (y - SHOULDER_START) / (1.0 - SHOULDER_START);
+                // Exponent > 1.0 yields a flatter shoulder near 1.0.
+                let t_shaped = 1.0 - (1.0 - t).powf(2.0);
+                y = SHOULDER_START + t_shaped * (1.0 - SHOULDER_START);
+            }
+
             (y * 65535.0).round() as u16
         })
         .collect()

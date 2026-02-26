@@ -152,7 +152,7 @@ Order of operations:
 
 In the GUI, **D-min**, **White balance**, **Print curve**, and **Color calibration profile** each have a checkbox: when unchecked, that step is skipped (identity or no-op), so you can isolate the effect of each stage.
 
-### ACES hybrid (optional)
+### ACES hybrid
 
 With **Use ACEScg** (GUI) or `--use-acescg` (CLI), the pipeline treats ACES as a linear working space only: linear camera RGB is converted to ACEScg via an **IDT** (Input Device Transform), then D-min, flat-field, white balance, and the density matrix + RA-4 curve run in ACEScg. Display output maps ACEScg directly to sRGB with the same RA-4 curve—no ACES RRT/ODT. You can optionally **Export ACES2065-1 EXR** to get a linear ACES2065-1 (AP0) file per image for VFX or archival. Color calibration profiles solved in camera space are automatically converted to ACEScg (M_aces = T · M_cam · T^(-1)) so existing profiles still match. See `colorSpaceUpdate.md` for the full design.
 
@@ -188,6 +188,9 @@ See repository for license information. LibRaw is used under its own license (e.
 
 ## Future work (ideas)
 
-- **Highlight handling**: `--curve-white` currently acts as a scalar white-point control. A future enhancement could add an optional soft‑clip or smooth highlight roll‑off just before 16‑bit quantization for even more graceful specular handling.
+- **Highlight handling**: A soft‑clip shoulder is now applied just before 16‑bit quantization to give smoother highlight roll‑off; future work could expose its parameters (threshold/strength) as user‑tunable options.
 
-- **ACES hybrid** — Implemented. Use **Use ACEScg** (GUI) or `--use-acescg` (CLI); optional `--export-aces-exr` and `--idt-matrix`. See "ACES hybrid (optional)" above and `colorSpaceUpdate.md`.
+- **Color MAtrix Limitation**A 3x3 matrix in the density domain is great for linear dye crosstalk, but C-41 dyes often behave non-linearly at the extreme shoulders and toes of the film's characteristic curve. A 3x3 matrix might struggle to perfectly align a ColorChecker across all exposure ranges. It's a great baseline, but eventually, you might want to explore 3D LUTs (though that complicates your elegant math).
+
+- **IDT matrix (camera ACEScg)**
+Add a dropdown with camera profiles like A7RII etc. common cameras 
