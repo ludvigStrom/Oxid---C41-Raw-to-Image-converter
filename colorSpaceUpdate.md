@@ -112,14 +112,14 @@ Check off each step as you complete it. Phases can be done in order; within a ph
 
 ### Phase 4: Calibration and docs
 
-- [ ] **4.1** Document or implement calibration matrix conversion for ACEScg: when `use_acescg`, either convert existing profile matrix (M_aces = T · M_cam · T_inv) or document that new calibrations should be solved in ACEScg. If converting, add a small helper or apply in curve pipeline when in ACEScg mode.
-- [ ] **4.2** Update README (and this doc if needed): mention ACES hybrid option, IDT, and ACES2065-1 EXR export. Trim or reference the duplicate "Future work" ACES paragraph in README.
+- [x] **4.1** Document or implement calibration matrix conversion for ACEScg: when `use_acescg`, either convert existing profile matrix (M_aces = T · M_cam · T_inv) or document that new calibrations should be solved in ACEScg. If converting, add a small helper or apply in curve pipeline when in ACEScg mode.
+- [x] **4.2** Update README (and this doc if needed): mention ACES hybrid option, IDT, and ACES2065-1 EXR export. Trim or reference the duplicate "Future work" ACES paragraph in README.
 
 ---
 
 ## Calibration
 
-The existing 3×3 density matrix remains; density and matrix are calculated in **ACEScg**. Existing calibration profiles (solved in camera space) should be interpreted or converted for ACEScg: either apply the camera→ACEScg transform to the density matrix (M_aces = T · M_cam · T_inv) so that the same visual result is achieved, or document that new calibrations can be solved with ACEScg reference densities for consistency.
+The existing 3×3 density matrix remains; density and matrix are calculated in **ACEScg** when `use_acescg` is true. When running in ACEScg mode, the pipeline converts camera-space calibration matrices into ACEScg via **M_aces = T · M_cam · T^(-1)** (using the IDT matrix T); see `aces::convert_density_matrix_to_acescg`. This preserves the same visual result for profiles solved in camera space. New calibrations can alternatively be solved with ACEScg reference densities for consistency.
 
 ---
 

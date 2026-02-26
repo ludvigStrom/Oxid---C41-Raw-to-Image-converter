@@ -280,17 +280,21 @@ pub fn process_files(
             gamma: options.curve_gamma,
             pivot: options.curve_pivot,
         };
-        let matrix = curve::DensityMatrix {
-            m: if options.apply_color_profile {
-                options.density_matrix
-            } else {
-                [
-                    [1.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0],
-                    [0.0, 0.0, 1.0],
-                ]
-            },
+        let base = if options.apply_color_profile {
+            options.density_matrix
+        } else {
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
         };
+        let m = if options.use_acescg {
+            aces::convert_density_matrix_to_acescg(base, &options.idt_matrix)
+        } else {
+            base
+        };
+        let matrix = curve::DensityMatrix { m };
         // Typical RA-4 densities fall within ~[0, 3.0–4.0]; keep a sensible default.
         curve::CurvePipeline::new(params, matrix, 4.0, true)
     });
@@ -475,9 +479,21 @@ pub fn process_one_to_preview(
             gamma: options.curve_gamma,
             pivot: options.curve_pivot,
         };
-        let matrix = curve::DensityMatrix {
-            m: options.density_matrix,
+        let base = if options.apply_color_profile {
+            options.density_matrix
+        } else {
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
         };
+        let m = if options.use_acescg {
+            aces::convert_density_matrix_to_acescg(base, &options.idt_matrix)
+        } else {
+            base
+        };
+        let matrix = curve::DensityMatrix { m };
         let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true);
         let u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
         u16_img

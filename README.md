@@ -97,6 +97,9 @@ When the print curve is active (default), output is always 16-bit (the LUT produ
 | `--write-exr` | -- | Also write an OpenEXR `.exr` alongside the TIFF (RGB, 32-bit float in [0,1]). |
 | `--density-matrix` | -- | 3×3 density-domain calibration matrix in row-major order: `C00,C01,C02,C10,C11,C12,C20,C21,C22`. Defaults to identity (`1,0,0,0,1,0,0,0,1`). Used for **color calibration** (dye crosstalk correction) in the density domain before the RA-4 curve. |
 | `--flat-field` | -- | Path to a RAW (or pre-blurred 32f TIFF) of an unexposed, developed frame for **luminance calibration**. When set, flat-field division replaces D-min neutralization. |
+| `--use-acescg` | -- | Run the pipeline in **ACEScg**: apply IDT (camera linear → ACEScg), then D-min, flat-field, white balance, and the print curve in ACEScg. Display output maps ACEScg to sRGB via the RA-4 curve (no ACES RRT/ODT). |
+| `--idt-matrix` | -- | 3×3 IDT matrix (row-major), 9 comma-separated values. Used when `--use-acescg`. Default: identity. |
+| `--export-aces-exr` | -- | When using `--use-acescg`, also write a linear **ACES2065-1** EXR per image (e.g. `stem_aces2065-1.exr`) for VFX/archival. |
 
 When the print curve is used, a **histogram summary** (min, p50, p90, p99, max in 8-bit bins of the u16 output) is printed to the console for tuning.
 
@@ -149,6 +152,10 @@ Order of operations:
 
 In the GUI, **D-min**, **White balance**, **Print curve**, and **Color calibration profile** each have a checkbox: when unchecked, that step is skipped (identity or no-op), so you can isolate the effect of each stage.
 
+### ACES hybrid (optional)
+
+With **Use ACEScg** (GUI) or `--use-acescg` (CLI), the pipeline treats ACES as a linear working space only: linear camera RGB is converted to ACEScg via an **IDT** (Input Device Transform), then D-min, flat-field, white balance, and the density matrix + RA-4 curve run in ACEScg. Display output maps ACEScg directly to sRGB with the same RA-4 curve—no ACES RRT/ODT. You can optionally **Export ACES2065-1 EXR** to get a linear ACES2065-1 (AP0) file per image for VFX or archival. Color calibration profiles solved in camera space are automatically converted to ACEScg (M_aces = T · M_cam · T^(-1)) so existing profiles still match. See `colorSpaceUpdate.md` for the full design.
+
 ---
 
 ## Project structure
@@ -180,6 +187,22 @@ See repository for license information. LibRaw is used under its own license (e.
 
 ## Future work (ideas)
 
-- **Color space / ICC profiles**: Today the tool operates in an implicit RGB working space and writes untagged TIFF/EXR. A possible extension is to define an explicit working space (e.g. sRGB, ProPhoto) and embed ICC profiles into TIFFs for stricter color management across viewers.
-
 - **Highlight handling**: `--curve-white` currently acts as a scalar white-point control. A future enhancement could add an optional soft‑clip or smooth highlight roll‑off just before 16‑bit quantization for even more graceful specular handling.
+
+- **Color space
+The Verdict: A Hybrid Approach
+To get the best of both worlds, you should treat ACES purely as a highly accurate mathematical container, bypassing its display rendering entirely.
+
+Your updated pipeline would look like this:
+
+LibRaw -> Linear camera RGB.
+
+IDT Matrix -> Convert linear camera RGB to ACEScg.
+
+Flat-field / D-min -> Applied in ACEScg.
+
+Log-Density Matrix -> Calculated in ACEScg.
+
+EXR Branch -> Export raw ACES2065-1 EXR here (for VFX/Archival).
+
+Your Custom RA-4 Curve -> Applied directly to the ACEScg data, mapping it directly to standard display RGB (bypassing the ACES RRT/ODT completely).
