@@ -1,6 +1,6 @@
 # c41-raw-tool
 
-A high-performance, command-line RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically accurate log-density math: no auto white balance, no hidden base curves, and no complex color science -- only explicit mathematical steps suitable for scientific and repeatable workflows.
+A high-performance, command-line and GUI RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically accurate log-density math: no auto white balance, no hidden base curves, and no complex color science -- only explicit mathematical steps suitable for scientific and repeatable workflows.
 
 **Target cameras:** Any LibRaw-supported Bayer RAW (Sony, Nikon, Canon, etc.). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
 
@@ -53,7 +53,7 @@ cargo run --release -- \
 
 ### Minimal GUI
 
-A small desktop UI lets you pick files, set all parameters with sliders and checkboxes, choose an output folder, and run Convert:
+A desktop UI provides three tabs: **Process** (main development with per-step checkboxes for D-min, white balance, print curve, and color calibration profile), **Color calibration** (solve a 3×3 matrix from a ColorChecker and save/load profiles), and **Luminance calibration** (load/save flat-field reference frames). Pick files, set parameters, choose an output folder, and run Convert:
 
 ```bash
 cargo run --release --bin c41-gui --features gui
@@ -95,11 +95,34 @@ When the print curve is active (default), output is always 16-bit (the LUT produ
 | `--curve-pivot` | -- | Half-saturation exposure for RA-4 S-curve. Default 3.0. |
 | `--curve-white` | -- | Normalized code that maps to display white (0–1). Default 1.0. Use e.g. 0.745 (190/255) to pull white in. |
 | `--write-exr` | -- | Also write an OpenEXR `.exr` alongside the TIFF (RGB, 32-bit float in [0,1]). |
-| `--density-matrix` | -- | 3×3 density-domain calibration matrix in row-major order: `C00,C01,C02,C10,C11,C12,C20,C21,C22`. Defaults to identity (`1,0,0,0,1,0,0,0,1`). Used to remove dye crosstalk in the **density** domain before the RA-4 curve. |
+| `--density-matrix` | -- | 3×3 density-domain calibration matrix in row-major order: `C00,C01,C02,C10,C11,C12,C20,C21,C22`. Defaults to identity (`1,0,0,0,1,0,0,0,1`). Used for **color calibration** (dye crosstalk correction) in the density domain before the RA-4 curve. |
+| `--flat-field` | -- | Path to a RAW (or pre-blurred 32f TIFF) of an unexposed, developed frame for **luminance calibration**. When set, flat-field division replaces D-min neutralization. |
 
 When the print curve is used, a **histogram summary** (min, p50, p90, p99, max in 8-bit bins of the u16 output) is printed to the console for tuning.
 
 Output filenames are derived from the input stem: e.g. `frame_001.arw` or `frame_001.png` -> `frame_001.tiff`.
+
+---
+
+## Calibration: color and luminance
+
+The tool supports two kinds of calibration, each with a clear role.
+
+### Color calibration (density-domain matrix)
+
+**What it does:** A 3×3 matrix is applied in the **optical density** domain (after log, before the RA-4 curve). It maps measured densities to reference densities, correcting dye crosstalk and aligning your film/light combination to a known target (e.g. a ColorChecker Classic).
+
+**Philosophy:** C-41 dyes are not perfectly separated; red dye absorbs some green and blue, etc. Measuring 24 patches from a chart and solving OLS gives a matrix that best fits your specific film stock and light source. The correction is explicit, repeatable, and saved as a JSON profile (name, light source notes, matrix, optional D-min medians). In Process mode you can enable or disable this step and choose a profile; when disabled, the identity matrix is used so no color correction is applied.
+
+**Workflow:** Use the **Color calibration** tab: load a RAW of a ColorChecker, align the 4 corner points to the chart, then “Solve 3×3 matrix from chart”. Save the profile to `profiles/` and in Process mode select it from the Color calibration profile dropdown.
+
+### Luminance calibration (flat-field)
+
+**What it does:** You provide a reference image of an **unexposed, developed** frame from the same roll (or same stock). It is linearized and heavily blurred to remove grain and dust, leaving only the low-frequency luminance pattern of your light source and lens. Each scan is then divided by this map pixel-by-pixel.
+
+**Philosophy:** The “empty” frame is not truly empty: it records the orange mask and base density, which is uniform, plus the **illumination** (LED falloff, vignetting). Dividing by this map makes the film base resolve to ~1.0 transmittance everywhere, so exposure and color are no longer biased by where the pixel sits in the frame. This is classic flat-field correction. D-min (single scalar per channel) is a special case when the light is perfectly even; flat-field generalizes to real setups.
+
+**Workflow:** Use the **Luminance calibration** tab: “Load Reference Frame…” (RAW of empty frame). The tool blurs it and keeps it in memory. You can “Save blurred flat-field as 32f TIFF…” to reuse the same camera/lens/light setup without re-blurring. In **Process** mode, under D-min, “Load flat-field map…” lets you choose either a RAW empty frame (linearized and blurred on the fly) or a saved 32f TIFF; when a flat-field is set, it overrides D-min for that session.
 
 ---
 
@@ -110,18 +133,21 @@ Order of operations:
 1. **Linear extraction** (RAW only) -- LibRaw decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
 2. **Demosaic** (RAW only) -- Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
    *PNG input skips 1-2: loaded as RGB and normalized to [0, 1].*
-3. **D-min neutralization** (optional) -- Either:
-   - If `--dmin-fixed` is set, use those fixed medians R,G,B (previously measured once) and divide the entire image per channel, **or**
-   - If `--dmin-rect` is set, compute median R,G,B in that rectangle and divide the entire image per channel.\n   After this, data represents **linear transmittance**.
-4. **White balance gains** (optional) -- Per-channel multipliers `--wb-r`, `--wb-g`, `--wb-b` (default 1.0). Applied after D-min; compensates narrowband LED intensity imbalance (e.g. increase red, decrease green). Same gains can be reused for a given light source.
-5. **Density-domain calibration + physical print film curve** (default on) -- implemented as high-resolution 1D LUTs plus a 3×3 matrix:
-   - `D = -log10(T)` -- optical density of the negative (per channel), computed either directly or via a `T → D` LUT.
-   - **Density matrix:** `D_out = M · D_in` where `M` is a 3×3 matrix supplied via `--density-matrix`. This operates strictly in the density domain to remove dye crosstalk.
+3. **D-min or flat-field** (optional, can be disabled) -- Either:
+   - **Flat-field:** If `--flat-field` is set, load that reference (RAW → linearize → heavy blur), then divide the image by it pixel-by-pixel. This removes light falloff and vignetting; the film base normalizes to ~1.0 transmittance everywhere. **Or**
+   - **D-min:** If `--dmin-fixed` is set, divide by those fixed R,G,B medians; if `--dmin-rect` is set, compute median R,G,B in that rectangle and divide.  
+   After this step, data represents **linear transmittance**.
+4. **White balance gains** (optional, can be disabled) -- Per-channel multipliers `--wb-r`, `--wb-g`, `--wb-b` (default 1.0). Applied after step 3; compensates narrowband LED intensity imbalance. Same gains can be reused for a given light source.
+5. **Density-domain color calibration + physical print curve** (optional, default on) -- Implemented as high-resolution 1D LUTs plus a 3×3 matrix:
+   - `D = -log10(T)` -- optical density of the negative (per channel).
+   - **Color calibration matrix:** `D_out = M · D_in` where `M` is the 3×3 matrix (from a saved profile or `--density-matrix`). When color calibration is disabled, the identity matrix is used. This step removes dye crosstalk and aligns colors to a reference (e.g. ColorChecker).
    - `logE = D_out + offset` -- density as print exposure (inversion in log domain)
    - `E = 10^logE` -- back to linear exposure
    - `out = E^g / (E^g + pivot^g)` -- RA-4 paper S-curve (Michaelis-Menten), implemented as a dedicated `D → RA-4` LUT over a fixed density range.
    Parameters: `--curve-offset`, `--curve-gamma`, `--curve-pivot`, `--density-matrix`. Then **white point**: if `--curve-white` < 1, output is scaled so that value maps to display white (e.g. 0.745 for 190/255). A **histogram summary** (min, p50, p90, p99, max) is printed for the final u16 image.
 6. **Fallback** (`--no-curve`) -- When the curve is off, optionally apply linear `1-x` inversion (`--no-invert` to skip). Export as 32-bit float (default) or 16-bit via `--format`.
+
+In the GUI, **D-min**, **White balance**, **Print curve**, and **Color calibration profile** each have a checkbox: when unchecked, that step is skipped (identity or no-op), so you can isolate the effect of each stage.
 
 ---
 
@@ -131,87 +157,21 @@ Order of operations:
 |------|------|
 | `src/lib.rs` | Shared pipeline: `PipelineOptions`, `process_files()`. Used by CLI and GUI. |
 | `src/main.rs` | CLI (clap), directory iteration, calls lib. |
-| `src/bin/c41_gui.rs` | Minimal GUI (egui/eframe): file picker, sliders/checkboxes, Convert. Requires `--features gui`. |
+| `src/bin/c41_gui.rs` | GUI (egui/eframe): Process / Color calibration / Luminance calibration tabs, per-step checkboxes, profile and flat-field load/save, Convert. Requires `--features gui`. |
 | `src/raw_reader.rs` | Load RAW via LibRaw (`.arw`, `.nef`, `.nrw`, `.cr2`, `.cr3`, `.crw`, `.dng`, `.raf`, `.orf`, `.rw2`) -> `Array3<f32>` (HxWx1) Bayer. |
 | `src/png_reader.rs` | Load `.png` (or other image crate formats) -> RGB `Array3<f32>` (HxWx3); any size. |
 | `src/demosaic.rs` | Bayer->RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
 | `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place; supports fixed medians via `--dmin-fixed`. |
 | `src/inversion.rs` | Simple linear inversion (`1-x`); used only with `--no-curve`. |
 | `src/curve.rs` | Physical Cineon/RA-4 print emulation: multi-stage pipeline (T → density → 3×3 density matrix → RA-4 S-curve) using high-resolution LUTs and rayon-parallel apply. |
+| `src/calibration.rs` | Color calibration: ColorChecker reference densities, OLS solver for 3×3 matrix, JSON profile load/save. |
 | `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32f/16 from f32, or u16 (after curve) via `write_tiff_u16`. |
 | `src/exr_export.rs` | Write RGB OpenEXR: f32 or normalized u16 to EXR via `--write-exr`. |
 
-Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`, `image` (PNG/raster ingestion), `exr` (OpenEXR export).
+Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`, `image` (PNG/raster ingestion), `exr` (OpenEXR export), `nalgebra` (calibration OLS), `serde`/`serde_json` (profiles).
 
 ---
 
 ## License
 
 See repository for license information. LibRaw is used under its own license (e.g. LGPL/CDDL).
-
-
-##TODO 
-
-TODO calibration 
-
-Phase 1: GUI Updates (The Calibration Tab)You need a dedicated workspace in your GUI so the user isn't accidentally trying to process standard photos with calibration tools.
-
-TODO 1.1: Mode Toggle. Add a segmented button or tab system at the top of the UI to switch between [ Process Mode ] and [ Calibrate Mode ].
-
-TODO 1.2: Reference Data Setup. Hardcode the 24 linear RGB (or CIELAB converted to linear RGB) reference values of the ColorChecker Classic into your codebase as a constant $24 \times 3$ array.
-
-TODO 1.3: Image Canvas. In Calibrate Mode, render the loaded RAW image to an egui texture so the user can see what they are clicking on. (You can use a fast, low-res demosaic for the preview to keep the UI snappy).
-
-Phase 2: The Interactive 24-Patch GridDrawing 24 individual draggable squares is a UI nightmare. The standard way to do this is to draw a grid controlled by 4 corner points.
-
-TODO 2.1: 4-Point Draggable Overlay. Create 4 draggable anchor points in egui corresponding to the 4 corners of the ColorChecker.
-
-TODO 2.2: Grid Interpolation. Write a function that takes those 4 points and mathematically interpolates the center coordinates of the 24 patches (a $6 \times 4$ grid).
-
-TODO 2.3: Patch Bounding Boxes. Calculate a small, fixed-size bounding box (e.g., $10 \times 10$ pixels) around each of the 24 interpolated center points. Draw these boxes on the UI overlay so the user can verify they are only sampling pure color, not the black borders of the chart.
-
-Phase 3: Data Extraction & Pipeline TapYou need to run the image through your pipeline, but stop halfway. The math must be done on the neutralized data.
-TODO 3.1: D-min & Linearize. Run the RAW image through 
-Step 1 (LibRaw) (if raw not png), 
-Step 2 (Demosaic), and 
-Step 3 (D-min neutralization). 
-
-You now have pure Linear Transmittance.
-
-TODO 3.2: Sample the Patches. For each of the 24 bounding boxes, calculate the median RGB values from the Linear Transmittance array.
-
-TODO 3.3: Convert to Density. Convert these 24 median RGB values into Optical Density: $D = -\log_{10}(T)$. Store this as your Measured_X array ($24 \times 3$). Convert your hardcoded reference values into density to create your Reference_Y array.
-
-Phase 4: The Least Squares Solver 
-TODO 4.1: Include a Linear Algebra Crate. Add ndarray-linalg or nalgebra to your Cargo.toml.
-
-TODO 4.2: Implement OLS. Write a function that computes the Ordinary Least Squares equation:$$M = (X^T X)^{-1} X^T Y$$(This calculates the $3 \times 3$ matrix $M$ that best maps the measured density $X$ to the reference density $Y$).
-
-TODO 4.3: Calculate Error. Compute the Mean Squared Error (MSE) of the result to display in the UI. If the MSE is huge, the user probably put the grid on upside down!
-
-Phase 5: JSON Export & Profile Management
-TODO 5.1: Define the Schema. Create a Rust struct that derives serde::Serialize and serde::Deserialize. It should include:Profile Name / Film Stock (String)Light Source Notes (String)Matrix (9 floats)Optional: The D-min RGB medians used during calibration (useful for consistency).
-
-TODO 5.2: Save to Disk. Add a "Save Calibration Profile" button in the UI that writes this struct to a .json file in a dedicated profiles/ folder. The user gets to name the json. For example "Kodak Gold 200" its embedded in the file as well. 
-
-Phase 6: Integrating with Process Mode
-
-TODO 6.1: Profile Dropdown. In your main [ Process Mode ] UI, add a dropdown that reads the profiles/ directory and lets the user select a saved JSON calibration.
-
-TODO 6.2: Pipeline Update. Update src/curve.rs (as discussed previously) to split the 1D LUT. Apply the log-conversion, multiply the array by the loaded $3 \times 3$ matrix, and then apply the RA-4 curve.
-
-Flat field (Empty frame calibration)
-Phase 1: Ingesting the Flat-Field (The Empty Frame)You need to allow the user to load a master reference frame that represents the specific light source and film stock's base.TODO 1.1: CLI / GUI Input. Add a --flat-field argument to your CLI and a "Load Reference Frame" file picker in your UI. This should accept a RAW file of an unexposed, developed frame from the same roll of film (or at least the same film stock).TODO 1.2: Initial Linearization. When a flat-field RAW is loaded, run it through Step 1 (LibRaw extraction) and Step 2 (Demosaic) so you have an Array3<f32> representing linear transmittance. 
-
-Phase 2: The Grain-Busting Blur (Crucial)To isolate the luminance falloff of the "Big scanlight" without capturing the microscopic film grain, you must aggressively blur the flat-field image.
-
-TODO 2.1: Implement a Fast Blur. Write or import a function to apply a heavy Gaussian blur to the flat-field Array3<f32>. Since ndarray doesn't have built-in blurring, you can temporarily convert it to an image::Rgb32FImage, use the image crate's image::imageops::blur, and convert it back. it must use edge pixels for bluring so black is not introduced in the edges
-
-TODO 2.2: Extreme Radius. The blur radius needs to be massive (e.g., 50+ pixels) to completely obliterate film grain and dust, leaving only the smooth, low-frequency gradients of the LED light falloff and lens vignetting.
-
-Phase 3: Pixel-by-Pixel DivisionThis replaces your current Step 3 (D-min neutralization) when a flat-field is provided. Keep the d-min neutralization as an option if no image is provided. TODO 3.1: The Flat-Field Division. Instead of dividing by a single scalar value, divide your actual image array by your blurred flat-field array, pixel-by-pixel, channel-by-channel:$$T_{out}(x, y) = \frac{T_{in}(x, y)}{T_{flat\_blurred}(x, y)}$$TODO 3.2: Safe Division Check. Ensure you handle cases where $T_{flat\_blurred} \le 0$ to avoid divide-by-zero errors or NaNs (though a properly exposed light source should never be zero). Clamp the denominator to a very small positive number if necessary.
-
-TODO 3.3: Normalization Verification. After this division, the darkest parts of the film (the orange mask/film base) will mathematically resolve to exactly 1.0 transmittance across the entire frame, completely erasing the light source's luminance variations.
-
-Phase 4: Workflow and Batch OptimizationTODO 4.1: 
- Save as Profile. Allow the user to save the processed, blurred flat-field as a raw binary file or 32-bit float TIFF so they don't have to re-process the empty frame every time they use that specific camera/lens/light setup.
