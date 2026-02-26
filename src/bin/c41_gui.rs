@@ -13,6 +13,7 @@ use c41_raw_tool::{
     demosaic,
     dmin,
     load_flat_field_linear,
+    lut3d,
     png_reader,
     process_files,
     process_one_to_preview,
@@ -272,6 +273,7 @@ fn default_options() -> PipelineOptions {
         use_acescg: false,
         idt_matrix: c41_raw_tool::aces::IDT_IDENTITY,
         export_aces_exr: false,
+        lut3d_path: None,
     }
 }
 
@@ -309,6 +311,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
             v.to_bits().hash(&mut h);
         }
     }
+    opts.lut3d_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
     h.finish()
 }
 
@@ -647,33 +650,13 @@ impl eframe::App for C41Gui {
                     }
 
                     // ACES: run pipeline in ACEScg. Export ACES2065-1 is chosen in the Export dropdown.
+                    let use_acescg_prev = opts.use_acescg;
                     ui.checkbox(&mut opts.use_acescg, "Use ACEScg");
+                    if use_acescg_prev && !opts.use_acescg {
+                        opts.idt_matrix = c41_raw_tool::aces::IDT_IDENTITY;
+                    }
                     if opts.use_acescg {
-                        ui.horizontal(|ui| {
-                            ui.label("Camera IDT profile");
-                            if ui.button("Refresh").clicked() {
-                                let base_dir = std::env::current_dir()
-                                    .unwrap_or_else(|_| PathBuf::from("."))
-                                    .join("camera_idt");
-                                match c41_raw_tool::aces::load_idt_profiles_from_dir(&base_dir) {
-                                    Ok(list) => {
-                                        self.idt_profiles = list;
-                                        self.status = format!(
-                                            "Loaded {} camera IDT profile(s) from {}",
-                                            self.idt_profiles.len(),
-                                            base_dir.display()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        self.status = format!(
-                                            "Failed to load IDT profiles from {}: {}",
-                                            base_dir.display(),
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        });
+                        ui.label("Camera IDT profile");
                         let current_label = if opts.idt_matrix == c41_raw_tool::aces::IDT_IDENTITY {
                             "Identity"
                         } else if let Some((_, p)) = self.idt_profiles.iter().find(|(_, p)| {
@@ -688,6 +671,13 @@ impl eframe::App for C41Gui {
                         egui::ComboBox::from_label("IDT profile")
                             .selected_text(current_label)
                             .show_ui(ui, |ui| {
+                                // Refresh list when dropdown is open
+                                let base_dir = std::env::current_dir()
+                                    .unwrap_or_else(|_| PathBuf::from("."))
+                                    .join("camera_idt");
+                                if let Ok(list) = c41_raw_tool::aces::load_idt_profiles_from_dir(&base_dir) {
+                                    self.idt_profiles = list;
+                                }
                                 if ui.selectable_label(
                                     opts.idt_matrix == c41_raw_tool::aces::IDT_IDENTITY,
                                     "Identity",
@@ -860,93 +850,132 @@ impl eframe::App for C41Gui {
                             }
                         }
                     }
+
+                    ui.separator();
+                    ui.heading("3D LUT");
+                    ui.label("Generate a .cube file from the current matrix; apply it in the Process tab.");
+                    if ui.button("Generate 3D LUT from current matrix…").clicked() {
+                        let matrix = opts.density_matrix;
+                        let lut = lut3d::Lut3d::generate_from_matrix(&matrix, 17, 4.0);
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("CUBE LUT", &["cube"])
+                            .set_file_name("density_matrix.cube")
+                            .save_file()
+                        {
+                            match lut3d::write_cube(&lut, &path) {
+                                Ok(()) => {
+                                    self.status = format!("Saved 3D LUT (17³) to {}", path.display());
+                                }
+                                Err(e) => {
+                                    self.status = format!("Failed to save 3D LUT: {}", e);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if self.mode == UIMode::Process {
+                    let apply_color_prev = opts.apply_color_profile;
                     ui.checkbox(&mut opts.apply_color_profile, "Color calibration profile");
+                    if apply_color_prev && !opts.apply_color_profile {
+                        opts.density_matrix = [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ];
+                        self.selected_profile_idx = None;
+                        opts.lut3d_path = None;
+                    }
                     if opts.apply_color_profile {
                     ui.collapsing("Color calibration profile settings", |ui| {
-                        if ui.button("Refresh profiles").clicked() {
-                            let base_dir = std::env::current_dir()
-                                .unwrap_or_else(|_| PathBuf::from("."))
-                                .join("profiles");
-                            match calibration::load_profiles_from_dir(&base_dir) {
-                                Ok(list) => {
-                                    self.calibration_profiles = list;
-                                    self.selected_profile_idx = None;
-                                    self.status = format!(
-                                        "Loaded {} color calibration profile(s) from {}",
-                                        self.calibration_profiles.len(),
-                                        base_dir.display()
-                                    );
-                                }
-                                Err(e) => {
-                                    self.status = format!(
-                                        "Failed to load color calibration profiles from {}: {}",
-                                        base_dir.display(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-
-                        if self.calibration_profiles.is_empty() {
-                            ui.label("No color calibration profiles loaded. Click 'Refresh profiles' to scan the profiles/ folder.");
-                        } else {
-                            let mut current_idx = self.selected_profile_idx.unwrap_or(usize::MAX);
-                            let selected_label = if let Some(i) = self.selected_profile_idx {
-                                if let Some((_, p)) = self.calibration_profiles.get(i) {
-                                    p.name.as_str()
-                                } else {
-                                    "None"
-                                }
+                        ui.label("Profile (open dropdown to scan profiles/ folder)");
+                        let mut current_idx = self.selected_profile_idx.unwrap_or(usize::MAX);
+                        let selected_label = if let Some(i) = self.selected_profile_idx {
+                            if let Some((_, p)) = self.calibration_profiles.get(i) {
+                                p.name.as_str()
                             } else {
                                 "None"
-                            };
+                            }
+                        } else {
+                            "None"
+                        };
 
-                            egui::ComboBox::from_label("Profile")
-                                .selected_text(selected_label)
-                                .show_ui(ui, |ui| {
+                        egui::ComboBox::from_label("Profile")
+                            .selected_text(selected_label)
+                            .show_ui(ui, |ui| {
+                                // Refresh list when dropdown is open
+                                let base_dir = std::env::current_dir()
+                                    .unwrap_or_else(|_| PathBuf::from("."))
+                                    .join("profiles");
+                                if let Ok(list) = calibration::load_profiles_from_dir(&base_dir) {
+                                    self.calibration_profiles = list;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        self.selected_profile_idx.is_none(),
+                                        "None",
+                                    )
+                                    .clicked()
+                                {
+                                    current_idx = usize::MAX;
+                                }
+                                for (i, (_, profile)) in
+                                    self.calibration_profiles.iter().enumerate()
+                                {
+                                    let is_selected = self.selected_profile_idx == Some(i);
                                     if ui
-                                        .selectable_label(
-                                            self.selected_profile_idx.is_none(),
-                                            "None",
-                                        )
+                                        .selectable_label(is_selected, &profile.name)
                                         .clicked()
                                     {
-                                        current_idx = usize::MAX;
+                                        current_idx = i;
                                     }
-                                    for (i, (_, profile)) in
-                                        self.calibration_profiles.iter().enumerate()
-                                    {
-                                        let is_selected = self.selected_profile_idx == Some(i);
-                                        if ui
-                                            .selectable_label(is_selected, &profile.name)
-                                            .clicked()
-                                        {
-                                            current_idx = i;
-                                        }
-                                    }
-                                });
-
-                            // Apply selection to current image options.
-                            if current_idx == usize::MAX {
-                                self.selected_profile_idx = None;
-                            } else if let Some((_, profile)) =
-                                self.calibration_profiles.get(current_idx).cloned()
-                            {
-                                self.selected_profile_idx = Some(current_idx);
-                                opts.density_matrix = profile.matrix;
-                                if let Some(dmin) = profile.dmin_medians {
-                                    opts.dmin_fixed = Some(dmin);
-                                    opts.dmin_rect = None;
                                 }
-                                self.status = format!(
-                                    "Applied color calibration profile '{}' to current image.",
-                                    profile.name
-                                );
+                                if self.calibration_profiles.is_empty() {
+                                    ui.label("No .json profiles in profiles/");
+                                }
+                            });
+
+                        // Apply selection to current image options.
+                        if current_idx == usize::MAX {
+                            self.selected_profile_idx = None;
+                        } else if let Some((_, profile)) =
+                            self.calibration_profiles.get(current_idx).cloned()
+                        {
+                            self.selected_profile_idx = Some(current_idx);
+                            opts.density_matrix = profile.matrix;
+                            if let Some(dmin) = profile.dmin_medians {
+                                opts.dmin_fixed = Some(dmin);
+                                opts.dmin_rect = None;
                             }
+                            self.status = format!(
+                                "Applied color calibration profile '{}' to current image.",
+                                profile.name
+                            );
                         }
+
+                        ui.separator();
+                        ui.label("Or use 3D LUT (generated in Color calibration tab):");
+                        ui.horizontal(|ui| {
+                            let path_str = opts
+                                .lut3d_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "None".to_string());
+                            ui.label(path_str.as_str());
+                            if ui.button("Browse…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("CUBE LUT", &["cube"])
+                                    .pick_file()
+                                {
+                                    opts.lut3d_path = Some(path.clone());
+                                    self.status = format!("Using 3D LUT: {}", path.display());
+                                }
+                            }
+                            if opts.lut3d_path.is_some() && ui.button("Clear").clicked() {
+                                opts.lut3d_path = None;
+                                self.status = "Cleared 3D LUT; using profile matrix.".to_string();
+                            }
+                        });
                     });
                     }
                 }

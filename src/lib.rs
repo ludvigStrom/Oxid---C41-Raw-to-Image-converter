@@ -10,12 +10,13 @@ use image::{
 use ndarray::{self, Array3};
 
 pub mod aces;
+pub mod calibration;
 pub mod curve;
 pub mod demosaic;
 pub mod dmin;
-pub mod calibration;
 pub mod exr_export;
 pub mod inversion;
+pub mod lut3d;
 pub mod png_reader;
 pub mod raw_reader;
 pub mod tiff_export;
@@ -63,6 +64,9 @@ pub struct PipelineOptions {
     pub idt_matrix: [[f32; 3]; 3],
     /// When true (and use_acescg), also write a linear ACES2065-1 EXR alongside display output.
     pub export_aces_exr: bool,
+    /// Optional 3D LUT (density domain) used instead of the density matrix when set.
+    /// If present, applied after T→D, before D→RA-4. Generated via "Generate 3D LUT" from current matrix.
+    pub lut3d_path: Option<PathBuf>,
 }
 
 impl Default for PipelineOptions {
@@ -94,6 +98,7 @@ impl Default for PipelineOptions {
             use_acescg: false,
             idt_matrix: aces::IDT_IDENTITY,
             export_aces_exr: false,
+            lut3d_path: None,
         }
     }
 }
@@ -265,7 +270,20 @@ fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f
     out
 }
 
-/// Process a list of input files and write TIFF (and optionally EXR) to `output_dir`.
+/// **Pipeline order (do not reorder without updating this comment).**
+///
+/// 1. **Load** RAW (linear Bayer) or PNG → demosaic → **linear camera RGB**.
+/// 2. **IDT** (if `use_acescg` and non-identity): linear camera RGB → **ACEScg**. Flat-field map is
+///    converted with the same IDT so division happens in the same space.
+/// 3. **D-min / flat-field** (optional).
+/// 4. **White balance** (optional).
+/// 5. **Optional ACES2065-1 export**: clone ACEScg image, convert to AP0, write EXR.
+/// 6. **Display path**: If curve: T→D → density matrix (converted to ACEScg when IDT active) →
+///    RA-4 → quantize; then if ACEScg, convert to **linear sRGB** for TIFF/EXR/JPEG. If no curve:
+///    ACEScg → linear sRGB, optional invert, then export.
+///
+/// Camera IDT must run immediately after we have linear camera RGB so all later steps (D-min, WB,
+/// density matrix, export) operate in a single color space (ACEScg or camera).
 pub fn process_files(
     paths: &[PathBuf],
     output_dir: &Path,
@@ -275,6 +293,11 @@ pub fn process_files(
 
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory {}", output_dir.display()))?;
+
+    let lut3d = options
+        .lut3d_path
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
 
     let curve_pipeline = (!options.no_curve).then(|| {
         let params = curve::PrintCurveParams {
@@ -297,8 +320,7 @@ pub fn process_files(
             base
         };
         let matrix = curve::DensityMatrix { m };
-        // Typical RA-4 densities fall within ~[0, 3.0–4.0]; keep a sensible default.
-        curve::CurvePipeline::new(params, matrix, 4.0, true)
+        curve::CurvePipeline::new(params, matrix, 4.0, true, lut3d.clone())
     });
 
     // Optional flat-field: load map once, then reuse for all images in this batch.
@@ -427,8 +449,9 @@ pub fn process_files(
     Ok(())
 }
 
-/// Process a single image in memory and return RGB u8 pixels scaled to fit within
-/// `max_width` x `max_height` (aspect ratio preserved). For GUI preview.
+/// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
+/// IDT (camera → ACEScg) → D-min/flat-field → WB → curve (with density matrix in ACEScg) or
+/// no-curve; display output is converted to sRGB when using ACEScg.
 pub fn process_one_to_preview(
     path: &Path,
     options: &PipelineOptions,
@@ -506,7 +529,11 @@ pub fn process_one_to_preview(
             base
         };
         let matrix = curve::DensityMatrix { m };
-        let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true);
+        let lut3d = options
+            .lut3d_path
+            .as_ref()
+            .and_then(|p| lut3d::read_cube(p).ok());
+        let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true, lut3d);
         let mut u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
         if has_real_idt {
             aces::convert_u16_linear_acescg_to_linear_srgb(&mut u16_img);

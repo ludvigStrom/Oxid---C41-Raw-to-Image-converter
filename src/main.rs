@@ -219,6 +219,7 @@ fn main() -> anyhow::Result<()> {
             [cli.idt_matrix[6], cli.idt_matrix[7], cli.idt_matrix[8]],
         ],
         export_aces_exr: cli.export_aces_exr,
+        lut3d_path: None,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

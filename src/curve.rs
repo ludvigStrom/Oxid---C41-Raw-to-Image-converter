@@ -167,6 +167,8 @@ pub struct CurvePipeline {
     pub d_max: f32,
     pub params: PrintCurveParams,
     pub matrix: DensityMatrix,
+    /// When set, used instead of the matrix for the density-domain color correction step.
+    pub lut3d: Option<crate::lut3d::Lut3d>,
 }
 
 impl CurvePipeline {
@@ -174,11 +176,13 @@ impl CurvePipeline {
     ///
     /// * `d_max` is the maximum density represented by the `d_to_u16_lut` (values above clamp).
     /// * If `use_t_to_d_lut` is false, transmittance → density uses direct log10 at runtime.
+    /// * If `lut3d` is `Some`, it is applied after T→D instead of the density matrix.
     pub fn new(
         params: PrintCurveParams,
         matrix: DensityMatrix,
         d_max: f32,
         use_t_to_d_lut: bool,
+        lut3d: Option<crate::lut3d::Lut3d>,
     ) -> Self {
         let t_to_d_lut = if use_t_to_d_lut {
             build_t_to_density_lut(THRESHOLD)
@@ -193,6 +197,7 @@ impl CurvePipeline {
             d_max,
             params,
             matrix,
+            lut3d,
         }
     }
 }
@@ -326,8 +331,12 @@ pub fn apply_curve_pipeline(
                     sample_t_to_density(t_b, pipeline),
                 ];
 
-                // Step 2: matrix in density domain
-                let d_out = apply_density_matrix_pixel(d_in, &pipeline.matrix);
+                // Step 2: matrix or 3D LUT in density domain
+                let d_out = if let Some(ref lut) = pipeline.lut3d {
+                    lut.sample_density(d_in[0], d_in[1], d_in[2])
+                } else {
+                    apply_density_matrix_pixel(d_in, &pipeline.matrix)
+                };
 
                 // Step 3: D -> RA-4 via LUT
                 let y_r = sample_density_to_u16(d_out[0], pipeline);

@@ -186,11 +186,41 @@ See repository for license information. LibRaw is used under its own license (e.
 ﻿
 ---
 
+## Exploring 3D LUTs (vs 3×3 density matrix)
+The softtware currently use a **3×3 matrix in the density domain**: it models linear, channel-mixing color correction (dye crosstalk, white balance, primaries). 
+
+**What a 3D LUT adds**
+
+- A 3D LUT maps each (R, G, B) input to an (R′, G′, B′) output on a grid (e.g. 17³ or 33³). It can represent:
+  - **Non-linear** corrections (e.g. different hue/saturation at shadows vs highlights).
+  - **Arbitrary** per-cell behavior, not just a single linear transform.
+- C-41 dyes are often **non-linear** at shoulders and toes, so a 3×3 can leave residual errors on a ColorChecker; a 3D LUT can reduce those errors if it’s built from (or constrained by) the same data.
+
+**Can you generate a 3D LUT from the ColorChecker?**
+
+Yes, but not by “solving” the LUT directly from 24 patches—you only have 24 (measured, reference) pairs, while a 17³ LUT has 4 913 grid points. Practical approaches:
+
+1. **Matrix → LUT**  
+   Evaluate your existing 3×3 density matrix on a dense grid (e.g. 17³ or 33³) in the **same place** in the pipeline (density domain). You get a 3D LUT that behaves like the matrix but in LUT form (useful for interchange, or as a base for hand tweaks).
+
+2. **ColorChecker-driven LUT**  
+   Use the 24 pairs to **fit a model**, then **fill the LUT** by evaluating that model:
+   - **Parametric**: e.g. 3×3 matrix plus a small “residual” LUT or polynomial; fit the 24 pairs (e.g. least squares), then evaluate the full model on the grid.
+   - **Regularized LUT fit**: optimize the LUT grid so that at the 24 input positions the output is close to the 24 targets, with a **smoothness** term so the rest of the grid is interpolated in a stable way (e.g. smoothness penalty on neighboring cells). This is how many grading tools build “LUT from chart”.
+
+3. **Hybrid**  
+   Keep the 3×3 from OLS as the main correction; add a **small 3D LUT** (e.g. 5³ or 9³) that encodes only the **residual** (measured − matrix prediction) at the 24 patches, interpolated smoothly. Pipeline: density → 3×3 → residual 3D LUT → RA-4.
+
+**What’s possible in this codebase**
+
+- **Pipeline slot**: A 3D LUT would sit in the same place as the density matrix: after T→D, before D→RA-4 (so in density domain), or you could define it in linear transmittance; the former keeps “one space” for all color correction.
+- **File format**: Standard formats (e.g. `.cube`) are easy to load and apply with tetrahedral or trilateral interpolation.
+- **Generation**: A first step is **matrix → LUT** (no new calibration math). Next step is using the existing ColorChecker OLS result plus the 24 patch positions to build a residual LUT or a regularized LUT so the same scan/chart can drive either a 3×3 or a 3D LUT.
+
+---
+
 ## Future work (ideas)
 
 - **Highlight handling**: A soft‑clip shoulder is now applied just before 16‑bit quantization to give smoother highlight roll‑off; future work could expose its parameters (threshold/strength) as user‑tunable options.
 
-- **Color MAtrix Limitation**A 3x3 matrix in the density domain is great for linear dye crosstalk, but C-41 dyes often behave non-linearly at the extreme shoulders and toes of the film's characteristic curve. A 3x3 matrix might struggle to perfectly align a ColorChecker across all exposure ranges. It's a great baseline, but eventually, you might want to explore 3D LUTs (though that complicates your elegant math).
-
-- **IDT matrix (camera ACEScg)**
-Add a dropdown with camera profiles like A7RII etc. common cameras 
+- **Color matrix limitation**: A 3×3 matrix in the density domain is great for linear dye crosstalk, but C-41 dyes often behave non-linearly at the extreme shoulders and toes of the film's characteristic curve. A 3×3 might struggle to perfectly align a ColorChecker across all exposure ranges. It's a great baseline; see “Exploring 3D LUTs” above for generating a 3D LUT from the ColorChecker or from the existing matrix.
