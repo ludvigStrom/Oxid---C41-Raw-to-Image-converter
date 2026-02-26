@@ -168,6 +168,8 @@ fn main() -> anyhow::Result<()> {
     println!("Found {} file(s) to process.", paths.len());
 
     let options = PipelineOptions {
+        apply_dmin: true,
+        apply_white_balance: true,
         dmin_rect: cli.dmin_rect,
         dmin_fixed: cli.dmin_fixed,
         format: cli.format,

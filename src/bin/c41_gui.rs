@@ -238,6 +238,8 @@ fn sample_patch_medians(
 
 fn default_options() -> PipelineOptions {
     PipelineOptions {
+        apply_dmin: true,
+        apply_white_balance: true,
         dmin_rect: None,
         dmin_fixed: Some((0.635294, 0.635294, 0.623529)),
         format: TiffFormat::Float32,
@@ -252,6 +254,7 @@ fn default_options() -> PipelineOptions {
         curve_gamma: 2.5,
         curve_pivot: 3.0,
         curve_white: 0.745,
+        apply_color_profile: true,
         density_matrix: [
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
@@ -264,6 +267,9 @@ fn default_options() -> PipelineOptions {
 fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     let mut h = DefaultHasher::new();
     path.display().to_string().hash(&mut h);
+    opts.apply_dmin.hash(&mut h);
+    opts.apply_white_balance.hash(&mut h);
+    opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
     if let Some((r, g, b)) = opts.dmin_fixed {
         r.to_bits().hash(&mut h);
@@ -512,7 +518,9 @@ impl eframe::App for C41Gui {
                 // D-min, White balance, and Print curve apply only to normal processing.
                 // In Luminance calibration we only load a reference frame (raw → demosaic → blur); no conversion settings.
                 if self.mode != UIMode::LuminanceCalibrate {
-                    ui.collapsing("D-min", |ui| {
+                    ui.checkbox(&mut opts.apply_dmin, "D-min");
+                    if opts.apply_dmin {
+                    ui.collapsing("D-min settings", |ui| {
                         // Option 1: classic D-min (fixed or crop) when no flat-field override is set.
                         let mut use_fixed = opts.dmin_fixed.is_some();
                         ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
@@ -596,8 +604,11 @@ impl eframe::App for C41Gui {
                             ui.label(egui::RichText::new("No flat-field override set.").small());
                         }
                     });
+                    }
 
-                    ui.collapsing("White balance", |ui| {
+                    ui.checkbox(&mut opts.apply_white_balance, "White balance");
+                    if opts.apply_white_balance {
+                    ui.collapsing("White balance settings", |ui| {
                         ui.horizontal(|ui| {
                             ui.label("R");
                             ui.add(egui::Slider::new(&mut opts.wb_r, 0.5..=2.0));
@@ -611,38 +622,39 @@ impl eframe::App for C41Gui {
                             ui.add(egui::Slider::new(&mut opts.wb_b, 0.5..=2.0));
                         });
                     });
+                    }
 
-                    ui.collapsing("Print curve", |ui| {
-                        let mut apply_curve = !opts.no_curve;
-                        ui.checkbox(&mut apply_curve, "Apply curve");
-                        opts.no_curve = !apply_curve;
-                        if apply_curve {
-                            ui.horizontal(|ui| {
-                                ui.label("Offset");
-                                ui.add(
-                                    egui::DragValue::new(&mut opts.curve_offset)
-                                        .range(-2.0..=2.0)
-                                        .speed(0.05),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Gamma");
-                                ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Pivot");
-                                ui.add(
-                                    egui::DragValue::new(&mut opts.curve_pivot)
-                                        .range(0.1..=10.0)
-                                        .speed(0.1),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("White");
-                                ui.add(egui::Slider::new(&mut opts.curve_white, 0.3..=1.0));
-                            });
-                        }
+                    let mut apply_curve = !opts.no_curve;
+                    ui.checkbox(&mut apply_curve, "Print curve");
+                    opts.no_curve = !apply_curve;
+                    if apply_curve {
+                    ui.collapsing("Print curve settings", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Offset");
+                            ui.add(
+                                egui::DragValue::new(&mut opts.curve_offset)
+                                    .range(-2.0..=2.0)
+                                    .speed(0.05),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Gamma");
+                            ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Pivot");
+                            ui.add(
+                                egui::DragValue::new(&mut opts.curve_pivot)
+                                    .range(0.1..=10.0)
+                                    .speed(0.1),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("White");
+                            ui.add(egui::Slider::new(&mut opts.curve_white, 0.3..=1.0));
+                        });
                     });
+                    }
                 }
 
                 if self.mode == UIMode::Calibrate {
@@ -758,7 +770,9 @@ impl eframe::App for C41Gui {
                 }
 
                 if self.mode == UIMode::Process {
-                    ui.collapsing("Color calibration profile", |ui| {
+                    ui.checkbox(&mut opts.apply_color_profile, "Color calibration profile");
+                    if opts.apply_color_profile {
+                    ui.collapsing("Color calibration profile settings", |ui| {
                         if ui.button("Refresh profiles").clicked() {
                             let base_dir = std::env::current_dir()
                                 .unwrap_or_else(|_| PathBuf::from("."))
@@ -841,6 +855,7 @@ impl eframe::App for C41Gui {
                             }
                         }
                     });
+                    }
                 }
 
                 if self.mode == UIMode::LuminanceCalibrate {

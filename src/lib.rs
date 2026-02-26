@@ -33,6 +33,10 @@ pub struct Rect {
 /// All pipeline options (CLI flags / GUI state).
 #[derive(Debug, Clone)]
 pub struct PipelineOptions {
+    /// When false, D-min and flat-field correction are skipped.
+    pub apply_dmin: bool,
+    /// When false, white balance gains are not applied.
+    pub apply_white_balance: bool,
     pub dmin_rect: Option<Rect>,
     pub dmin_fixed: Option<(f32, f32, f32)>,
     pub format: TiffFormat,
@@ -47,6 +51,8 @@ pub struct PipelineOptions {
     pub curve_gamma: f32,
     pub curve_pivot: f32,
     pub curve_white: f32,
+    /// When false, the 3×3 density matrix is ignored (identity is used instead).
+    pub apply_color_profile: bool,
     pub density_matrix: [[f32; 3]; 3],
     /// Path to a RAW flat-field (unexposed) frame for luminance calibration. Optional.
     pub flat_field_path: Option<PathBuf>,
@@ -55,6 +61,8 @@ pub struct PipelineOptions {
 impl Default for PipelineOptions {
     fn default() -> Self {
         Self {
+            apply_dmin: true,
+            apply_white_balance: true,
             dmin_rect: None,
             dmin_fixed: None,
             format: TiffFormat::Float32,
@@ -69,6 +77,7 @@ impl Default for PipelineOptions {
             curve_gamma: 2.5,
             curve_pivot: 3.0,
             curve_white: 1.0,
+            apply_color_profile: true,
             density_matrix: [
                 [1.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0],
@@ -262,7 +271,15 @@ pub fn process_files(
             pivot: options.curve_pivot,
         };
         let matrix = curve::DensityMatrix {
-            m: options.density_matrix,
+            m: if options.apply_color_profile {
+                options.density_matrix
+            } else {
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            },
         };
         // Typical RA-4 densities fall within ~[0, 3.0–4.0]; keep a sensible default.
         curve::CurvePipeline::new(params, matrix, 4.0, true)
@@ -292,16 +309,21 @@ pub fn process_files(
             _ => continue,
         };
 
-        // Step 3: either flat-field division (if provided) or classic D-min neutralization.
-        if let Some(ref flat) = flat_field_map {
-            apply_flat_field_division(&mut image, flat);
-        } else if let Some((r, g, b)) = options.dmin_fixed {
-            dmin::neutralize_with_medians(&mut image, r, g, b)?;
-        } else if let Some(rect) = options.dmin_rect {
-            dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+        // Step 3: D-min / flat-field (skipped if apply_dmin is false).
+        if options.apply_dmin {
+            if let Some(ref flat) = flat_field_map {
+                apply_flat_field_division(&mut image, flat);
+            } else if let Some((r, g, b)) = options.dmin_fixed {
+                dmin::neutralize_with_medians(&mut image, r, g, b)?;
+            } else if let Some(rect) = options.dmin_rect {
+                dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+            }
         }
 
-        if options.wb_r != 1.0 || options.wb_g != 1.0 || options.wb_b != 1.0 {
+        // White balance (skipped if apply_white_balance is false).
+        if options.apply_white_balance
+            && (options.wb_r != 1.0 || options.wb_g != 1.0 || options.wb_b != 1.0)
+        {
             image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * options.wb_r);
             image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * options.wb_g);
             image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * options.wb_b);
@@ -383,17 +405,21 @@ pub fn process_one_to_preview(
         _ => anyhow::bail!("Unsupported extension for preview"),
     };
 
-    // Step 3 for preview: flat-field if provided, else D-min.
-    if let Some(ref flat_path) = options.flat_field_path {
-        let flat_map = load_flat_field_map(flat_path)?;
-        apply_flat_field_division(&mut image, &flat_map);
-    } else if let Some((r, g, b)) = options.dmin_fixed {
-        dmin::neutralize_with_medians(&mut image, r, g, b)?;
-    } else if let Some(rect) = options.dmin_rect {
-        dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+    // Step 3 for preview: D-min / flat-field (skipped if apply_dmin is false).
+    if options.apply_dmin {
+        if let Some(ref flat_path) = options.flat_field_path {
+            let flat_map = load_flat_field_map(flat_path)?;
+            apply_flat_field_division(&mut image, &flat_map);
+        } else if let Some((r, g, b)) = options.dmin_fixed {
+            dmin::neutralize_with_medians(&mut image, r, g, b)?;
+        } else if let Some(rect) = options.dmin_rect {
+            dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+        }
     }
 
-    if options.wb_r != 1.0 || options.wb_g != 1.0 || options.wb_b != 1.0 {
+    if options.apply_white_balance
+        && (options.wb_r != 1.0 || options.wb_g != 1.0 || options.wb_b != 1.0)
+    {
         image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * options.wb_r);
         image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * options.wb_g);
         image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * options.wb_b);
