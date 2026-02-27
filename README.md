@@ -176,6 +176,8 @@ The tool supports two kinds of calibration, each with a clear role.
 
 **Workflow:** Use the **Color calibration** tab: load a RAW of a ColorChecker, align the 4 corner points to the chart, then “Solve 3×3 matrix from chart”. Save the profile to `profiles/` and in Process mode select it from the Color calibration profile dropdown.
 
+***TODO:*** Check the pipeline for color calibration workflow. It should do the same inversion d-min and other steps except color calibration. It should also
+
 ### Luminance calibration (flat-field)
 
 **What it does:** You provide a reference image of an **unexposed, developed** frame from the same roll (or same stock). It is linearized and heavily blurred to remove grain and dust, leaving only the low-frequency luminance pattern of your light source and lens. Each scan is then divided by this map pixel-by-pixel.
@@ -211,7 +213,7 @@ In the GUI, **D-min**, **White balance**, **Print curve**, and **Color calibrati
 
 ### ACES hybrid
 
-With **Use ACEScg** (GUI) or `--use-acescg` (CLI), the pipeline treats ACES as a linear working space only: linear camera RGB is converted to ACEScg via an **IDT** (Input Device Transform), then D-min, flat-field, white balance, and the density matrix + RA-4 curve run in ACEScg. Display output maps ACEScg directly to sRGB with the same RA-4 curve—no ACES RRT/ODT. You can optionally **Export ACES2065-1 EXR** to get a linear ACES2065-1 (AP0) file per image for VFX or archival. Color calibration profiles solved in camera space are automatically converted to ACEScg (M_aces = T · M_cam · T^(-1)) so existing profiles still match. See `colorSpaceUpdate.md` for the full design.
+With **Use ACEScg** (GUI) or `--use-acescg` (CLI), the pipeline treats ACES as a linear working space only: linear camera RGB is converted to ACEScg via an **IDT** (Input Device Transform), then D-min, flat-field, white balance, and the density matrix + RA-4 curve run in ACEScg. Display output maps ACEScg directly to sRGB with the same RA-4 curve—no ACES RRT/ODT. You can optionally **Export ACES2065-1 EXR** to get a linear ACES2065-1 (AP0) file per image for archival. Color calibration profiles solved in camera space are automatically converted to ACEScg (M_aces = T · M_cam · T^(-1)) so existing profiles still match.
 
 ---
 
