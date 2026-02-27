@@ -457,7 +457,7 @@ pub fn process_one_to_preview(
     options: &PipelineOptions,
     max_width: u32,
     max_height: u32,
-) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>)> {
     let has_real_idt = options.use_acescg && options.idt_matrix != aces::IDT_IDENTITY;
 
     let ext = path
@@ -504,9 +504,9 @@ pub fn process_one_to_preview(
         image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * options.wb_b);
     }
 
-    let (h, w, _) = image.dim();
-    let w = w as u32;
-    let h = h as u32;
+    let (orig_h, orig_w, _) = image.dim();
+    let orig_w = orig_w as u32;
+    let orig_h = orig_h as u32;
 
     let rgb_u8: Vec<u8> = if !options.no_curve {
         let params = curve::PrintCurveParams {
@@ -555,13 +555,16 @@ pub fn process_one_to_preview(
             .collect()
     };
 
-    let img = RgbImage::from_raw(w, h, rgb_u8).ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
+    let img = RgbImage::from_raw(orig_w, orig_h, rgb_u8)
+        .ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
 
-    let scale = (max_width as f32 / w as f32).min(max_height as f32 / h as f32).min(1.0);
-    let new_w = (w as f32 * scale).round().max(1.0) as u32;
-    let new_h = (h as f32 * scale).round().max(1.0) as u32;
+    let scale = (max_width as f32 / orig_w as f32)
+        .min(max_height as f32 / orig_h as f32)
+        .min(1.0);
+    let new_w = (orig_w as f32 * scale).round().max(1.0) as u32;
+    let new_h = (orig_h as f32 * scale).round().max(1.0) as u32;
 
     let resized = imageops::resize(&img, new_w, new_h, FilterType::Triangle);
     let out = resized.into_raw();
-    Ok((new_w, new_h, out))
+    Ok((orig_w, orig_h, new_w, new_h, out))
 }

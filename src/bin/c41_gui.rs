@@ -62,6 +62,8 @@ struct ImageEntry {
     options: PipelineOptions,
     preview_texture: Option<egui::TextureHandle>,
     preview_hash: u64,
+    /// Dimensions of the image at the stage where D-min/flat-field are applied (before preview downscale).
+    preview_input_size: Option<[u32; 2]>,
     // Per-channel histograms (R, G, B) over 0–255
     histogram: Option<([u32; 256], [u32; 256], [u32; 256])>,
     export_format: ExportFormat,
@@ -115,7 +117,7 @@ struct C41Gui {
     selected_index: Option<usize>,
     output_dir: Option<PathBuf>,
     status: String,
-    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, Vec<u8>)>>>,
+    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>)>>>,
     preview_started_at: Option<Instant>,
     mode: UIMode,
     calibration_overlay: CalibrationOverlay,
@@ -352,7 +354,7 @@ impl C41Gui {
                 PREVIEW_MAX_WIDTH,
                 PREVIEW_MAX_HEIGHT,
             )
-            .map(|(w, h, rgb)| (index, w, h, rgb));
+            .map(|(input_w, input_h, w, h, rgb)| (index, input_w, input_h, w, h, rgb));
             let _ = tx.send(res);
         });
         ctx.request_repaint();
@@ -393,7 +395,7 @@ impl eframe::App for C41Gui {
         // Poll preview worker
         if let Some(rx) = self.preview_receiver.as_ref() {
             match rx.try_recv() {
-                Ok(Ok((idx, w, h, rgb))) => {
+                Ok(Ok((idx, input_w, input_h, w, h, rgb))) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
                     if idx < self.images.len() {
@@ -422,6 +424,7 @@ impl eframe::App for C41Gui {
                         let hash = options_hash_for(&self.images[idx].path, &self.images[idx].options);
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_hash = hash;
+                        self.images[idx].preview_input_size = Some([input_w, input_h]);
                         self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
                     }
                 }
@@ -474,6 +477,7 @@ impl eframe::App for C41Gui {
                                             options: default_options(),
                                             preview_texture: None,
                                             preview_hash: 0,
+                                            preview_input_size: None,
                                             histogram: None,
                                             export_format: ExportFormat::Tiff16,
                                         });
@@ -1380,6 +1384,53 @@ impl eframe::App for C41Gui {
                                         0.0,
                                         egui::Stroke::new(1.0, egui::Color32::LIGHT_GREEN),
                                     );
+                                }
+                            }
+                        }
+
+                        // In Process mode, when D-min is active and using a rectangle (no flat-field /
+                        // fixed D-min), draw the D-min sampling rectangle over the preview.
+                        if self.mode == UIMode::Process {
+                            if let Some(entry) = self.images.get(idx) {
+                                let opts = &entry.options;
+                                if opts.apply_dmin
+                                    && opts.dmin_fixed.is_none()
+                                    && self.flat_field_path.is_none()
+                                {
+                                    if let (Some(rect), Some([input_w, input_h])) =
+                                        (opts.dmin_rect, entry.preview_input_size)
+                                    {
+                                        if input_w > 0 && input_h > 0 {
+                                            let painter = ui.painter_at(image_rect);
+                                            let norm_x = rect.x as f32 / input_w as f32;
+                                            let norm_y = rect.y as f32 / input_h as f32;
+                                            let norm_w = rect.width as f32 / input_w as f32;
+                                            let norm_h = rect.height as f32 / input_h as f32;
+
+                                            let rect_left =
+                                                image_rect.left() + norm_x * image_rect.width();
+                                            let rect_top =
+                                                image_rect.top() + norm_y * image_rect.height();
+                                            let rect_width =
+                                                norm_w * image_rect.width();
+                                            let rect_height =
+                                                norm_h * image_rect.height();
+
+                                            let screen_rect = egui::Rect::from_min_size(
+                                                egui::pos2(rect_left, rect_top),
+                                                egui::vec2(rect_width, rect_height),
+                                            );
+
+                                            painter.rect_stroke(
+                                                screen_rect,
+                                                0.0,
+                                                egui::Stroke::new(
+                                                    1.5,
+                                                    egui::Color32::from_rgb(255, 200, 0),
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }

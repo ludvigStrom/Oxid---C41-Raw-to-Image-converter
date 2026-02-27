@@ -279,7 +279,4 @@ Yes, but not by “solving” the LUT directly from 24 patches—you only have 2
 ---
 
 ## Future work (ideas)
-
-- **Highlight handling**: A soft‑clip shoulder is now applied just before 16‑bit quantization to give smoother highlight roll‑off; future work could expose its parameters (threshold/strength) as user‑tunable options.
-
-- **Color matrix limitation**: A 3×3 matrix in the density domain is great for linear dye crosstalk, but C-41 dyes often behave non-linearly at the extreme shoulders and toes of the film's characteristic curve. A 3×3 might struggle to perfectly align a ColorChecker across all exposure ranges. It's a great baseline; see “Exploring 3D LUTs” above for generating a 3D LUT from the ColorChecker or from the existing matrix.
+- **Streamline Color profiles** Right now it creates botha a 3x3 matrix and 3d lut. Maybe just a 3d lut would be nice. 3d lut + json in a zip? or a zip called *.c41?
