@@ -78,7 +78,7 @@ enum ExportFormat {
     Tiff32,
     Exr,
     Jpeg,
-    /// TIFF 16-bit display + linear ACES2065-1 EXR.
+    /// EXR ACES2065-1 only (32-bit float).
     ExrAces2065,
 }
 
@@ -302,6 +302,7 @@ fn default_options() -> PipelineOptions {
         flat_field_path: None,
         idt_matrix: c41_raw_tool::aces::IDT_IDENTITY,
         export_aces_exr: false,
+        write_aces2065_only: false,
         lut3d_path: None,
         rotation_degrees: 0,
     }
@@ -337,6 +338,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     }
     opts.flat_field_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
     opts.export_aces_exr.hash(&mut h);
+    opts.write_aces2065_only.hash(&mut h);
     for row in &opts.idt_matrix {
         for v in row {
             v.to_bits().hash(&mut h);
@@ -887,8 +889,11 @@ impl eframe::App for C41Gui {
                     }
 
                     // Pipeline: inversion (1-x). Only applies when Print curve is off.
-                    ui.checkbox(&mut opts.no_invert, "Skip color inversion");
-                    if opts.no_curve {
+                    ui.add_enabled(
+                        opts.no_curve,
+                        egui::Checkbox::new(&mut opts.no_invert, "Skip color inversion"),
+                    );
+                    if !opts.no_curve {
                         ui.label(egui::RichText::new("(Applies when Print curve is off)").small());
                     }
                 }
@@ -1230,7 +1235,7 @@ impl eframe::App for C41Gui {
                     ExportFormat::Tiff32 => "TIFF 32-bit float",
                     ExportFormat::Exr => "EXR (32-bit float)",
                     ExportFormat::Jpeg => "JPEG",
-                    ExportFormat::ExrAces2065 => "TIFF 16-bit + EXR ACES2065-1",
+                    ExportFormat::ExrAces2065 => "EXR ACES2065-1 (32-bit float)",
                 };
                 egui::ComboBox::from_label("Output format")
                     .selected_text(label)
@@ -1261,7 +1266,7 @@ impl eframe::App for C41Gui {
                         }
                         let aces_selected = matches!(entry.export_format, ExportFormat::ExrAces2065);
                         if ui
-                            .selectable_label(aces_selected, "TIFF 16-bit + EXR ACES2065-1")
+                            .selectable_label(aces_selected, "EXR ACES2065-1 (32-bit float)")
                             .clicked()
                         {
                             entry.export_format = ExportFormat::ExrAces2065;
@@ -1275,18 +1280,21 @@ impl eframe::App for C41Gui {
                         opts.write_exr = false;
                         opts.write_jpeg_only = false;
                         opts.export_aces_exr = false;
+                        opts.write_aces2065_only = false;
                     }
                     ExportFormat::Tiff32 => {
                         opts.format = TiffFormat::Float32;
                         opts.write_exr = false;
                         opts.write_jpeg_only = false;
                         opts.export_aces_exr = false;
+                        opts.write_aces2065_only = false;
                     }
                     ExportFormat::Exr => {
                         opts.format = TiffFormat::Float32;
                         opts.write_exr = true;
                         opts.write_jpeg_only = false;
                         opts.export_aces_exr = false;
+                        opts.write_aces2065_only = false;
                     }
                     ExportFormat::Jpeg => {
                         opts.format = TiffFormat::U16;
@@ -1294,12 +1302,14 @@ impl eframe::App for C41Gui {
                         opts.write_jpeg_only = true;
                         opts.write_jpeg = false;
                         opts.export_aces_exr = false;
+                        opts.write_aces2065_only = false;
                     }
                     ExportFormat::ExrAces2065 => {
-                        opts.format = TiffFormat::U16;
+                        opts.format = TiffFormat::Float32;
                         opts.write_exr = false;
                         opts.write_jpeg_only = false;
-                        opts.export_aces_exr = true;
+                        opts.export_aces_exr = false;
+                        opts.write_aces2065_only = true;
                     }
                 }
 
@@ -1329,23 +1339,42 @@ impl eframe::App for C41Gui {
                 ui.label(egui::RichText::new(out_label).small());
 
                 let ready = !self.images.is_empty() && self.output_dir.is_some();
-                if ui.add_enabled(ready, egui::Button::new("Convert all")).clicked() {
-                    let output_dir = self.output_dir.clone().unwrap();
-                    let mut err: Option<anyhow::Error> = None;
-                    for img in &self.images {
-                        let mut opts = img.options.clone();
-                        opts.flat_field_path = self.flat_field_path.clone();
-                        if let Err(e) = process_files(&[img.path.clone()], &output_dir, &opts) {
-                            err = Some(e);
-                            break;
+                let selected_ready = self.selected_index.is_some()
+                    && self.selected_index.unwrap() < self.images.len()
+                    && self.output_dir.is_some();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(ready, egui::Button::new("Convert all")).clicked() {
+                        let output_dir = self.output_dir.clone().unwrap();
+                        let mut err: Option<anyhow::Error> = None;
+                        for img in &self.images {
+                            let mut opts = img.options.clone();
+                            opts.flat_field_path = self.flat_field_path.clone();
+                            if let Err(e) = process_files(&[img.path.clone()], &output_dir, &opts) {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                        self.status = if let Some(e) = err {
+                            format!("Error: {}", e)
+                        } else {
+                            "Done.".to_string()
+                        };
+                    }
+                    if ui.add_enabled(selected_ready, egui::Button::new("Export selected")).clicked() {
+                        if let Some(idx) = self.selected_index {
+                            if idx < self.images.len() {
+                                let img = &self.images[idx];
+                                let output_dir = self.output_dir.clone().unwrap();
+                                let mut opts = img.options.clone();
+                                opts.flat_field_path = self.flat_field_path.clone();
+                                match process_files(&[img.path.clone()], &output_dir, &opts) {
+                                    Ok(()) => self.status = "Done.".to_string(),
+                                    Err(e) => self.status = format!("Error: {}", e),
+                                }
+                            }
                         }
                     }
-                    self.status = if let Some(e) = err {
-                        format!("Error: {}", e)
-                    } else {
-                        "Done.".to_string()
-                    };
-                }
+                });
 
                 if !self.status.is_empty() {
                     ui.add_space(4.0);

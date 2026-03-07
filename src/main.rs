@@ -212,6 +212,7 @@ fn main() -> anyhow::Result<()> {
             [cli.idt_matrix[6], cli.idt_matrix[7], cli.idt_matrix[8]],
         ],
         export_aces_exr: cli.export_aces_exr,
+        write_aces2065_only: false,
         lut3d_path: None,
         rotation_degrees: 0,
     };

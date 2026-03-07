@@ -64,6 +64,8 @@ pub struct PipelineOptions {
     pub idt_matrix: [[f32; 3]; 3],
     /// When true, also write a linear ACES2065-1 EXR alongside display output.
     pub export_aces_exr: bool,
+    /// When true, output is only ACES2065-1 EXR (32-bit float); no TIFF/JPEG.
+    pub write_aces2065_only: bool,
     /// Optional 3D LUT (density domain) used instead of the density matrix when set.
     /// If present, applied after T→D, before D→RA-4. Generated via "Generate 3D LUT" from current matrix.
     pub lut3d_path: Option<PathBuf>,
@@ -100,6 +102,7 @@ impl Default for PipelineOptions {
             flat_field_path: None,
             idt_matrix: aces::IDT_IDENTITY,
             export_aces_exr: false,
+            write_aces2065_only: false,
             lut3d_path: None,
             rotation_degrees: 0,
         }
@@ -410,7 +413,15 @@ pub fn process_files(
         let exr_path = output_dir.join(format!("{}.exr", stem));
         let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
 
-        // Optional ACES2065-1 branch: export linear ACES2065-1 EXR alongside display output.
+        // ACES2065-1 only: write just the EXR (32-bit float) and skip display output.
+        if options.write_aces2065_only {
+            let mut aces2065 = image.clone();
+            aces::linear_acescg_to_aces2065_1(&mut aces2065);
+            exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
+            continue;
+        }
+
+        // Optional ACES2065-1 alongside display output.
         if options.export_aces_exr {
             let mut aces2065 = image.clone();
             aces::linear_acescg_to_aces2065_1(&mut aces2065);
