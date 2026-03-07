@@ -595,7 +595,8 @@ impl eframe::App for C41Gui {
                             }
                         });
                     });
-                    if !to_remove.is_empty() {
+                    let had_removals = !to_remove.is_empty();
+                    if had_removals {
                         self.preview_receiver = None;
                         for &i in &to_remove {
                             if let Some(e) = self.images.get(i) {
@@ -610,6 +611,9 @@ impl eframe::App for C41Gui {
                         } else if self.selected_index.map(|s| s > i).unwrap_or(false) {
                             self.selected_index = self.selected_index.map(|s| s - 1);
                         }
+                    }
+                    if had_removals {
+                        self.status = format!("{} file(s)", self.images.len());
                     }
                 });
             });
@@ -627,7 +631,7 @@ impl eframe::App for C41Gui {
                     ui.selectable_value(
                         &mut self.mode,
                         UIMode::LuminanceCalibrate,
-                        "Luminance calibration",
+                        "Capture flat field",
                     );
                     ui.add_space(10.0);
                 });
@@ -654,7 +658,7 @@ impl eframe::App for C41Gui {
                         ui.heading("Color calibration");
                     }
                     UIMode::LuminanceCalibrate => {
-                        ui.heading("Luminance calibration");
+                        ui.heading("Capture flat field");
                     }
                 }
                 ui.add_space(10.0);
@@ -887,6 +891,12 @@ impl eframe::App for C41Gui {
                             ui.add(egui::Slider::new(&mut opts.curve_white, 0.3..=1.0));
                         });
                     });
+                    }
+
+                    // Pipeline: inversion (1-x). Only applies when Print curve is off.
+                    ui.checkbox(&mut opts.no_invert, "Skip color inversion");
+                    if opts.no_curve {
+                        ui.label(egui::RichText::new("(Applies when Print curve is off)").small());
                     }
                 }
 
@@ -1297,12 +1307,6 @@ impl eframe::App for C41Gui {
                         opts.write_exr = false;
                         opts.export_aces_exr = true;
                     }
-                }
-
-                if opts.no_curve {
-                    ui.checkbox(&mut opts.no_invert, "Skip color inversion");
-                } else {
-                    ui.label("Inversion handled by print curve.");
                 }
 
                 ui.checkbox(&mut opts.write_jpeg, "Also export JPG");

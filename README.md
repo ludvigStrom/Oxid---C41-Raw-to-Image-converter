@@ -236,12 +236,3 @@ Yes, but not by “solving” the LUT directly from 24 patches—you only have 2
 - **Streamline Color profiles** Right now it creates botha a 3x3 matrix and 3d lut. Maybe just a 3d lut would be nice. 3d lut + json in a zip? or a zip called *.c41?
 
 
-
-TODO:
-(X) Rotate preview.
-(X) option to bypass inversion
-(X) mini images in add pictures
-
-(X) scroll in right menu
-( ) rename Luminance Calibration to Capture flat field
-( ) When removing images they are still counted for in the Batch export settings. for example i add nine pictures and remove them it still says i have 9 files. If i add one file it shows the correct value one file
