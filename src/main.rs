@@ -220,6 +220,7 @@ fn main() -> anyhow::Result<()> {
         ],
         export_aces_exr: cli.export_aces_exr,
         lut3d_path: None,
+        rotation_degrees: 0,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

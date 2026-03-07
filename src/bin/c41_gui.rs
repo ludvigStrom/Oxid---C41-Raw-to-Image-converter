@@ -1,6 +1,6 @@
 //! C-41 RAW Tool GUI: three-panel layout — center preview, right per-image settings, bottom image strip + global output/convert.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -27,6 +27,7 @@ use eframe::egui;
 
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
+const THUMB_MAX_SIZE: u32 = 64;
 const BOTTOM_PANEL_HEIGHT: f32 = 120.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
 
@@ -64,6 +65,8 @@ struct ImageEntry {
     preview_hash: u64,
     /// Dimensions of the image at the stage where D-min/flat-field are applied (before preview downscale).
     preview_input_size: Option<[u32; 2]>,
+    /// Small thumbnail for the image strip (generated when loading).
+    thumbnail_texture: Option<egui::TextureHandle>,
     // Per-channel histograms (R, G, B) over 0–255
     histogram: Option<([u32; 256], [u32; 256], [u32; 256])>,
     export_format: ExportFormat,
@@ -119,6 +122,9 @@ struct C41Gui {
     status: String,
     preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>)>>>,
     preview_started_at: Option<Instant>,
+    /// Thumbnails for the image strip: (path, Ok((w, h, rgb)) or Err).
+    thumbnail_receiver: Option<mpsc::Receiver<(PathBuf, anyhow::Result<(u32, u32, Vec<u8>)>)>>,
+    thumbnail_pending: HashSet<PathBuf>,
     mode: UIMode,
     calibration_overlay: CalibrationOverlay,
     calibration_result: Option<([[f32; 3]; 3], f32)>, // (matrix, mse)
@@ -142,6 +148,8 @@ impl Default for C41Gui {
             status: String::new(),
             preview_receiver: None,
             preview_started_at: None,
+            thumbnail_receiver: None,
+            thumbnail_pending: HashSet::new(),
             mode: UIMode::Process,
             calibration_overlay: CalibrationOverlay::default(),
             calibration_result: None,
@@ -455,6 +463,64 @@ impl eframe::App for C41Gui {
             }
         }
 
+        // Request thumbnail for one image at a time (strip icons).
+        if self.thumbnail_receiver.is_none() {
+            if let Some(entry) = self
+                .images
+                .iter()
+                .find(|e| e.thumbnail_texture.is_none() && !self.thumbnail_pending.contains(&e.path))
+            {
+                let path = entry.path.clone();
+                let mut options = entry.options.clone();
+                options.flat_field_path = self.flat_field_path.clone();
+                let (tx, rx) = mpsc::channel();
+                self.thumbnail_receiver = Some(rx);
+                self.thumbnail_pending.insert(path.clone());
+                thread::spawn(move || {
+                    let result = process_one_to_preview(
+                        &path,
+                        &options,
+                        THUMB_MAX_SIZE,
+                        THUMB_MAX_SIZE,
+                    )
+                    .map(|(_orig_w, _orig_h, new_w, new_h, rgb)| (new_w, new_h, rgb));
+                    let _ = tx.send((path, result));
+                });
+            }
+        }
+        if let Some(rx) = self.thumbnail_receiver.as_ref() {
+            match rx.try_recv() {
+                Ok((path, Ok((w, h, rgb)))) => {
+                    self.thumbnail_receiver = None;
+                    self.thumbnail_pending.remove(&path);
+                    if let Some(entry) = self.images.iter_mut().find(|e| e.path == path) {
+                        let pixels: Vec<egui::Color32> = rgb
+                            .chunks_exact(3)
+                            .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                            .collect();
+                        let image = egui::ColorImage {
+                            size: [w as usize, h as usize],
+                            pixels,
+                        };
+                        let tex = ctx.load_texture(
+                            format!("thumb_{}", path.display().to_string().replace('\\', "_").replace('/', "_")),
+                            image,
+                            egui::TextureOptions::default(),
+                        );
+                        entry.thumbnail_texture = Some(tex);
+                    }
+                }
+                Ok((path, Err(_))) => {
+                    self.thumbnail_receiver = None;
+                    self.thumbnail_pending.remove(&path);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.thumbnail_receiver = None;
+                }
+            }
+        }
+
         // ---- Bottom panel: image strip + global output / convert ----
         egui::TopBottomPanel::bottom("bottom_panel")
             .min_height(BOTTOM_PANEL_HEIGHT)
@@ -480,6 +546,7 @@ impl eframe::App for C41Gui {
                                             preview_texture: None,
                                             preview_hash: 0,
                                             preview_input_size: None,
+                                            thumbnail_texture: None,
                                             histogram: None,
                                             export_format: ExportFormat::Tiff16,
                                         });
@@ -495,39 +562,55 @@ impl eframe::App for C41Gui {
 
                     ui.add_space(10.0);
 
+                    let mut to_remove = Vec::new();
                     egui::ScrollArea::horizontal().show(ui, |ui| {
-                        let mut to_remove = Vec::new();
                         ui.horizontal(|ui| {
                             for (i, entry) in self.images.iter().enumerate() {
-                                let name = entry
-                                    .path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("?");
-                                let selected = self.selected_index == Some(i);
-                                let resp = ui
-                                    .selectable_label(selected, name)
-                                    .on_hover_text(entry.path.display().to_string());
-                                if resp.clicked() {
-                                    self.selected_index = Some(i);
-                                }
-                                if ui.small_button("X").clicked() {
-                                    to_remove.push(i);
-                                }
+                                ui.vertical(|ui| {
+                                    let thumb_size = 48.0;
+                                    if let Some(ref thumb) = entry.thumbnail_texture {
+                                        let size = thumb.size();
+                                        let (w, h) = (size[0] as f32, size[1] as f32);
+                                        let scale = (thumb_size / w).min(thumb_size / h).min(1.0);
+                                        ui.image((thumb.id(), egui::vec2(w * scale, h * scale)));
+                                    } else {
+                                        ui.allocate_space(egui::vec2(thumb_size, thumb_size));
+                                    }
+                                    let name = entry
+                                        .path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("?");
+                                    let selected = self.selected_index == Some(i);
+                                    let resp = ui
+                                        .selectable_label(selected, name)
+                                        .on_hover_text(entry.path.display().to_string());
+                                    if resp.clicked() {
+                                        self.selected_index = Some(i);
+                                    }
+                                    if ui.small_button("X").clicked() {
+                                        to_remove.push(i);
+                                    }
+                                });
                             }
                         });
-                        if !to_remove.is_empty() {
-                            self.preview_receiver = None;
-                        }
-                        for i in to_remove.into_iter().rev() {
-                            self.images.remove(i);
-                            if self.selected_index == Some(i) {
-                                self.selected_index = None;
-                            } else if self.selected_index.map(|s| s > i).unwrap_or(false) {
-                                self.selected_index = self.selected_index.map(|s| s - 1);
+                    });
+                    if !to_remove.is_empty() {
+                        self.preview_receiver = None;
+                        for &i in &to_remove {
+                            if let Some(e) = self.images.get(i) {
+                                self.thumbnail_pending.remove(&e.path);
                             }
                         }
-                    });
+                    }
+                    for i in to_remove.into_iter().rev() {
+                        self.images.remove(i);
+                        if self.selected_index == Some(i) {
+                            self.selected_index = None;
+                        } else if self.selected_index.map(|s| s > i).unwrap_or(false) {
+                            self.selected_index = self.selected_index.map(|s| s - 1);
+                        }
+                    }
                 });
             });
 
@@ -1217,7 +1300,7 @@ impl eframe::App for C41Gui {
                 }
 
                 if opts.no_curve {
-                    ui.checkbox(&mut opts.no_invert, "Invert (1-x)");
+                    ui.checkbox(&mut opts.no_invert, "Skip color inversion");
                 } else {
                     ui.label("Inversion handled by print curve.");
                 }
