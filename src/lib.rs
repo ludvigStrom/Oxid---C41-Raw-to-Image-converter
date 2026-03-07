@@ -67,6 +67,8 @@ pub struct PipelineOptions {
     /// Optional 3D LUT (density domain) used instead of the density matrix when set.
     /// If present, applied after T→D, before D→RA-4. Generated via "Generate 3D LUT" from current matrix.
     pub lut3d_path: Option<PathBuf>,
+    /// Output rotation in degrees: 0, 90, 180, or 270 (applied after load/demosaic).
+    pub rotation_degrees: i32,
 }
 
 impl Default for PipelineOptions {
@@ -99,6 +101,7 @@ impl Default for PipelineOptions {
             idt_matrix: aces::IDT_IDENTITY,
             export_aces_exr: false,
             lut3d_path: None,
+            rotation_degrees: 0,
         }
     }
 }
@@ -238,6 +241,34 @@ fn apply_flat_field_division(image: &mut Array3<f32>, flat_blurred: &Array3<f32>
     }
 }
 
+/// Rotate Array3<f32> (H, W, 3) by 90° clockwise. Returns new array with shape (W, H, 3).
+fn rotate_array3_90_cw(image: &Array3<f32>) -> Array3<f32> {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let mut out = Array3::<f32>::zeros((w, h, 3));
+    for y in 0..h {
+        for x in 0..w {
+            let (new_y, new_x) = (x, h - 1 - y);
+            for ch in 0..3 {
+                out[(new_y, new_x, ch)] = image[(y, x, ch)];
+            }
+        }
+    }
+    out
+}
+
+/// Apply rotation (0, 90, 180, 270) to an image. Returns a new Array3.
+fn apply_rotation(image: &Array3<f32>, rotation_degrees: i32) -> Array3<f32> {
+    let r = ((rotation_degrees % 360 + 360) % 360) / 90;
+    match r {
+        0 => image.clone(),
+        1 => rotate_array3_90_cw(image),
+        2 => rotate_array3_90_cw(&rotate_array3_90_cw(image)),
+        3 => rotate_array3_90_cw(&rotate_array3_90_cw(&rotate_array3_90_cw(image))),
+        _ => image.clone(),
+    }
+}
+
 fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f32> {
     let (h, w, c) = bayer.dim();
     assert_eq!(c, 1, "Expected single-channel Bayer for preview");
@@ -355,6 +386,10 @@ pub fn process_files(
             "png" => png_reader::load_png_as_ndarray(path)?,
             _ => continue,
         };
+
+        if options.rotation_degrees != 0 {
+            image = apply_rotation(&image, options.rotation_degrees);
+        }
 
         // Optional IDT: convert linear camera RGB to ACEScg before D-min / flat-field and WB.
         if has_real_idt {
@@ -475,6 +510,10 @@ pub fn process_one_to_preview(
         "png" => png_reader::load_png_as_ndarray(path)?,
         _ => anyhow::bail!("Unsupported extension for preview"),
     };
+
+    if options.rotation_degrees != 0 {
+        image = apply_rotation(&image, options.rotation_degrees);
+    }
 
     // Optional IDT for preview: keep the same space as batch processing.
     if has_real_idt {

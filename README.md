@@ -237,8 +237,10 @@ Yes, but not by “solving” the LUT directly from 24 patches—you only have 2
 
 
 TODO:
-() Rotate preview.
-() bypass inversion
-() mini images in add pictures
+(X) Rotate preview.
+( ) option to bypass inversion
+   
+( ) mini images in add pictures
 (X) scroll in right menu
-() rename Luminance Calibration to Capture flat field
+( ) rename Luminance Calibration to Capture flat field
+( ) When removing images they are still counted for in the Batch export settings. for example i add nine pictures and remove them it still says i have 9 files. If i add one file it shows the correct value one file

@@ -295,6 +295,7 @@ fn default_options() -> PipelineOptions {
         idt_matrix: c41_raw_tool::aces::IDT_IDENTITY,
         export_aces_exr: false,
         lut3d_path: None,
+        rotation_degrees: 0,
     }
 }
 
@@ -333,6 +334,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
         }
     }
     opts.lut3d_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
+    opts.rotation_degrees.hash(&mut h);
     h.finish()
 }
 
@@ -1450,6 +1452,25 @@ impl eframe::App for C41Gui {
                                 }
                             }
                         }
+
+                        // Rotate left / right buttons under the image, lower right, before histogram
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Rotate right").clicked() {
+                                    let entry = &mut self.images[idx];
+                                    entry.options.rotation_degrees =
+                                        (entry.options.rotation_degrees + 90).rem_euclid(360);
+                                    self.preview_receiver = None;
+                                }
+                                if ui.button("Rotate left").clicked() {
+                                    let entry = &mut self.images[idx];
+                                    entry.options.rotation_degrees =
+                                        (entry.options.rotation_degrees - 90).rem_euclid(360);
+                                    self.preview_receiver = None;
+                                }
+                            });
+                        });
                         ui.add_space(8.0);
                         if let Some((r_hist, g_hist, b_hist)) = &self.images[idx].histogram {
                             // Histogram aligned to bottom of the central panel.
