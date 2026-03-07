@@ -190,6 +190,7 @@ fn main() -> anyhow::Result<()> {
         format: cli.format,
         write_exr: cli.write_exr,
         write_jpeg: false,
+        write_jpeg_only: false,
         no_invert: cli.no_invert,
         no_curve: cli.no_curve,
         wb_r: cli.wb_r,

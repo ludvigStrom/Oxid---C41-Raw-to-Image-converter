@@ -76,8 +76,8 @@ struct ImageEntry {
 enum ExportFormat {
     Tiff16,
     Tiff32,
-    Dng,
     Exr,
+    Jpeg,
     /// TIFF 16-bit display + linear ACES2065-1 EXR.
     ExrAces2065,
 }
@@ -283,6 +283,7 @@ fn default_options() -> PipelineOptions {
         format: TiffFormat::Float32,
         write_exr: false,
         write_jpeg: false,
+        write_jpeg_only: false,
         no_invert: false,
         no_curve: false,
         wb_r: 1.15,
@@ -327,6 +328,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.curve_white.to_bits().hash(&mut h);
     (opts.format as u8).hash(&mut h);
     opts.write_exr.hash(&mut h);
+    opts.write_jpeg.hash(&mut h);
+    opts.write_jpeg_only.hash(&mut h);
     for row in &opts.density_matrix {
         for v in row {
             v.to_bits().hash(&mut h);
@@ -1225,8 +1228,8 @@ impl eframe::App for C41Gui {
                 let label = match entry.export_format {
                     ExportFormat::Tiff16 => "TIFF 16-bit",
                     ExportFormat::Tiff32 => "TIFF 32-bit float",
-                    ExportFormat::Dng => "DNG (not yet implemented)",
                     ExportFormat::Exr => "EXR (32-bit float)",
+                    ExportFormat::Jpeg => "JPEG",
                     ExportFormat::ExrAces2065 => "TIFF 16-bit + EXR ACES2065-1",
                 };
                 egui::ComboBox::from_label("Output format")
@@ -1245,16 +1248,16 @@ impl eframe::App for C41Gui {
                             entry.export_format = ExportFormat::Tiff32;
                         }
                         if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Dng), "DNG")
-                            .clicked()
-                        {
-                            entry.export_format = ExportFormat::Dng;
-                        }
-                        if ui
                             .selectable_label(matches!(entry.export_format, ExportFormat::Exr), "EXR (32-bit float)")
                             .clicked()
                         {
                             entry.export_format = ExportFormat::Exr;
+                        }
+                        if ui
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Jpeg), "JPEG")
+                            .clicked()
+                        {
+                            entry.export_format = ExportFormat::Jpeg;
                         }
                         let aces_selected = matches!(entry.export_format, ExportFormat::ExrAces2065);
                         if ui
@@ -1265,32 +1268,45 @@ impl eframe::App for C41Gui {
                         }
                     });
 
-                // Keep PipelineOptions.format and export_aces_exr in sync with export dropdown
+                // Keep PipelineOptions in sync with export dropdown
                 match entry.export_format {
                     ExportFormat::Tiff16 => {
                         opts.format = TiffFormat::U16;
                         opts.write_exr = false;
+                        opts.write_jpeg_only = false;
                         opts.export_aces_exr = false;
                     }
                     ExportFormat::Tiff32 => {
                         opts.format = TiffFormat::Float32;
                         opts.write_exr = false;
+                        opts.write_jpeg_only = false;
                         opts.export_aces_exr = false;
                     }
                     ExportFormat::Exr => {
                         opts.format = TiffFormat::Float32;
                         opts.write_exr = true;
+                        opts.write_jpeg_only = false;
                         opts.export_aces_exr = false;
                     }
-                    ExportFormat::Dng => { /* pipeline uses TIFF; DNG is placeholder */ }
+                    ExportFormat::Jpeg => {
+                        opts.format = TiffFormat::U16;
+                        opts.write_exr = false;
+                        opts.write_jpeg_only = true;
+                        opts.write_jpeg = false;
+                        opts.export_aces_exr = false;
+                    }
                     ExportFormat::ExrAces2065 => {
                         opts.format = TiffFormat::U16;
                         opts.write_exr = false;
+                        opts.write_jpeg_only = false;
                         opts.export_aces_exr = true;
                     }
                 }
 
-                ui.checkbox(&mut opts.write_jpeg, "Also export JPG");
+                ui.add_enabled(
+                    entry.export_format != ExportFormat::Jpeg,
+                    egui::Checkbox::new(&mut opts.write_jpeg, "Also export JPG"),
+                );
 
                 ui.add_space(8.0);
 
@@ -1317,10 +1333,6 @@ impl eframe::App for C41Gui {
                     let output_dir = self.output_dir.clone().unwrap();
                     let mut err: Option<anyhow::Error> = None;
                     for img in &self.images {
-                        if matches!(img.export_format, ExportFormat::Dng) {
-                            err = Some(anyhow::anyhow!("DNG export is not implemented yet"));
-                            break;
-                        }
                         let mut opts = img.options.clone();
                         opts.flat_field_path = self.flat_field_path.clone();
                         if let Err(e) = process_files(&[img.path.clone()], &output_dir, &opts) {

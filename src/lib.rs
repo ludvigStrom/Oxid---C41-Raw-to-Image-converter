@@ -44,6 +44,8 @@ pub struct PipelineOptions {
     pub format: TiffFormat,
     pub write_exr: bool,
     pub write_jpeg: bool,
+    /// When true, output is JPEG only (no TIFF). Implies JPEG write; "Also export JPG" is irrelevant.
+    pub write_jpeg_only: bool,
     pub no_invert: bool,
     pub no_curve: bool,
     pub wb_r: f32,
@@ -79,6 +81,7 @@ impl Default for PipelineOptions {
             format: TiffFormat::Float32,
             write_exr: false,
             write_jpeg: false,
+            write_jpeg_only: false,
             no_invert: false,
             no_curve: false,
             wb_r: 1.0,
@@ -403,6 +406,7 @@ pub fn process_files(
             .and_then(|s| s.to_str())
             .unwrap_or("image");
         let out_path = output_dir.join(format!("{}.tiff", stem));
+        let jpg_path = output_dir.join(format!("{}.jpg", stem));
         let exr_path = output_dir.join(format!("{}.exr", stem));
         let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
 
@@ -413,17 +417,19 @@ pub fn process_files(
             exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
         }
 
+        let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
+
         if let Some(ref pipeline) = curve_pipeline {
             let mut image_u16 =
                 curve::apply_curve_pipeline(&image, pipeline, options.curve_white, true);
             aces::convert_u16_linear_acescg_to_linear_srgb(&mut image_u16);
-            tiff_export::write_tiff_u16(&image_u16, &out_path)?;
+            if !options.write_jpeg_only {
+                tiff_export::write_tiff_u16(&image_u16, &out_path)?;
+            }
             if options.write_exr {
                 exr_export::write_exr_u16(&image_u16, &exr_path)?;
             }
-            if options.write_jpeg {
-                // JPEG is 8-bit; down-quantize from u16.
-                let jpg_path = output_dir.join(format!("{}.jpg", stem));
+            if write_jpeg_this {
                 let (height, width, _) = image_u16.dim();
                 let mut buf = Vec::with_capacity(height * width * 3);
                 for chunk in image_u16.iter() {
@@ -438,12 +444,13 @@ pub fn process_files(
             if !options.no_invert {
                 inversion::invert(&mut image);
             }
-            tiff_export::write_tiff(&image, &out_path, options.format)?;
+            if !options.write_jpeg_only {
+                tiff_export::write_tiff(&image, &out_path, options.format)?;
+            }
             if options.write_exr {
                 exr_export::write_exr_f32(&image, &exr_path)?;
             }
-            if options.write_jpeg {
-                let jpg_path = output_dir.join(format!("{}.jpg", stem));
+            if write_jpeg_this {
                 let (height, width, _) = image.dim();
                 let mut buf = Vec::with_capacity(height * width * 3);
                 for v in image.iter() {
