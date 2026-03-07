@@ -130,8 +130,6 @@ The tool supports two kinds of calibration, each with a clear role.
 
 **Workflow:** Use the **Color calibration** tab: load a RAW of a ColorChecker, align the 4 corner points to the chart, then “Solve 3×3 matrix from chart”. Save the profile to `profiles/` and in Process mode select it from the Color calibration profile dropdown.
 
-***TODO:*** Check the pipeline for color calibration workflow. It should do the same inversion d-min and other steps except color calibration. It should also
-
 ### Luminance calibration (flat-field)
 
 **What it does:** You provide a reference image of an **unexposed, developed** frame from the same roll (or same stock). It is linearized and heavily blurred to remove grain and dust, leaving only the low-frequency luminance pattern of your light source and lens. Each scan is then divided by this map pixel-by-pixel.
@@ -231,8 +229,3 @@ Yes, but not by “solving” the LUT directly from 24 patches—you only have 2
 - **Generation**: A first step is **matrix → LUT** (no new calibration math). Next step is using the existing ColorChecker OLS result plus the 24 patch positions to build a residual LUT or a regularized LUT so the same scan/chart can drive either a 3×3 or a 3D LUT.
 
 ---
-
-## Future work (ideas)
-- **Streamline Color profiles** Right now it creates botha a 3x3 matrix and 3d lut. Maybe just a 3d lut would be nice. 3d lut + json in a zip? or a zip called *.c41?
-
-

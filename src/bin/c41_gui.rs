@@ -388,26 +388,6 @@ impl eframe::App for C41Gui {
         style.visuals.selection.bg_fill = egui::Color32::from_gray(70); // selected tabs/items: gray instead of blue
         ctx.set_style(style);
 
-        // Dark title bar; on macOS OS title is hidden so we draw the app name here (white)
-        egui::TopBottomPanel::top("dark_title_bar")
-            .exact_height(28.0)
-            .frame(egui::Frame::none().fill(egui::Color32::from_gray(30)))
-            .show(ctx, |_ui| {
-                #[cfg(target_os = "macos")]
-                {
-                    _ui.with_layout(
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                egui::RichText::new("C-41 RAW Tool")
-                                    .color(egui::Color32::from_gray(240))
-                                    .size(14.0),
-                            );
-                        },
-                    );
-                }
-            });
-
         // Poll preview worker
         if let Some(rx) = self.preview_receiver.as_ref() {
             match rx.try_recv() {
