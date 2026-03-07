@@ -1,5 +1,8 @@
 //! C-41 RAW Tool GUI: three-panel layout — center preview, right per-image settings, bottom image strip + global output/convert.
 
+// On Windows, use GUI subsystem so closing the window exits with code 0 instead of 0xC000013A (STATUS_CONTROL_C_EXIT).
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -13,7 +16,6 @@ use c41_raw_tool::{
     demosaic,
     dmin,
     load_flat_field_linear,
-    lut3d,
     png_reader,
     process_files,
     process_one_to_preview,
@@ -130,7 +132,8 @@ struct C41Gui {
     calibration_result: Option<([[f32; 3]; 3], f32)>, // (matrix, mse)
     calibration_profile_name: String,
     calibration_light_source: String,
-    calibration_profiles: Vec<(PathBuf, calibration::CalibrationProfile)>,
+    /// (path, profile, LUT path for .c41 or None for .json)
+    calibration_profiles: Vec<(PathBuf, calibration::CalibrationProfile, Option<PathBuf>)>,
     selected_profile_idx: Option<usize>,
     /// Luminance calibration: path and linearized flat-field image (RAW → demosaic only).
     flat_field_path: Option<PathBuf>,
@@ -902,27 +905,38 @@ impl eframe::App for C41Gui {
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    ui.heading("Solve color calibration");
+                    ui.label("Set the profile name / film stock and notes, then create the color profile in one step (matrix + 3D LUT saved as .c41).");
                     ui.add_space(8.0);
 
-                    if ui.button("Solve 3×3 matrix from chart").clicked() {
+                    if self.calibration_profile_name.is_empty() {
+                        if let Some(stem) = entry
+                            .path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                        {
+                            self.calibration_profile_name = stem.to_string();
+                        }
+                    }
+                    ui.label("Profile name / film stock");
+                    ui.text_edit_singleline(&mut self.calibration_profile_name);
+                    ui.label("Notes (e.g. light source)");
+                    ui.text_edit_singleline(&mut self.calibration_light_source);
+                    ui.add_space(8.0);
+
+                    if ui.button("Create color profile").clicked() {
                         let path = entry.path.clone();
                         let opts_clone = calibration_opts_snapshot.clone();
                         match load_linear_transmittance_for_calibration(&path, &opts_clone) {
                             Ok(image_lin) => {
-                                // Step 3.2: sample 24 patches (medians) from linear transmittance.
                                 let centers_norm =
                                     compute_patch_centers_normalized(self.calibration_overlay.corners);
                                 let patches_linear =
                                     sample_patch_medians(&image_lin, &centers_norm, 5.0);
-
-                                // Step 3.3: convert to density.
                                 let measured_density =
                                     calibration::linear_to_density_24(patches_linear);
                                 let reference_density =
                                     calibration::reference_density_24();
 
-                                // Phase 4: OLS solver.
                                 match calibration::solve_density_matrix_ols(
                                     measured_density,
                                     reference_density,
@@ -930,10 +944,45 @@ impl eframe::App for C41Gui {
                                     Some((m, mse)) => {
                                         self.calibration_result = Some((m, mse));
                                         opts.density_matrix = m;
-                                        self.status = format!(
-                                            "Solved color calibration matrix (MSE {:.6}) applied to this image.",
-                                            mse
-                                        );
+                                        let name = if self.calibration_profile_name.trim().is_empty() {
+                                            "profile".to_string()
+                                        } else {
+                                            self.calibration_profile_name.trim().to_string()
+                                        };
+                                        let profile = calibration::CalibrationProfile {
+                                            name: name.clone(),
+                                            light_source: self.calibration_light_source.clone(),
+                                            matrix: m,
+                                            dmin_medians: calibration_opts_snapshot.dmin_fixed,
+                                        };
+                                        let base_dir = std::env::current_dir()
+                                            .unwrap_or_else(|_| PathBuf::from("."))
+                                            .join("profiles");
+                                        let _ = std::fs::create_dir_all(&base_dir);
+                                        if let Some(save_path) = rfd::FileDialog::new()
+                                            .set_directory(&base_dir)
+                                            .add_filter("C-41 profile", &["c41"])
+                                            .set_file_name(&(name.clone() + ".c41"))
+                                            .save_file()
+                                        {
+                                            match calibration::save_c41_profile(&profile, &save_path) {
+                                                Ok(()) => {
+                                                    self.status = format!(
+                                                        "Created .c41 profile (MSE {:.6}): {}",
+                                                        mse,
+                                                        save_path.display()
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    self.status = format!("Failed to save .c41 profile: {}", e);
+                                                }
+                                            }
+                                        } else {
+                                            self.status = format!(
+                                                "Solved matrix (MSE {:.6}); save cancelled.",
+                                                mse
+                                            );
+                                        }
                                     }
                                     None => {
                                         self.status = "Color calibration failed: singular system".to_string();
@@ -947,93 +996,14 @@ impl eframe::App for C41Gui {
                     }
 
                     if let Some((m, mse)) = self.calibration_result {
-                        ui.add_space(4.0);
-                        ui.label(format!("MSE: {:.6}", mse));
+                        ui.add_space(8.0);
+                        ui.label(format!("Last result — MSE: {:.6}", mse));
                         ui.monospace(format!(
-                            "Matrix:\n[{:.6}, {:.6}, {:.6}]\n[{:.6}, {:.6}, {:.6}]\n[{:.6}, {:.6}, {:.6}]",
+                            "[{:.4}, {:.4}, {:.4}]  [{:.4}, {:.4}, {:.4}]  [{:.4}, {:.4}, {:.4}]",
                             m[0][0], m[0][1], m[0][2],
                             m[1][0], m[1][1], m[1][2],
                             m[2][0], m[2][1], m[2][2],
                         ));
-
-                        ui.add_space(4.0);
-                        ui.label("Profile name / film stock");
-                        if self.calibration_profile_name.is_empty() {
-                            if let Some(stem) = entry
-                                .path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                            {
-                                self.calibration_profile_name = stem.to_string();
-                            }
-                        }
-                        ui.text_edit_singleline(&mut self.calibration_profile_name);
-
-                        ui.label("Light source notes");
-                        ui.text_edit_singleline(&mut self.calibration_light_source);
-
-                        if ui.button("Save color calibration profile…").clicked() {
-                            let dmin_snapshot = calibration_opts_snapshot.dmin_fixed;
-                            let name = if self.calibration_profile_name.trim().is_empty() {
-                                "profile".to_string()
-                            } else {
-                                self.calibration_profile_name.trim().to_string()
-                            };
-
-                            let profile = calibration::CalibrationProfile {
-                                name: name.clone(),
-                                light_source: self.calibration_light_source.clone(),
-                                matrix: m,
-                                dmin_medians: dmin_snapshot,
-                            };
-
-                            let base_dir = std::env::current_dir()
-                                .unwrap_or_else(|_| PathBuf::from("."))
-                                .join("profiles");
-                            let _ = std::fs::create_dir_all(&base_dir);
-
-                            if let Some(path) = rfd::FileDialog::new()
-                                .set_directory(&base_dir)
-                                .set_file_name(&(name.clone() + ".json"))
-                                .save_file()
-                            {
-                                match calibration::save_profile_to_path(&profile, &path) {
-                                    Ok(()) => {
-                                        self.status =
-                                            format!("Saved color calibration profile to {}", path.display());
-                                    }
-                                    Err(e) => {
-                                        self.status =
-                                            format!("Failed to save color calibration profile: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.heading("3D LUT");
-                    ui.add_space(4.0);
-                    ui.label("Generate a .cube file from the current matrix; apply it in the Process tab.");
-                    if ui.button("Generate 3D LUT from current matrix…").clicked() {
-                        let matrix = opts.density_matrix;
-                        let lut = lut3d::Lut3d::generate_from_matrix(&matrix, 17, 4.0);
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("CUBE LUT", &["cube"])
-                            .set_file_name("density_matrix.cube")
-                            .save_file()
-                        {
-                            match lut3d::write_cube(&lut, &path) {
-                                Ok(()) => {
-                                    self.status = format!("Saved 3D LUT (17³) to {}", path.display());
-                                }
-                                Err(e) => {
-                                    self.status = format!("Failed to save 3D LUT: {}", e);
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -1054,7 +1024,7 @@ impl eframe::App for C41Gui {
                         ui.label("Profile (open dropdown to scan profiles/ folder)");
                         let mut current_idx = self.selected_profile_idx.unwrap_or(usize::MAX);
                         let selected_label = if let Some(i) = self.selected_profile_idx {
-                            if let Some((_, p)) = self.calibration_profiles.get(i) {
+                            if let Some((_, p, _)) = self.calibration_profiles.get(i) {
                                 p.name.as_str()
                             } else {
                                 "None"
@@ -1082,7 +1052,7 @@ impl eframe::App for C41Gui {
                                 {
                                     current_idx = usize::MAX;
                                 }
-                                for (i, (_, profile)) in
+                                for (i, (_, profile, _)) in
                                     self.calibration_profiles.iter().enumerate()
                                 {
                                     let is_selected = self.selected_profile_idx == Some(i);
@@ -1094,14 +1064,15 @@ impl eframe::App for C41Gui {
                                     }
                                 }
                                 if self.calibration_profiles.is_empty() {
-                                    ui.label("No .json profiles in profiles/");
+                                    ui.label("No .json or .c41 profiles in profiles/");
                                 }
                             });
 
                         // Apply selection to current image options.
                         if current_idx == usize::MAX {
                             self.selected_profile_idx = None;
-                        } else if let Some((_, profile)) =
+                            opts.lut3d_path = None;
+                        } else if let Some((_, profile, lut_path)) =
                             self.calibration_profiles.get(current_idx).cloned()
                         {
                             self.selected_profile_idx = Some(current_idx);
@@ -1110,6 +1081,7 @@ impl eframe::App for C41Gui {
                                 opts.dmin_fixed = Some(dmin);
                                 opts.dmin_rect = None;
                             }
+                            opts.lut3d_path = lut_path;
                             self.status = format!(
                                 "Applied color calibration profile '{}' to current image.",
                                 profile.name
@@ -1223,6 +1195,7 @@ impl eframe::App for C41Gui {
                     });
                 }
 
+                if self.mode == UIMode::Process {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -1258,18 +1231,18 @@ impl eframe::App for C41Gui {
                         {
                             entry.export_format = ExportFormat::Exr;
                         }
-                        if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Jpeg), "JPEG")
-                            .clicked()
-                        {
-                            entry.export_format = ExportFormat::Jpeg;
-                        }
                         let aces_selected = matches!(entry.export_format, ExportFormat::ExrAces2065);
                         if ui
                             .selectable_label(aces_selected, "EXR ACES2065-1 (32-bit float)")
                             .clicked()
                         {
                             entry.export_format = ExportFormat::ExrAces2065;
+                        }
+                        if ui
+                            .selectable_label(matches!(entry.export_format, ExportFormat::Jpeg), "JPEG")
+                            .clicked()
+                        {
+                            entry.export_format = ExportFormat::Jpeg;
                         }
                     });
 
@@ -1378,6 +1351,12 @@ impl eframe::App for C41Gui {
 
                 if !self.status.is_empty() {
                     ui.add_space(4.0);
+                    ui.label(egui::RichText::new(&self.status).small());
+                }
+                } else if !self.status.is_empty() {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
                     ui.label(egui::RichText::new(&self.status).small());
                 }
                     });

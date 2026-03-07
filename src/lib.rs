@@ -117,40 +117,77 @@ pub fn load_flat_field_linear(path: &Path) -> anyhow::Result<Array3<f32>> {
     demosaic::demosaic_quality(&bayer, demosaic::BayerPattern::Rggb)
 }
 
+/// Build a 1D Gaussian kernel (odd length, normalized). Sigma in pixels.
+fn gaussian_1d_kernel(sigma: f32) -> Vec<f32> {
+    if sigma <= 0.0 {
+        return vec![1.0];
+    }
+    let half_len = (3.0 * sigma).ceil().max(1.0) as usize;
+    let len = 2 * half_len + 1;
+    let mut k = Vec::with_capacity(len);
+    let mut sum = 0.0_f32;
+    for i in 0..len {
+        let x = (i as f32) - (half_len as f32);
+        let w = (-x * x / (2.0 * sigma * sigma)).exp();
+        k.push(w);
+        sum += w;
+    }
+    for w in k.iter_mut() {
+        *w /= sum;
+    }
+    k
+}
+
+/// Separable Gaussian blur on (H, W, 3) f32 array. Uses full f32 precision to avoid banding.
+/// Sigma in pixels; boundary uses edge clamping.
+fn separable_gaussian_f32(image: &Array3<f32>, sigma: f32) -> Array3<f32> {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    if sigma <= 0.0 {
+        return image.to_owned();
+    }
+    let kernel = gaussian_1d_kernel(sigma);
+    let half = kernel.len() / 2;
+
+    // Horizontal pass: (y, x, ch) -> temp(y, x, ch)
+    let mut temp = Array3::<f32>::zeros((h, w, 3));
+    for y in 0..h {
+        for ch in 0..3 {
+            for x in 0..w {
+                let mut acc = 0.0_f32;
+                for (i, &k) in kernel.iter().enumerate() {
+                    let xi = (x as i32 + i as i32 - half as i32).clamp(0, w as i32 - 1) as usize;
+                    acc += image[(y, xi, ch)] * k;
+                }
+                temp[(y, x, ch)] = acc;
+            }
+        }
+    }
+
+    // Vertical pass: temp -> out
+    let mut out = Array3::<f32>::zeros((h, w, 3));
+    for x in 0..w {
+        for ch in 0..3 {
+            for y in 0..h {
+                let mut acc = 0.0_f32;
+                for (i, &k) in kernel.iter().enumerate() {
+                    let yi = (y as i32 + i as i32 - half as i32).clamp(0, h as i32 - 1) as usize;
+                    acc += temp[(yi, x, ch)] * k;
+                }
+                out[(y, x, ch)] = acc;
+            }
+        }
+    }
+    out
+}
+
 /// Apply a heavy Gaussian blur to a linear RGB flat-field image to remove film grain and dust,
 /// leaving only low-frequency luminance falloff (light source + lens vignetting).
 ///
 /// Input and output are `(height, width, 3)` arrays in linear [0, 1] space.
+/// Uses a separable f32 Gaussian to avoid banding from external blur implementations.
 pub fn blur_flat_field(input: &Array3<f32>, radius: f32) -> Array3<f32> {
-    let (h, w, c) = input.dim();
-    assert_eq!(
-        c, 3,
-        "blur_flat_field expects a 3-channel RGB flat-field image"
-    );
-
-    let mut img = Rgb32FImage::new(w as u32, h as u32);
-    for y in 0..h {
-        for x in 0..w {
-            let r = input[(y, x, 0)];
-            let g = input[(y, x, 1)];
-            let b = input[(y, x, 2)];
-            img.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
-        }
-    }
-
-    let blurred = imageops::blur(&img, radius);
-
-    let mut out = Array3::<f32>::zeros((h, w, 3));
-    for (x, y, pixel) in blurred.enumerate_pixels() {
-        let [r, g, b] = pixel.0;
-        let yi = y as usize;
-        let xi = x as usize;
-        out[(yi, xi, 0)] = r;
-        out[(yi, xi, 1)] = g;
-        out[(yi, xi, 2)] = b;
-    }
-
-    out
+    separable_gaussian_f32(input, radius)
 }
 
 /// Load a flat-field map from an image file (e.g. 32f TIFF saved from the GUI).

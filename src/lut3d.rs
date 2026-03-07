@@ -167,16 +167,21 @@ impl Lut3d {
     }
 }
 
-/// Write a 3D LUT to a .cube file (Adobe CUBE format).
-/// Grid is normalized [0, 1] input and output; one line per vertex, red-major order.
-pub fn write_cube(lut: &Lut3d, path: &Path) -> std::io::Result<()> {
+/// Return the .cube file content as a string (for embedding in .c41 zip).
+pub fn cube_to_string(lut: &Lut3d) -> String {
     let mut out = String::new();
     out.push_str("# C-41 RAW Tool 3D LUT (density domain, normalized 0..1)\n");
     out.push_str(&format!("LUT_3D_SIZE {}\n", lut.size));
     for tri in &lut.data {
         out.push_str(&format!("{} {} {}\n", tri[0], tri[1], tri[2]));
     }
-    std::fs::write(path, out)
+    out
+}
+
+/// Write a 3D LUT to a .cube file (Adobe CUBE format).
+/// Grid is normalized [0, 1] input and output; one line per vertex, red-major order.
+pub fn write_cube(lut: &Lut3d, path: &Path) -> std::io::Result<()> {
+    std::fs::write(path, cube_to_string(lut))
 }
 
 /// Read a .cube file. Supports LUT_3D_SIZE and optional DOMAIN_MAX; data must be red-major (R fastest).
