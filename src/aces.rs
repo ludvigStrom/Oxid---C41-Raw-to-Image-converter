@@ -103,7 +103,7 @@ pub fn linear_acescg_to_linear_srgb(image: &mut Array3<f32>) {
 
 /// Convert u16 image from linear ACEScg to linear sRGB in place.
 /// Treats u16 values as linear in [0, 1] (divide by 65535), applies the primaries matrix,
-/// clamps, and writes back as u16. Used for curve output when use_acescg so export is sRGB.
+/// clamps, and writes back as u16. Used for curve output so export is sRGB.
 pub fn convert_u16_linear_acescg_to_linear_srgb(image: &mut Array3<u16>) {
     let (h, w, _) = image.dim();
     let m = &ACESCG_TO_LINEAR_SRGB;

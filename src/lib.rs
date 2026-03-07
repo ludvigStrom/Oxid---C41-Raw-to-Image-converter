@@ -58,11 +58,9 @@ pub struct PipelineOptions {
     pub density_matrix: [[f32; 3]; 3],
     /// Path to a RAW flat-field (unexposed) frame for luminance calibration. Optional.
     pub flat_field_path: Option<PathBuf>,
-    /// When true, apply IDT and run pipeline in ACEScg; when false, keep current camera-linear behavior.
-    pub use_acescg: bool,
-    /// 3×3 IDT matrix (camera linear RGB → ACEScg). Identity when not using ACEScg.
+    /// 3×3 IDT matrix (camera linear RGB → ACEScg). Default identity; optional profiles in camera_idt/.
     pub idt_matrix: [[f32; 3]; 3],
-    /// When true (and use_acescg), also write a linear ACES2065-1 EXR alongside display output.
+    /// When true, also write a linear ACES2065-1 EXR alongside display output.
     pub export_aces_exr: bool,
     /// Optional 3D LUT (density domain) used instead of the density matrix when set.
     /// If present, applied after T→D, before D→RA-4. Generated via "Generate 3D LUT" from current matrix.
@@ -97,7 +95,6 @@ impl Default for PipelineOptions {
                 [0.0, 0.0, 1.0],
             ],
             flat_field_path: None,
-            use_acescg: false,
             idt_matrix: aces::IDT_IDENTITY,
             export_aces_exr: false,
             lut3d_path: None,
@@ -303,25 +300,21 @@ fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f
 
 /// **Pipeline order (do not reorder without updating this comment).**
 ///
+/// Internal colorspace is always ACEScg.
+///
 /// 1. **Load** RAW (linear Bayer) or PNG → demosaic → **linear camera RGB**.
-/// 2. **IDT** (if `use_acescg` and non-identity): linear camera RGB → **ACEScg**. Flat-field map is
-///    converted with the same IDT so division happens in the same space.
+/// 2. **IDT**: linear camera RGB → **ACEScg** (identity or camera profile from camera_idt/).
+///    Flat-field map is converted with the same IDT.
 /// 3. **D-min / flat-field** (optional).
 /// 4. **White balance** (optional).
 /// 5. **Optional ACES2065-1 export**: clone ACEScg image, convert to AP0, write EXR.
-/// 6. **Display path**: If curve: T→D → density matrix (converted to ACEScg when IDT active) →
-///    RA-4 → quantize; then if ACEScg, convert to **linear sRGB** for TIFF/EXR/JPEG. If no curve:
-///    ACEScg → linear sRGB, optional invert, then export.
-///
-/// Camera IDT must run immediately after we have linear camera RGB so all later steps (D-min, WB,
-/// density matrix, export) operate in a single color space (ACEScg or camera).
+/// 6. **Display path**: If curve: T→D → density matrix (in ACEScg) → RA-4 → quantize; convert to
+///    **linear sRGB** for TIFF/EXR/JPEG. If no curve: ACEScg → linear sRGB, optional invert, export.
 pub fn process_files(
     paths: &[PathBuf],
     output_dir: &Path,
     options: &PipelineOptions,
 ) -> anyhow::Result<()> {
-    let has_real_idt = options.use_acescg && options.idt_matrix != aces::IDT_IDENTITY;
-
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory {}", output_dir.display()))?;
 
@@ -345,29 +338,20 @@ pub fn process_files(
                 [0.0, 0.0, 1.0],
             ]
         };
-        let m = if options.use_acescg {
-            aces::convert_density_matrix_to_acescg(base, &options.idt_matrix)
-        } else {
-            base
-        };
+        let m = aces::convert_density_matrix_to_acescg(base, &options.idt_matrix);
         let matrix = curve::DensityMatrix { m };
         curve::CurvePipeline::new(params, matrix, 4.0, true, lut3d.clone())
     });
 
-    // Optional flat-field: load map once, then reuse for all images in this batch.
-    // When running in ACEScg mode, convert the flat-field map with the same IDT so that
-    // flat-field division happens in the same space as the main image.
+    // Optional flat-field: load map once, convert with IDT so division is in ACEScg.
     let mut flat_field_map: Option<Array3<f32>> =
         if let Some(ref flat_path) = options.flat_field_path {
             Some(load_flat_field_map(flat_path)?)
         } else {
             None
         };
-
-    if has_real_idt {
-        if let Some(ref mut flat) = flat_field_map {
-            aces::apply_idt(flat, &options.idt_matrix);
-        }
+    if let Some(ref mut flat) = flat_field_map {
+        aces::apply_idt(flat, &options.idt_matrix);
     }
 
     for path in paths {
@@ -391,10 +375,8 @@ pub fn process_files(
             image = apply_rotation(&image, options.rotation_degrees);
         }
 
-        // Optional IDT: convert linear camera RGB to ACEScg before D-min / flat-field and WB.
-        if has_real_idt {
-            aces::apply_idt(&mut image, &options.idt_matrix);
-        }
+        // IDT: linear camera RGB → ACEScg (identity or camera profile).
+        aces::apply_idt(&mut image, &options.idt_matrix);
 
         // Step 3: D-min / flat-field (skipped if apply_dmin is false).
         if options.apply_dmin {
@@ -425,7 +407,7 @@ pub fn process_files(
         let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
 
         // Optional ACES2065-1 branch: export linear ACES2065-1 EXR alongside display output.
-        if has_real_idt && options.export_aces_exr {
+        if options.export_aces_exr {
             let mut aces2065 = image.clone();
             aces::linear_acescg_to_aces2065_1(&mut aces2065);
             exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
@@ -434,11 +416,7 @@ pub fn process_files(
         if let Some(ref pipeline) = curve_pipeline {
             let mut image_u16 =
                 curve::apply_curve_pipeline(&image, pipeline, options.curve_white, true);
-            // When using ACEScg with a non-identity IDT, convert curve output to linear sRGB
-            // so TIFF/EXR/JPEG are in sRGB primaries.
-            if has_real_idt {
-                aces::convert_u16_linear_acescg_to_linear_srgb(&mut image_u16);
-            }
+            aces::convert_u16_linear_acescg_to_linear_srgb(&mut image_u16);
             tiff_export::write_tiff_u16(&image_u16, &out_path)?;
             if options.write_exr {
                 exr_export::write_exr_u16(&image_u16, &exr_path)?;
@@ -456,9 +434,7 @@ pub fn process_files(
                 img.save(&jpg_path)?;
             }
         } else {
-            if has_real_idt {
-                aces::linear_acescg_to_linear_srgb(&mut image);
-            }
+            aces::linear_acescg_to_linear_srgb(&mut image);
             if !options.no_invert {
                 inversion::invert(&mut image);
             }
@@ -485,16 +461,14 @@ pub fn process_files(
 }
 
 /// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
-/// IDT (camera → ACEScg) → D-min/flat-field → WB → curve (with density matrix in ACEScg) or
-/// no-curve; display output is converted to sRGB when using ACEScg.
+/// IDT (camera → ACEScg) → D-min/flat-field → WB → curve (density matrix in ACEScg) or no-curve;
+/// display output is converted to sRGB.
 pub fn process_one_to_preview(
     path: &Path,
     options: &PipelineOptions,
     max_width: u32,
     max_height: u32,
 ) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>)> {
-    let has_real_idt = options.use_acescg && options.idt_matrix != aces::IDT_IDENTITY;
-
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -515,18 +489,13 @@ pub fn process_one_to_preview(
         image = apply_rotation(&image, options.rotation_degrees);
     }
 
-    // Optional IDT for preview: keep the same space as batch processing.
-    if has_real_idt {
-        aces::apply_idt(&mut image, &options.idt_matrix);
-    }
+    aces::apply_idt(&mut image, &options.idt_matrix);
 
     // Step 3 for preview: D-min / flat-field (skipped if apply_dmin is false).
     if options.apply_dmin {
         if let Some(ref flat_path) = options.flat_field_path {
             let mut flat_map = load_flat_field_map(flat_path)?;
-            if has_real_idt {
-                aces::apply_idt(&mut flat_map, &options.idt_matrix);
-            }
+            aces::apply_idt(&mut flat_map, &options.idt_matrix);
             apply_flat_field_division(&mut image, &flat_map);
         } else if let Some((r, g, b)) = options.dmin_fixed {
             dmin::neutralize_with_medians(&mut image, r, g, b)?;
@@ -562,11 +531,7 @@ pub fn process_one_to_preview(
                 [0.0, 0.0, 1.0],
             ]
         };
-        let m = if has_real_idt {
-            aces::convert_density_matrix_to_acescg(base, &options.idt_matrix)
-        } else {
-            base
-        };
+        let m = aces::convert_density_matrix_to_acescg(base, &options.idt_matrix);
         let matrix = curve::DensityMatrix { m };
         let lut3d = options
             .lut3d_path
@@ -574,17 +539,13 @@ pub fn process_one_to_preview(
             .and_then(|p| lut3d::read_cube(p).ok());
         let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true, lut3d);
         let mut u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
-        if has_real_idt {
-            aces::convert_u16_linear_acescg_to_linear_srgb(&mut u16_img);
-        }
+        aces::convert_u16_linear_acescg_to_linear_srgb(&mut u16_img);
         u16_img
             .iter()
             .map(|v| ((*v as u32) >> 8).min(255) as u8)
             .collect()
     } else {
-        if has_real_idt {
-            aces::linear_acescg_to_linear_srgb(&mut image);
-        }
+        aces::linear_acescg_to_linear_srgb(&mut image);
         if !options.no_invert {
             inversion::invert(&mut image);
         }

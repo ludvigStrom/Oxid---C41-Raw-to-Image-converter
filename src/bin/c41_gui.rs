@@ -78,7 +78,7 @@ enum ExportFormat {
     Tiff32,
     Dng,
     Exr,
-    /// TIFF 16-bit display + linear ACES2065-1 EXR (only when Use ACEScg is on).
+    /// TIFF 16-bit display + linear ACES2065-1 EXR.
     ExrAces2065,
 }
 
@@ -299,7 +299,6 @@ fn default_options() -> PipelineOptions {
             [0.0, 0.0, 1.0],
         ],
         flat_field_path: None,
-        use_acescg: false,
         idt_matrix: c41_raw_tool::aces::IDT_IDENTITY,
         export_aces_exr: false,
         lut3d_path: None,
@@ -334,7 +333,6 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
         }
     }
     opts.flat_field_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
-    opts.use_acescg.hash(&mut h);
     opts.export_aces_exr.hash(&mut h);
     for row in &opts.idt_matrix {
         for v in row {
@@ -803,63 +801,55 @@ impl eframe::App for C41Gui {
                     });
                     }
 
-                    // ACES: run pipeline in ACEScg. Export ACES2065-1 is chosen in the Export dropdown.
-                    let use_acescg_prev = opts.use_acescg;
-                    ui.checkbox(&mut opts.use_acescg, "Use ACEScg");
-                    if use_acescg_prev && !opts.use_acescg {
-                        opts.idt_matrix = c41_raw_tool::aces::IDT_IDENTITY;
-                    }
-                    if opts.use_acescg {
-                        ui.label("Camera IDT profile");
-                        let current_label = if opts.idt_matrix == c41_raw_tool::aces::IDT_IDENTITY {
-                            "Identity"
-                        } else if let Some((_, p)) = self.idt_profiles.iter().find(|(_, p)| {
-                            p.matrix.iter().zip(opts.idt_matrix.iter()).all(|(a, b)| {
-                                a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5)
-                            })
-                        }) {
-                            p.name.as_str()
-                        } else {
-                            "Custom"
-                        };
-                        egui::ComboBox::from_label("IDT profile")
-                            .selected_text(current_label)
-                            .show_ui(ui, |ui| {
-                                // Refresh list when dropdown is open
-                                let base_dir = std::env::current_dir()
-                                    .unwrap_or_else(|_| PathBuf::from("."))
-                                    .join("camera_idt");
-                                if let Ok(list) = c41_raw_tool::aces::load_idt_profiles_from_dir(&base_dir) {
-                                    self.idt_profiles = list;
+                    // Pipeline always runs in ACEScg. Optional camera IDT (identity = no transform).
+                    ui.label("Camera IDT profile");
+                    let current_label = if opts.idt_matrix == c41_raw_tool::aces::IDT_IDENTITY {
+                        "Identity"
+                    } else if let Some((_, p)) = self.idt_profiles.iter().find(|(_, p)| {
+                        p.matrix.iter().zip(opts.idt_matrix.iter()).all(|(a, b)| {
+                            a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5)
+                        })
+                    }) {
+                        p.name.as_str()
+                    } else {
+                        "Custom"
+                    };
+                    egui::ComboBox::from_label("IDT profile")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            let base_dir = std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join("camera_idt");
+                            if let Ok(list) = c41_raw_tool::aces::load_idt_profiles_from_dir(&base_dir) {
+                                self.idt_profiles = list;
+                            }
+                            if ui.selectable_label(
+                                opts.idt_matrix == c41_raw_tool::aces::IDT_IDENTITY,
+                                "Identity",
+                            ).clicked()
+                            {
+                                opts.idt_matrix = c41_raw_tool::aces::IDT_IDENTITY;
+                            }
+                            for (_, profile) in &self.idt_profiles {
+                                let selected = opts.idt_matrix
+                                    .iter()
+                                    .zip(profile.matrix.iter())
+                                    .all(|(a, b)| a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5));
+                                if ui.selectable_label(selected, &profile.name).clicked() {
+                                    opts.idt_matrix = profile.matrix;
                                 }
-                                if ui.selectable_label(
-                                    opts.idt_matrix == c41_raw_tool::aces::IDT_IDENTITY,
-                                    "Identity",
-                                ).clicked()
-                                {
-                                    opts.idt_matrix = c41_raw_tool::aces::IDT_IDENTITY;
-                                }
-                                for (_, profile) in &self.idt_profiles {
-                                    let selected = opts.idt_matrix
-                                        .iter()
-                                        .zip(profile.matrix.iter())
-                                        .all(|(a, b)| a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5));
-                                    if ui.selectable_label(selected, &profile.name).clicked() {
-                                        opts.idt_matrix = profile.matrix;
-                                    }
-                                }
-                            });
-                        ui.collapsing("IDT matrix (custom edit)", |ui| {
-                            let m = &mut opts.idt_matrix;
-                            ui.horizontal(|ui| {
-                                for row in 0..3 {
-                                    for col in 0..3 {
-                                        ui.add(egui::DragValue::new(&mut m[row][col]).speed(0.05));
-                                    }
-                                }
-                            });
+                            }
                         });
-                    }
+                    ui.collapsing("IDT matrix (custom edit)", |ui| {
+                        let m = &mut opts.idt_matrix;
+                        ui.horizontal(|ui| {
+                            for row in 0..3 {
+                                for col in 0..3 {
+                                    ui.add(egui::DragValue::new(&mut m[row][col]).speed(0.05));
+                                }
+                            }
+                        });
+                    });
 
                     let mut apply_curve = !opts.no_curve;
                     ui.checkbox(&mut apply_curve, "Print curve");
@@ -1266,23 +1256,14 @@ impl eframe::App for C41Gui {
                         {
                             entry.export_format = ExportFormat::Exr;
                         }
-                        // EXR ACES2065-1: only valid when Use ACEScg is on; greyed out otherwise.
                         let aces_selected = matches!(entry.export_format, ExportFormat::ExrAces2065);
                         if ui
-                            .add_enabled(
-                                opts.use_acescg,
-                                egui::SelectableLabel::new(aces_selected, "TIFF 16-bit + EXR ACES2065-1"),
-                            )
+                            .selectable_label(aces_selected, "TIFF 16-bit + EXR ACES2065-1")
                             .clicked()
                         {
                             entry.export_format = ExportFormat::ExrAces2065;
                         }
                     });
-
-                // If Use ACEScg is off but user had picked ACES2065 export, revert to TIFF 16.
-                if !opts.use_acescg && entry.export_format == ExportFormat::ExrAces2065 {
-                    entry.export_format = ExportFormat::Tiff16;
-                }
 
                 // Keep PipelineOptions.format and export_aces_exr in sync with export dropdown
                 match entry.export_format {
