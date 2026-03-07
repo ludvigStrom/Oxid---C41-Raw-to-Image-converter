@@ -2,7 +2,7 @@
 
 A high-performance, command-line and GUI RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically accurate log-density math: no auto white balance, no hidden base curves only explicit mathematical steps suitable for scientific and repeatable workflows. Internally it uses ACEScg color space. 
 
-**Target cameras:** Any LibRaw-supported Bayer RAW (Sony, Nikon, Canon, etc.). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
+**Target cameras:** Any rawloader-supported Bayer RAW (Sony, Nikon, Canon, Fuji, Panasonic, Adobe DNG, etc.). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
 
 ---
 
@@ -14,68 +14,22 @@ Film dye density is logarithmic. A simple `1.0 - input` inversion in linear spac
 
 ## Prerequisites
 
-- **Rust** (2021 edition; install via [rustup](https://rustup.rs/))
-- **LibRaw** (used for raw decoding)
-  - **macOS:** `brew install libraw`
-  - **Debian/Ubuntu:** `sudo apt-get install libraw-dev`
-  - **Windows:** see [Building on Windows](#building-on-windows) below (build script + one-time patch).
+- **Rust** (2021 edition; install via [rustup](https://rustup.rs/)). Raw decoding uses **rawloader** (pure Rust); no system libraries or native build steps are required.
 
 ---
 
 ## Building on Windows
 
-LibRaw is built from source by the `libraw-rs-sys` crate. On MSVC that fails without patches: the crate passes `-pthread` (unsupported), and the C API is declared `dllimport` so defining it in a static build causes C2491. This project fixes that with a one-time patch and a build script that helps with linking.
+From the project root:
 
-1. **One-time patch (required)**  
-   From the project root, run (PowerShell):
-   ```powershell
-   .\scripts\patch-libraw-windows.ps1
-   ```
-   That creates `vendor/libraw-rs-sys` from the Cargo registry and patches `build.rs` to:
-   - use `-pthread` only on Unix (not MSVC),
-   - define `LIBRAW_BUILDLIB` and add `/EHsc` on MSVC (fixes C2491 and C++ exception semantics).
+```powershell
+cargo build --release
+```
 
-2. **Use the patched crate**  
-   Append the contents of `scripts/cargo-patch-windows.toml` to your `Cargo.toml` (the `[patch.crates-io]` block).
+If `cargo` is not in your PATH, add it for the session: `$env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path`, then build.
 
-3. **Clean and build**
-   ```powershell
-   cargo clean
-   cargo build --release
-   ```
+   To run the GUI: `.\target\release\c41-gui.exe` or `cargo run --release --bin c41-gui --features gui`.
 
-4. **Optional: vcpkg for LibRaw dependencies**  
-   The vendored LibRaw may need zlib, lcms2, and jasper. If you use [vcpkg](https://vcpkg.io/):
-   ```powershell
-   vcpkg install libraw
-   vcpkg integrate install
-   ```
-   Set `VCPKG_ROOT` if vcpkg is not on `%USERPROFILE%\vcpkg`. The project `build.rs` will then add the right link search paths and link libs.
-
-   Alternatively, set `LIBRAW_DIR` to the root of a directory that contains `lib` (or `x64-windows\lib`) with the required libraries.
-
-5. **Cargo in PATH (PowerShell)**  
-   If `cargo` is not recognized in PowerShell, add it for the current session:
-   ```powershell
-   $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
-   ```
-   Then run the build. That only affects the current window.
-
-   **So it works every time**, either:
-   - **One-time per session** (in any new PowerShell): run the line above, then your build/run commands.
-   - **Permanent:** add Cargo to your user PATH:
-     - Win+R → `rundll32 sysdm.cpl,EditEnvironmentVariables`
-     - Under “User variables” select **Path** → Edit → New → add: `C:\Users\<YourUsername>\.cargo\bin`
-     - OK out, then open a **new** PowerShell.
-
-   **Run the GUI:**
-   ```powershell
-   .\target\release\c41-gui.exe
-   ```
-   Or from the project root (with PATH set as above):
-   ```powershell
-   cargo run --release --bin c41-gui --features gui
-   ```
 
 ---
 
@@ -192,8 +146,8 @@ The tool supports two kinds of calibration, each with a clear role.
 
 Order of operations:
 
-1. **Linear extraction** (RAW only) -- LibRaw decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
-2. **Demosaic** (RAW only) -- Bilinear interpolation from Bayer to RGB. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32.
+1. **Linear extraction** (RAW only) -- rawloader (pure Rust) decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
+2. **Demosaic** (RAW only) -- High-quality demosaic: edge-aware green (Hamilton–Adams) plus **color-difference** (R−G, B−G) interpolation for red and blue. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32. This minimizes false color and zippering while preserving detail and grain.
    *PNG input skips 1-2: loaded as RGB and normalized to [0, 1].*
 3. **D-min or flat-field** (optional, can be disabled) -- Either:
    - **Flat-field:** If `--flat-field` is set, load that reference (RAW → linearize → heavy blur), then divide the image by it pixel-by-pixel. This removes light falloff and vignetting; the film base normalizes to ~1.0 transmittance everywhere. **Or**
@@ -224,9 +178,9 @@ With **Use ACEScg** (GUI) or `--use-acescg` (CLI), the pipeline treats ACES as a
 | `src/lib.rs` | Shared pipeline: `PipelineOptions`, `process_files()`. Used by CLI and GUI. |
 | `src/main.rs` | CLI (clap), directory iteration, calls lib. |
 | `src/bin/c41_gui.rs` | GUI (egui/eframe): Process / Color calibration / Luminance calibration tabs, per-step checkboxes, profile and flat-field load/save, Convert. Requires `--features gui`. |
-| `src/raw_reader.rs` | Load RAW via LibRaw (`.arw`, `.nef`, `.nrw`, `.cr2`, `.cr3`, `.crw`, `.dng`, `.raf`, `.orf`, `.rw2`) -> `Array3<f32>` (HxWx1) Bayer. |
+| `src/raw_reader.rs` | Load RAW via **rawloader** (pure Rust): `.arw`, `.nef`, `.nrw`, `.cr2`, `.cr3`, `.crw`, `.dng`, `.raf`, `.orf`, `.rw2`, etc. -> `Array3<f32>` (H×W×1) Bayer. |
 | `src/png_reader.rs` | Load `.png` (or other image crate formats) -> RGB `Array3<f32>` (HxWx3); any size. |
-| `src/demosaic.rs` | Bayer->RGB bilinear demosaic; supports RGGB, Grbg, Gbrg, Bggr. |
+| `src/demosaic.rs` | Bayer→RGB: bilinear (fallback), edge-aware green, and **quality** (edge-aware G + R−G/B−G color-difference). Supports RGGB, Grbg, Gbrg, Bggr. |
 | `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place; supports fixed medians via `--dmin-fixed`. |
 | `src/inversion.rs` | Simple linear inversion (`1-x`); used only with `--no-curve`. |
 | `src/curve.rs` | Physical Cineon/RA-4 print emulation: multi-stage pipeline (T → density → 3×3 density matrix → RA-4 S-curve) using high-resolution LUTs and rayon-parallel apply. |
@@ -235,13 +189,13 @@ With **Use ACEScg** (GUI) or `--use-acescg` (CLI), the pipeline treats ACES as a
 | `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32f/16 from f32, or u16 (after curve) via `write_tiff_u16`. |
 | `src/exr_export.rs` | Write RGB OpenEXR: f32 or normalized u16 to EXR via `--write-exr`. |
 
-Dependencies (see `Cargo.toml`): `libraw-rs`, `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`, `image` (PNG/raster ingestion), `exr` (OpenEXR export), `nalgebra` (calibration OLS), `serde`/`serde_json` (profiles).
+Dependencies (see `Cargo.toml`): `rawloader` (RAW decoding), `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`, `image` (PNG/raster ingestion), `exr` (OpenEXR export), `nalgebra` (calibration OLS), `serde`/`serde_json` (profiles).
 
 ---
 
 ## License
 
-See repository for license information. LibRaw is used under its own license (e.g. LGPL/CDDL).
+See repository for license information.
 ﻿
 ---
 

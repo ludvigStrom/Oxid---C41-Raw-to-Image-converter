@@ -170,7 +170,7 @@ fn load_linear_transmittance_for_calibration(
         // RAW formats handled by LibRaw; assume Bayer sensor and RGGB.
         "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
             let bayer = raw_reader::load_raw_as_ndarray(path)?;
-            demosaic::demosaic_bilinear(&bayer, demosaic::BayerPattern::Rggb)?
+            demosaic::demosaic_quality(&bayer, demosaic::BayerPattern::Rggb)?
         }
         "png" => png_reader::load_png_as_ndarray(path)?,
         _ => anyhow::bail!("Unsupported extension for calibration"),

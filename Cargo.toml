@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# LibRaw bindings: safe wrapper crate, links to system libraw
-libraw-rs = "0.0.4"
+# Pure-Rust RAW decoding (replaces LibRaw)
+rawloader = "0.37"
 
 # N-dimensional arrays, used for the image volume
 ndarray = { version = "0.17.2", features = ["rayon"] }
@@ -48,8 +48,3 @@ name = "c41-gui"
 path = "src/bin/c41_gui.rs"
 required-features = ["gui"]
 
-# Use patched libraw-rs-sys for all targets: fixes -pthread / -static flags on MSVC
-# and dllimport issues (C2491) while remaining compatible with Unix builds.
-# Create/refresh vendor/ with: .\scripts\patch-libraw-windows.ps1
-[patch.crates-io]
-libraw-rs-sys = { path = "vendor/libraw-rs-sys" }

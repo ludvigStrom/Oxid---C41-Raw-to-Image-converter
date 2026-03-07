@@ -108,7 +108,7 @@ impl Default for PipelineOptions {
 /// Use for luminance (flat-field) calibration reference.
 pub fn load_flat_field_linear(path: &Path) -> anyhow::Result<Array3<f32>> {
     let bayer = raw_reader::load_raw_as_ndarray(path)?;
-    demosaic::demosaic_edge_aware(&bayer, demosaic::BayerPattern::Rggb)
+    demosaic::demosaic_quality(&bayer, demosaic::BayerPattern::Rggb)
 }
 
 /// Apply a heavy Gaussian blur to a linear RGB flat-field image to remove film grain and dust,
@@ -350,7 +350,7 @@ pub fn process_files(
             // RAW formats handled by LibRaw; we assume a Bayer sensor and RGGB for now.
             "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
                 let bayer = raw_reader::load_raw_as_ndarray(path)?;
-                demosaic::demosaic_edge_aware(&bayer, demosaic::BayerPattern::Rggb)?
+                demosaic::demosaic_quality(&bayer, demosaic::BayerPattern::Rggb)?
             }
             "png" => png_reader::load_png_as_ndarray(path)?,
             _ => continue,
@@ -470,7 +470,7 @@ pub fn process_one_to_preview(
         "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
             let bayer = raw_reader::load_raw_as_ndarray(path)?;
             let small_bayer = downsample_bayer_for_preview(&bayer, max_width);
-            demosaic::demosaic_edge_aware(&small_bayer, demosaic::BayerPattern::Rggb)?
+            demosaic::demosaic_quality(&small_bayer, demosaic::BayerPattern::Rggb)?
         }
         "png" => png_reader::load_png_as_ndarray(path)?,
         _ => anyhow::bail!("Unsupported extension for preview"),

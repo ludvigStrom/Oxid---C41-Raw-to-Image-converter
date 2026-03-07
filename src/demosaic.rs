@@ -2,9 +2,10 @@
 //!
 //! This module provides:
 //! - `demosaic_bilinear`: simple bilinear interpolation (reference / fallback).
-//! - `demosaic_edge_aware`: a lightweight edge-aware variant that preserves grain
-//!   and reduces zippering by adapting green-channel interpolation to local
-//!   gradients (Hamilton–Adams style) while keeping everything strictly linear.
+//! - `demosaic_edge_aware`: edge-aware green (Hamilton–Adams) + bilinear R/B.
+//! - `demosaic_quality`: best-in-class — edge-aware green plus **color-difference**
+//!   (R−G, B−G) interpolation for R and B. Interpolating differences instead of
+//!   raw R/B greatly reduces false color and zippering while preserving detail.
 //!
 //! Sony a7R II uses RGGB (red at top-left of 2×2 Bayer block).
 
@@ -103,6 +104,122 @@ pub fn demosaic_edge_aware(bayer: &Array3<f32>, pattern: BayerPattern) -> Result
     });
 
     Ok(rgb)
+}
+
+/// Best-in-class demosaic for RGGB: edge-aware green plus **color-difference**
+/// (R−G, B−G) interpolation for red and blue.
+///
+/// High-frequency content in R and B is highly correlated with G. Interpolating
+/// (R−G) and (B−G) instead of R and B directly sharply reduces false color and
+/// zippering while preserving detail and grain. For non-RGGB patterns falls back
+/// to `demosaic_edge_aware`.
+pub fn demosaic_quality(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
+    if !matches!(pattern, BayerPattern::Rggb) {
+        return demosaic_edge_aware(bayer, pattern);
+    }
+
+    let (height, width, c) = bayer.dim();
+    if c != 1 {
+        bail!("Demosaic expects (H, W, 1), got channels {}", c);
+    }
+
+    let bayer_2d = bayer.slice(ndarray::s![.., .., 0]);
+    let h = height;
+    let w = width;
+
+    // Pass 1: interpolate green at every pixel (edge-aware), parallel over rows.
+    let mut g_plane = ndarray::Array2::<f32>::zeros((height, width));
+    let g_ptr = g_plane.as_mut_ptr() as usize;
+    (0..height).into_par_iter().for_each(|y| {
+        let ptr = g_ptr as *mut f32;
+        for x in 0..width {
+            let g = sample_channel_edge_aware_rggb_g(&bayer_2d, y, x, h, w);
+            unsafe { *ptr.add(y * width + x) = g };
+        }
+    });
+
+    // Pass 2: at each pixel, interpolate (R-G) and (B-G) from native sites, then R = (R-G)+G, B = (B-G)+G.
+    let mut rgb = Array3::<f32>::zeros((height, width, 3));
+    let ptr_base = rgb.as_mut_ptr() as usize;
+    let g_ptr = g_plane.as_ptr() as usize;
+
+    (0..height).into_par_iter().for_each(|y| {
+        let ptr = ptr_base as *mut f32;
+        let g_base = g_ptr as *const f32;
+        for x in 0..width {
+            let g = unsafe { *g_base.add(y * width + x) };
+            let r_minus_g = interpolate_r_minus_g_rggb(&bayer_2d, &g_plane, y, x, h, w);
+            let b_minus_g = interpolate_b_minus_g_rggb(&bayer_2d, &g_plane, y, x, h, w);
+            let r = r_minus_g + g;
+            let b = b_minus_g + g;
+            let base = y * width * 3 + x * 3;
+            unsafe {
+                *ptr.add(base) = r;
+                *ptr.add(base + 1) = g;
+                *ptr.add(base + 2) = b;
+            }
+        }
+    });
+
+    Ok(rgb)
+}
+
+/// Average of (R - G) at the four nearest R sites (RGGB: even, even).
+#[inline]
+fn interpolate_r_minus_g_rggb(
+    bayer: &ArrayView2<f32>,
+    g_plane: &ndarray::Array2<f32>,
+    y: usize,
+    x: usize,
+    h: usize,
+    w: usize,
+) -> f32 {
+    let yt = (y >> 1) << 1;
+    let xt = (x >> 1) << 1;
+    let mut sum = 0f32;
+    let mut n = 0u32;
+    for dy in [0, 2] {
+        for dx in [0, 2] {
+            let (yy, xx) = clamp(
+                yt as i32 + dy,
+                xt as i32 + dx,
+                h,
+                w,
+            );
+            sum += bayer[[yy, xx]] - g_plane[[yy, xx]];
+            n += 1;
+        }
+    }
+    sum / (n as f32)
+}
+
+/// Average of (B - G) at the four nearest B sites (RGGB: odd, odd).
+#[inline]
+fn interpolate_b_minus_g_rggb(
+    bayer: &ArrayView2<f32>,
+    g_plane: &ndarray::Array2<f32>,
+    y: usize,
+    x: usize,
+    h: usize,
+    w: usize,
+) -> f32 {
+    let base_y = (y >> 1) << 1;
+    let base_x = (x >> 1) << 1;
+    let mut sum = 0f32;
+    let mut n = 0u32;
+    for dy in [1, 3] {
+        for dx in [1, 3] {
+            let (yy, xx) = clamp(
+                base_y as i32 + dy,
+                base_x as i32 + dx,
+                h,
+                w,
+            );
+            sum += bayer[[yy, xx]] - g_plane[[yy, xx]];
+            n += 1;
+        }
+    }
+    sum / (n as f32)
 }
 
 #[derive(Clone, Copy)]
