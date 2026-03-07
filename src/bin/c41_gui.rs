@@ -458,7 +458,7 @@ impl eframe::App for C41Gui {
             .min_height(BOTTOM_PANEL_HEIGHT)
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    ui.add_space(10.0);
+                    ui.add_space(14.0);
                     ui.horizontal(|ui| {
                         if ui.button("Add image…").clicked() {
                             if let Some(paths) = rfd::FileDialog::new()
@@ -489,12 +489,9 @@ impl eframe::App for C41Gui {
                                 self.status = format!("{} file(s)", self.images.len());
                             }
                         }
-
-                        ui.separator();
-
                     });
 
-                    ui.add_space(4.0);
+                    ui.add_space(10.0);
 
                     egui::ScrollArea::horizontal().show(ui, |ui| {
                         let mut to_remove = Vec::new();
@@ -512,7 +509,7 @@ impl eframe::App for C41Gui {
                                 if resp.clicked() {
                                     self.selected_index = Some(i);
                                 }
-                                if ui.small_button("✕").clicked() {
+                                if ui.small_button("X").clicked() {
                                     to_remove.push(i);
                                 }
                             }
@@ -537,7 +534,7 @@ impl eframe::App for C41Gui {
             .resizable(false)
             .exact_width(RIGHT_PANEL_WIDTH)
             .show(ctx, |ui| {
-                ui.add_space(12.0);
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
                     ui.selectable_value(&mut self.mode, UIMode::Process, "Process");
@@ -549,12 +546,21 @@ impl eframe::App for C41Gui {
                     );
                     ui.add_space(10.0);
                 });
-                ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(10.0);
+                // Full-width divider: draw line across entire panel (no side margin)
+                let sep_y = ui.cursor().top() + 1.0;
+                ui.painter().hline(
+                    ui.clip_rect().x_range(),
+                    sep_y,
+                    egui::Stroke::new(1.0, ui.visuals().window_stroke.color),
+                );
+                ui.allocate_space(egui::vec2(ui.available_width(), 4.0));
+                ui.add_space(8.0);
 
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    ui.vertical(|ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.vertical(|ui| {
                 match self.mode {
                     UIMode::Process => {
                         ui.heading("Image Settings");
@@ -566,7 +572,7 @@ impl eframe::App for C41Gui {
                         ui.heading("Luminance calibration");
                     }
                 }
-                ui.add_space(4.0);
+                ui.add_space(10.0);
 
                 let Some(idx) = self.selected_index else {
                     ui.label("No image selected.");
@@ -597,7 +603,7 @@ impl eframe::App for C41Gui {
                     )
                     .strong(),
                 );
-                ui.add_space(4.0);
+                ui.add_space(8.0);
 
                 // D-min, White balance, and Print curve apply only to normal processing.
                 // In Luminance calibration we only load a reference frame (raw → demosaic → blur); no conversion settings.
@@ -800,9 +806,11 @@ impl eframe::App for C41Gui {
                 }
 
                 if self.mode == UIMode::Calibrate {
+                    ui.add_space(12.0);
                     ui.separator();
+                    ui.add_space(8.0);
                     ui.heading("Solve color calibration");
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
 
                     if ui.button("Solve 3×3 matrix from chart").clicked() {
                         let path = entry.path.clone();
@@ -910,8 +918,11 @@ impl eframe::App for C41Gui {
                         }
                     }
 
+                    ui.add_space(12.0);
                     ui.separator();
+                    ui.add_space(8.0);
                     ui.heading("3D LUT");
+                    ui.add_space(4.0);
                     ui.label("Generate a .cube file from the current matrix; apply it in the Process tab.");
                     if ui.button("Generate 3D LUT from current matrix…").clicked() {
                         let matrix = opts.density_matrix;
@@ -1119,9 +1130,11 @@ impl eframe::App for C41Gui {
                     });
                 }
 
+                ui.add_space(12.0);
                 ui.separator();
+                ui.add_space(8.0);
                 ui.heading("Export");
-                ui.add_space(4.0);
+                ui.add_space(8.0);
 
                 // Per-image export options
                 let label = match entry.export_format {
@@ -1212,7 +1225,9 @@ impl eframe::App for C41Gui {
                 ui.add_space(8.0);
 
                 // Global export: output folder + convert all
+                ui.add_space(12.0);
                 ui.separator();
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("Batch export").strong());
 
                 let out_label = self
@@ -1255,7 +1270,8 @@ impl eframe::App for C41Gui {
                     ui.label(egui::RichText::new(&self.status).small());
                 }
                     });
-                    ui.add_space(10.0);
+                    ui.add_space(16.0);
+                });
                 });
             });
 
