@@ -2192,6 +2192,61 @@ impl eframe::App for C41Gui {
                                                 );
                                             }
 
+                                            // Keep D-min visuals above crop dark overlay.
+                                            if opts.apply_dmin
+                                                && opts.dmin_fixed.is_none()
+                                                && self.flat_field_path.is_none()
+                                            {
+                                                if let Some(dmin_rect) = opts.dmin_rect {
+                                                    let dmin_rect = scale_rect_to_size(
+                                                        dmin_rect,
+                                                        opts.dmin_rect_reference_size,
+                                                        input_w,
+                                                        input_h,
+                                                    );
+                                                    let dmin_norm_x =
+                                                        dmin_rect.x as f32 / input_w as f32;
+                                                    let dmin_norm_y =
+                                                        dmin_rect.y as f32 / input_h as f32;
+                                                    let dmin_norm_w =
+                                                        dmin_rect.width as f32 / input_w as f32;
+                                                    let dmin_norm_h =
+                                                        dmin_rect.height as f32 / input_h as f32;
+                                                    let dmin_left = image_rect.left()
+                                                        + dmin_norm_x * image_rect.width();
+                                                    let dmin_top = image_rect.top()
+                                                        + dmin_norm_y * image_rect.height();
+                                                    let dmin_right =
+                                                        dmin_left + dmin_norm_w * image_rect.width();
+                                                    let dmin_bottom =
+                                                        dmin_top + dmin_norm_h * image_rect.height();
+                                                    let dmin_screen_rect = egui::Rect::from_min_max(
+                                                        egui::pos2(dmin_left, dmin_top),
+                                                        egui::pos2(dmin_right, dmin_bottom),
+                                                    );
+                                                    painter.rect_stroke(
+                                                        dmin_screen_rect,
+                                                        0.0,
+                                                        egui::Stroke::new(
+                                                            1.5,
+                                                            egui::Color32::from_rgb(255, 200, 0),
+                                                        ),
+                                                    );
+                                                    for p in [
+                                                        egui::pos2(dmin_left, dmin_top),
+                                                        egui::pos2(dmin_right, dmin_top),
+                                                        egui::pos2(dmin_left, dmin_bottom),
+                                                        egui::pos2(dmin_right, dmin_bottom),
+                                                    ] {
+                                                        painter.circle_filled(
+                                                            p,
+                                                            5.0,
+                                                            egui::Color32::from_rgb(255, 200, 0),
+                                                        );
+                                                    }
+                                                }
+                                            }
+
                                             if rect_changed {
                                                 let img_w = image_rect.width().max(1.0);
                                                 let img_h = image_rect.height().max(1.0);
