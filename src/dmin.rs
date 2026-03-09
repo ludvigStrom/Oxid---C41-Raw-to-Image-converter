@@ -1,6 +1,11 @@
 //! D-min neutralization: sample unexposed film border and divide image by median R, G, B.
 //!
 //! Purely linear: each channel is divided by its median in the crop region.
+//!
+//! When the film base (orange mask) is sampled, med_r > med_g > med_b. Dividing by (med_r, med_g, med_b)
+//! makes the base neutral (1,1,1) but can introduce a blue/green cast in the rest of the image. Use
+//! `neutral_only: true` to divide all channels by the same value (geometric mean of medians), which
+//! removes density without shifting color.
 
 use anyhow::{bail, Result};
 
@@ -21,6 +26,8 @@ fn median_f32(slice: &[f32]) -> f32 {
 
 /// Neutralize D-min in-place: sample the crop region (x, y, width, height), compute median R/G/B, divide the whole image by those values.
 ///
+/// If `neutral_only` is true, all channels are divided by the same value (geometric mean of medians)
+/// so density is removed without changing the base color (avoids blue/green cast when base is orange).
 /// If any median is 0, that channel is left unchanged (divide by 1.0) to avoid NaNs.
 /// The rect is clamped to the image bounds; at least one pixel must remain in the crop.
 pub fn neutralize(
@@ -29,6 +36,7 @@ pub fn neutralize(
     y: u32,
     width: u32,
     height: u32,
+    neutral_only: bool,
 ) -> Result<()> {
     let (h, w, _c) = image.dim();
     if _c != 3 {
@@ -76,14 +84,15 @@ pub fn neutralize(
     let med_r = median_f32(&r_vals);
     let med_g = median_f32(&g_vals);
     let med_b = median_f32(&b_vals);
-/*
-    // Print D-min medians so they can be measured once and hard-coded later if desired.
-    println!(
-        "D-min medians (linear [0,1]): R={:.6} G={:.6} B={:.6}",
-        med_r, med_g, med_b
-    );*/
 
-    neutralize_with_medians(image, med_r, med_g, med_b)
+    if neutral_only {
+        // Single divisor (geometric mean) so we remove density without shifting color.
+        let g = (med_r * med_g * med_b).max(0.0).cbrt();
+        let k = if g > 0.0 { g } else { 1.0 };
+        neutralize_with_medians(image, k, k, k)
+    } else {
+        neutralize_with_medians(image, med_r, med_g, med_b)
+    }
 }
 
 /// Neutralize D-min using fixed medians (e.g. previously measured once).

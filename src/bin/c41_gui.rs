@@ -30,7 +30,7 @@ use eframe::egui;
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
 const THUMB_MAX_SIZE: u32 = 64;
-const BOTTOM_PANEL_HEIGHT: f32 = 120.0;
+const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
 
 fn main() -> eframe::Result<()> {
@@ -72,6 +72,8 @@ struct ImageEntry {
     // Per-channel histograms (R, G, B) over 0–255
     histogram: Option<([u32; 256], [u32; 256], [u32; 256])>,
     export_format: ExportFormat,
+    /// Rawloader debug report for this file (Debug tab).
+    raw_debug_report: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +91,7 @@ enum UIMode {
     Process,
     Calibrate,
     LuminanceCalibrate,
+    Debug,
 }
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
@@ -178,10 +181,9 @@ fn load_linear_transmittance_for_calibration(
         .unwrap_or_default();
 
     let mut image = match ext.as_str() {
-        // RAW formats handled by LibRaw; assume Bayer sensor and RGGB.
         "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
-            let bayer = raw_reader::load_raw_as_ndarray(path)?;
-            demosaic::demosaic_quality(&bayer, demosaic::BayerPattern::Rggb)?
+            let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
+            demosaic::demosaic_quality(&bayer, pattern)?
         }
         "png" => png_reader::load_png_as_ndarray(path)?,
         _ => anyhow::bail!("Unsupported extension for calibration"),
@@ -190,7 +192,14 @@ fn load_linear_transmittance_for_calibration(
     if let Some((r, g, b)) = opts.dmin_fixed {
         dmin::neutralize_with_medians(&mut image, r, g, b)?;
     } else if let Some(rect) = opts.dmin_rect {
-        dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+        dmin::neutralize(
+            &mut image,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            opts.dmin_neutral_only,
+        )?;
     }
 
     Ok(image)
@@ -282,7 +291,9 @@ fn default_options() -> PipelineOptions {
         apply_dmin: true,
         apply_white_balance: true,
         dmin_rect: None,
+        dmin_rect_reference_size: None,
         dmin_fixed: Some((0.635294, 0.635294, 0.623529)),
+        dmin_neutral_only: true,
         format: TiffFormat::Float32,
         write_exr: false,
         write_jpeg: false,
@@ -292,6 +303,7 @@ fn default_options() -> PipelineOptions {
         wb_r: 1.15,
         wb_g: 0.88,
         wb_b: 1.0,
+        temp_k: None,
         curve_offset: 0.0,
         curve_gamma: 2.5,
         curve_pivot: 3.0,
@@ -308,6 +320,8 @@ fn default_options() -> PipelineOptions {
         write_aces2065_only: false,
         lut3d_path: None,
         rotation_degrees: 0,
+        debug_pipeline_step: 6,
+        debug_preview_simple_debayer: false,
     }
 }
 
@@ -318,12 +332,14 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.apply_white_balance.hash(&mut h);
     opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
+    opts.dmin_neutral_only.hash(&mut h);
     if let Some((r, g, b)) = opts.dmin_fixed {
         r.to_bits().hash(&mut h);
         g.to_bits().hash(&mut h);
         b.to_bits().hash(&mut h);
     }
     (opts.wb_r.to_bits(), opts.wb_g.to_bits(), opts.wb_b.to_bits()).hash(&mut h);
+    opts.temp_k.map(|k| k.to_bits()).hash(&mut h);
     opts.no_curve.hash(&mut h);
     opts.no_invert.hash(&mut h);
     opts.curve_offset.to_bits().hash(&mut h);
@@ -349,6 +365,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     }
     opts.lut3d_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
+    opts.debug_pipeline_step.hash(&mut h);
+    opts.debug_preview_simple_debayer.hash(&mut h);
     h.finish()
 }
 
@@ -386,6 +404,7 @@ impl eframe::App for C41Gui {
         style.visuals.panel_fill = egui::Color32::from_gray(30);
         style.visuals.override_text_color = Some(egui::Color32::from_gray(240));
         style.visuals.selection.bg_fill = egui::Color32::from_gray(70); // selected tabs/items: gray instead of blue
+        style.spacing.button_padding = egui::vec2(10.0, 4.0); // extra left/right and top/bottom around button text
         ctx.set_style(style);
 
         // Poll preview worker
@@ -421,6 +440,10 @@ impl eframe::App for C41Gui {
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_hash = hash;
                         self.images[idx].preview_input_size = Some([input_w, input_h]);
+                        if self.images[idx].options.dmin_rect.is_some() {
+                            self.images[idx].options.dmin_rect_reference_size =
+                                Some((input_w, input_h));
+                        }
                         self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
                     }
                 }
@@ -535,6 +558,7 @@ impl eframe::App for C41Gui {
                                             thumbnail_texture: None,
                                             histogram: None,
                                             export_format: ExportFormat::Tiff16,
+                                            raw_debug_report: None,
                                         });
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);
@@ -549,35 +573,103 @@ impl eframe::App for C41Gui {
                     ui.add_space(10.0);
 
                     let mut to_remove = Vec::new();
+                    const CARD_WIDTH: f32 = 88.0;
+                    const CARD_HEIGHT: f32 = 96.0; // more space in bottom panel
+                    const THUMB_SIZE: f32 = 44.0;
+                    const NAME_MAX_CHARS: usize = 10;
+                    const X_BUTTON_SIZE: f32 = 22.0;
+                    const CARD_PADDING: f32 = 4.0;
+
                     egui::ScrollArea::horizontal().show(ui, |ui| {
                         ui.horizontal(|ui| {
                             for (i, entry) in self.images.iter().enumerate() {
-                                ui.vertical(|ui| {
-                                    let thumb_size = 48.0;
-                                    if let Some(ref thumb) = entry.thumbnail_texture {
-                                        let size = thumb.size();
-                                        let (w, h) = (size[0] as f32, size[1] as f32);
-                                        let scale = (thumb_size / w).min(thumb_size / h).min(1.0);
-                                        ui.image((thumb.id(), egui::vec2(w * scale, h * scale)));
-                                    } else {
-                                        ui.allocate_space(egui::vec2(thumb_size, thumb_size));
-                                    }
-                                    let name = entry
-                                        .path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("?");
-                                    let selected = self.selected_index == Some(i);
-                                    let resp = ui
-                                        .selectable_label(selected, name)
-                                        .on_hover_text(entry.path.display().to_string());
-                                    if resp.clicked() {
-                                        self.selected_index = Some(i);
-                                    }
-                                    if ui.small_button("X").clicked() {
-                                        to_remove.push(i);
-                                    }
-                                });
+                                let name = entry
+                                    .path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("?");
+                                let display_name = if name.chars().count() > NAME_MAX_CHARS {
+                                    format!(
+                                        "{}...",
+                                        name.chars().take(NAME_MAX_CHARS).collect::<String>()
+                                    )
+                                } else {
+                                    name.to_string()
+                                };
+                                let selected = self.selected_index == Some(i);
+
+                                let card_response = ui.allocate_ui(
+                                    egui::vec2(CARD_WIDTH, CARD_HEIGHT),
+                                    |ui| {
+                                        let card_rect = ui.available_rect_before_wrap();
+                                        let id = ui.make_persistent_id(("strip_card", i));
+                                        let interact_resp =
+                                            ui.interact(card_rect, id, egui::Sense::click());
+
+                                        // Card background and border (drawn first so content is on top)
+                                        let stroke = if selected {
+                                            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255))
+                                        } else if interact_resp.hovered() {
+                                            egui::Stroke::new(1.0, egui::Color32::from_gray(120))
+                                        } else {
+                                            egui::Stroke::new(1.0, egui::Color32::from_gray(70))
+                                        };
+                                        ui.painter().rect_filled(
+                                            card_rect,
+                                            4.0,
+                                            egui::Color32::from_gray(45),
+                                        );
+                                        ui.painter().rect_stroke(card_rect, 4.0, stroke);
+
+                                        // X button fixed in top-right corner of card
+                                        let x_rect = egui::Rect::from_min_size(
+                                            egui::pos2(
+                                                card_rect.right() - X_BUTTON_SIZE - CARD_PADDING,
+                                                card_rect.top() + CARD_PADDING,
+                                            ),
+                                            egui::vec2(X_BUTTON_SIZE, X_BUTTON_SIZE),
+                                        );
+                                        let x_clicked = ui
+                                            .allocate_new_ui(egui::UiBuilder::new().max_rect(x_rect), |ui| ui.small_button("X").clicked())
+                                            .inner;
+
+                                        // Content area: thumbnail + name, clipped to card (below X row)
+                                        let content_top = card_rect.top() + CARD_PADDING + X_BUTTON_SIZE + 2.0;
+                                        let content_rect = egui::Rect::from_min_max(
+                                            egui::pos2(card_rect.left() + CARD_PADDING, content_top),
+                                            egui::pos2(card_rect.right() - CARD_PADDING, card_rect.bottom() - CARD_PADDING),
+                                        );
+                                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
+                                            ui.set_clip_rect(card_rect);
+                                            ui.vertical_centered(|ui| {
+                                                if let Some(ref thumb) = entry.thumbnail_texture {
+                                                    let size = thumb.size();
+                                                    let (w, h) = (size[0] as f32, size[1] as f32);
+                                                    let scale =
+                                                        (THUMB_SIZE / w).min(THUMB_SIZE / h).min(1.0);
+                                                    ui.image((thumb.id(), egui::vec2(w * scale, h * scale)));
+                                                } else {
+                                                    ui.allocate_space(egui::vec2(THUMB_SIZE, THUMB_SIZE));
+                                                }
+                                                ui.add_space(2.0);
+                                                ui.label(
+                                                    egui::RichText::new(&display_name).small(),
+                                                )
+                                                .on_hover_text(entry.path.display().to_string());
+                                            });
+                                        });
+
+                                        (interact_resp, x_clicked)
+                                    },
+                                );
+
+                                let (interact_resp, x_clicked) = card_response.inner;
+
+                                if x_clicked {
+                                    to_remove.push(i);
+                                } else if interact_resp.clicked() {
+                                    self.selected_index = Some(i);
+                                }
                             }
                         });
                     });
@@ -619,6 +711,7 @@ impl eframe::App for C41Gui {
                         UIMode::LuminanceCalibrate,
                         "Capture flat field",
                     );
+                    ui.selectable_value(&mut self.mode, UIMode::Debug, "Debug");
                     ui.add_space(10.0);
                 });
                 ui.add_space(10.0);
@@ -645,6 +738,9 @@ impl eframe::App for C41Gui {
                     }
                     UIMode::LuminanceCalibrate => {
                         ui.heading("Capture flat field");
+                    }
+                    UIMode::Debug => {
+                        ui.heading("Debug");
                     }
                 }
                 ui.add_space(10.0);
@@ -680,9 +776,99 @@ impl eframe::App for C41Gui {
                 );
                 ui.add_space(8.0);
 
-                // D-min, White balance, and Print curve apply only to normal processing.
-                // In Luminance calibration we only load a reference frame (raw → demosaic → blur); no conversion settings.
-                if self.mode != UIMode::LuminanceCalibrate {
+                if self.mode == UIMode::Debug {
+                    ui.label("Pipeline step (1–6). Preview shows output up to this step.");
+                    ui.add(egui::Slider::new(&mut opts.debug_pipeline_step, 1..=6).text("Step"));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(if opts.debug_preview_simple_debayer {
+                                "Use full pipeline preview"
+                            } else {
+                                "Use simple debayer preview"
+                            })
+                            .clicked()
+                        {
+                            opts.debug_preview_simple_debayer = !opts.debug_preview_simple_debayer;
+                        }
+                        if opts.debug_preview_simple_debayer {
+                            ui.label(
+                                egui::RichText::new("simple RAW bilinear debayer mode ON")
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("1: load+demosaic+rot · 3: +D-min · 4: +WB · 6: full (curve/invert)")
+                            .small(),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Steps 2 and 5 are no-ops (display path is camera RGB only).")
+                            .small(),
+                    );
+                    ui.separator();
+                    ui.label(egui::RichText::new("Rawloader report").strong());
+                    let ext = entry
+                        .path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    let is_raw = matches!(
+                        ext.as_str(),
+                        "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2"
+                    );
+                    if is_raw {
+                        ui.horizontal(|ui| {
+                            if ui.button("Run rawloader debug for selected file").clicked() {
+                                match raw_reader::debug_raw_report(&entry.path) {
+                                    Ok(report) => {
+                                        entry.raw_debug_report = Some(report);
+                                    }
+                                    Err(e) => {
+                                        entry.raw_debug_report = Some(format!(
+                                            "Failed to decode raw file:\n{}",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
+                            if ui.button("Copy report").clicked() {
+                                if let Some(report) = entry.raw_debug_report.as_ref() {
+                                    ui.ctx().copy_text(report.clone());
+                                }
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Selected file is not a RAW format.")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    if let Some(report) = entry.raw_debug_report.as_ref() {
+                        egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+                            let mut report_text = report.clone();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut report_text)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace)
+                                    .interactive(false),
+                            );
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("No raw report yet. Click the button above.")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                } else if self.mode != UIMode::LuminanceCalibrate {
+                    // D-min, White balance, and Print curve apply only to normal processing.
                     ui.checkbox(&mut opts.apply_dmin, "D-min");
                     if opts.apply_dmin {
                     ui.collapsing("D-min settings", |ui| {
@@ -704,6 +890,7 @@ impl eframe::App for C41Gui {
                             });
                             opts.dmin_fixed = Some((r, g, b));
                             opts.dmin_rect = None;
+                            opts.dmin_rect_reference_size = None;
                         } else {
                             if opts.dmin_rect.is_none() {
                                 opts.dmin_rect = Some(Rect {
@@ -721,6 +908,13 @@ impl eframe::App for C41Gui {
                                     ui.add(egui::DragValue::new(&mut rect.width).speed(1));
                                     ui.add(egui::DragValue::new(&mut rect.height).speed(1));
                                 });
+                                ui.checkbox(
+                                    &mut opts.dmin_neutral_only,
+                                    "Neutral only (recommended — avoids teal/cyan cast from orange base)",
+                                );
+                                if !opts.dmin_neutral_only {
+                                    ui.label(egui::RichText::new("Off = make base white but image will have strong teal cast.").small().weak());
+                                }
                             }
                             opts.dmin_fixed = None;
                         }
@@ -745,6 +939,7 @@ impl eframe::App for C41Gui {
                                     // When flat-field is active, disable per-image D-min.
                                     opts.dmin_fixed = None;
                                     opts.dmin_rect = None;
+                                    opts.dmin_rect_reference_size = None;
                                     self.status = format!(
                                         "Using flat-field map from {} (overrides D-min).",
                                         path.display()
@@ -756,6 +951,7 @@ impl eframe::App for C41Gui {
                                 && ui.button("Clear flat-field override").clicked()
                             {
                                 self.flat_field_path = None;
+                                opts.dmin_rect_reference_size = None;
                                 self.status =
                                     "Flat-field override cleared; D-min settings are active again."
                                         .to_string();
@@ -774,6 +970,15 @@ impl eframe::App for C41Gui {
                     ui.checkbox(&mut opts.apply_white_balance, "White balance");
                     if opts.apply_white_balance {
                     ui.collapsing("White balance settings", |ui| {
+                        let mut use_temp = opts.temp_k.is_some();
+                        ui.checkbox(&mut use_temp, "Use color temperature (K)");
+                        if use_temp {
+                            let mut k = opts.temp_k.unwrap_or(5500.0);
+                            ui.add(egui::Slider::new(&mut k, 2000.0..=12000.0).suffix(" K"));
+                            opts.temp_k = Some(k);
+                        } else {
+                            opts.temp_k = None;
+                        }
                         ui.horizontal(|ui| {
                             ui.label("R");
                             ui.add(egui::Slider::new(&mut opts.wb_r, 0.5..=2.0));
@@ -1060,6 +1265,7 @@ impl eframe::App for C41Gui {
                             if let Some(dmin) = profile.dmin_medians {
                                 opts.dmin_fixed = Some(dmin);
                                 opts.dmin_rect = None;
+                                opts.dmin_rect_reference_size = None;
                             }
                             opts.lut3d_path = lut_path;
                             self.status = format!(
@@ -1366,7 +1572,12 @@ impl eframe::App for C41Gui {
                         let size = tex.size();
                         let (w, h) = (size[0] as f32, size[1] as f32);
                         let available = ui.available_rect_before_wrap();
-                        let area_for_image = available.height() - 80.0; // leave room for histogram
+                        const CONTROL_ROW_HEIGHT: f32 = 28.0;
+                        const HISTOGRAM_HEIGHT: f32 = 72.0;
+                        const BOTTOM_PADDING: f32 = 8.0;
+                        const IMAGE_PREVIEW_BOTTOM_PADDING: f32 = 16.0; // padding below the image
+                        let reserved_bottom = IMAGE_PREVIEW_BOTTOM_PADDING + CONTROL_ROW_HEIGHT + BOTTOM_PADDING + HISTOGRAM_HEIGHT + BOTTOM_PADDING;
+                        let area_for_image = (available.height() - reserved_bottom).max(60.0);
                         let scale = (available.width() / w).min(area_for_image / h).min(1.0);
                         let display_size = egui::vec2(w * scale, h * scale);
                         let margin_x = (available.width() - display_size.x) / 2.0;
@@ -1377,6 +1588,7 @@ impl eframe::App for C41Gui {
                             ui.image((tex.id(), display_size))
                         }).inner;
                         let image_rect = image_resp.rect;
+                        ui.add_space(IMAGE_PREVIEW_BOTTOM_PADDING);
 
                         // In Calibrate mode, draw and allow interaction with the
                         // 4-point overlay and the interpolated 24 patch boxes.
@@ -1521,9 +1733,17 @@ impl eframe::App for C41Gui {
                             }
                         }
 
-                        // Rotate left / right buttons under the image, lower right, before histogram
-                        ui.add_space(6.0);
+                        // Row under the image: full filename (left, truncated) + Rotate left/right (right)
+                        ui.add_space(BOTTOM_PADDING);
                         ui.horizontal(|ui| {
+                            let full_name = self.images[idx].path.display().to_string();
+                            let max_filename_w = (ui.available_width() - 220.0).max(80.0); // leave room for rotate buttons
+                            ui.allocate_ui(egui::vec2(max_filename_w, CONTROL_ROW_HEIGHT), |ui| {
+                                ui.label(
+                                    egui::RichText::new(full_name).small().color(egui::Color32::from_gray(200)),
+                                )
+                                .on_hover_text(self.images[idx].path.display().to_string());
+                            });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("Rotate right").clicked() {
                                     let entry = &mut self.images[idx];
@@ -1539,16 +1759,15 @@ impl eframe::App for C41Gui {
                                 }
                             });
                         });
-                        ui.add_space(8.0);
+                        ui.add_space(BOTTOM_PADDING);
                         if let Some((r_hist, g_hist, b_hist)) = &self.images[idx].histogram {
-                            // Histogram aligned to bottom of the central panel.
-                            let available = ui.available_rect_before_wrap();
-                            let h_hist = 72.0;
-                            let rect = egui::Rect::from_min_max(
-                                egui::pos2(available.left(), available.bottom() - h_hist),
-                                egui::pos2(available.right(), available.bottom()),
+                            const H_HIST: f32 = 72.0;
+                            let (hist_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), H_HIST),
+                                egui::Sense::hover(),
                             );
-                            let painter = ui.painter_at(rect);
+                            let painter = ui.painter_at(hist_rect);
+                            let rect = hist_rect;
 
                             let max_r = r_hist.iter().copied().max().unwrap_or(1) as f32;
                             let max_g = g_hist.iter().copied().max().unwrap_or(1) as f32;

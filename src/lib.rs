@@ -40,7 +40,11 @@ pub struct PipelineOptions {
     /// When false, white balance gains are not applied.
     pub apply_white_balance: bool,
     pub dmin_rect: Option<Rect>,
+    /// When set, the rect is in pixels for this (width, height). Used to scale rect when exporting at full size.
+    pub dmin_rect_reference_size: Option<(u32, u32)>,
     pub dmin_fixed: Option<(f32, f32, f32)>,
+    /// When true and using rect, divide all channels by the same value (geometric mean of medians) to remove density without shifting color.
+    pub dmin_neutral_only: bool,
     pub format: TiffFormat,
     pub write_exr: bool,
     pub write_jpeg: bool,
@@ -51,6 +55,8 @@ pub struct PipelineOptions {
     pub wb_r: f32,
     pub wb_g: f32,
     pub wb_b: f32,
+    /// When set, multiply WB by gains derived from this color temperature (K). e.g. 5500 = daylight, 3000 = tungsten.
+    pub temp_k: Option<f32>,
     pub curve_offset: f32,
     pub curve_gamma: f32,
     pub curve_pivot: f32,
@@ -71,6 +77,11 @@ pub struct PipelineOptions {
     pub lut3d_path: Option<PathBuf>,
     /// Output rotation in degrees: 0, 90, 180, or 270 (applied after load/demosaic).
     pub rotation_degrees: i32,
+    /// Debug: only run pipeline up to this step (1..=6). Preview and export use this. See TODO_DEBUG.md.
+    pub debug_pipeline_step: u32,
+    /// Debug preview mode: for RAW files, show only a simple bilinear demosaic
+    /// (plus optional rotation) and skip the rest of the pipeline.
+    pub debug_preview_simple_debayer: bool,
 }
 
 impl Default for PipelineOptions {
@@ -79,7 +90,9 @@ impl Default for PipelineOptions {
             apply_dmin: true,
             apply_white_balance: true,
             dmin_rect: None,
+            dmin_rect_reference_size: None,
             dmin_fixed: None,
+            dmin_neutral_only: true,
             format: TiffFormat::Float32,
             write_exr: false,
             write_jpeg: false,
@@ -89,6 +102,7 @@ impl Default for PipelineOptions {
             wb_r: 1.0,
             wb_g: 1.0,
             wb_b: 1.0,
+            temp_k: None,
             curve_offset: 0.0,
             curve_gamma: 2.5,
             curve_pivot: 3.0,
@@ -105,6 +119,8 @@ impl Default for PipelineOptions {
             write_aces2065_only: false,
             lut3d_path: None,
             rotation_degrees: 0,
+            debug_pipeline_step: 6,
+            debug_preview_simple_debayer: false,
         }
     }
 }
@@ -113,8 +129,8 @@ impl Default for PipelineOptions {
 /// Returns linear RGB transmittance as `Array3<f32>` (H, W, 3). No D-min, no curve.
 /// Use for luminance (flat-field) calibration reference.
 pub fn load_flat_field_linear(path: &Path) -> anyhow::Result<Array3<f32>> {
-    let bayer = raw_reader::load_raw_as_ndarray(path)?;
-    demosaic::demosaic_quality(&bayer, demosaic::BayerPattern::Rggb)
+    let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
+    demosaic::demosaic_quality(&bayer, pattern)
 }
 
 /// Build a 1D Gaussian kernel (odd length, normalized). Sigma in pixels.
@@ -262,6 +278,57 @@ fn resize_flat_field(flat: &Array3<f32>, height: usize, width: usize) -> Array3<
     out
 }
 
+/// Black-body temperature (K) to white-balance gains (R, G, B). 5500 K ≈ (1, 1, 1). Lower K = warm light → gains correct toward cool.
+fn temp_k_to_wb_gains(temp_k: f32) -> (f32, f32, f32) {
+    let t = (temp_k / 100.0).clamp(1.0, 400.0);
+    let (r, g, b) = if t <= 66.0 {
+        let g = 99.4708025861 * t.ln() - 161.1195681661;
+        let b = if t > 19.0 {
+            138.5177312231 * (t - 10.0).ln() - 305.0447927307
+        } else {
+            0.0
+        };
+        (255.0, g.clamp(0.0, 255.0), b.clamp(0.0, 255.0))
+    } else {
+        let r = 329.698727446 * (t - 60.0).powf(-0.1332047592);
+        let g = 288.1221695283 * (t - 60.0).powf(-0.0755148492);
+        (r.clamp(0.0, 255.0), g.clamp(0.0, 255.0), 255.0)
+    };
+    let r = r.max(1.0);
+    let g = g.max(1.0);
+    let b = b.max(1.0);
+    let gain_r = 255.0 / r;
+    let gain_g = 255.0 / g;
+    let gain_b = 255.0 / b;
+    let geom = (gain_r * gain_g * gain_b).cbrt();
+    (gain_r / geom, gain_g / geom, gain_b / geom)
+}
+
+/// Scale D-min rect from reference size to current image size. If reference is None or matches current size, returns rect as-is.
+fn scale_dmin_rect(
+    rect: Rect,
+    reference_size: Option<(u32, u32)>,
+    current_w: u32,
+    current_h: u32,
+) -> (u32, u32, u32, u32) {
+    let (x, y, rw, rh) = (rect.x, rect.y, rect.width, rect.height);
+    match reference_size {
+        None => (x, y, rw, rh),
+        Some((ref_w, ref_h)) if ref_w == current_w && ref_h == current_h => (x, y, rw, rh),
+        Some((ref_w, ref_h)) if ref_w > 0 && ref_h > 0 => {
+            let sx = current_w as f32 / ref_w as f32;
+            let sy = current_h as f32 / ref_h as f32;
+            (
+                (x as f32 * sx).round() as u32,
+                (y as f32 * sy).round() as u32,
+                (rw as f32 * sx).round().max(1.0) as u32,
+                (rh as f32 * sy).round().max(1.0) as u32,
+            )
+        }
+        _ => (x, y, rw, rh),
+    }
+}
+
 /// Apply pixel-by-pixel flat-field division:
 /// T_out(x, y) = T_in(x, y) / T_flat_blurred(x, y), with safe division.
 fn apply_flat_field_division(image: &mut Array3<f32>, flat_blurred: &Array3<f32>) {
@@ -366,36 +433,35 @@ pub fn process_files(
         .as_ref()
         .and_then(|p| lut3d::read_cube(p).ok());
 
+    // Display path stays in camera RGB (no ACES). Curve uses camera-space density matrix.
+    // When white balance is off, use identity matrix so the profile (calibrated for WB'd data) doesn't collapse color to B&W.
     let curve_pipeline = (!options.no_curve).then(|| {
         let params = curve::PrintCurveParams {
             offset: options.curve_offset,
             gamma: options.curve_gamma,
             pivot: options.curve_pivot,
         };
-        let base = if options.apply_color_profile {
+        let identity = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let m = if options.apply_color_profile && options.apply_white_balance {
             options.density_matrix
         } else {
-            [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ]
+            identity
         };
-        let m = aces::convert_density_matrix_to_acescg(base, &options.idt_matrix);
         let matrix = curve::DensityMatrix { m };
         curve::CurvePipeline::new(params, matrix, 4.0, true, lut3d.clone())
     });
 
-    // Optional flat-field: load map once, convert with IDT so division is in ACEScg.
-    let mut flat_field_map: Option<Array3<f32>> =
+    // Optional flat-field: keep in camera RGB to match main image (no IDT).
+    let flat_field_map: Option<Array3<f32>> =
         if let Some(ref flat_path) = options.flat_field_path {
             Some(load_flat_field_map(flat_path)?)
         } else {
             None
         };
-    if let Some(ref mut flat) = flat_field_map {
-        aces::apply_idt(flat, &options.idt_matrix);
-    }
 
     for path in paths {
         let ext = path
@@ -405,10 +471,9 @@ pub fn process_files(
             .unwrap_or_default();
 
         let mut image = match ext.as_str() {
-            // RAW formats handled by LibRaw; we assume a Bayer sensor and RGGB for now.
             "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
-                let bayer = raw_reader::load_raw_as_ndarray(path)?;
-                demosaic::demosaic_quality(&bayer, demosaic::BayerPattern::Rggb)?
+                let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
+                demosaic::demosaic_quality(&bayer, pattern)?
             }
             "png" => png_reader::load_png_as_ndarray(path)?,
             _ => continue,
@@ -418,27 +483,51 @@ pub fn process_files(
             image = apply_rotation(&image, options.rotation_degrees);
         }
 
-        // IDT: linear camera RGB → ACEScg (identity or camera profile).
-        aces::apply_idt(&mut image, &options.idt_matrix);
+        // Display path: no IDT (keep camera RGB). IDT is only applied when exporting ACES2065-1 below.
 
         // Step 3: D-min / flat-field (skipped if apply_dmin is false).
-        if options.apply_dmin {
+        if options.debug_pipeline_step >= 3 && options.apply_dmin {
             if let Some(ref flat) = flat_field_map {
                 apply_flat_field_division(&mut image, flat);
             } else if let Some((r, g, b)) = options.dmin_fixed {
                 dmin::neutralize_with_medians(&mut image, r, g, b)?;
             } else if let Some(rect) = options.dmin_rect {
-                dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+                let (h, w, _) = image.dim();
+                let (x, y, rw, rh) = scale_dmin_rect(
+                    rect,
+                    options.dmin_rect_reference_size,
+                    w as u32,
+                    h as u32,
+                );
+                dmin::neutralize(
+                    &mut image,
+                    x,
+                    y,
+                    rw,
+                    rh,
+                    options.dmin_neutral_only,
+                )?;
             }
         }
 
-        // White balance (skipped if apply_white_balance is false).
-        if options.apply_white_balance
-            && (options.wb_r != 1.0 || options.wb_g != 1.0 || options.wb_b != 1.0)
-        {
-            image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * options.wb_r);
-            image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * options.wb_g);
-            image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * options.wb_b);
+        // Step 4: White balance (R,G,B gains and optional color temperature).
+        if options.debug_pipeline_step >= 4 {
+            let (mut wb_r, mut wb_g, mut wb_b) = if options.apply_white_balance {
+                (options.wb_r, options.wb_g, options.wb_b)
+            } else {
+                (1.0, 1.0, 1.0)
+            };
+            if let Some(k) = options.temp_k {
+                let (tr, tg, tb) = temp_k_to_wb_gains(k);
+                wb_r *= tr;
+                wb_g *= tg;
+                wb_b *= tb;
+            }
+            if wb_r != 1.0 || wb_g != 1.0 || wb_b != 1.0 {
+                image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * wb_r);
+                image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * wb_g);
+                image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * wb_b);
+            }
         }
 
         let stem = path
@@ -450,48 +539,71 @@ pub fn process_files(
         let exr_path = output_dir.join(format!("{}.exr", stem));
         let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
 
-        // ACES2065-1 only: write just the EXR (32-bit float) and skip display output.
+        // ACES2065-1 only: apply IDT (camera → ACEScg) then convert to ACES2065-1. Display path never uses ACES.
         if options.write_aces2065_only {
             let mut aces2065 = image.clone();
+            aces::apply_idt(&mut aces2065, &options.idt_matrix);
             aces::linear_acescg_to_aces2065_1(&mut aces2065);
             exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
             continue;
         }
 
-        // Optional ACES2065-1 alongside display output.
         if options.export_aces_exr {
             let mut aces2065 = image.clone();
+            aces::apply_idt(&mut aces2065, &options.idt_matrix);
             aces::linear_acescg_to_aces2065_1(&mut aces2065);
             exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
         }
 
         let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
 
-        if let Some(ref pipeline) = curve_pipeline {
-            let mut image_u16 =
-                curve::apply_curve_pipeline(&image, pipeline, options.curve_white, true);
-            aces::convert_u16_linear_acescg_to_linear_srgb(&mut image_u16);
-            if !options.write_jpeg_only {
-                tiff_export::write_tiff_u16(&image_u16, &out_path)?;
-            }
-            if options.write_exr {
-                exr_export::write_exr_u16(&image_u16, &exr_path)?;
-            }
-            if write_jpeg_this {
-                let (height, width, _) = image_u16.dim();
-                let mut buf = Vec::with_capacity(height * width * 3);
-                for chunk in image_u16.iter() {
-                    buf.push((*chunk >> 8) as u8);
+        // No ACEScg→sRGB: display path stays in camera RGB (avoids teal cast from out-of-gamut conversion).
+
+        // Step 6: curve or density inversion; else output linear (clamped).
+        if options.debug_pipeline_step >= 6 {
+            if let Some(ref pipeline) = curve_pipeline {
+                let image_u16 =
+                    curve::apply_curve_pipeline(&image, pipeline, options.curve_white, true);
+                if !options.write_jpeg_only {
+                    tiff_export::write_tiff_u16(&image_u16, &out_path)?;
                 }
-                let img = RgbImage::from_raw(width as u32, height as u32, buf)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                img.save(&jpg_path)?;
+                if options.write_exr {
+                    exr_export::write_exr_u16(&image_u16, &exr_path)?;
+                }
+                if write_jpeg_this {
+                    let (height, width, _) = image_u16.dim();
+                    let mut buf = Vec::with_capacity(height * width * 3);
+                    for chunk in image_u16.iter() {
+                        buf.push((*chunk >> 8) as u8);
+                    }
+                    let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                    img.save(&jpg_path)?;
+                }
+            } else {
+                if !options.no_invert {
+                    inversion::invert_density(&mut image);
+                }
+                if !options.write_jpeg_only {
+                    tiff_export::write_tiff(&image, &out_path, options.format)?;
+                }
+                if options.write_exr {
+                    exr_export::write_exr_f32(&image, &exr_path)?;
+                }
+                if write_jpeg_this {
+                    let (height, width, _) = image.dim();
+                    let mut buf = Vec::with_capacity(height * width * 3);
+                    for v in image.iter() {
+                        let x = v.clamp(0.0, 1.0);
+                        buf.push((x * 255.0).round() as u8);
+                    }
+                    let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                    img.save(&jpg_path)?;
+                }
             }
         } else {
-            aces::linear_acescg_to_linear_srgb(&mut image);
-            if !options.no_invert {
-                inversion::invert(&mut image);
-            }
+            // Steps 1–5: output linear image (clamped 0..1).
             if !options.write_jpeg_only {
                 tiff_export::write_tiff(&image, &out_path, options.format)?;
             }
@@ -516,8 +628,7 @@ pub fn process_files(
 }
 
 /// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
-/// IDT (camera → ACEScg) → D-min/flat-field → WB → curve (density matrix in ACEScg) or no-curve;
-/// display output is converted to sRGB.
+/// D-min/flat-field → WB → curve or no-curve. Display path stays in camera RGB (no IDT/ACES).
 pub fn process_one_to_preview(
     path: &Path,
     options: &PipelineOptions,
@@ -532,9 +643,13 @@ pub fn process_one_to_preview(
 
     let mut image = match ext.as_str() {
         "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
-            let bayer = raw_reader::load_raw_as_ndarray(path)?;
+            let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
             let small_bayer = downsample_bayer_for_preview(&bayer, max_width);
-            demosaic::demosaic_quality(&small_bayer, demosaic::BayerPattern::Rggb)?
+            if options.debug_preview_simple_debayer {
+                demosaic::demosaic_bilinear(&small_bayer, pattern)?
+            } else {
+                demosaic::demosaic_quality(&small_bayer, pattern)?
+            }
         }
         "png" => png_reader::load_png_as_ndarray(path)?,
         _ => anyhow::bail!("Unsupported extension for preview"),
@@ -544,66 +659,116 @@ pub fn process_one_to_preview(
         image = apply_rotation(&image, options.rotation_degrees);
     }
 
-    aces::apply_idt(&mut image, &options.idt_matrix);
+    // Debug preview mode: show simple demosaic only.
+    if options.debug_preview_simple_debayer && ext != "png" {
+        let (orig_h, orig_w, _) = image.dim();
+        let orig_w = orig_w as u32;
+        let orig_h = orig_h as u32;
+        let rgb_u8: Vec<u8> = image
+            .iter()
+            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect();
+        let img = RgbImage::from_raw(orig_w, orig_h, rgb_u8)
+            .ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
+        let scale = (max_width as f32 / orig_w as f32)
+            .min(max_height as f32 / orig_h as f32)
+            .min(1.0);
+        let new_w = (orig_w as f32 * scale).round().max(1.0) as u32;
+        let new_h = (orig_h as f32 * scale).round().max(1.0) as u32;
+        let resized = imageops::resize(&img, new_w, new_h, FilterType::Triangle);
+        let out = resized.into_raw();
+        return Ok((orig_w, orig_h, new_w, new_h, out));
+    }
 
-    // Step 3 for preview: D-min / flat-field (skipped if apply_dmin is false).
-    if options.apply_dmin {
+    // Display path: no IDT (camera RGB only).
+
+    // Step 3: D-min / flat-field (flat stays in camera RGB).
+    if options.debug_pipeline_step >= 3 && options.apply_dmin {
         if let Some(ref flat_path) = options.flat_field_path {
-            let mut flat_map = load_flat_field_map(flat_path)?;
-            aces::apply_idt(&mut flat_map, &options.idt_matrix);
+            let flat_map = load_flat_field_map(flat_path)?;
             apply_flat_field_division(&mut image, &flat_map);
         } else if let Some((r, g, b)) = options.dmin_fixed {
             dmin::neutralize_with_medians(&mut image, r, g, b)?;
         } else if let Some(rect) = options.dmin_rect {
-            dmin::neutralize(&mut image, rect.x, rect.y, rect.width, rect.height)?;
+            let (h, w, _) = image.dim();
+            let (x, y, rw, rh) = scale_dmin_rect(
+                rect,
+                options.dmin_rect_reference_size,
+                w as u32,
+                h as u32,
+            );
+            dmin::neutralize(&mut image, x, y, rw, rh, options.dmin_neutral_only)?;
         }
     }
 
-    if options.apply_white_balance
-        && (options.wb_r != 1.0 || options.wb_g != 1.0 || options.wb_b != 1.0)
-    {
-        image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * options.wb_r);
-        image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * options.wb_g);
-        image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * options.wb_b);
+    // Step 4: White balance.
+    if options.debug_pipeline_step >= 4 {
+        let (mut wb_r, mut wb_g, mut wb_b) = if options.apply_white_balance {
+            (options.wb_r, options.wb_g, options.wb_b)
+        } else {
+            (1.0, 1.0, 1.0)
+        };
+        if let Some(k) = options.temp_k {
+            let (tr, tg, tb) = temp_k_to_wb_gains(k);
+            wb_r *= tr;
+            wb_g *= tg;
+            wb_b *= tb;
+        }
+        if wb_r != 1.0 || wb_g != 1.0 || wb_b != 1.0 {
+            image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * wb_r);
+            image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * wb_g);
+            image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * wb_b);
+        }
     }
 
     let (orig_h, orig_w, _) = image.dim();
     let orig_w = orig_w as u32;
     let orig_h = orig_h as u32;
 
-    let rgb_u8: Vec<u8> = if !options.no_curve {
+    // No ACEScg→sRGB: display stays in camera RGB.
+
+    // Step 6: curve or density inversion; else linear (clamped) to u8.
+    let rgb_u8: Vec<u8> = if options.debug_pipeline_step >= 6 && !options.no_curve {
         let params = curve::PrintCurveParams {
             offset: options.curve_offset,
             gamma: options.curve_gamma,
             pivot: options.curve_pivot,
         };
-        let base = if options.apply_color_profile {
+        let identity = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let m = if options.apply_color_profile && options.apply_white_balance {
             options.density_matrix
         } else {
-            [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ]
+            identity
         };
-        let m = aces::convert_density_matrix_to_acescg(base, &options.idt_matrix);
         let matrix = curve::DensityMatrix { m };
         let lut3d = options
             .lut3d_path
             .as_ref()
             .and_then(|p| lut3d::read_cube(p).ok());
         let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true, lut3d);
-        let mut u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
-        aces::convert_u16_linear_acescg_to_linear_srgb(&mut u16_img);
+        let u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
         u16_img
             .iter()
             .map(|v| ((*v as u32) >> 8).min(255) as u8)
             .collect()
+    } else if options.debug_pipeline_step >= 6 && options.no_invert {
+        // Step 6 with curve off but invert skipped: still linear.
+        image
+            .iter()
+            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect()
+    } else if options.debug_pipeline_step >= 6 {
+        inversion::invert_density(&mut image);
+        image
+            .iter()
+            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect()
     } else {
-        aces::linear_acescg_to_linear_srgb(&mut image);
-        if !options.no_invert {
-            inversion::invert(&mut image);
-        }
+        // Steps 1–5: linear (clamped) to u8.
         image
             .iter()
             .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)

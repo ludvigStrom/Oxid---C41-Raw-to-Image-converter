@@ -5,15 +5,31 @@ use anyhow::Context;
 use clap::Parser;
 
 use c41_raw_tool::{process_files, PipelineOptions, Rect, TiffFormat};
+use c41_raw_tool::raw_reader;
 
-/// CLI definition.
 #[derive(Parser, Debug)]
 #[command(
     name = "c41-raw-tool",
     about = "High-performance, strictly linear RAW processor for C-41 narrowband RGB scans",
     long_about = None
 )]
-struct Cli {
+enum Cli {
+    /// Process RAW/PNG files from a directory (default workflow)
+    Convert(ConvertArgs),
+
+    /// Validate rawloader decode of a single RAW file (ARW, RAF, etc.); print metadata and sample values
+    DebugRaw(DebugRawArgs),
+}
+
+#[derive(Parser, Debug)]
+struct DebugRawArgs {
+    /// Path to a single RAW file (e.g. .arw, .raf)
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+}
+
+#[derive(Parser, Debug)]
+struct ConvertArgs {
     /// Input directory containing .ARW (RAW) and/or .png files
     #[arg(short = 'i', long = "input-dir")]
     input_dir: PathBuf,
@@ -148,8 +164,16 @@ fn parse_density_matrix(s: &str) -> Result<[f32; 9], String> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    match Cli::parse() {
+        Cli::DebugRaw(args) => {
+            raw_reader::debug_raw(&args.file)?;
+            Ok(())
+        }
+        Cli::Convert(cli) => run_convert(cli),
+    }
+}
 
+fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
     println!("Input directory:  {}", cli.input_dir.display());
     println!("Output directory: {}", cli.output_dir.display());
     println!("D-min rect:       {:?}", cli.dmin_rect);
@@ -186,7 +210,9 @@ fn main() -> anyhow::Result<()> {
         apply_white_balance: true,
         apply_color_profile: true,
         dmin_rect: cli.dmin_rect,
+        dmin_rect_reference_size: None,
         dmin_fixed: cli.dmin_fixed,
+        dmin_neutral_only: true,
         format: cli.format,
         write_exr: cli.write_exr,
         write_jpeg: false,
@@ -196,6 +222,7 @@ fn main() -> anyhow::Result<()> {
         wb_r: cli.wb_r,
         wb_g: cli.wb_g,
         wb_b: cli.wb_b,
+        temp_k: None,
         curve_offset: cli.curve_offset,
         curve_gamma: cli.curve_gamma,
         curve_pivot: cli.curve_pivot,
@@ -215,6 +242,8 @@ fn main() -> anyhow::Result<()> {
         write_aces2065_only: false,
         lut3d_path: None,
         rotation_degrees: 0,
+        debug_pipeline_step: 6,
+        debug_preview_simple_debayer: false,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

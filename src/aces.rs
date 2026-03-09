@@ -58,6 +58,22 @@ pub const IDT_IDENTITY: [[f32; 3]; 3] = [
     [0.0, 0.0, 1.0],
 ];
 
+/// Returns true when a 3×3 matrix is (approximately) the identity.
+/// Used to detect the default IDT so we can skip the ACEScg→sRGB primaries conversion
+/// (camera RGB ≈ sRGB for most DSLRs; treating it as ACEScg is wrong).
+pub fn is_identity(m: &[[f32; 3]; 3]) -> bool {
+    const EPS: f32 = 1e-6;
+    for i in 0..3 {
+        for j in 0..3 {
+            let expected = if i == j { 1.0 } else { 0.0 };
+            if (m[i][j] - expected).abs() > EPS {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// ACEScg (AP1 linear) → ACES2065-1 (AP0 linear). TRA_2 from ACES spec.
 /// Source: ACEScg specification, "Converting ACEScg RGB values to ACES2065-1 RGB values".
 const ACESCG_TO_ACES2065_1: [[f32; 3]; 3] = [
@@ -146,6 +162,41 @@ pub fn convert_density_matrix_to_acescg(
         m_cam[2][0], m_cam[2][1], m_cam[2][2],
     ]);
     let result = t * m * t_inv;
+    [
+        [result[(0, 0)], result[(0, 1)], result[(0, 2)]],
+        [result[(1, 0)], result[(1, 1)], result[(1, 2)]],
+        [result[(2, 0)], result[(2, 1)], result[(2, 2)]],
+    ]
+}
+
+/// Convert a density-domain calibration matrix from camera space to linear sRGB.
+/// Combined transform: camera → ACEScg (IDT) → linear sRGB, conjugated around the density matrix.
+/// `M_srgb = (S·T) · M_cam · (S·T)^(-1)` where S = ACEScg→sRGB and T = IDT.
+/// For identity IDT and identity density matrix, result is identity.
+pub fn convert_density_matrix_to_srgb(
+    m_cam: [[f32; 3]; 3],
+    idt: &[[f32; 3]; 3],
+) -> [[f32; 3]; 3] {
+    let t = Matrix3::from_row_slice(&[
+        idt[0][0], idt[0][1], idt[0][2],
+        idt[1][0], idt[1][1], idt[1][2],
+        idt[2][0], idt[2][1], idt[2][2],
+    ]);
+    let s = Matrix3::from_row_slice(&[
+        ACESCG_TO_LINEAR_SRGB[0][0], ACESCG_TO_LINEAR_SRGB[0][1], ACESCG_TO_LINEAR_SRGB[0][2],
+        ACESCG_TO_LINEAR_SRGB[1][0], ACESCG_TO_LINEAR_SRGB[1][1], ACESCG_TO_LINEAR_SRGB[1][2],
+        ACESCG_TO_LINEAR_SRGB[2][0], ACESCG_TO_LINEAR_SRGB[2][1], ACESCG_TO_LINEAR_SRGB[2][2],
+    ]);
+    let combined = s * t;
+    let Some(combined_inv) = combined.try_inverse() else {
+        return m_cam;
+    };
+    let m = Matrix3::from_row_slice(&[
+        m_cam[0][0], m_cam[0][1], m_cam[0][2],
+        m_cam[1][0], m_cam[1][1], m_cam[1][2],
+        m_cam[2][0], m_cam[2][1], m_cam[2][2],
+    ]);
+    let result = combined * m * combined_inv;
     [
         [result[(0, 0)], result[(0, 1)], result[(0, 2)]],
         [result[(1, 0)], result[(1, 1)], result[(1, 2)]],
