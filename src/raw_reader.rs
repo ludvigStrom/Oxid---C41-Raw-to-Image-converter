@@ -119,7 +119,13 @@ pub fn load_raw_as_ndarray(path: &Path) -> Result<(Array3<f32>, BayerPattern)> {
     // Without this, raw sensor data looks nearly grayscale because the sensor's
     // RGB filters have very different spectral sensitivities.
     let wb = raw_image.wb_coeffs;
-    let wb_valid = wb.iter().all(|&w| w > 0.0 && w.is_finite());
+    // Some files have wb_coeffs[3] (E) as NaN; only RGB are relevant for Bayer.
+    let wb_valid = wb[0].is_finite()
+        && wb[1].is_finite()
+        && wb[2].is_finite()
+        && wb[0] > 0.0
+        && wb[1] > 0.0
+        && wb[2] > 0.0;
     let (wb_r, wb_g, wb_b) = if wb_valid {
         let g = wb[1];
         (wb[0] / g, 1.0f32, wb[2] / g)

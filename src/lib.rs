@@ -376,6 +376,12 @@ fn apply_rotation(image: &Array3<f32>, rotation_degrees: i32) -> Array3<f32> {
     }
 }
 
+/// Downsample a single-channel Bayer array for preview, preserving the 2×2
+/// RGGB pattern so demosaic can produce real color.
+///
+/// Strides through 2×2 super-pixels and copies each block intact.
+/// Old code sampled every Nth pixel with N even, which always landed on the
+/// same Bayer position (e.g. all R) → grayscale after demosaic.
 fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f32> {
     let (h, w, c) = bayer.dim();
     assert_eq!(c, 1, "Expected single-channel Bayer for preview");
@@ -385,27 +391,44 @@ fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f
         return bayer.clone();
     }
 
-    let mut factor = (w_u32 as f32 / max_width as f32).ceil() as usize;
-    if factor < 1 {
-        factor = 1;
-    }
-    if factor % 2 != 0 {
-        factor += 1;
-    }
+    let n_super_w = w / 2;
+    let n_super_h = h / 2;
+    let max_super_w = (max_width as usize / 2).max(1);
 
-    let new_w = w / factor;
-    let new_h = h / factor;
-    let mut out = Array3::<f32>::zeros((new_h, new_w, 1));
+    let step = (n_super_w as f32 / max_super_w as f32).ceil().max(1.0) as usize;
 
-    for y in 0..new_h {
-        for x in 0..new_w {
-            let src_y = y * factor;
-            let src_x = x * factor;
-            out[(y, x, 0)] = bayer[(src_y, src_x, 0)];
+    let out_super_w = n_super_w / step;
+    let out_super_h = n_super_h / step;
+    let out_w = out_super_w * 2;
+    let out_h = out_super_h * 2;
+
+    let mut out = Array3::<f32>::zeros((out_h, out_w, 1));
+
+    for sy in 0..out_super_h {
+        for sx in 0..out_super_w {
+            let src_sy = sy * step * 2;
+            let src_sx = sx * step * 2;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    out[(sy * 2 + dy, sx * 2 + dx, 0)] =
+                        bayer[(src_sy + dy, src_sx + dx, 0)];
+                }
+            }
         }
     }
 
     out
+}
+
+#[inline]
+fn linear_to_srgb_u8(v: f32) -> u8 {
+    let x = v.clamp(0.0, 1.0);
+    let y = if x <= 0.003_130_8 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    };
+    (y.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// **Pipeline order (do not reorder without updating this comment).**
@@ -664,9 +687,17 @@ pub fn process_one_to_preview(
         let (orig_h, orig_w, _) = image.dim();
         let orig_w = orig_w as u32;
         let orig_h = orig_h as u32;
+        // For debayer validation, map linear RAW RGB to display space:
+        // auto-expose to image max and apply sRGB OETF so color differences are visible.
+        let max_v = image
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(1.0e-6);
+        let inv_max = 1.0 / max_v;
         let rgb_u8: Vec<u8> = image
             .iter()
-            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .map(|v| linear_to_srgb_u8(v * inv_max))
             .collect();
         let img = RgbImage::from_raw(orig_w, orig_h, rgb_u8)
             .ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
