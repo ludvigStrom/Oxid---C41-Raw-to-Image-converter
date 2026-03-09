@@ -32,6 +32,18 @@ const PREVIEW_MAX_HEIGHT: u32 = 1200;
 const THUMB_MAX_SIZE: u32 = 64;
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
+const ICON_CLOSE_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/X-d67d1f11-dfa7-4ff3-b0d4-a40cae1c357b.png";
+const ICON_ROTATE_RIGHT_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/rotate_right-c83fec20-39c3-4f05-b7b7-dadb525de8c5.png";
+const ICON_ROTATE_LEFT_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/rotate_left-ebbb0f40-9849-4e0e-91dd-48945ff59e2c.png";
+const ICON_LOGO_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/logo-6001e4ef-8453-4eb6-8ed5-c7622d9a8d7b.png";
+
+#[derive(Default)]
+struct UiIcons {
+    close: Option<egui::TextureHandle>,
+    rotate_left: Option<egui::TextureHandle>,
+    rotate_right: Option<egui::TextureHandle>,
+    logo: Option<egui::TextureHandle>,
+}
 
 fn main() -> eframe::Result<()> {
     let native_options = if cfg!(target_os = "macos") {
@@ -127,8 +139,10 @@ struct C41Gui {
     selected_index: Option<usize>,
     output_dir: Option<PathBuf>,
     status: String,
-    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>, String)>>>,
+    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>, String, bool)>>>,
     preview_started_at: Option<Instant>,
+    /// One-shot flag: capture detailed pipeline debug log on the next preview render.
+    capture_pipeline_debug_next: bool,
     /// Thumbnails for the image strip: (path, Ok((w, h, rgb)) or Err).
     thumbnail_receiver: Option<mpsc::Receiver<(PathBuf, anyhow::Result<(u32, u32, Vec<u8>)>)>>,
     thumbnail_pending: HashSet<PathBuf>,
@@ -145,6 +159,7 @@ struct C41Gui {
     flat_field_image: Option<ndarray::Array3<f32>>,
     /// Camera IDT profiles loaded from camera_idt/ (path, profile).
     idt_profiles: Vec<(PathBuf, c41_raw_tool::aces::IdtProfile)>,
+    ui_icons: UiIcons,
 }
 
 impl Default for C41Gui {
@@ -156,6 +171,7 @@ impl Default for C41Gui {
             status: String::new(),
             preview_receiver: None,
             preview_started_at: None,
+            capture_pipeline_debug_next: false,
             thumbnail_receiver: None,
             thumbnail_pending: HashSet::new(),
             mode: UIMode::Process,
@@ -168,6 +184,7 @@ impl Default for C41Gui {
             flat_field_path: None,
             flat_field_image: None,
             idt_profiles: Vec::new(),
+            ui_icons: UiIcons::default(),
         }
     }
 }
@@ -299,7 +316,7 @@ fn default_options() -> PipelineOptions {
         apply_crop: false,
         crop_rect: None,
         crop_rect_reference_size: None,
-        dmin_fixed: Some((0.635294, 0.635294, 0.623529)),
+        dmin_fixed: Some((0.222537, 0.108183, 0.054116)),
         dmin_neutral_only: false,
         format: TiffFormat::Float32,
         write_exr: false,
@@ -446,6 +463,23 @@ fn scale_rect_to_size(
     }
 }
 
+fn parse_decimal_f64(input: &str) -> Option<f64> {
+    let normalized = input.trim().replace(',', ".");
+    normalized.parse::<f64>().ok()
+}
+
+fn drag_decimal_f32<'a>(value: &'a mut f32) -> egui::DragValue<'a> {
+    egui::DragValue::new(value).custom_parser(|s| parse_decimal_f64(s))
+}
+
+fn load_icon_texture(ctx: &egui::Context, texture_name: &str, path: &str) -> Option<egui::TextureHandle> {
+    let image = image::open(path).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_vec();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+    Some(ctx.load_texture(texture_name.to_string(), color_image, egui::TextureOptions::default()))
+}
+
 impl C41Gui {
     fn request_preview_for(&mut self, index: usize, ctx: &egui::Context) {
         if index >= self.images.len() {
@@ -454,7 +488,9 @@ impl C41Gui {
         let path = self.images[index].path.clone();
         let mut options = self.images[index].options.clone();
         options.flat_field_path = self.flat_field_path.clone();
-        options.verbose_debug = self.mode == UIMode::Debug;
+        let capture_debug = self.capture_pipeline_debug_next;
+        self.capture_pipeline_debug_next = false;
+        options.verbose_debug = capture_debug;
         let (tx, rx) = mpsc::channel();
         self.preview_receiver = Some(rx);
         self.preview_started_at = Some(Instant::now());
@@ -465,7 +501,9 @@ impl C41Gui {
                 PREVIEW_MAX_WIDTH,
                 PREVIEW_MAX_HEIGHT,
             )
-            .map(|(input_w, input_h, w, h, rgb, dbg_log)| (index, input_w, input_h, w, h, rgb, dbg_log));
+            .map(|(input_w, input_h, w, h, rgb, dbg_log)| {
+                (index, input_w, input_h, w, h, rgb, dbg_log, capture_debug)
+            });
             let _ = tx.send(res);
         });
         ctx.request_repaint();
@@ -484,10 +522,23 @@ impl eframe::App for C41Gui {
         style.spacing.button_padding = egui::vec2(10.0, 4.0); // extra left/right and top/bottom around button text
         ctx.set_style(style);
 
+        if self.ui_icons.close.is_none() {
+            self.ui_icons.close = load_icon_texture(ctx, "ui_icon_close", ICON_CLOSE_PATH);
+        }
+        if self.ui_icons.rotate_left.is_none() {
+            self.ui_icons.rotate_left = load_icon_texture(ctx, "ui_icon_rotate_left", ICON_ROTATE_LEFT_PATH);
+        }
+        if self.ui_icons.rotate_right.is_none() {
+            self.ui_icons.rotate_right = load_icon_texture(ctx, "ui_icon_rotate_right", ICON_ROTATE_RIGHT_PATH);
+        }
+        if self.ui_icons.logo.is_none() {
+            self.ui_icons.logo = load_icon_texture(ctx, "ui_icon_logo", ICON_LOGO_PATH);
+        }
+
         // Poll preview worker
         if let Some(rx) = self.preview_receiver.as_ref() {
             match rx.try_recv() {
-                Ok(Ok((idx, input_w, input_h, w, h, rgb, dbg_log))) => {
+                Ok(Ok((idx, input_w, input_h, w, h, rgb, dbg_log, captured_debug))) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
                     if idx < self.images.len() {
@@ -563,7 +614,9 @@ impl eframe::App for C41Gui {
                                 Some((input_w, input_h));
                         }
                         self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
-                        self.images[idx].pipeline_debug_log = Some(dbg_log);
+                        if captured_debug {
+                            self.images[idx].pipeline_debug_log = Some(dbg_log);
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -741,7 +794,7 @@ impl eframe::App for C41Gui {
                                         );
                                         ui.painter().rect_stroke(card_rect, 4.0, stroke);
 
-                                        // X button fixed in top-right corner of card
+                                        // Close button fixed in top-right corner of card
                                         let x_rect = egui::Rect::from_min_size(
                                             egui::pos2(
                                                 card_rect.right() - X_BUTTON_SIZE - CARD_PADDING,
@@ -750,7 +803,20 @@ impl eframe::App for C41Gui {
                                             egui::vec2(X_BUTTON_SIZE, X_BUTTON_SIZE),
                                         );
                                         let x_clicked = ui
-                                            .allocate_new_ui(egui::UiBuilder::new().max_rect(x_rect), |ui| ui.small_button("X").clicked())
+                                            .allocate_new_ui(egui::UiBuilder::new().max_rect(x_rect), |ui| {
+                                                if let Some(icon) = &self.ui_icons.close {
+                                                    ui.add(
+                                                        egui::ImageButton::new((
+                                                            icon.id(),
+                                                            egui::vec2(X_BUTTON_SIZE - 6.0, X_BUTTON_SIZE - 6.0),
+                                                        ))
+                                                        .frame(false),
+                                                    )
+                                                    .clicked()
+                                                } else {
+                                                    ui.small_button("X").clicked()
+                                                }
+                                            })
                                             .inner;
 
                                         // Content area: thumbnail + name, clipped to card (below X row)
@@ -824,6 +890,10 @@ impl eframe::App for C41Gui {
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
+                    if let Some(logo) = &self.ui_icons.logo {
+                        ui.image((logo.id(), egui::vec2(24.0, 24.0)));
+                        ui.add_space(6.0);
+                    }
                     ui.selectable_value(&mut self.mode, UIMode::Process, "Process");
                     ui.selectable_value(&mut self.mode, UIMode::Calibrate, "Color calibration");
                     ui.selectable_value(
@@ -992,15 +1062,24 @@ impl eframe::App for C41Gui {
                     ui.separator();
                     ui.label(egui::RichText::new("Pipeline debug log").strong());
                     ui.label(
-                        egui::RichText::new("Updated on every preview render. Shows per-channel stats at each pipeline step.")
+                        egui::RichText::new("Captured on demand. Click the button to snapshot current settings.")
                             .small()
                             .weak(),
                     );
                     ui.add_space(4.0);
-                    if let Some(ref log) = entry.pipeline_debug_log {
-                        if ui.button("Copy pipeline log").clicked() {
-                            ui.ctx().copy_text(log.clone());
+                    ui.horizontal(|ui| {
+                        if ui.button("Capture pipeline log for current settings").clicked() {
+                            self.capture_pipeline_debug_next = true;
+                            entry.preview_texture = None; // force one fresh render with debug capture
                         }
+                        if let Some(ref log) = entry.pipeline_debug_log {
+                            if ui.button("Copy pipeline log").clicked() {
+                                ui.ctx().copy_text(log.clone());
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if let Some(ref log) = entry.pipeline_debug_log {
                         egui::ScrollArea::vertical()
                             .id_salt("pipeline_debug_scroll")
                             .max_height(520.0)
@@ -1030,16 +1109,28 @@ impl eframe::App for C41Gui {
                         ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
                         if use_fixed {
                             if opts.dmin_fixed.is_none() {
-                                opts.dmin_fixed = Some((0.635294, 0.635294, 0.623529));
+                                opts.dmin_fixed = Some((0.222537, 0.108183, 0.054116));
                             }
                             let (mut r, mut g, mut b) = opts.dmin_fixed.unwrap();
                             ui.horizontal(|ui| {
                                 ui.label("R");
-                                ui.add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.01));
+                                ui.add(
+                                    drag_decimal_f32(&mut r)
+                                        .range(0.0..=1.0)
+                                        .speed(0.01),
+                                );
                                 ui.label("G");
-                                ui.add(egui::DragValue::new(&mut g).range(0.0..=1.0).speed(0.01));
+                                ui.add(
+                                    drag_decimal_f32(&mut g)
+                                        .range(0.0..=1.0)
+                                        .speed(0.01),
+                                );
                                 ui.label("B");
-                                ui.add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.01));
+                                ui.add(
+                                    drag_decimal_f32(&mut b)
+                                        .range(0.0..=1.0)
+                                        .speed(0.01),
+                                );
                             });
                             opts.dmin_fixed = Some((r, g, b));
                             opts.dmin_rect = None;
@@ -1239,7 +1330,7 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             for row in 0..3 {
                                 for col in 0..3 {
-                                    ui.add(egui::DragValue::new(&mut m[row][col]).speed(0.05));
+                                    ui.add(drag_decimal_f32(&mut m[row][col]).speed(0.05));
                                 }
                             }
                         });
@@ -1253,7 +1344,7 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             ui.label("Offset");
                             ui.add(
-                                egui::DragValue::new(&mut opts.curve_offset)
+                                drag_decimal_f32(&mut opts.curve_offset)
                                     .range(-2.0..=2.0)
                                     .speed(0.05),
                             );
@@ -1265,7 +1356,7 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             ui.label("Pivot");
                             ui.add(
-                                egui::DragValue::new(&mut opts.curve_pivot)
+                                drag_decimal_f32(&mut opts.curve_pivot)
                                     .range(0.1..=10.0)
                                     .speed(0.1),
                             );
@@ -2346,11 +2437,11 @@ impl eframe::App for C41Gui {
                             }
                         }
 
-                        // Row under the image: full filename (left, truncated) + Rotate left/right (right)
+                        // Row under the image: full filename (left, truncated) + Rotate icon buttons (right)
                         ui.add_space(BOTTOM_PADDING);
                         ui.horizontal(|ui| {
                             let full_name = self.images[idx].path.display().to_string();
-                            let max_filename_w = (ui.available_width() - 220.0).max(80.0); // leave room for rotate buttons
+                            let max_filename_w = (ui.available_width() - 150.0).max(80.0); // leave room for rotate icons
                             ui.allocate_ui(egui::vec2(max_filename_w, CONTROL_ROW_HEIGHT), |ui| {
                                 ui.label(
                                     egui::RichText::new(full_name).small().color(egui::Color32::from_gray(200)),
@@ -2358,7 +2449,14 @@ impl eframe::App for C41Gui {
                                 .on_hover_text(self.images[idx].path.display().to_string());
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Rotate right").clicked() {
+                                let rotate_right_clicked = if let Some(icon) = &self.ui_icons.rotate_right {
+                                    ui.add(egui::ImageButton::new((icon.id(), egui::vec2(20.0, 20.0))).frame(false))
+                                        .on_hover_text("Rotate right")
+                                        .clicked()
+                                } else {
+                                    ui.button("Rotate right").clicked()
+                                };
+                                if rotate_right_clicked {
                                     let entry = &mut self.images[idx];
                                     let preview_size =
                                         entry.preview_input_size.map(|[w, h]| (w, h));
@@ -2388,7 +2486,14 @@ impl eframe::App for C41Gui {
                                         (entry.options.rotation_degrees + 90).rem_euclid(360);
                                     self.preview_receiver = None;
                                 }
-                                if ui.button("Rotate left").clicked() {
+                                let rotate_left_clicked = if let Some(icon) = &self.ui_icons.rotate_left {
+                                    ui.add(egui::ImageButton::new((icon.id(), egui::vec2(20.0, 20.0))).frame(false))
+                                        .on_hover_text("Rotate left")
+                                        .clicked()
+                                } else {
+                                    ui.button("Rotate left").clicked()
+                                };
+                                if rotate_left_clicked {
                                     let entry = &mut self.images[idx];
                                     let preview_size =
                                         entry.preview_input_size.map(|[w, h]| (w, h));
