@@ -54,10 +54,11 @@ fn detect_bayer_pattern_at(cfa: &rawloader::CFA, row: usize, col: usize) -> Opti
 /// 1. Subtract per-channel **black level** (removes dark current / sensor bias).
 /// 2. Divide by a **single global scale** (max white − min black) to preserve
 ///    inter-channel color ratios.
-/// 3. Apply the camera's **white balance coefficients** so that channel balance
-///    matches the camera's JPG output. Without this, raw sensor data looks
-///    desaturated / nearly grayscale because the sensor's R/G/B filters have
-///    very different spectral sensitivities.
+/// 3. Apply **camera white balance** at the Bayer (pre-demosaic) level. This
+///    roughly balances R/G/B so the demosaic algorithm sees comparable channel
+///    levels. Without this, the blue channel (heavily attenuated by the C-41
+///    orange base) has very poor SNR and the demosaic produces extreme artifacts.
+///    With per-channel D-min, camera WB cancels out mathematically.
 /// 4. Apply sensor crops (forced even for Bayer alignment).
 /// 5. Detect and validate the CFA pattern (rejects X-Trans / non-Bayer sensors).
 ///
@@ -115,11 +116,16 @@ pub fn load_raw_as_ndarray(path: &Path) -> Result<(Array3<f32>, BayerPattern)> {
     let max_white = whites.iter().copied().reduce(f32::max).unwrap_or(1.0);
     let global_scale = (max_white - min_black).max(1.0);
 
-    // Camera white balance coefficients (RGBE order), normalized so green = 1.0.
-    // Without this, raw sensor data looks nearly grayscale because the sensor's
-    // RGB filters have very different spectral sensitivities.
+    // Camera WB is applied at the Bayer (pre-demosaic) level to roughly balance
+    // channels. This is critical for demosaic quality: the orange C-41 base
+    // transmits ~3-4× more red than blue, so without WB the B channel has very
+    // poor SNR and the demosaic produces severe artifacts and negative values.
+    //
+    // With per-channel D-min, camera WB cancels out mathematically (both the
+    // image and the base sample are scaled by the same factor), so it does NOT
+    // affect the final color — it only improves the quality of the intermediate
+    // demosaiced data.
     let wb = raw_image.wb_coeffs;
-    // Some files have wb_coeffs[3] (E) as NaN; only RGB are relevant for Bayer.
     let wb_valid = wb[0].is_finite()
         && wb[1].is_finite()
         && wb[2].is_finite()

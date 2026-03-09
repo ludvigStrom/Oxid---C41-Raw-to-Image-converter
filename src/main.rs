@@ -208,6 +208,8 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
     let options = PipelineOptions {
         apply_dmin: true,
         apply_white_balance: true,
+        auto_wb: true,
+        film_gamma: 0.65,
         apply_color_profile: true,
         dmin_rect: cli.dmin_rect,
         dmin_rect_reference_size: None,
@@ -215,7 +217,7 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         crop_rect: None,
         crop_rect_reference_size: None,
         dmin_fixed: cli.dmin_fixed,
-        dmin_neutral_only: true,
+        dmin_neutral_only: false,
         format: cli.format,
         write_exr: cli.write_exr,
         write_jpeg: false,

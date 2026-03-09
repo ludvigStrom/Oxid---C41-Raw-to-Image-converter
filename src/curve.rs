@@ -85,8 +85,8 @@ pub fn apply_curve_and_quantize(
         *o = lut[idx];
     });
 
-    // Optional white-point scaling: map `white_point` (normalized) to display white.
-    let wp = white_point.clamp(1e-6, 1.0);
+    // Optional white-point scaling: map `white_point` to display white.
+    let wp = white_point.clamp(1e-6, 10.0);
     if (wp - 1.0).abs() > f32::EPSILON {
         let inv_wp = 1.0 / wp;
 
@@ -297,6 +297,51 @@ fn sample_density_to_u16(d: f32, pipeline: &CurvePipeline) -> u16 {
     pipeline.d_to_u16_lut[idx]
 }
 
+/// Apply RA-4 curve from density input (T→D and matrix/WB already applied upstream).
+///
+/// `density_image` is in density domain (H, W, 3): D=0 is film base, higher D = more dye.
+/// Produces the final positive u16 output: high density → bright (correct inversion).
+pub fn apply_ra4_from_density(
+    density_image: &Array3<f32>,
+    params: PrintCurveParams,
+    d_max: f32,
+    white_point: f32,
+) -> Array3<u16> {
+    let (h, w, c) = density_image.dim();
+    assert_eq!(c, 3, "Expected 3-channel RGB image");
+
+    let d_to_u16_lut = build_density_to_ra4_lut(params, d_max);
+    let mut out = Array3::<u16>::zeros((h, w, c));
+
+    out.axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .zip(density_image.axis_iter(Axis(0)))
+        .for_each(|(mut out_row, in_row)| {
+            let row_w = in_row.dim().0;
+            for x in 0..row_w {
+                for ch in 0..3 {
+                    let d = in_row[(x, ch)].clamp(0.0, d_max);
+                    let frac = if d_max > 0.0 { d / d_max } else { 0.0 };
+                    let idx = (frac * 65535.0).round() as usize;
+                    let idx = idx.min(65535);
+                    out_row[(x, ch)] = d_to_u16_lut[idx];
+                }
+            }
+        });
+
+    let wp = white_point.clamp(1e-6, 10.0);
+    if (wp - 1.0).abs() > f32::EPSILON {
+        let inv_wp = 1.0 / wp;
+        Zip::from(out.view_mut()).par_for_each(|o| {
+            let normalized = *o as f32 / 65535.0;
+            let scaled = (normalized * inv_wp).clamp(0.0, 1.0);
+            *o = (scaled * 65535.0).round() as u16;
+        });
+    }
+
+    out
+}
+
 /// Apply the full multi-stage curve pipeline (T → D → matrix → RA-4) and quantize to u16.
 ///
 /// `image` is linear transmittance [0, 1] with shape (H, W, 3).
@@ -349,14 +394,14 @@ pub fn apply_curve_pipeline(
             }
         });
 
-    // Optional white-point scaling: map `white_point` (normalized) to display white.
-    let wp = white_point.clamp(1e-6, 1.0);
+    // Optional white-point scaling: map `white_point` to display white.
+    let wp = white_point.clamp(1e-6, 10.0);
     if (wp - 1.0).abs() > f32::EPSILON {
         let inv_wp = 1.0 / wp;
 
         Zip::from(out.view_mut()).par_for_each(|o| {
             let normalized = *o as f32 / 65535.0;
-            let scaled = (normalized * inv_wp).min(1.0);
+            let scaled = (normalized * inv_wp).clamp(0.0, 1.0);
             *o = (scaled * 65535.0).round() as u16;
         });
     }

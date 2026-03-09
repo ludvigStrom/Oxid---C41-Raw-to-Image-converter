@@ -1,5 +1,6 @@
 //! C-41 RAW pipeline library. Used by both CLI and GUI.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -39,6 +40,13 @@ pub struct PipelineOptions {
     pub apply_dmin: bool,
     /// When false, white balance gains are not applied.
     pub apply_white_balance: bool,
+    /// When true, automatically equalize per-channel density medians after D-min
+    /// using multiplicative correction (per-channel gamma). Preserves D=0 black point.
+    pub auto_wb: bool,
+    /// C-41 film negative gamma. Scene log-exposure = density / film_gamma.
+    /// Typical values: 0.55–0.75 for C-41, ~0.65 default. Applied as D *= 1/gamma
+    /// to decompress density into scene-relative log-exposure before the paper curve.
+    pub film_gamma: f32,
     pub dmin_rect: Option<Rect>,
     /// When set, the rect is in pixels for this (width, height). Used to scale rect when exporting at full size.
     pub dmin_rect_reference_size: Option<(u32, u32)>,
@@ -95,13 +103,15 @@ impl Default for PipelineOptions {
         Self {
             apply_dmin: true,
             apply_white_balance: true,
+            auto_wb: true,
+            film_gamma: 0.65,
             dmin_rect: None,
             dmin_rect_reference_size: None,
             apply_crop: false,
             crop_rect: None,
             crop_rect_reference_size: None,
             dmin_fixed: None,
-            dmin_neutral_only: true,
+            dmin_neutral_only: false,
             format: TiffFormat::Float32,
             write_exr: false,
             write_jpeg: false,
@@ -139,7 +149,9 @@ impl Default for PipelineOptions {
 /// Use for luminance (flat-field) calibration reference.
 pub fn load_flat_field_linear(path: &Path) -> anyhow::Result<Array3<f32>> {
     let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
-    demosaic::demosaic_quality(&bayer, pattern)
+    let mut img = demosaic::demosaic_quality(&bayer, pattern)?;
+    img.mapv_inplace(|v| v.max(0.0));
+    Ok(img)
 }
 
 /// Build a 1D Gaussian kernel (odd length, normalized). Sigma in pixels.
@@ -484,27 +496,12 @@ pub fn process_files(
         .as_ref()
         .and_then(|p| lut3d::read_cube(p).ok());
 
-    // Display path stays in camera RGB (no ACES). Curve uses camera-space density matrix.
-    // When white balance is off, use identity matrix so the profile (calibrated for WB'd data) doesn't collapse color to B&W.
-    let curve_pipeline = (!options.no_curve).then(|| {
-        let params = curve::PrintCurveParams {
-            offset: options.curve_offset,
-            gamma: options.curve_gamma,
-            pivot: options.curve_pivot,
-        };
-        let identity = [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ];
-        let m = if options.apply_color_profile && options.apply_white_balance {
-            options.density_matrix
-        } else {
-            identity
-        };
-        let matrix = curve::DensityMatrix { m };
-        curve::CurvePipeline::new(params, matrix, 4.0, true, lut3d.clone())
-    });
+    // RA-4 curve parameters (used at step 6 if !no_curve).
+    let ra4_params = curve::PrintCurveParams {
+        offset: options.curve_offset,
+        gamma: options.curve_gamma,
+        pivot: options.curve_pivot,
+    };
 
     // Optional flat-field: keep in camera RGB to match main image (no IDT).
     let flat_field_map: Option<Array3<f32>> =
@@ -524,7 +521,9 @@ pub fn process_files(
         let mut image = match ext.as_str() {
             "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
                 let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
-                demosaic::demosaic_quality(&bayer, pattern)?
+                let mut img = demosaic::demosaic_quality(&bayer, pattern)?;
+                img.mapv_inplace(|v| v.max(0.0));
+                img
             }
             "png" => png_reader::load_png_as_ndarray(path)?,
             _ => continue,
@@ -559,26 +558,96 @@ pub fn process_files(
                     options.dmin_neutral_only,
                 )?;
             }
+            image.mapv_inplace(|v| v.clamp(0.0, 1.0));
         }
 
-        // Step 4: White balance (R,G,B gains and optional color temperature).
+        // Step 4: T → D → WB (multiplicative) → Film γ
         if options.debug_pipeline_step >= 4 {
-            let (mut wb_r, mut wb_g, mut wb_b) = if options.apply_white_balance {
+            image.mapv_inplace(|t| -(t.max(1e-10_f32)).log10());
+
+            // Auto WB: multiplicative density scaling (per-channel γ correction).
+            let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.apply_dmin {
+                let stats = channel_stats(&image);
+                let med_r = stats[0].2.max(1e-4);
+                let med_g = stats[1].2.max(1e-4);
+                let med_b = stats[2].2.max(1e-4);
+                let mean_d = (med_r + med_g + med_b) / 3.0;
+                (mean_d / med_r, mean_d / med_g, mean_d / med_b)
+            } else {
+                (1.0, 1.0, 1.0)
+            };
+
+            // Manual WB: density scale factors (default 1.0).
+            let (man_s_r, man_s_g, man_s_b) = if options.apply_white_balance {
                 (options.wb_r, options.wb_g, options.wb_b)
             } else {
                 (1.0, 1.0, 1.0)
             };
+
+            // Film gamma decompression.
+            let inv_gamma = 1.0 / options.film_gamma.max(0.1);
+
+            // Combined per-channel scale (single pass).
+            let s_r = auto_s_r * man_s_r * inv_gamma;
+            let s_g = auto_s_g * man_s_g * inv_gamma;
+            let s_b = auto_s_b * man_s_b * inv_gamma;
+
+            image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * s_r);
+            image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * s_g);
+            image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * s_b);
+
+            // Color temperature: additive density offset (small correction).
             if let Some(k) = options.temp_k {
                 let (tr, tg, tb) = temp_k_to_wb_gains(k);
-                wb_r *= tr;
-                wb_g *= tg;
-                wb_b *= tb;
+                let off_r = -(tr.max(1e-6) as f64).log10() as f32;
+                let off_g = -(tg.max(1e-6) as f64).log10() as f32;
+                let off_b = -(tb.max(1e-6) as f64).log10() as f32;
+                image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v + off_r);
+                image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v + off_g);
+                image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v + off_b);
             }
-            if wb_r != 1.0 || wb_g != 1.0 || wb_b != 1.0 {
-                image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * wb_r);
-                image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * wb_g);
-                image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * wb_b);
+        }
+
+        // Step 5: Density matrix / 3D LUT.
+        if options.debug_pipeline_step >= 5 {
+            let m = if options.apply_color_profile {
+                options.density_matrix
+            } else {
+                [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]
+            };
+            if let Some(ref lut) = lut3d {
+                let (h, w, _) = image.dim();
+                for y in 0..h {
+                    for x in 0..w {
+                        let dr = image[[y, x, 0]];
+                        let dg = image[[y, x, 1]];
+                        let db = image[[y, x, 2]];
+                        let [or, og, ob] = lut.sample_density(dr, dg, db);
+                        image[[y, x, 0]] = or;
+                        image[[y, x, 1]] = og;
+                        image[[y, x, 2]] = ob;
+                    }
+                }
+            } else {
+                let is_identity = (m[0][0] - 1.0).abs() < 1e-6
+                    && m[0][1].abs() < 1e-6 && m[0][2].abs() < 1e-6
+                    && m[1][0].abs() < 1e-6 && (m[1][1] - 1.0).abs() < 1e-6 && m[1][2].abs() < 1e-6
+                    && m[2][0].abs() < 1e-6 && m[2][1].abs() < 1e-6 && (m[2][2] - 1.0).abs() < 1e-6;
+                if !is_identity {
+                    let (h, w, _) = image.dim();
+                    for y in 0..h {
+                        for x in 0..w {
+                            let dr = image[[y, x, 0]];
+                            let dg = image[[y, x, 1]];
+                            let db = image[[y, x, 2]];
+                            image[[y, x, 0]] = m[0][0]*dr + m[0][1]*dg + m[0][2]*db;
+                            image[[y, x, 1]] = m[1][0]*dr + m[1][1]*dg + m[1][2]*db;
+                            image[[y, x, 2]] = m[2][0]*dr + m[2][1]*dg + m[2][2]*db;
+                        }
+                    }
+                }
             }
+            image.mapv_inplace(|v| v.max(0.0));
         }
 
         // Optional crop (export path only): keep only selected region.
@@ -622,53 +691,31 @@ pub fn process_files(
 
         let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
 
-        // No ACEScg→sRGB: display path stays in camera RGB (avoids teal cast from out-of-gamut conversion).
-
-        // Step 6: curve or density inversion; else output linear (clamped).
-        if options.debug_pipeline_step >= 6 {
-            if let Some(ref pipeline) = curve_pipeline {
-                let image_u16 =
-                    curve::apply_curve_pipeline(&image, pipeline, options.curve_white, true);
-                if !options.write_jpeg_only {
-                    tiff_export::write_tiff_u16(&image_u16, &out_path)?;
-                }
-                if options.write_exr {
-                    exr_export::write_exr_u16(&image_u16, &exr_path)?;
-                }
-                if write_jpeg_this {
-                    let (height, width, _) = image_u16.dim();
-                    let mut buf = Vec::with_capacity(height * width * 3);
-                    for chunk in image_u16.iter() {
-                        buf.push((*chunk >> 8) as u8);
-                    }
-                    let img = RgbImage::from_raw(width as u32, height as u32, buf)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                    img.save(&jpg_path)?;
-                }
-            } else {
-                if !options.no_invert {
-                    inversion::invert_density(&mut image);
-                }
-                if !options.write_jpeg_only {
-                    tiff_export::write_tiff(&image, &out_path, options.format)?;
-                }
-                if options.write_exr {
-                    exr_export::write_exr_f32(&image, &exr_path)?;
-                }
-                if write_jpeg_this {
-                    let (height, width, _) = image.dim();
-                    let mut buf = Vec::with_capacity(height * width * 3);
-                    for v in image.iter() {
-                        let x = v.clamp(0.0, 1.0);
-                        buf.push((x * 255.0).round() as u8);
-                    }
-                    let img = RgbImage::from_raw(width as u32, height as u32, buf)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                    img.save(&jpg_path)?;
-                }
+        // Step 6: RA-4 curve (from density) or direct density output.
+        if options.debug_pipeline_step >= 6 && !options.no_curve {
+            let image_u16 = curve::apply_ra4_from_density(&image, ra4_params, 4.0, options.curve_white);
+            if !options.write_jpeg_only {
+                tiff_export::write_tiff_u16(&image_u16, &out_path)?;
             }
-        } else {
-            // Steps 1–5: output linear image (clamped 0..1).
+            if options.write_exr {
+                exr_export::write_exr_u16(&image_u16, &exr_path)?;
+            }
+            if write_jpeg_this {
+                let (height, width, _) = image_u16.dim();
+                let mut buf = Vec::with_capacity(height * width * 3);
+                for chunk in image_u16.iter() {
+                    buf.push((*chunk >> 8) as u8);
+                }
+                let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                img.save(&jpg_path)?;
+            }
+        } else if options.debug_pipeline_step >= 6 {
+            // No-curve: output density values (positive: D/D_max → [0,1]).
+            if !options.no_invert {
+                const D_DISP_MAX: f32 = 2.5;
+                image.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+            }
             if !options.write_jpeg_only {
                 tiff_export::write_tiff(&image, &out_path, options.format)?;
             }
@@ -679,12 +726,19 @@ pub fn process_files(
                 let (height, width, _) = image.dim();
                 let mut buf = Vec::with_capacity(height * width * 3);
                 for v in image.iter() {
-                    let x = v.clamp(0.0, 1.0);
-                    buf.push((x * 255.0).round() as u8);
+                    buf.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
                 }
                 let img = RgbImage::from_raw(width as u32, height as u32, buf)
                     .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
                 img.save(&jpg_path)?;
+            }
+        } else {
+            // Steps 1–5: output density (or transmittance if step < 4).
+            if !options.write_jpeg_only {
+                tiff_export::write_tiff(&image, &out_path, options.format)?;
+            }
+            if options.write_exr {
+                exr_export::write_exr_f32(&image, &exr_path)?;
             }
         }
     }
@@ -692,14 +746,46 @@ pub fn process_files(
     Ok(())
 }
 
+/// Compute per-channel statistics (min, max, median) for a (H, W, 3) image.
+fn channel_stats(image: &Array3<f32>) -> [(f32, f32, f32); 3] {
+    let mut stats = [(0.0_f32, 0.0_f32, 0.0_f32); 3];
+    for ch in 0..3 {
+        let slice = image.slice(ndarray::s![.., .., ch]);
+        let mut vals: Vec<f32> = slice.iter().copied().collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let min = vals.first().copied().unwrap_or(0.0);
+        let max = vals.last().copied().unwrap_or(0.0);
+        let median = if vals.is_empty() {
+            0.0
+        } else {
+            vals[vals.len() / 2]
+        };
+        stats[ch] = (min, max, median);
+    }
+    stats
+}
+
+fn fmt_stats(label: &str, stats: &[(f32, f32, f32); 3]) -> String {
+    format!(
+        "{}\n  R: min={:.6} max={:.6} med={:.6}\n  G: min={:.6} max={:.6} med={:.6}\n  B: min={:.6} max={:.6} med={:.6}\n",
+        label,
+        stats[0].0, stats[0].1, stats[0].2,
+        stats[1].0, stats[1].1, stats[1].2,
+        stats[2].0, stats[2].1, stats[2].2,
+    )
+}
+
 /// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
 /// D-min/flat-field → WB → curve or no-curve. Display path stays in camera RGB (no IDT/ACES).
+///
+/// Returns `(input_w, input_h, preview_w, preview_h, rgb_u8, debug_log)`.
 pub fn process_one_to_preview(
     path: &Path,
     options: &PipelineOptions,
     max_width: u32,
     max_height: u32,
-) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>)> {
+) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>, String)> {
+    let mut dbg = String::new();
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -710,27 +796,38 @@ pub fn process_one_to_preview(
         "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
             let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
             let small_bayer = downsample_bayer_for_preview(&bayer, max_width);
-            if options.debug_preview_simple_debayer {
+            let mut img = if options.debug_preview_simple_debayer {
                 demosaic::demosaic_bilinear(&small_bayer, pattern)?
             } else {
                 demosaic::demosaic_quality(&small_bayer, pattern)?
-            }
+            };
+            img.mapv_inplace(|v| v.max(0.0));
+            img
         }
         "png" => png_reader::load_png_as_ndarray(path)?,
         _ => anyhow::bail!("Unsupported extension for preview"),
     };
 
+    let (dim_h, dim_w, _) = image.dim();
+    let _ = writeln!(dbg, "=== Pipeline Debug ===");
+    let _ = writeln!(dbg, "image: {}x{} (preview downsampled)", dim_w, dim_h);
+    let _ = writeln!(dbg, "rotation: {}°", options.rotation_degrees);
+    let _ = writeln!(dbg, "pipeline step: {}", options.debug_pipeline_step);
+    let _ = writeln!(dbg);
+
     if options.rotation_degrees != 0 {
         image = apply_rotation(&image, options.rotation_degrees);
     }
+
+    // Step 1: load + demosaic + rotate
+    let _ = write!(dbg, "{}", fmt_stats("Step 1 (load+demosaic+rot):", &channel_stats(&image)));
+    let _ = writeln!(dbg);
 
     // Debug preview mode: show simple demosaic only.
     if options.debug_preview_simple_debayer && ext != "png" {
         let (orig_h, orig_w, _) = image.dim();
         let orig_w = orig_w as u32;
         let orig_h = orig_h as u32;
-        // For debayer validation, map linear RAW RGB to display space:
-        // auto-expose to image max and apply sRGB OETF so color differences are visible.
         let max_v = image
             .iter()
             .copied()
@@ -750,17 +847,17 @@ pub fn process_one_to_preview(
         let new_h = (orig_h as f32 * scale).round().max(1.0) as u32;
         let resized = imageops::resize(&img, new_w, new_h, FilterType::Triangle);
         let out = resized.into_raw();
-        return Ok((orig_w, orig_h, new_w, new_h, out));
+        return Ok((orig_w, orig_h, new_w, new_h, out, dbg));
     }
-
-    // Display path: no IDT (camera RGB only).
 
     // Step 3: D-min / flat-field (flat stays in camera RGB).
     if options.debug_pipeline_step >= 3 && options.apply_dmin {
         if let Some(ref flat_path) = options.flat_field_path {
             let flat_map = load_flat_field_map(flat_path)?;
             apply_flat_field_division(&mut image, &flat_map);
+            let _ = writeln!(dbg, "D-min mode: flat-field ({})", flat_path.display());
         } else if let Some((r, g, b)) = options.dmin_fixed {
+            let _ = writeln!(dbg, "D-min mode: fixed ({:.6}, {:.6}, {:.6})", r, g, b);
             dmin::neutralize_with_medians(&mut image, r, g, b)?;
         } else if let Some(rect) = options.dmin_rect {
             let (h, w, _) = image.dim();
@@ -770,83 +867,242 @@ pub fn process_one_to_preview(
                 w as u32,
                 h as u32,
             );
+            let _ = writeln!(
+                dbg,
+                "D-min mode: rect x={} y={} w={} h={} neutral_only={}",
+                x, y, rw, rh, options.dmin_neutral_only
+            );
+            // Sample D-min region stats before neutralization
+            {
+                let x0 = (x as usize).min(w.saturating_sub(1));
+                let y0 = (y as usize).min(h.saturating_sub(1));
+                let x1 = ((x + rw) as usize).min(w).max(x0 + 1);
+                let y1 = ((y + rh) as usize).min(h).max(y0 + 1);
+                let region = image.slice(ndarray::s![y0..y1, x0..x1, ..]).to_owned();
+                let _ = write!(dbg, "{}", fmt_stats("  D-min sample region (before):", &channel_stats(&region)));
+            }
             dmin::neutralize(&mut image, x, y, rw, rh, options.dmin_neutral_only)?;
         }
+        image.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        let _ = write!(dbg, "{}", fmt_stats("Step 3 (after D-min, clamped [0,1]):", &channel_stats(&image)));
+    } else if options.debug_pipeline_step >= 3 {
+        let _ = writeln!(dbg, "Step 3: D-min SKIPPED (apply_dmin=false)");
+    } else {
+        let _ = writeln!(dbg, "Step 3: SKIPPED (pipeline_step < 3)");
     }
+    let _ = writeln!(dbg);
 
-    // Step 4: White balance.
+    // ──────────────────────────────────────────────────────────────────────
+    // Step 4: Transmittance → Optical Density → WB (multiplicative) → Film γ
+    //
+    //   4a  D = -log₁₀(T)
+    //   4b  Auto WB:  D *= mean_D / ch_median_D  (per-channel γ correction)
+    //   4c  Manual WB: D *= slider              (density scale, default 1.0)
+    //   4d  Film γ:   D *= 1/γ                  (density → scene log-exposure)
+    //
+    //   Multiplicative WB preserves D=0 → 0 for all channels (no black-point shift).
+    //   Film γ decompresses the density range by the film's characteristic curve slope.
+    // ──────────────────────────────────────────────────────────────────────
     if options.debug_pipeline_step >= 4 {
-        let (mut wb_r, mut wb_g, mut wb_b) = if options.apply_white_balance {
+        // 4a: T → D
+        image.mapv_inplace(|t| -(t.max(1e-10_f32)).log10());
+        let _ = write!(dbg, "{}", fmt_stats("Step 4a (T→D, density):", &channel_stats(&image)));
+
+        // 4b: Auto WB — multiplicative equalization of per-channel density medians.
+        //     D *= mean_D / ch_median_D  (equivalent to per-channel gamma correction).
+        let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.apply_dmin {
+            let stats = channel_stats(&image);
+            let med_r = stats[0].2.max(1e-4);
+            let med_g = stats[1].2.max(1e-4);
+            let med_b = stats[2].2.max(1e-4);
+            let mean_d = (med_r + med_g + med_b) / 3.0;
+            (mean_d / med_r, mean_d / med_g, mean_d / med_b)
+        } else {
+            (1.0, 1.0, 1.0)
+        };
+
+        // 4c: Manual WB — density scale factors (slider default 1.0).
+        //     >1 = more density = brighter in positive = more of that color.
+        let (man_s_r, man_s_g, man_s_b) = if options.apply_white_balance {
             (options.wb_r, options.wb_g, options.wb_b)
         } else {
             (1.0, 1.0, 1.0)
         };
+
+        // 4d: Film gamma — D_scene = D_film / γ.
+        let inv_gamma = 1.0 / options.film_gamma.max(0.1);
+
+        // Combined per-channel scale (single pass over the data).
+        let s_r = auto_s_r * man_s_r * inv_gamma;
+        let s_g = auto_s_g * man_s_g * inv_gamma;
+        let s_b = auto_s_b * man_s_b * inv_gamma;
+
+        let _ = writeln!(dbg, "Auto WB (×): R={:.4} G={:.4} B={:.4} (enabled={})",
+            auto_s_r, auto_s_g, auto_s_b, options.auto_wb && options.apply_dmin);
+        let _ = writeln!(dbg, "Manual WB (×): R={:.4} G={:.4} B={:.4}", man_s_r, man_s_g, man_s_b);
+        let _ = writeln!(dbg, "Film gamma: {:.3} → 1/γ = {:.4}", options.film_gamma, inv_gamma);
+        let _ = writeln!(dbg, "Combined density scale: R={:.4} G={:.4} B={:.4}", s_r, s_g, s_b);
+
+        image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * s_r);
+        image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * s_g);
+        image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * s_b);
+
+        // Color temperature: additive density offset (small correction, OK to shift black slightly).
         if let Some(k) = options.temp_k {
             let (tr, tg, tb) = temp_k_to_wb_gains(k);
-            wb_r *= tr;
-            wb_g *= tg;
-            wb_b *= tb;
+            let off_r = -(tr.max(1e-6) as f64).log10() as f32;
+            let off_g = -(tg.max(1e-6) as f64).log10() as f32;
+            let off_b = -(tb.max(1e-6) as f64).log10() as f32;
+            let _ = writeln!(dbg, "Temp {} K → density offset: R={:+.4} G={:+.4} B={:+.4}", k, off_r, off_g, off_b);
+            image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v + off_r);
+            image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v + off_g);
+            image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v + off_b);
         }
-        if wb_r != 1.0 || wb_g != 1.0 || wb_b != 1.0 {
-            image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * wb_r);
-            image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * wb_g);
-            image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * wb_b);
-        }
+
+        let _ = write!(dbg, "{}", fmt_stats("Step 4 (after WB + film γ):", &channel_stats(&image)));
+    } else {
+        let _ = writeln!(dbg, "Step 4: SKIPPED (pipeline_step < 4)");
     }
+    let _ = writeln!(dbg);
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Step 5: Density-domain color calibration (3×3 matrix or 3D LUT).
+    // ──────────────────────────────────────────────────────────────────────
+    if options.debug_pipeline_step >= 5 {
+        let m = if options.apply_color_profile {
+            options.density_matrix
+        } else {
+            [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]
+        };
+        let lut3d = options
+            .lut3d_path
+            .as_ref()
+            .and_then(|p| lut3d::read_cube(p).ok());
+
+        let _ = writeln!(
+            dbg,
+            "Step 5: density matrix [{:.4},{:.4},{:.4}] [{:.4},{:.4},{:.4}] [{:.4},{:.4},{:.4}], lut3d: {}",
+            m[0][0], m[0][1], m[0][2],
+            m[1][0], m[1][1], m[1][2],
+            m[2][0], m[2][1], m[2][2],
+            lut3d.is_some(),
+        );
+
+        if let Some(ref lut) = lut3d {
+            let (h, w, _) = image.dim();
+            for y in 0..h {
+                for x in 0..w {
+                    let dr = image[[y, x, 0]];
+                    let dg = image[[y, x, 1]];
+                    let db = image[[y, x, 2]];
+                    let [or, og, ob] = lut.sample_density(dr, dg, db);
+                    image[[y, x, 0]] = or;
+                    image[[y, x, 1]] = og;
+                    image[[y, x, 2]] = ob;
+                }
+            }
+        } else {
+            let is_identity = (m[0][0] - 1.0).abs() < 1e-6
+                && m[0][1].abs() < 1e-6 && m[0][2].abs() < 1e-6
+                && m[1][0].abs() < 1e-6 && (m[1][1] - 1.0).abs() < 1e-6 && m[1][2].abs() < 1e-6
+                && m[2][0].abs() < 1e-6 && m[2][1].abs() < 1e-6 && (m[2][2] - 1.0).abs() < 1e-6;
+            if !is_identity {
+                let (h, w, _) = image.dim();
+                for y in 0..h {
+                    for x in 0..w {
+                        let dr = image[[y, x, 0]];
+                        let dg = image[[y, x, 1]];
+                        let db = image[[y, x, 2]];
+                        image[[y, x, 0]] = m[0][0]*dr + m[0][1]*dg + m[0][2]*db;
+                        image[[y, x, 1]] = m[1][0]*dr + m[1][1]*dg + m[1][2]*db;
+                        image[[y, x, 2]] = m[2][0]*dr + m[2][1]*dg + m[2][2]*db;
+                    }
+                }
+            }
+        }
+        image.mapv_inplace(|v| v.max(0.0));
+        let _ = write!(dbg, "{}", fmt_stats("Step 5 (after density matrix):", &channel_stats(&image)));
+    } else {
+        let _ = writeln!(dbg, "Step 5: SKIPPED (pipeline_step < 5)");
+    }
+    let _ = writeln!(dbg);
 
     let (orig_h, orig_w, _) = image.dim();
     let orig_w = orig_w as u32;
     let orig_h = orig_h as u32;
 
-    // No ACEScg→sRGB: display stays in camera RGB.
-
-    // Step 6: curve or density inversion; else linear (clamped) to u8.
+    // ──────────────────────────────────────────────────────────────────────
+    // Step 6: RA-4 print curve (density → positive) or linear density map.
+    //         Image is already in density domain; the curve applies the
+    //         virtual enlarger exposure + Michaelis-Menten S-curve.
+    // ──────────────────────────────────────────────────────────────────────
     let rgb_u8: Vec<u8> = if options.debug_pipeline_step >= 6 && !options.no_curve {
         let params = curve::PrintCurveParams {
             offset: options.curve_offset,
             gamma: options.curve_gamma,
             pivot: options.curve_pivot,
         };
-        let identity = [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ];
-        let m = if options.apply_color_profile && options.apply_white_balance {
-            options.density_matrix
-        } else {
-            identity
-        };
-        let matrix = curve::DensityMatrix { m };
-        let lut3d = options
-            .lut3d_path
-            .as_ref()
-            .and_then(|p| lut3d::read_cube(p).ok());
-        let pipeline = curve::CurvePipeline::new(params, matrix, 4.0, true, lut3d);
-        let u16_img = curve::apply_curve_pipeline(&image, &pipeline, options.curve_white, false);
+        let _ = writeln!(
+            dbg,
+            "Step 6: RA-4 curve (offset={:.3} gamma={:.3} pivot={:.3} white={:.4})",
+            params.offset, params.gamma, params.pivot, options.curve_white
+        );
+        let _ = write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&image)));
+        let u16_img = curve::apply_ra4_from_density(&image, params, 4.0, options.curve_white);
+        {
+            let u16_stats: [(u16, u16, u16); 3] = {
+                let mut s = [(0u16, 0u16, 0u16); 3];
+                for ch in 0..3 {
+                    let slice = u16_img.slice(ndarray::s![.., .., ch]);
+                    let mut vals: Vec<u16> = slice.iter().copied().collect();
+                    vals.sort_unstable();
+                    s[ch] = (
+                        vals.first().copied().unwrap_or(0),
+                        vals.last().copied().unwrap_or(0),
+                        if vals.is_empty() { 0 } else { vals[vals.len() / 2] },
+                    );
+                }
+                s
+            };
+            let _ = writeln!(dbg, "  u16 output:");
+            let _ = writeln!(dbg, "    R: min={} max={} med={}", u16_stats[0].0, u16_stats[0].1, u16_stats[0].2);
+            let _ = writeln!(dbg, "    G: min={} max={} med={}", u16_stats[1].0, u16_stats[1].1, u16_stats[1].2);
+            let _ = writeln!(dbg, "    B: min={} max={} med={}", u16_stats[2].0, u16_stats[2].1, u16_stats[2].2);
+        }
         u16_img
             .iter()
             .map(|v| ((*v as u32) >> 8).min(255) as u8)
             .collect()
     } else if options.debug_pipeline_step >= 6 && options.no_invert {
-        // Step 6 with curve off but invert skipped: still linear.
+        // Debug: output raw density as grayscale (D/4 → [0,1]).
+        let _ = writeln!(dbg, "Step 6: raw density output (no curve, no invert)");
+        const D_DISP_MAX: f32 = 4.0;
         image
             .iter()
-            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .map(|v| ((*v / D_DISP_MAX).clamp(0.0, 1.0) * 255.0).round() as u8)
             .collect()
     } else if options.debug_pipeline_step >= 6 {
-        inversion::invert_density(&mut image);
+        // No-curve positive: density → linear brightness.
+        // Higher density = more dye = brighter subject = brighter output.
+        let _ = writeln!(dbg, "Step 6: linear density inversion (no curve)");
+        let _ = write!(dbg, "{}", fmt_stats("  density:", &channel_stats(&image)));
+        const D_DISP_MAX: f32 = 2.5;
         image
             .iter()
-            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .map(|v| ((*v / D_DISP_MAX).clamp(0.0, 1.0) * 255.0).round() as u8)
             .collect()
     } else {
-        // Steps 1–5: linear (clamped) to u8.
+        // Pipeline stopped early: density still in image, map for display.
+        let _ = writeln!(dbg, "Steps 1-5 only: density → display");
+        const D_DISP_MAX: f32 = 2.5;
         image
             .iter()
-            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .map(|v| ((*v / D_DISP_MAX).clamp(0.0, 1.0) * 255.0).round() as u8)
             .collect()
     };
+
+    let _ = writeln!(dbg);
+    let _ = writeln!(dbg, "=== end pipeline debug ===");
 
     let img = RgbImage::from_raw(orig_w, orig_h, rgb_u8)
         .ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
@@ -859,5 +1115,5 @@ pub fn process_one_to_preview(
 
     let resized = imageops::resize(&img, new_w, new_h, FilterType::Triangle);
     let out = resized.into_raw();
-    Ok((orig_w, orig_h, new_w, new_h, out))
+    Ok((orig_w, orig_h, new_w, new_h, out, dbg))
 }

@@ -74,6 +74,8 @@ struct ImageEntry {
     export_format: ExportFormat,
     /// Rawloader debug report for this file (Debug tab).
     raw_debug_report: Option<String>,
+    /// Pipeline debug log from the most recent preview render.
+    pipeline_debug_log: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +127,7 @@ struct C41Gui {
     selected_index: Option<usize>,
     output_dir: Option<PathBuf>,
     status: String,
-    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>)>>>,
+    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>, String)>>>,
     preview_started_at: Option<Instant>,
     /// Thumbnails for the image strip: (path, Ok((w, h, rgb)) or Err).
     thumbnail_receiver: Option<mpsc::Receiver<(PathBuf, anyhow::Result<(u32, u32, Vec<u8>)>)>>,
@@ -290,27 +292,29 @@ fn default_options() -> PipelineOptions {
     PipelineOptions {
         apply_dmin: true,
         apply_white_balance: true,
+        auto_wb: true,
+        film_gamma: 0.65,
         dmin_rect: None,
         dmin_rect_reference_size: None,
         apply_crop: false,
         crop_rect: None,
         crop_rect_reference_size: None,
         dmin_fixed: Some((0.635294, 0.635294, 0.623529)),
-        dmin_neutral_only: true,
+        dmin_neutral_only: false,
         format: TiffFormat::Float32,
         write_exr: false,
         write_jpeg: false,
         write_jpeg_only: false,
         no_invert: false,
         no_curve: false,
-        wb_r: 1.15,
-        wb_g: 0.88,
+        wb_r: 1.0,
+        wb_g: 1.0,
         wb_b: 1.0,
         temp_k: None,
         curve_offset: 0.0,
         curve_gamma: 2.5,
         curve_pivot: 3.0,
-        curve_white: 0.745,
+        curve_white: 1.0,
         apply_color_profile: true,
         density_matrix: [
             [1.0, 0.0, 0.0],
@@ -333,6 +337,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     path.display().to_string().hash(&mut h);
     opts.apply_dmin.hash(&mut h);
     opts.apply_white_balance.hash(&mut h);
+    opts.auto_wb.hash(&mut h);
+    opts.film_gamma.to_bits().hash(&mut h);
     opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
     opts.apply_crop.hash(&mut h);
@@ -456,7 +462,7 @@ impl C41Gui {
                 PREVIEW_MAX_WIDTH,
                 PREVIEW_MAX_HEIGHT,
             )
-            .map(|(input_w, input_h, w, h, rgb)| (index, input_w, input_h, w, h, rgb));
+            .map(|(input_w, input_h, w, h, rgb, dbg_log)| (index, input_w, input_h, w, h, rgb, dbg_log));
             let _ = tx.send(res);
         });
         ctx.request_repaint();
@@ -478,7 +484,7 @@ impl eframe::App for C41Gui {
         // Poll preview worker
         if let Some(rx) = self.preview_receiver.as_ref() {
             match rx.try_recv() {
-                Ok(Ok((idx, input_w, input_h, w, h, rgb))) => {
+                Ok(Ok((idx, input_w, input_h, w, h, rgb, dbg_log))) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
                     if idx < self.images.len() {
@@ -554,6 +560,7 @@ impl eframe::App for C41Gui {
                                 Some((input_w, input_h));
                         }
                         self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
+                        self.images[idx].pipeline_debug_log = Some(dbg_log);
                     }
                 }
                 Ok(Err(e)) => {
@@ -601,7 +608,7 @@ impl eframe::App for C41Gui {
                         THUMB_MAX_SIZE,
                         THUMB_MAX_SIZE,
                     )
-                    .map(|(_orig_w, _orig_h, new_w, new_h, rgb)| (new_w, new_h, rgb));
+                    .map(|(_orig_w, _orig_h, new_w, new_h, rgb, _dbg)| (new_w, new_h, rgb));
                     let _ = tx.send((path, result));
                 });
             }
@@ -668,6 +675,7 @@ impl eframe::App for C41Gui {
                                             histogram: None,
                                             export_format: ExportFormat::Tiff16,
                                             raw_debug_report: None,
+                                            pipeline_debug_log: None,
                                         });
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);
@@ -976,6 +984,39 @@ impl eframe::App for C41Gui {
                                 .weak(),
                         );
                     }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Pipeline debug log").strong());
+                    ui.label(
+                        egui::RichText::new("Updated on every preview render. Shows per-channel stats at each pipeline step.")
+                            .small()
+                            .weak(),
+                    );
+                    ui.add_space(4.0);
+                    if let Some(ref log) = entry.pipeline_debug_log {
+                        if ui.button("Copy pipeline log").clicked() {
+                            ui.ctx().copy_text(log.clone());
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("pipeline_debug_scroll")
+                            .max_height(520.0)
+                            .show(ui, |ui| {
+                                let mut log_text = log.clone();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut log_text)
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::TextStyle::Monospace)
+                                        .interactive(false),
+                                );
+                            });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("No pipeline log yet. Preview must render first.")
+                                .small()
+                                .weak(),
+                        );
+                    }
                 } else if self.mode != UIMode::LuminanceCalibrate {
                     // D-min, White balance, and Print curve apply only to normal processing.
                     ui.checkbox(&mut opts.apply_dmin, "D-min");
@@ -1019,10 +1060,10 @@ impl eframe::App for C41Gui {
                                 });
                                 ui.checkbox(
                                     &mut opts.dmin_neutral_only,
-                                    "Neutral only (recommended — avoids teal/cyan cast from orange base)",
+                                    "Neutral only (density removal without per-channel balance)",
                                 );
-                                if !opts.dmin_neutral_only {
-                                    ui.label(egui::RichText::new("Off = make base white but image will have strong teal cast.").small().weak());
+                                if opts.dmin_neutral_only {
+                                    ui.label(egui::RichText::new("On = single divisor (geometric mean). May leave a cast if channels are unbalanced.").small().weak());
                                 }
                             }
                             opts.dmin_fixed = None;
@@ -1109,6 +1150,19 @@ impl eframe::App for C41Gui {
                     ui.checkbox(&mut opts.apply_white_balance, "White balance");
                     if opts.apply_white_balance {
                     ui.collapsing("White balance settings", |ui| {
+                        ui.checkbox(&mut opts.auto_wb, "Auto WB (multiplicative)");
+                        ui.label(
+                            egui::RichText::new(
+                                if opts.auto_wb {
+                                    "Per-channel γ correction: D × (mean_D / ch_median). Preserves black point."
+                                } else {
+                                    "Manual only. Sliders scale density per channel."
+                                }
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.separator();
                         let mut use_temp = opts.temp_k.is_some();
                         ui.checkbox(&mut use_temp, "Use color temperature (K)");
                         if use_temp {
@@ -1118,6 +1172,7 @@ impl eframe::App for C41Gui {
                         } else {
                             opts.temp_k = None;
                         }
+                        ui.label(egui::RichText::new("Density scale (1.0 = neutral, >1 = more color)").small().weak());
                         ui.horizontal(|ui| {
                             ui.label("R");
                             ui.add(egui::Slider::new(&mut opts.wb_r, 0.5..=2.0));
@@ -1132,6 +1187,17 @@ impl eframe::App for C41Gui {
                         });
                     });
                     }
+
+                    ui.collapsing("Film gamma", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "C-41 γ ≈ 0.55–0.75. Converts density → scene log-exposure: D/γ"
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add(egui::Slider::new(&mut opts.film_gamma, 0.3..=1.2).text("γ"));
+                    });
 
                     // Pipeline always runs in ACEScg. Optional camera IDT (identity = no transform).
                     ui.label("Camera IDT profile");
@@ -1210,7 +1276,7 @@ impl eframe::App for C41Gui {
                         });
                         ui.horizontal(|ui| {
                             ui.label("White");
-                            ui.add(egui::Slider::new(&mut opts.curve_white, 0.3..=1.0));
+                            ui.add(egui::Slider::new(&mut opts.curve_white, -1.0..=2.0));
                         });
                     });
                     }
