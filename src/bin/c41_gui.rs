@@ -6,7 +6,7 @@
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,17 @@ const ICON_ROTATE_RIGHT_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-
 const ICON_ROTATE_LEFT_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/rotate_left-ebbb0f40-9849-4e0e-91dd-48945ff59e2c.png";
 const ICON_LOGO_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/logo-6001e4ef-8453-4eb6-8ed5-c7622d9a8d7b.png";
 
+fn app_icon_data() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../img/logo.png");
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
+
 #[derive(Default)]
 struct UiIcons {
     close: Option<egui::TextureHandle>,
@@ -46,7 +57,7 @@ struct UiIcons {
 }
 
 fn main() -> eframe::Result<()> {
-    let native_options = if cfg!(target_os = "macos") {
+    let mut native_options = if cfg!(target_os = "macos") {
         let mut o = eframe::NativeOptions::default();
         o.viewport = o
             .viewport
@@ -58,6 +69,9 @@ fn main() -> eframe::Result<()> {
     } else {
         eframe::NativeOptions::default()
     };
+    if let Some(icon) = app_icon_data() {
+        native_options.viewport = native_options.viewport.clone().with_icon(Arc::new(icon));
+    }
     eframe::run_native(
         "C-41 RAW Tool",
         native_options,
