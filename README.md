@@ -1,6 +1,6 @@
 # c41-raw-tool
 
-A high-performance, command-line and GUI RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically accurate log-density math: no auto white balance, no hidden base curves only explicit mathematical steps suitable for scientific and repeatable workflows. Internally it uses ACEScg color space. 
+A high-performance, command-line and GUI RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically grounded log-density math with explicit, ordered operations (including camera IDT to ACEScg, D-min/flat-field normalization, density-domain calibration, and RA-4 print curve). Auto white balance is optional and explicit (toggleable), with no hidden tone/base curves.
 
 **Target cameras:** Any rawloader-supported Bayer RAW (Sony, Nikon, Canon, Fuji, Panasonic, Adobe DNG, etc.). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
 
@@ -144,28 +144,31 @@ The tool supports two kinds of calibration, each with a clear role.
 
 Order of operations:
 
-1. **Linear extraction** (RAW only) -- rawloader (pure Rust) decodes the raw Bayer plane only (no gamma, no camera WB). Data is normalized to `[0, 1]` as f32.
-2. **Demosaic** (RAW only) -- High-quality demosaic: edge-aware green (Hamilton–Adams) plus **color-difference** (R−G, B−G) interpolation for red and blue. Pattern: **RGGB** (Sony a7R II). Result: `(height, width, 3)` f32. This minimizes false color and zippering while preserving detail and grain.
-   *PNG input skips 1-2: loaded as RGB and normalized to [0, 1].*
-3. **D-min or flat-field** (optional, can be disabled) -- Either:
-   - **Flat-field:** If `--flat-field` is set, load that reference (RAW → linearize → heavy blur), then divide the image by it pixel-by-pixel. This removes light falloff and vignetting; the film base normalizes to ~1.0 transmittance everywhere. **Or**
-   - **D-min:** If `--dmin-fixed` is set, divide by those fixed R,G,B medians; if `--dmin-rect` is set, compute median R,G,B in that rectangle and divide.  
-   After this step, data represents **linear transmittance**.
-4. **White balance gains** (optional, can be disabled) -- Per-channel multipliers `--wb-r`, `--wb-g`, `--wb-b` (default 1.0). Applied after step 3; compensates narrowband LED intensity imbalance. Same gains can be reused for a given light source.
-5. **Density-domain color calibration + physical print curve** (optional, default on) -- Implemented as high-resolution 1D LUTs plus a 3×3 matrix:
-   - `D = -log10(T)` -- optical density of the negative (per channel).
-   - **Color calibration matrix:** `D_out = M · D_in` where `M` is the 3×3 matrix (from a saved profile or `--density-matrix`). When color calibration is disabled, the identity matrix is used. This step removes dye crosstalk and aligns colors to a reference (e.g. ColorChecker).
-   - `logE = D_out + offset` -- density as print exposure (inversion in log domain)
-   - `E = 10^logE` -- back to linear exposure
-   - `out = E^g / (E^g + pivot^g)` -- RA-4 paper S-curve (Michaelis-Menten), implemented as a dedicated `D → RA-4` LUT over a fixed density range.
-   Parameters: `--curve-offset`, `--curve-gamma`, `--curve-pivot`, `--density-matrix`. Then **white point**: if `--curve-white` < 1, output is scaled so that value maps to display white (e.g. 0.745 for 190/255). A **histogram summary** (min, p50, p90, p99, max) is printed for the final u16 image.
-6. **Fallback** (`--no-curve`) -- When the curve is off, optionally apply linear `1-x` inversion (`--no-invert` to skip). Export as 32-bit float (default) or 16-bit via `--format`.
+1. **Load and linearize**  
+   RAW: `rawloader` decode -> demosaic -> linear camera RGB (`f32`).  
+   PNG: load as linearized RGB input path used for development/testing.
 
-In the GUI, **D-min**, **White balance**, **Print curve**, and **Color calibration profile** each have a checkbox: when unchecked, that step is skipped (identity or no-op), so you can isolate the effect of each stage.
+2. **IDT (camera RGB -> ACEScg)**  
+   Apply selected camera IDT matrix (identity by default).  
+   This now runs in the main preview/export pipeline (not only ACES export).
 
-### ACES hybrid
+3. **D-min / flat-field normalization**  
+   Either fixed D-min RGB, sampled D-min rectangle, or flat-field map (if set).  
+   Output stays bounded to valid transmittance range.
 
-With **Use ACEScg** (GUI) or `--use-acescg` (CLI), the pipeline treats ACES as a linear working space only: linear camera RGB is converted to ACEScg via an **IDT** (Input Device Transform), then D-min, flat-field, white balance, and the density matrix + RA-4 curve run in ACEScg. Display output maps ACEScg directly to sRGB with the same RA-4 curve—no ACES RRT/ODT. You can optionally **Export ACES2065-1 EXR** to get a linear ACES2065-1 (AP0) file per image for archival. Color calibration profiles solved in camera space are automatically converted to ACEScg (M_aces = T · M_cam · T^(-1)) so existing profiles still match.
+4. **Transmittance -> density + WB + film gamma**  
+   Convert to optical density: `D = -log10(T)`.  
+   Apply auto/manual WB in density domain and film-gamma decompression (`D / gamma`).
+
+5. **Density calibration**  
+   Apply density-domain 3x3 matrix or 3D LUT (if loaded).
+
+6. **Render/output stage**  
+   - With print curve: RA-4 curve from density -> positive image.  
+   - Without print curve: direct density display mapping.
+
+7. **Export transforms**  
+   Optional ACES2065-1 EXR export from ACEScg working data.
 
 ---
 

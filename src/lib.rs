@@ -486,8 +486,7 @@ fn linear_to_srgb_u8(v: f32) -> u8 {
 /// 3. **D-min / flat-field** (optional).
 /// 4. **White balance** (optional).
 /// 5. **Optional ACES2065-1 export**: clone ACEScg image, convert to AP0, write EXR.
-/// 6. **Display path**: If curve: T→D → density matrix (in ACEScg) → RA-4 → quantize; convert to
-///    **linear sRGB** for TIFF/EXR/JPEG. If no curve: ACEScg → linear sRGB, optional invert, export.
+/// 6. **Display path**: If curve: T→D → density matrix (in ACEScg) → RA-4. If no curve: direct density map.
 pub fn process_files(
     paths: &[PathBuf],
     output_dir: &Path,
@@ -508,10 +507,16 @@ pub fn process_files(
         pivot: options.curve_pivot,
     };
 
-    // Optional flat-field: keep in camera RGB to match main image (no IDT).
+    // Optional flat-field map (Step 3 input). If IDT is active, transform the map to ACEScg once
+    // so flat-field division stays in the same space as the main image.
     let flat_field_map: Option<Array3<f32>> =
         if let Some(ref flat_path) = options.flat_field_path {
-            Some(load_flat_field_map(flat_path)?)
+            let mut ff = load_flat_field_map(flat_path)?;
+            if options.debug_pipeline_step >= 2 && !aces::is_identity(&options.idt_matrix) {
+                aces::apply_idt(&mut ff, &options.idt_matrix);
+                ff.mapv_inplace(|v| v.max(0.0));
+            }
+            Some(ff)
         } else {
             None
         };
@@ -538,7 +543,14 @@ pub fn process_files(
             image = apply_rotation(&image, options.rotation_degrees);
         }
 
-        // Display path: no IDT (keep camera RGB). IDT is only applied when exporting ACES2065-1 below.
+        // Step 2: Camera RGB -> ACEScg via IDT.
+        if options.debug_pipeline_step >= 2 {
+            if !aces::is_identity(&options.idt_matrix) {
+                aces::apply_idt(&mut image, &options.idt_matrix);
+                // Density pipeline expects non-negative transmittance values.
+                image.mapv_inplace(|v| v.max(0.0));
+            }
+        }
 
         // Step 3: D-min / flat-field (skipped if apply_dmin is false).
         if options.debug_pipeline_step >= 3 && options.apply_dmin {
@@ -678,10 +690,9 @@ pub fn process_files(
         let exr_path = output_dir.join(format!("{}.exr", stem));
         let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
 
-        // ACES2065-1 only: apply IDT (camera → ACEScg) then convert to ACES2065-1. Display path never uses ACES.
+        // ACES2065-1 only: image is already in ACEScg (after Step 2).
         if options.write_aces2065_only {
             let mut aces2065 = image.clone();
-            aces::apply_idt(&mut aces2065, &options.idt_matrix);
             aces::linear_acescg_to_aces2065_1(&mut aces2065);
             exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
             continue;
@@ -689,7 +700,6 @@ pub fn process_files(
 
         if options.export_aces_exr {
             let mut aces2065 = image.clone();
-            aces::apply_idt(&mut aces2065, &options.idt_matrix);
             aces::linear_acescg_to_aces2065_1(&mut aces2065);
             exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
         }
@@ -781,7 +791,7 @@ fn fmt_stats(label: &str, stats: &[(f32, f32, f32); 3]) -> String {
 }
 
 /// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
-/// D-min/flat-field → WB → curve or no-curve. Display path stays in camera RGB (no IDT/ACES).
+/// IDT → D-min/flat-field → WB → curve or no-curve.
 ///
 /// Returns `(input_w, input_h, preview_w, preview_h, rgb_u8, debug_log)`.
 pub fn process_one_to_preview(
@@ -857,10 +867,30 @@ pub fn process_one_to_preview(
         return Ok((orig_w, orig_h, new_w, new_h, out, dbg));
     }
 
-    // Step 3: D-min / flat-field (flat stays in camera RGB).
+    // Step 2: Camera RGB -> ACEScg via IDT.
+    if options.debug_pipeline_step >= 2 {
+        let idt_is_identity = aces::is_identity(&options.idt_matrix);
+        let _ = writeln!(dbg, "Step 2: IDT (identity={})", idt_is_identity);
+        if !idt_is_identity {
+            aces::apply_idt(&mut image, &options.idt_matrix);
+            image.mapv_inplace(|v| v.max(0.0));
+        }
+        if options.verbose_debug {
+            let _ = write!(dbg, "{}", fmt_stats("Step 2 (after IDT):", &channel_stats(&image)));
+        }
+    } else {
+        let _ = writeln!(dbg, "Step 2: SKIPPED (pipeline_step < 2)");
+    }
+    let _ = writeln!(dbg);
+
+    // Step 3: D-min / flat-field.
     if options.debug_pipeline_step >= 3 && options.apply_dmin {
         if let Some(ref flat_path) = options.flat_field_path {
-            let flat_map = load_flat_field_map(flat_path)?;
+            let mut flat_map = load_flat_field_map(flat_path)?;
+            if options.debug_pipeline_step >= 2 && !aces::is_identity(&options.idt_matrix) {
+                aces::apply_idt(&mut flat_map, &options.idt_matrix);
+                flat_map.mapv_inplace(|v| v.max(0.0));
+            }
             apply_flat_field_division(&mut image, &flat_map);
             let _ = writeln!(dbg, "D-min mode: flat-field ({})", flat_path.display());
         } else if let Some((r, g, b)) = options.dmin_fixed {
