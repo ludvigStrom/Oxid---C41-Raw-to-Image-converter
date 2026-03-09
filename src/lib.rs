@@ -42,6 +42,12 @@ pub struct PipelineOptions {
     pub dmin_rect: Option<Rect>,
     /// When set, the rect is in pixels for this (width, height). Used to scale rect when exporting at full size.
     pub dmin_rect_reference_size: Option<(u32, u32)>,
+    /// When false, crop is skipped and full frame is exported.
+    pub apply_crop: bool,
+    /// Optional export crop rectangle in pixel coordinates.
+    pub crop_rect: Option<Rect>,
+    /// Reference size for `crop_rect` coordinates (width, height), used to scale to current image size.
+    pub crop_rect_reference_size: Option<(u32, u32)>,
     pub dmin_fixed: Option<(f32, f32, f32)>,
     /// When true and using rect, divide all channels by the same value (geometric mean of medians) to remove density without shifting color.
     pub dmin_neutral_only: bool,
@@ -91,6 +97,9 @@ impl Default for PipelineOptions {
             apply_white_balance: true,
             dmin_rect: None,
             dmin_rect_reference_size: None,
+            apply_crop: false,
+            crop_rect: None,
+            crop_rect_reference_size: None,
             dmin_fixed: None,
             dmin_neutral_only: true,
             format: TiffFormat::Float32,
@@ -329,6 +338,25 @@ fn scale_dmin_rect(
     }
 }
 
+/// Crop an image to `(x, y, w, h)` (clamped), returning a new `(H, W, 3)` array.
+fn crop_array3(image: &Array3<f32>, x: u32, y: u32, width: u32, height: u32) -> Array3<f32> {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let x = x as usize;
+    let y = y as usize;
+    let rw = width as usize;
+    let rh = height as usize;
+
+    let x_start = x.min(w.saturating_sub(1));
+    let y_start = y.min(h.saturating_sub(1));
+    let x_end = (x + rw).min(w).max(x_start + 1);
+    let y_end = (y + rh).min(h).max(y_start + 1);
+
+    image
+        .slice(ndarray::s![y_start..y_end, x_start..x_end, ..])
+        .to_owned()
+}
+
 /// Apply pixel-by-pixel flat-field division:
 /// T_out(x, y) = T_in(x, y) / T_flat_blurred(x, y), with safe division.
 fn apply_flat_field_division(image: &mut Array3<f32>, flat_blurred: &Array3<f32>) {
@@ -550,6 +578,20 @@ pub fn process_files(
                 image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * wb_r);
                 image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * wb_g);
                 image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * wb_b);
+            }
+        }
+
+        // Optional crop (export path only): keep only selected region.
+        if options.apply_crop {
+            if let Some(rect) = options.crop_rect {
+                let (h, w, _) = image.dim();
+                let (x, y, rw, rh) = scale_dmin_rect(
+                    rect,
+                    options.crop_rect_reference_size,
+                    w as u32,
+                    h as u32,
+                );
+                image = crop_array3(&image, x, y, rw, rh);
             }
         }
 

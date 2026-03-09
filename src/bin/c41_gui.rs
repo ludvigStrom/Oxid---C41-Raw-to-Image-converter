@@ -292,6 +292,9 @@ fn default_options() -> PipelineOptions {
         apply_white_balance: true,
         dmin_rect: None,
         dmin_rect_reference_size: None,
+        apply_crop: false,
+        crop_rect: None,
+        crop_rect_reference_size: None,
         dmin_fixed: Some((0.635294, 0.635294, 0.623529)),
         dmin_neutral_only: true,
         format: TiffFormat::Float32,
@@ -332,6 +335,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.apply_white_balance.hash(&mut h);
     opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
+    opts.apply_crop.hash(&mut h);
+    opts.crop_rect.hash(&mut h);
     opts.dmin_neutral_only.hash(&mut h);
     if let Some((r, g, b)) = opts.dmin_fixed {
         r.to_bits().hash(&mut h);
@@ -368,6 +373,69 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
     h.finish()
+}
+
+/// Rotate a pixel-space rect 90 degrees within an image of `img_w` × `img_h`.
+/// Coordinates are treated as half-open bounds: [x, x+width) × [y, y+height).
+fn rotate_dmin_rect_90(rect: Rect, img_w: u32, img_h: u32, clockwise: bool) -> Rect {
+    let img_w = img_w as i64;
+    let img_h = img_h as i64;
+
+    // Clamp incoming bounds to source image size before rotating.
+    let left = (rect.x as i64).clamp(0, img_w);
+    let top = (rect.y as i64).clamp(0, img_h);
+    let right = ((rect.x as i64) + (rect.width as i64)).clamp(0, img_w);
+    let bottom = ((rect.y as i64) + (rect.height as i64)).clamp(0, img_h);
+
+    let (new_left, new_top, new_right, new_bottom) = if clockwise {
+        // 90 CW: (x, y) -> (h - y, x) in half-open space.
+        (img_h - bottom, left, img_h - top, right)
+    } else {
+        // 90 CCW: (x, y) -> (y, w - x) in half-open space.
+        (top, img_w - right, bottom, img_w - left)
+    };
+
+    Rect {
+        x: new_left.max(0) as u32,
+        y: new_top.max(0) as u32,
+        width: (new_right - new_left).max(1) as u32,
+        height: (new_bottom - new_top).max(1) as u32,
+    }
+}
+
+fn scale_rect_to_size(
+    rect: Rect,
+    reference_size: Option<(u32, u32)>,
+    current_w: u32,
+    current_h: u32,
+) -> Rect {
+    let (x, y, rw, rh) = (rect.x, rect.y, rect.width, rect.height);
+    match reference_size {
+        None => Rect {
+            x,
+            y,
+            width: rw.max(1),
+            height: rh.max(1),
+        },
+        Some((ref_w, ref_h)) if ref_w == current_w && ref_h == current_h => Rect {
+            x,
+            y,
+            width: rw.max(1),
+            height: rh.max(1),
+        },
+        Some((ref_w, ref_h)) if ref_w > 0 && ref_h > 0 => Rect {
+            x: (x as f32 * current_w as f32 / ref_w as f32).round() as u32,
+            y: (y as f32 * current_h as f32 / ref_h as f32).round() as u32,
+            width: (rw as f32 * current_w as f32 / ref_w as f32).round().max(1.0) as u32,
+            height: (rh as f32 * current_h as f32 / ref_h as f32).round().max(1.0) as u32,
+        },
+        _ => Rect {
+            x,
+            y,
+            width: rw.max(1),
+            height: rh.max(1),
+        },
+    }
 }
 
 impl C41Gui {
@@ -418,18 +486,55 @@ impl eframe::App for C41Gui {
                         let mut r_hist = [0u32; 256];
                         let mut g_hist = [0u32; 256];
                         let mut b_hist = [0u32; 256];
-                        let pixels: Vec<egui::Color32> = rgb
-                            .chunks_exact(3)
-                            .map(|c| {
+                        let crop_in_preview = {
+                            let opts = &self.images[idx].options;
+                            if opts.apply_crop {
+                                if let Some(crop_rect) = opts.crop_rect {
+                                    let scaled = scale_rect_to_size(
+                                        crop_rect,
+                                        opts.crop_rect_reference_size,
+                                        input_w,
+                                        input_h,
+                                    );
+                                    Some(scale_rect_to_size(
+                                        scaled,
+                                        Some((input_w, input_h)),
+                                        w,
+                                        h,
+                                    ))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        let mut pixels: Vec<egui::Color32> = Vec::with_capacity(size[0] * size[1]);
+                        for (i, c) in rgb.chunks_exact(3).enumerate() {
+                            let x = (i % size[0]) as u32;
+                            let y = (i / size[0]) as u32;
+
+                            let in_hist_crop = if let Some(rect) = crop_in_preview {
+                                let x0 = rect.x.min(w.saturating_sub(1));
+                                let y0 = rect.y.min(h.saturating_sub(1));
+                                let x1 = (rect.x + rect.width).min(w).max(x0 + 1);
+                                let y1 = (rect.y + rect.height).min(h).max(y0 + 1);
+                                x >= x0 && x < x1 && y >= y0 && y < y1
+                            } else {
+                                true
+                            };
+
+                            if in_hist_crop {
                                 let r = c[0] as usize;
                                 let g = c[1] as usize;
                                 let b = c[2] as usize;
                                 r_hist[r] += 1;
                                 g_hist[g] += 1;
                                 b_hist[b] += 1;
-                                egui::Color32::from_rgb(c[0], c[1], c[2])
-                            })
-                            .collect();
+                            }
+                            pixels.push(egui::Color32::from_rgb(c[0], c[1], c[2]));
+                        }
                         let image = egui::ColorImage { size, pixels };
                         let tex = ctx.load_texture(
                             format!("preview_{}", idx),
@@ -442,6 +547,10 @@ impl eframe::App for C41Gui {
                         self.images[idx].preview_input_size = Some([input_w, input_h]);
                         if self.images[idx].options.dmin_rect.is_some() {
                             self.images[idx].options.dmin_rect_reference_size =
+                                Some((input_w, input_h));
+                        }
+                        if self.images[idx].options.crop_rect.is_some() {
+                            self.images[idx].options.crop_rect_reference_size =
                                 Some((input_w, input_h));
                         }
                         self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
@@ -965,6 +1074,36 @@ impl eframe::App for C41Gui {
                             ui.label(egui::RichText::new("No flat-field override set.").small());
                         }
                     });
+                    }
+
+                    ui.checkbox(&mut opts.apply_crop, "Crop");
+                    if opts.apply_crop {
+                        ui.collapsing("Crop settings", |ui| {
+                            if opts.crop_rect.is_none() {
+                                opts.crop_rect = Some(Rect {
+                                    x: 40,
+                                    y: 40,
+                                    width: 240,
+                                    height: 240,
+                                });
+                            }
+                            if let Some(rect) = opts.crop_rect.as_mut() {
+                                ui.horizontal(|ui| {
+                                    ui.label("x,y,w,h");
+                                    ui.add(egui::DragValue::new(&mut rect.x).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.y).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.width).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.height).speed(1));
+                                });
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Preview darkens outside crop. Histogram + export use inside only.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
                     }
 
                     ui.checkbox(&mut opts.apply_white_balance, "White balance");
@@ -1689,8 +1828,8 @@ impl eframe::App for C41Gui {
                         // In Process mode, when D-min is active and using a rectangle (no flat-field /
                         // fixed D-min), draw the D-min sampling rectangle over the preview.
                         if self.mode == UIMode::Process {
-                            if let Some(entry) = self.images.get(idx) {
-                                let opts = &entry.options;
+                            if let Some(entry) = self.images.get_mut(idx) {
+                                let opts = &mut entry.options;
                                 if opts.apply_dmin
                                     && opts.dmin_fixed.is_none()
                                     && self.flat_field_path.is_none()
@@ -1705,20 +1844,114 @@ impl eframe::App for C41Gui {
                                             let norm_w = rect.width as f32 / input_w as f32;
                                             let norm_h = rect.height as f32 / input_h as f32;
 
-                                            let rect_left =
+                                            let mut left =
                                                 image_rect.left() + norm_x * image_rect.width();
-                                            let rect_top =
+                                            let mut top =
                                                 image_rect.top() + norm_y * image_rect.height();
-                                            let rect_width =
-                                                norm_w * image_rect.width();
-                                            let rect_height =
-                                                norm_h * image_rect.height();
+                                            let mut right = left + norm_w * image_rect.width();
+                                            let mut bottom = top + norm_h * image_rect.height();
 
-                                            let screen_rect = egui::Rect::from_min_size(
-                                                egui::pos2(rect_left, rect_top),
-                                                egui::vec2(rect_width, rect_height),
+                                            // Draggable corner handles for direct D-min crop editing.
+                                            let handle_radius = 5.0;
+                                            let min_screen_size = 8.0;
+                                            let mut rect_changed = false;
+
+                                            let corners = [
+                                                egui::pos2(left, top),
+                                                egui::pos2(right, top),
+                                                egui::pos2(left, bottom),
+                                                egui::pos2(right, bottom),
+                                            ];
+
+                                            for (corner_idx, corner_pos) in corners.iter().enumerate() {
+                                                let handle_rect = egui::Rect::from_center_size(
+                                                    *corner_pos,
+                                                    egui::vec2(handle_radius * 2.0, handle_radius * 2.0),
+                                                );
+                                                let id =
+                                                    ui.make_persistent_id(("dmin_rect_handle", idx, corner_idx));
+                                                let resp = ui.interact(
+                                                    handle_rect,
+                                                    id,
+                                                    egui::Sense::click_and_drag(),
+                                                );
+                                                if resp.dragged() {
+                                                    let delta = resp.drag_delta();
+                                                    rect_changed = true;
+                                                    match corner_idx {
+                                                        0 => {
+                                                            left += delta.x;
+                                                            top += delta.y;
+                                                        }
+                                                        1 => {
+                                                            right += delta.x;
+                                                            top += delta.y;
+                                                        }
+                                                        2 => {
+                                                            left += delta.x;
+                                                            bottom += delta.y;
+                                                        }
+                                                        3 => {
+                                                            right += delta.x;
+                                                            bottom += delta.y;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+
+                                            if rect_changed {
+                                                left = left.clamp(
+                                                    image_rect.left(),
+                                                    image_rect.right() - min_screen_size,
+                                                );
+                                                top = top.clamp(
+                                                    image_rect.top(),
+                                                    image_rect.bottom() - min_screen_size,
+                                                );
+                                                right = right
+                                                    .clamp(left + min_screen_size, image_rect.right());
+                                                bottom = bottom
+                                                    .clamp(top + min_screen_size, image_rect.bottom());
+                                            } else {
+                                                let screen_rect =
+                                                    egui::Rect::from_min_max(
+                                                        egui::pos2(left, top),
+                                                        egui::pos2(right, bottom),
+                                                    );
+                                                let move_id =
+                                                    ui.make_persistent_id(("dmin_rect_move", idx));
+                                                let move_resp = ui.interact(
+                                                    screen_rect,
+                                                    move_id,
+                                                    egui::Sense::click_and_drag(),
+                                                );
+                                                if move_resp.dragged() {
+                                                    let delta = move_resp.drag_delta();
+                                                    let rect_w = right - left;
+                                                    let rect_h = bottom - top;
+
+                                                    let mut dx = delta.x;
+                                                    let mut dy = delta.y;
+                                                    dx = dx
+                                                        .max(image_rect.left() - left)
+                                                        .min(image_rect.right() - right);
+                                                    dy = dy
+                                                        .max(image_rect.top() - top)
+                                                        .min(image_rect.bottom() - bottom);
+
+                                                    left += dx;
+                                                    right = left + rect_w;
+                                                    top += dy;
+                                                    bottom = top + rect_h;
+                                                    rect_changed = true;
+                                                }
+                                            }
+
+                                            let screen_rect = egui::Rect::from_min_max(
+                                                egui::pos2(left, top),
+                                                egui::pos2(right, bottom),
                                             );
-
                                             painter.rect_stroke(
                                                 screen_rect,
                                                 0.0,
@@ -1727,6 +1960,269 @@ impl eframe::App for C41Gui {
                                                     egui::Color32::from_rgb(255, 200, 0),
                                                 ),
                                             );
+                                            for p in [
+                                                egui::pos2(left, top),
+                                                egui::pos2(right, top),
+                                                egui::pos2(left, bottom),
+                                                egui::pos2(right, bottom),
+                                            ] {
+                                                painter.circle_filled(
+                                                    p,
+                                                    handle_radius,
+                                                    egui::Color32::from_rgb(255, 200, 0),
+                                                );
+                                            }
+
+                                            if rect_changed {
+                                                let img_w = image_rect.width().max(1.0);
+                                                let img_h = image_rect.height().max(1.0);
+
+                                                let norm_left = (left - image_rect.left()) / img_w;
+                                                let norm_top = (top - image_rect.top()) / img_h;
+                                                let norm_width = (right - left) / img_w;
+                                                let norm_height = (bottom - top) / img_h;
+
+                                                let x = (norm_left * input_w as f32)
+                                                    .round()
+                                                    .clamp(0.0, input_w.saturating_sub(1) as f32)
+                                                    as u32;
+                                                let y = (norm_top * input_h as f32)
+                                                    .round()
+                                                    .clamp(0.0, input_h.saturating_sub(1) as f32)
+                                                    as u32;
+                                                let mut w_px =
+                                                    (norm_width * input_w as f32).round().max(1.0) as u32;
+                                                let mut h_px =
+                                                    (norm_height * input_h as f32).round().max(1.0) as u32;
+                                                w_px = w_px.min(input_w.saturating_sub(x).max(1));
+                                                h_px = h_px.min(input_h.saturating_sub(y).max(1));
+
+                                                opts.dmin_rect = Some(Rect {
+                                                    x,
+                                                    y,
+                                                    width: w_px,
+                                                    height: h_px,
+                                                });
+                                                opts.dmin_rect_reference_size = Some((input_w, input_h));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // In Process mode, draw/edit crop overlay (optional):
+                        // darken outside region and allow drag handles.
+                        if self.mode == UIMode::Process {
+                            if let Some(entry) = self.images.get_mut(idx) {
+                                let opts = &mut entry.options;
+                                if opts.apply_crop {
+                                    if let (Some(crop), Some([input_w, input_h])) =
+                                        (opts.crop_rect, entry.preview_input_size)
+                                    {
+                                        if input_w > 0 && input_h > 0 {
+                                            let painter = ui.painter_at(image_rect);
+                                            let crop = scale_rect_to_size(
+                                                crop,
+                                                opts.crop_rect_reference_size,
+                                                input_w,
+                                                input_h,
+                                            );
+                                            let norm_x = crop.x as f32 / input_w as f32;
+                                            let norm_y = crop.y as f32 / input_h as f32;
+                                            let norm_w = crop.width as f32 / input_w as f32;
+                                            let norm_h = crop.height as f32 / input_h as f32;
+
+                                            let mut left =
+                                                image_rect.left() + norm_x * image_rect.width();
+                                            let mut top =
+                                                image_rect.top() + norm_y * image_rect.height();
+                                            let mut right = left + norm_w * image_rect.width();
+                                            let mut bottom = top + norm_h * image_rect.height();
+
+                                            let handle_radius = 5.0;
+                                            let min_screen_size = 8.0;
+                                            let mut rect_changed = false;
+
+                                            let corners = [
+                                                egui::pos2(left, top),
+                                                egui::pos2(right, top),
+                                                egui::pos2(left, bottom),
+                                                egui::pos2(right, bottom),
+                                            ];
+                                            for (corner_idx, corner_pos) in corners.iter().enumerate() {
+                                                let handle_rect = egui::Rect::from_center_size(
+                                                    *corner_pos,
+                                                    egui::vec2(handle_radius * 2.0, handle_radius * 2.0),
+                                                );
+                                                let id =
+                                                    ui.make_persistent_id(("crop_rect_handle", idx, corner_idx));
+                                                let resp = ui.interact(
+                                                    handle_rect,
+                                                    id,
+                                                    egui::Sense::click_and_drag(),
+                                                );
+                                                if resp.dragged() {
+                                                    let delta = resp.drag_delta();
+                                                    rect_changed = true;
+                                                    match corner_idx {
+                                                        0 => {
+                                                            left += delta.x;
+                                                            top += delta.y;
+                                                        }
+                                                        1 => {
+                                                            right += delta.x;
+                                                            top += delta.y;
+                                                        }
+                                                        2 => {
+                                                            left += delta.x;
+                                                            bottom += delta.y;
+                                                        }
+                                                        3 => {
+                                                            right += delta.x;
+                                                            bottom += delta.y;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+
+                                            if rect_changed {
+                                                left = left.clamp(
+                                                    image_rect.left(),
+                                                    image_rect.right() - min_screen_size,
+                                                );
+                                                top = top.clamp(
+                                                    image_rect.top(),
+                                                    image_rect.bottom() - min_screen_size,
+                                                );
+                                                right = right
+                                                    .clamp(left + min_screen_size, image_rect.right());
+                                                bottom = bottom
+                                                    .clamp(top + min_screen_size, image_rect.bottom());
+                                            } else {
+                                                let screen_rect =
+                                                    egui::Rect::from_min_max(
+                                                        egui::pos2(left, top),
+                                                        egui::pos2(right, bottom),
+                                                    );
+                                                let move_id =
+                                                    ui.make_persistent_id(("crop_rect_move", idx));
+                                                let move_resp = ui.interact(
+                                                    screen_rect,
+                                                    move_id,
+                                                    egui::Sense::click_and_drag(),
+                                                );
+                                                if move_resp.dragged() {
+                                                    let delta = move_resp.drag_delta();
+                                                    let rect_w = right - left;
+                                                    let rect_h = bottom - top;
+                                                    let mut dx = delta.x;
+                                                    let mut dy = delta.y;
+                                                    dx = dx
+                                                        .max(image_rect.left() - left)
+                                                        .min(image_rect.right() - right);
+                                                    dy = dy
+                                                        .max(image_rect.top() - top)
+                                                        .min(image_rect.bottom() - bottom);
+                                                    left += dx;
+                                                    right = left + rect_w;
+                                                    top += dy;
+                                                    bottom = top + rect_h;
+                                                    rect_changed = true;
+                                                }
+                                            }
+
+                                            let screen_rect = egui::Rect::from_min_max(
+                                                egui::pos2(left, top),
+                                                egui::pos2(right, bottom),
+                                            );
+                                            let overlay = egui::Color32::from_black_alpha(128);
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    image_rect.min,
+                                                    egui::pos2(image_rect.max.x, top),
+                                                ),
+                                                0.0,
+                                                overlay,
+                                            );
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(image_rect.min.x, bottom),
+                                                    image_rect.max,
+                                                ),
+                                                0.0,
+                                                overlay,
+                                            );
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(image_rect.min.x, top),
+                                                    egui::pos2(left, bottom),
+                                                ),
+                                                0.0,
+                                                overlay,
+                                            );
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(right, top),
+                                                    egui::pos2(image_rect.max.x, bottom),
+                                                ),
+                                                0.0,
+                                                overlay,
+                                            );
+
+                                            painter.rect_stroke(
+                                                screen_rect,
+                                                0.0,
+                                                egui::Stroke::new(
+                                                    2.0,
+                                                    egui::Color32::from_rgb(120, 230, 120),
+                                                ),
+                                            );
+                                            for p in [
+                                                egui::pos2(left, top),
+                                                egui::pos2(right, top),
+                                                egui::pos2(left, bottom),
+                                                egui::pos2(right, bottom),
+                                            ] {
+                                                painter.circle_filled(
+                                                    p,
+                                                    handle_radius,
+                                                    egui::Color32::from_rgb(120, 230, 120),
+                                                );
+                                            }
+
+                                            if rect_changed {
+                                                let img_w = image_rect.width().max(1.0);
+                                                let img_h = image_rect.height().max(1.0);
+                                                let norm_left = (left - image_rect.left()) / img_w;
+                                                let norm_top = (top - image_rect.top()) / img_h;
+                                                let norm_width = (right - left) / img_w;
+                                                let norm_height = (bottom - top) / img_h;
+
+                                                let x = (norm_left * input_w as f32)
+                                                    .round()
+                                                    .clamp(0.0, input_w.saturating_sub(1) as f32)
+                                                    as u32;
+                                                let y = (norm_top * input_h as f32)
+                                                    .round()
+                                                    .clamp(0.0, input_h.saturating_sub(1) as f32)
+                                                    as u32;
+                                                let mut w_px =
+                                                    (norm_width * input_w as f32).round().max(1.0) as u32;
+                                                let mut h_px =
+                                                    (norm_height * input_h as f32).round().max(1.0) as u32;
+                                                w_px = w_px.min(input_w.saturating_sub(x).max(1));
+                                                h_px = h_px.min(input_h.saturating_sub(y).max(1));
+
+                                                opts.crop_rect = Some(Rect {
+                                                    x,
+                                                    y,
+                                                    width: w_px,
+                                                    height: h_px,
+                                                });
+                                                opts.crop_rect_reference_size = Some((input_w, input_h));
+                                            }
                                         }
                                     }
                                 }
@@ -1747,12 +2243,60 @@ impl eframe::App for C41Gui {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("Rotate right").clicked() {
                                     let entry = &mut self.images[idx];
+                                    let preview_size =
+                                        entry.preview_input_size.map(|[w, h]| (w, h));
+                                    if let Some(rect) = entry.options.dmin_rect {
+                                        let source_size = entry
+                                            .options
+                                            .dmin_rect_reference_size
+                                            .or(preview_size);
+                                        if let Some((w, h)) = source_size {
+                                            entry.options.dmin_rect =
+                                                Some(rotate_dmin_rect_90(rect, w, h, true));
+                                            entry.options.dmin_rect_reference_size = Some((h, w));
+                                        }
+                                    }
+                                    if let Some(rect) = entry.options.crop_rect {
+                                        let source_size = entry
+                                            .options
+                                            .crop_rect_reference_size
+                                            .or(preview_size);
+                                        if let Some((w, h)) = source_size {
+                                            entry.options.crop_rect =
+                                                Some(rotate_dmin_rect_90(rect, w, h, true));
+                                            entry.options.crop_rect_reference_size = Some((h, w));
+                                        }
+                                    }
                                     entry.options.rotation_degrees =
                                         (entry.options.rotation_degrees + 90).rem_euclid(360);
                                     self.preview_receiver = None;
                                 }
                                 if ui.button("Rotate left").clicked() {
                                     let entry = &mut self.images[idx];
+                                    let preview_size =
+                                        entry.preview_input_size.map(|[w, h]| (w, h));
+                                    if let Some(rect) = entry.options.dmin_rect {
+                                        let source_size = entry
+                                            .options
+                                            .dmin_rect_reference_size
+                                            .or(preview_size);
+                                        if let Some((w, h)) = source_size {
+                                            entry.options.dmin_rect =
+                                                Some(rotate_dmin_rect_90(rect, w, h, false));
+                                            entry.options.dmin_rect_reference_size = Some((h, w));
+                                        }
+                                    }
+                                    if let Some(rect) = entry.options.crop_rect {
+                                        let source_size = entry
+                                            .options
+                                            .crop_rect_reference_size
+                                            .or(preview_size);
+                                        if let Some((w, h)) = source_size {
+                                            entry.options.crop_rect =
+                                                Some(rotate_dmin_rect_90(rect, w, h, false));
+                                            entry.options.crop_rect_reference_size = Some((h, w));
+                                        }
+                                    }
                                     entry.options.rotation_degrees =
                                         (entry.options.rotation_degrees - 90).rem_euclid(360);
                                     self.preview_receiver = None;

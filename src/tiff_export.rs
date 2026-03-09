@@ -103,4 +103,3 @@ pub fn write_tiff_u16(image: &Array3<u16>, path: &Path) -> Result<()> {
 
     Ok(())
 }
-
