@@ -329,6 +329,7 @@ fn default_options() -> PipelineOptions {
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
+        verbose_debug: false,
     }
 }
 
@@ -378,6 +379,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.rotation_degrees.hash(&mut h);
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
+    opts.verbose_debug.hash(&mut h);
     h.finish()
 }
 
@@ -452,6 +454,7 @@ impl C41Gui {
         let path = self.images[index].path.clone();
         let mut options = self.images[index].options.clone();
         options.flat_field_path = self.flat_field_path.clone();
+        options.verbose_debug = self.mode == UIMode::Debug;
         let (tx, rx) = mpsc::channel();
         self.preview_receiver = Some(rx);
         self.preview_started_at = Some(Instant::now());
@@ -1058,13 +1061,6 @@ impl eframe::App for C41Gui {
                                     ui.add(egui::DragValue::new(&mut rect.width).speed(1));
                                     ui.add(egui::DragValue::new(&mut rect.height).speed(1));
                                 });
-                                ui.checkbox(
-                                    &mut opts.dmin_neutral_only,
-                                    "Neutral only (density removal without per-channel balance)",
-                                );
-                                if opts.dmin_neutral_only {
-                                    ui.label(egui::RichText::new("On = single divisor (geometric mean). May leave a cast if channels are unbalanced.").small().weak());
-                                }
                             }
                             opts.dmin_fixed = None;
                         }
@@ -1119,15 +1115,15 @@ impl eframe::App for C41Gui {
 
                     ui.checkbox(&mut opts.apply_crop, "Crop");
                     if opts.apply_crop {
+                        if opts.crop_rect.is_none() {
+                            opts.crop_rect = Some(Rect {
+                                x: 40,
+                                y: 40,
+                                width: 240,
+                                height: 240,
+                            });
+                        }
                         ui.collapsing("Crop settings", |ui| {
-                            if opts.crop_rect.is_none() {
-                                opts.crop_rect = Some(Rect {
-                                    x: 40,
-                                    y: 40,
-                                    width: 240,
-                                    height: 240,
-                                });
-                            }
                             if let Some(rect) = opts.crop_rect.as_mut() {
                                 ui.horizontal(|ui| {
                                     ui.label("x,y,w,h");

@@ -249,6 +249,7 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
+        verbose_debug: false,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

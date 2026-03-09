@@ -96,6 +96,10 @@ pub struct PipelineOptions {
     /// Debug preview mode: for RAW files, show only a simple bilinear demosaic
     /// (plus optional rotation) and skip the rest of the pipeline.
     pub debug_preview_simple_debayer: bool,
+    /// When true, compute per-step channel statistics (min/max/median) in the
+    /// debug log. Expensive (sorts entire image per channel per step). Only
+    /// enable when the Debug tab is active.
+    pub verbose_debug: bool,
 }
 
 impl Default for PipelineOptions {
@@ -140,6 +144,7 @@ impl Default for PipelineOptions {
             rotation_degrees: 0,
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
+            verbose_debug: false,
         }
     }
 }
@@ -820,8 +825,10 @@ pub fn process_one_to_preview(
     }
 
     // Step 1: load + demosaic + rotate
-    let _ = write!(dbg, "{}", fmt_stats("Step 1 (load+demosaic+rot):", &channel_stats(&image)));
-    let _ = writeln!(dbg);
+    if options.verbose_debug {
+        let _ = write!(dbg, "{}", fmt_stats("Step 1 (load+demosaic+rot):", &channel_stats(&image)));
+        let _ = writeln!(dbg);
+    }
 
     // Debug preview mode: show simple demosaic only.
     if options.debug_preview_simple_debayer && ext != "png" {
@@ -872,8 +879,7 @@ pub fn process_one_to_preview(
                 "D-min mode: rect x={} y={} w={} h={} neutral_only={}",
                 x, y, rw, rh, options.dmin_neutral_only
             );
-            // Sample D-min region stats before neutralization
-            {
+            if options.verbose_debug {
                 let x0 = (x as usize).min(w.saturating_sub(1));
                 let y0 = (y as usize).min(h.saturating_sub(1));
                 let x1 = ((x + rw) as usize).min(w).max(x0 + 1);
@@ -884,7 +890,9 @@ pub fn process_one_to_preview(
             dmin::neutralize(&mut image, x, y, rw, rh, options.dmin_neutral_only)?;
         }
         image.mapv_inplace(|v| v.clamp(0.0, 1.0));
-        let _ = write!(dbg, "{}", fmt_stats("Step 3 (after D-min, clamped [0,1]):", &channel_stats(&image)));
+        if options.verbose_debug {
+            let _ = write!(dbg, "{}", fmt_stats("Step 3 (after D-min, clamped [0,1]):", &channel_stats(&image)));
+        }
     } else if options.debug_pipeline_step >= 3 {
         let _ = writeln!(dbg, "Step 3: D-min SKIPPED (apply_dmin=false)");
     } else {
@@ -906,7 +914,9 @@ pub fn process_one_to_preview(
     if options.debug_pipeline_step >= 4 {
         // 4a: T → D
         image.mapv_inplace(|t| -(t.max(1e-10_f32)).log10());
-        let _ = write!(dbg, "{}", fmt_stats("Step 4a (T→D, density):", &channel_stats(&image)));
+        if options.verbose_debug {
+            let _ = write!(dbg, "{}", fmt_stats("Step 4a (T→D, density):", &channel_stats(&image)));
+        }
 
         // 4b: Auto WB — multiplicative equalization of per-channel density medians.
         //     D *= mean_D / ch_median_D  (equivalent to per-channel gamma correction).
@@ -959,7 +969,9 @@ pub fn process_one_to_preview(
             image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v + off_b);
         }
 
-        let _ = write!(dbg, "{}", fmt_stats("Step 4 (after WB + film γ):", &channel_stats(&image)));
+        if options.verbose_debug {
+            let _ = write!(dbg, "{}", fmt_stats("Step 4 (after WB + film γ):", &channel_stats(&image)));
+        }
     } else {
         let _ = writeln!(dbg, "Step 4: SKIPPED (pipeline_step < 4)");
     }
@@ -1021,7 +1033,9 @@ pub fn process_one_to_preview(
             }
         }
         image.mapv_inplace(|v| v.max(0.0));
-        let _ = write!(dbg, "{}", fmt_stats("Step 5 (after density matrix):", &channel_stats(&image)));
+        if options.verbose_debug {
+            let _ = write!(dbg, "{}", fmt_stats("Step 5 (after density matrix):", &channel_stats(&image)));
+        }
     } else {
         let _ = writeln!(dbg, "Step 5: SKIPPED (pipeline_step < 5)");
     }
@@ -1047,9 +1061,11 @@ pub fn process_one_to_preview(
             "Step 6: RA-4 curve (offset={:.3} gamma={:.3} pivot={:.3} white={:.4})",
             params.offset, params.gamma, params.pivot, options.curve_white
         );
-        let _ = write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&image)));
+        if options.verbose_debug {
+            let _ = write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&image)));
+        }
         let u16_img = curve::apply_ra4_from_density(&image, params, 4.0, options.curve_white);
-        {
+        if options.verbose_debug {
             let u16_stats: [(u16, u16, u16); 3] = {
                 let mut s = [(0u16, 0u16, 0u16); 3];
                 for ch in 0..3 {
@@ -1085,7 +1101,9 @@ pub fn process_one_to_preview(
         // No-curve positive: density → linear brightness.
         // Higher density = more dye = brighter subject = brighter output.
         let _ = writeln!(dbg, "Step 6: linear density inversion (no curve)");
-        let _ = write!(dbg, "{}", fmt_stats("  density:", &channel_stats(&image)));
+        if options.verbose_debug {
+            let _ = write!(dbg, "{}", fmt_stats("  density:", &channel_stats(&image)));
+        }
         const D_DISP_MAX: f32 = 2.5;
         image
             .iter()
