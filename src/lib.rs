@@ -38,6 +38,8 @@ pub struct Rect {
 pub enum OutputStage {
     /// RA-4 print emulation (current behavior).
     Ra4,
+    /// Film Print: per-channel RA-4 curves with color bleed and vibrance.
+    FilmPrint,
     /// Generic display-space 3D LUT (e.g. Cineon→Kodak 2383 D65 cube).
     Lut2383,
     /// No print/display stage; density or linear mapping out.
@@ -127,6 +129,28 @@ pub struct PipelineOptions {
     pub lut_in_black: f32,
     /// Pre-LUT levels: white point (input density that maps to 1). Default 1.0.
     pub lut_in_white: f32,
+    /// Pre-LUT levels: midpoint gamma. Redistributes tones between black and
+    /// white: v_out = v_in^(1/mid). 1.0 = linear (no change), >1.0 = brighter
+    /// midtones, <1.0 = darker midtones. Default 1.0.
+    pub lut_in_mid: f32,
+    // ── Film Print stage parameters ──────────────────────────────────
+    /// Per-channel offset deltas added to `curve_offset` (log-exposure shift).
+    /// Positive = brighter in that channel. Default 0.0.
+    pub fp_offset_r: f32,
+    pub fp_offset_g: f32,
+    pub fp_offset_b: f32,
+    /// Per-channel gamma multipliers applied to `curve_gamma`.
+    /// 1.0 = same as global, <1 = softer (less contrast), >1 = harder. Default 1.0.
+    pub fp_gamma_r: f32,
+    pub fp_gamma_g: f32,
+    pub fp_gamma_b: f32,
+    /// Inter-channel density bleed (0.0–0.5). Mixes adjacent channel densities
+    /// before the curve to simulate dye-layer crosstalk in real photo paper.
+    /// 0.0 = no bleed, 0.1 = subtle, 0.3 = heavy. Default 0.08.
+    pub fp_color_bleed: f32,
+    /// Post-curve vibrance: luminance-aware saturation that boosts muted colors
+    /// more than already-saturated ones. 0.0 = off, 1.0 = strong. Default 0.3.
+    pub fp_vibrance: f32,
     /// Output rotation in degrees: 0, 90, 180, or 270 (applied after load/demosaic).
     pub rotation_degrees: i32,
     /// Debug: only run pipeline up to this step (1..=6). Preview and export use this. See TODO_DEBUG.md.
@@ -137,6 +161,11 @@ pub struct PipelineOptions {
     /// 1.0 = neutral (no change), >1.0 = more saturated. Default 1.2.
     /// Compensates for the S-curve's tendency to compress channel differences.
     pub saturation: f32,
+    /// Post-curve highlight warmth (Noritsu/Frontier style).
+    /// Adds a golden/warm tint to neutral highlights while leaving saturated
+    /// colors (blue sky, red etc.) untouched.
+    /// 0.0 = neutral, 0.3–0.6 = subtle lab-scan warmth. Default 0.4.
+    pub highlight_warmth: f32,
     /// Debug preview mode: for RAW files, show only a simple bilinear demosaic
     /// (plus optional rotation) and skip the rest of the pipeline.
     pub debug_preview_simple_debayer: bool,
@@ -190,7 +219,17 @@ impl Default for PipelineOptions {
             output_lut_encoding: OutputLutEncoding::CineonLog,
             lut_in_black: 0.0,
             lut_in_white: 1.0,
+            lut_in_mid: 1.0,
+            fp_offset_r: 0.0,
+            fp_offset_g: 0.0,
+            fp_offset_b: 0.0,
+            fp_gamma_r: 1.0,
+            fp_gamma_g: 1.0,
+            fp_gamma_b: 1.0,
+            fp_color_bleed: 0.08,
+            fp_vibrance: 0.3,
             saturation: 1.2,
+            highlight_warmth: 0.4,
             rotation_degrees: 0,
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
@@ -527,16 +566,23 @@ fn linear_to_srgb_u8(v: f32) -> u8 {
 }
 
 /// Normalize density to [0, 1] with levels remap: D/d_max → [0,1], then
-/// stretch [black, white] → [0, 1]. Identity when black=0, white=1.
-fn apply_density_levels(image: &mut Array3<f32>, d_max: f32, in_black: f32, in_white: f32) {
+/// stretch [black, white] → [0, 1], then midpoint gamma: v^(1/mid).
+/// Identity when black=0, white=1, mid=1.
+fn apply_density_levels(image: &mut Array3<f32>, d_max: f32, in_black: f32, in_white: f32, mid: f32) {
     let range = (in_white - in_black).max(1e-6);
+    let inv_mid = 1.0 / mid.clamp(0.01, 10.0);
+    let apply_gamma = (mid - 1.0).abs() > 1e-6;
     let (h, w, c) = image.dim();
     assert_eq!(c, 3);
     for y in 0..h {
         for x in 0..w {
             for ch in 0..3 {
-                let v = (image[[y, x, ch]] / d_max).clamp(0.0, 1.0);
-                image[[y, x, ch]] = ((v - in_black) / range).clamp(0.0, 1.0);
+                let mut v = (image[[y, x, ch]] / d_max).clamp(0.0, 1.0);
+                v = ((v - in_black) / range).clamp(0.0, 1.0);
+                if apply_gamma {
+                    v = v.powf(inv_mid);
+                }
+                image[[y, x, ch]] = v;
             }
         }
     }
@@ -553,16 +599,19 @@ fn linear_to_srgb(v: f32) -> f32 {
     }
 }
 
-/// Normalize density to [0, 1] with sRGB/Rec.709 gamma, then levels remap.
+/// Normalize density to [0, 1] with sRGB/Rec.709 gamma, then levels remap + midpoint.
 /// The LUT handles the neg→pos inversion (print emulation), so we keep
-/// density orientation: D / d_max → gamma-encode → levels.
+/// density orientation: D / d_max → gamma-encode → levels → midpoint.
 fn density_to_rec709_leveled(
     image: &mut Array3<f32>,
     in_black: f32,
     in_white: f32,
+    mid: f32,
 ) {
     const D_MAX: f32 = 2.5;
     let range = (in_white - in_black).max(1e-6);
+    let inv_mid = 1.0 / mid.clamp(0.01, 10.0);
+    let apply_mid = (mid - 1.0).abs() > 1e-6;
     let (h, w, c) = image.dim();
     assert_eq!(c, 3);
     for y in 0..h {
@@ -570,7 +619,11 @@ fn density_to_rec709_leveled(
             for ch in 0..3 {
                 let norm = (image[[y, x, ch]] / D_MAX).clamp(0.0, 1.0);
                 let gamma = linear_to_srgb(norm);
-                image[[y, x, ch]] = ((gamma - in_black) / range).clamp(0.0, 1.0);
+                let mut v = ((gamma - in_black) / range).clamp(0.0, 1.0);
+                if apply_mid {
+                    v = v.powf(inv_mid);
+                }
+                image[[y, x, ch]] = v;
             }
         }
     }
@@ -599,6 +652,99 @@ fn apply_density_saturation(image: &mut Array3<f32>, saturation: f32) {
             image[[y, x, 0]] = (d_mean + saturation * (dr - d_mean)).max(0.0);
             image[[y, x, 1]] = (d_mean + saturation * (dg - d_mean)).max(0.0);
             image[[y, x, 2]] = (d_mean + saturation * (db - d_mean)).max(0.0);
+        }
+    }
+}
+
+/// Build `FilmPrintParams` from `PipelineOptions`.
+fn build_film_print_params(opts: &PipelineOptions) -> curve::FilmPrintParams {
+    curve::FilmPrintParams {
+        base: curve::PrintCurveParams {
+            offset: opts.curve_offset,
+            gamma: opts.curve_gamma,
+            pivot: opts.curve_pivot,
+        },
+        offset_rgb: [opts.fp_offset_r, opts.fp_offset_g, opts.fp_offset_b],
+        gamma_rgb: [opts.fp_gamma_r, opts.fp_gamma_g, opts.fp_gamma_b],
+        white_point: opts.curve_white,
+        color_bleed: opts.fp_color_bleed,
+        vibrance: opts.fp_vibrance,
+    }
+}
+
+/// Smooth hermite interpolation: returns 0 for x <= edge0, 1 for x >= edge1.
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Post-curve highlight warmth: adds a golden/warm tint to neutral highlights
+/// while leaving already-saturated pixels untouched (chroma-aware).
+///
+/// Works on u16 RA-4 output (0–65535). Only applies when warmth != 0.
+///
+/// Noritsu/Frontier scanners shift neutral highlights toward golden/cream
+/// but leave punchy saturated colors (blue sky, red tones) alone.
+fn apply_highlight_warmth_u16(image: &mut Array3<u16>, warmth: f32) {
+    if warmth.abs() < 1e-6 {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let scale = 1.0 / 65535.0_f32;
+
+    for y in 0..h {
+        for x in 0..w {
+            let r = image[[y, x, 0]] as f32 * scale;
+            let g = image[[y, x, 1]] as f32 * scale;
+            let b = image[[y, x, 2]] as f32 * scale;
+
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let chroma = r.max(g).max(b) - r.min(g).min(b);
+
+            // Ramp: full effect in bright highlights, fades toward midtones.
+            let highlight_ramp = smoothstep(0.35, 0.85, luma);
+            // Neutrality gate: full effect on neutral tones, zero on saturated.
+            let neutrality = 1.0 - smoothstep(0.04, 0.18, chroma);
+
+            let strength = highlight_ramp * neutrality * warmth;
+
+            let r_new = (r + strength * 0.035).clamp(0.0, 1.0);
+            let g_new = (g + strength * 0.015).clamp(0.0, 1.0);
+            let b_new = (b - strength * 0.055).clamp(0.0, 1.0);
+
+            image[[y, x, 0]] = (r_new * 65535.0).round() as u16;
+            image[[y, x, 1]] = (g_new * 65535.0).round() as u16;
+            image[[y, x, 2]] = (b_new * 65535.0).round() as u16;
+        }
+    }
+}
+
+/// Same as `apply_highlight_warmth_u16` but operates on normalized f32 [0, 1] RGB.
+fn apply_highlight_warmth_f32(image: &mut Array3<f32>, warmth: f32) {
+    if warmth.abs() < 1e-6 {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+
+    for y in 0..h {
+        for x in 0..w {
+            let r = image[[y, x, 0]].clamp(0.0, 1.0);
+            let g = image[[y, x, 1]].clamp(0.0, 1.0);
+            let b = image[[y, x, 2]].clamp(0.0, 1.0);
+
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let chroma = r.max(g).max(b) - r.min(g).min(b);
+
+            let highlight_ramp = smoothstep(0.35, 0.85, luma);
+            let neutrality = 1.0 - smoothstep(0.04, 0.18, chroma);
+            let strength = highlight_ramp * neutrality * warmth;
+
+            image[[y, x, 0]] = (r + strength * 0.035).clamp(0.0, 1.0);
+            image[[y, x, 1]] = (g + strength * 0.015).clamp(0.0, 1.0);
+            image[[y, x, 2]] = (b - strength * 0.055).clamp(0.0, 1.0);
         }
     }
 }
@@ -867,17 +1013,58 @@ pub fn process_files(
             match options.output_stage {
                 OutputStage::Ra4 => {
                     let mut leveled = image.clone();
-                    if options.lut_in_black != 0.0 || options.lut_in_white != 1.0 {
+                    let levels_active = options.lut_in_black != 0.0
+                        || options.lut_in_white != 1.0
+                        || (options.lut_in_mid - 1.0).abs() > 1e-6;
+                    if levels_active {
                         apply_density_levels(
                             &mut leveled,
                             4.0,
                             options.lut_in_black,
                             options.lut_in_white,
+                            options.lut_in_mid,
                         );
                         leveled.mapv_inplace(|v| v * 4.0);
                     }
-                    let image_u16 =
+                    let mut image_u16 =
                         curve::apply_ra4_from_density(&leveled, ra4_params, 4.0, options.curve_white);
+                    apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
+                    if !options.write_jpeg_only {
+                        tiff_export::write_tiff_u16(&image_u16, &out_path)?;
+                    }
+                    if options.write_exr {
+                        exr_export::write_exr_u16(&image_u16, &exr_path)?;
+                    }
+                    if write_jpeg_this {
+                        let (height, width, _) = image_u16.dim();
+                        let mut buf = Vec::with_capacity(height * width * 3);
+                        for chunk in image_u16.iter() {
+                            buf.push((*chunk >> 8) as u8);
+                        }
+                        let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                            .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                        img.save(&jpg_path)?;
+                    }
+                }
+                OutputStage::FilmPrint => {
+                    let fp_params = build_film_print_params(options);
+                    let mut leveled = image.clone();
+                    let levels_active = options.lut_in_black != 0.0
+                        || options.lut_in_white != 1.0
+                        || (options.lut_in_mid - 1.0).abs() > 1e-6;
+                    if levels_active {
+                        apply_density_levels(
+                            &mut leveled,
+                            4.0,
+                            options.lut_in_black,
+                            options.lut_in_white,
+                            options.lut_in_mid,
+                        );
+                        leveled.mapv_inplace(|v| v * 4.0);
+                    }
+                    let mut image_u16 =
+                        curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
+                    apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
                     if !options.write_jpeg_only {
                         tiff_export::write_tiff_u16(&image_u16, &out_path)?;
                     }
@@ -927,6 +1114,7 @@ pub fn process_files(
                                 &mut display,
                                 options.lut_in_black,
                                 options.lut_in_white,
+                                options.lut_in_mid,
                             );
                         }
                         enc => {
@@ -940,12 +1128,14 @@ pub fn process_files(
                                 d_max,
                                 options.lut_in_black,
                                 options.lut_in_white,
+                                options.lut_in_mid,
                             );
                         }
                     }
                     if let Some(ref lut) = output_lut_cube {
                         apply_output_cube_rgb(&mut display, lut);
                     }
+                    apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
 
                     if !options.write_jpeg_only {
                         // Quantize to 16-bit and write TIFF.
@@ -1338,17 +1528,21 @@ pub fn process_one_to_preview(
                 };
                 let _ = writeln!(
                     dbg,
-                    "Step 6: RA-4 curve (offset={:.3} gamma={:.3} pivot={:.3} white={:.4} levels=[{:.3}, {:.3}])",
+                    "Step 6: RA-4 curve (offset={:.3} gamma={:.3} pivot={:.3} white={:.4} levels=[{:.3}, {:.2}, {:.3}])",
                     params.offset, params.gamma, params.pivot, options.curve_white,
-                    options.lut_in_black, options.lut_in_white,
+                    options.lut_in_black, options.lut_in_mid, options.lut_in_white,
                 );
                 let mut leveled = image.clone();
-                if options.lut_in_black != 0.0 || options.lut_in_white != 1.0 {
+                let levels_active = options.lut_in_black != 0.0
+                    || options.lut_in_white != 1.0
+                    || (options.lut_in_mid - 1.0).abs() > 1e-6;
+                if levels_active {
                     apply_density_levels(
                         &mut leveled,
                         4.0,
                         options.lut_in_black,
                         options.lut_in_white,
+                        options.lut_in_mid,
                     );
                     leveled.mapv_inplace(|v| v * 4.0);
                 }
@@ -1356,8 +1550,9 @@ pub fn process_one_to_preview(
                     let _ =
                         write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&leveled)));
                 }
-                let u16_img =
+                let mut u16_img =
                     curve::apply_ra4_from_density(&leveled, params, 4.0, options.curve_white);
+                apply_highlight_warmth_u16(&mut u16_img, options.highlight_warmth);
                 if options.verbose_debug {
                     let u16_stats: [(u16, u16, u16); 3] = {
                         let mut s = [(0u16, 0u16, 0u16); 3];
@@ -1390,6 +1585,42 @@ pub fn process_one_to_preview(
                         u16_stats[2].0, u16_stats[2].1, u16_stats[2].2
                     );
                 }
+                u16_img
+                    .iter()
+                    .map(|v| ((*v as u32) >> 8).min(255) as u8)
+                    .collect()
+            }
+            OutputStage::FilmPrint => {
+                let fp_params = build_film_print_params(options);
+                let _ = writeln!(
+                    dbg,
+                    "Step 6: Film Print (offset={:.3} gamma={:.3} pivot={:.3} bleed={:.3} vibrance={:.2})",
+                    fp_params.base.offset, fp_params.base.gamma, fp_params.base.pivot,
+                    fp_params.color_bleed, fp_params.vibrance,
+                );
+                let _ = writeln!(
+                    dbg,
+                    "  per-ch offset: [{:+.3}, {:+.3}, {:+.3}]  gamma: [{:.3}, {:.3}, {:.3}]",
+                    fp_params.offset_rgb[0], fp_params.offset_rgb[1], fp_params.offset_rgb[2],
+                    fp_params.gamma_rgb[0], fp_params.gamma_rgb[1], fp_params.gamma_rgb[2],
+                );
+                let mut leveled = image.clone();
+                let levels_active = options.lut_in_black != 0.0
+                    || options.lut_in_white != 1.0
+                    || (options.lut_in_mid - 1.0).abs() > 1e-6;
+                if levels_active {
+                    apply_density_levels(
+                        &mut leveled,
+                        4.0,
+                        options.lut_in_black,
+                        options.lut_in_white,
+                        options.lut_in_mid,
+                    );
+                    leveled.mapv_inplace(|v| v * 4.0);
+                }
+                let mut u16_img =
+                    curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
+                apply_highlight_warmth_u16(&mut u16_img, options.highlight_warmth);
                 u16_img
                     .iter()
                     .map(|v| ((*v as u32) >> 8).min(255) as u8)
@@ -1432,6 +1663,7 @@ pub fn process_one_to_preview(
                             &mut display,
                             options.lut_in_black,
                             options.lut_in_white,
+                            options.lut_in_mid,
                         );
                     }
                     enc => {
@@ -1445,6 +1677,7 @@ pub fn process_one_to_preview(
                             d_max,
                             options.lut_in_black,
                             options.lut_in_white,
+                            options.lut_in_mid,
                         );
                     }
                 }
@@ -1455,6 +1688,7 @@ pub fn process_one_to_preview(
                 {
                     apply_output_cube_rgb(&mut display, &output_lut);
                 }
+                apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
 
                 display
                     .iter()

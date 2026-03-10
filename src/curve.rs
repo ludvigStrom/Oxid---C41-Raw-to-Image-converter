@@ -451,3 +451,147 @@ pub fn apply_curve_pipeline(
 
     out
 }
+
+// ─── Film Print stage ──────────────────────────────────────────────────────
+
+/// Per-channel parameters for the Film Print curve.
+#[derive(Debug, Clone, Copy)]
+pub struct FilmPrintParams {
+    /// Base offset, gamma, pivot (shared starting point).
+    pub base: PrintCurveParams,
+    /// Per-channel offset deltas (added to base.offset).
+    pub offset_rgb: [f32; 3],
+    /// Per-channel gamma multipliers (multiplied with base.gamma).
+    pub gamma_rgb: [f32; 3],
+    /// White point.
+    pub white_point: f32,
+    /// Inter-channel density bleed before the curve (0.0–0.5).
+    pub color_bleed: f32,
+    /// Post-curve luminance-aware vibrance (0.0–2.0).
+    pub vibrance: f32,
+}
+
+/// Build per-channel density→u16 LUTs for Film Print.
+fn build_film_print_luts(params: &FilmPrintParams, d_max: f32) -> [Vec<u16>; 3] {
+    let mut luts: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for ch in 0..3 {
+        let offset = params.base.offset + params.offset_rgb[ch];
+        let gamma = (params.base.gamma * params.gamma_rgb[ch]).max(0.1);
+        let pivot = params.base.pivot;
+
+        let lut: Vec<u16> = (0..LUT_LEN)
+            .map(|i| {
+                let d = (i as f32 / 65535.0) * d_max;
+                let d = d.max(0.0);
+                let log_exposure = d + offset;
+                let linear_exposure = (10.0f32).powf(log_exposure);
+                let eg = linear_exposure.powf(gamma);
+                let pg = pivot.powf(gamma);
+                let mut y = (eg / (eg + pg)).clamp(0.0, 1.0);
+
+                const SHOULDER_START: f32 = 0.93;
+                if y > SHOULDER_START {
+                    let t = (y - SHOULDER_START) / (1.0 - SHOULDER_START);
+                    let t_shaped = 1.0 - (1.0 - t).powf(1.5);
+                    y = SHOULDER_START + t_shaped * (1.0 - SHOULDER_START);
+                }
+
+                (y * 65535.0).round() as u16
+            })
+            .collect();
+        luts[ch] = lut;
+    }
+    luts
+}
+
+/// Apply color bleed: mix a fraction of each channel's density with its
+/// neighbours. Symmetric blend toward the mean, modulated by `bleed`.
+#[inline]
+fn apply_color_bleed(dr: f32, dg: f32, db: f32, bleed: f32) -> (f32, f32, f32) {
+    if bleed <= 0.0 {
+        return (dr, dg, db);
+    }
+    let keep = 1.0 - bleed;
+    let half_bleed = bleed * 0.5;
+    (
+        dr * keep + dg * half_bleed + db * half_bleed,
+        dg * keep + dr * half_bleed + db * half_bleed,
+        db * keep + dr * half_bleed + dg * half_bleed,
+    )
+}
+
+/// Post-curve vibrance: luminance-aware saturation boost that affects muted
+/// colors more than already-saturated ones.
+///
+/// Works on linear [0, 1] RGB. `strength` of 0 is identity; 1.0 is strong.
+#[inline]
+fn apply_vibrance_pixel(r: f32, g: f32, b: f32, strength: f32) -> (f32, f32, f32) {
+    if strength.abs() < 1e-6 {
+        return (r, g, b);
+    }
+    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let chroma = r.max(g).max(b) - r.min(g).min(b);
+    let boost = 1.0 + strength * (1.0 - chroma.clamp(0.0, 1.0));
+    (
+        (luma + (r - luma) * boost).clamp(0.0, 1.0),
+        (luma + (g - luma) * boost).clamp(0.0, 1.0),
+        (luma + (b - luma) * boost).clamp(0.0, 1.0),
+    )
+}
+
+/// Apply the Film Print curve from density input.
+///
+/// Per-channel Michaelis-Menten curves with color bleed and vibrance.
+pub fn apply_film_print_from_density(
+    density_image: &Array3<f32>,
+    params: &FilmPrintParams,
+    d_max: f32,
+) -> Array3<u16> {
+    let (h, w, c) = density_image.dim();
+    assert_eq!(c, 3, "Expected 3-channel RGB image");
+
+    let luts = build_film_print_luts(params, d_max);
+    let bleed = params.color_bleed;
+    let vibrance = params.vibrance;
+    let wp = params.white_point.clamp(1e-6, 10.0);
+    let apply_wp = (wp - 1.0).abs() > f32::EPSILON;
+    let inv_wp = if apply_wp { 1.0 / wp } else { 1.0 };
+
+    let mut out = Array3::<u16>::zeros((h, w, c));
+
+    out.axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .zip(density_image.axis_iter(Axis(0)))
+        .for_each(|(mut out_row, in_row)| {
+            let row_w = in_row.dim().0;
+            for x in 0..row_w {
+                let dr = in_row[(x, 0)];
+                let dg = in_row[(x, 1)];
+                let db = in_row[(x, 2)];
+
+                let (dr, dg, db) = apply_color_bleed(dr, dg, db, bleed);
+
+                let mut rgb_f = [0.0_f32; 3];
+                for ch in 0..3 {
+                    let d = [dr, dg, db][ch].clamp(0.0, d_max);
+                    let frac = d / d_max;
+                    let idx = (frac * 65535.0).round().min(65535.0) as usize;
+                    rgb_f[ch] = luts[ch][idx] as f32 / 65535.0;
+                }
+
+                if apply_wp {
+                    for v in rgb_f.iter_mut() {
+                        *v = (*v * inv_wp).clamp(0.0, 1.0);
+                    }
+                }
+
+                let (r, g, b) = apply_vibrance_pixel(rgb_f[0], rgb_f[1], rgb_f[2], vibrance);
+
+                out_row[(x, 0)] = (r.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                out_row[(x, 1)] = (g.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                out_row[(x, 2)] = (b.clamp(0.0, 1.0) * 65535.0).round() as u16;
+            }
+        });
+
+    out
+}

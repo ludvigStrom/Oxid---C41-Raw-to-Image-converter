@@ -379,7 +379,17 @@ fn default_options() -> PipelineOptions {
         output_lut_encoding: OutputLutEncoding::CineonLog,
         lut_in_black: 0.0,
         lut_in_white: 1.0,
+        lut_in_mid: 1.0,
+        fp_offset_r: 0.0,
+        fp_offset_g: 0.0,
+        fp_offset_b: 0.0,
+        fp_gamma_r: 1.0,
+        fp_gamma_g: 1.0,
+        fp_gamma_b: 1.0,
+        fp_color_bleed: 0.08,
+        fp_vibrance: 0.3,
         saturation: 1.2,
+        highlight_warmth: 0.4,
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
@@ -395,6 +405,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.auto_wb.hash(&mut h);
     opts.film_gamma.to_bits().hash(&mut h);
     opts.saturation.to_bits().hash(&mut h);
+    opts.highlight_warmth.to_bits().hash(&mut h);
     opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
     opts.apply_crop.hash(&mut h);
@@ -439,6 +450,15 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.output_lut_encoding.hash(&mut h);
     opts.lut_in_black.to_bits().hash(&mut h);
     opts.lut_in_white.to_bits().hash(&mut h);
+    opts.lut_in_mid.to_bits().hash(&mut h);
+    opts.fp_offset_r.to_bits().hash(&mut h);
+    opts.fp_offset_g.to_bits().hash(&mut h);
+    opts.fp_offset_b.to_bits().hash(&mut h);
+    opts.fp_gamma_r.to_bits().hash(&mut h);
+    opts.fp_gamma_g.to_bits().hash(&mut h);
+    opts.fp_gamma_b.to_bits().hash(&mut h);
+    opts.fp_color_bleed.to_bits().hash(&mut h);
+    opts.fp_vibrance.to_bits().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
@@ -1683,6 +1703,23 @@ impl eframe::App for C41Gui {
                         );
                     });
 
+                    ui.collapsing("Highlight warmth", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Golden tint in neutral highlights (Noritsu/Frontier style).\n\
+                                 Saturated colors (blue sky, reds) are left untouched.\n\
+                                 0.0 = neutral, 0.3–0.6 = subtle lab warmth."
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut opts.highlight_warmth, 0.0..=1.5)
+                                .fixed_decimals(2)
+                                .text("Warmth"),
+                        );
+                    });
+
                     ui.collapsing("Levels (black / white point)", |ui| {
                         ui.label(
                             egui::RichText::new(
@@ -1705,6 +1742,14 @@ impl eframe::App for C41Gui {
                             ui.add(
                                 egui::Slider::new(&mut opts.lut_in_white, 0.0..=1.0)
                                     .fixed_decimals(3),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Mid");
+                            ui.add(
+                                egui::Slider::new(&mut opts.lut_in_mid, 0.1..=4.0)
+                                    .logarithmic(true)
+                                    .fixed_decimals(2),
                             );
                         });
                         if opts.lut_in_black >= opts.lut_in_white {
@@ -1735,6 +1780,7 @@ impl eframe::App for C41Gui {
                     if apply_curve {
                     let current_label = match opts.output_stage {
                         OutputStage::Ra4 => "RA-4 print emulation",
+                        OutputStage::FilmPrint => "Film Print",
                         OutputStage::Lut2383 => "3D LUT (display-space)",
                         OutputStage::None => "No curve",
                     };
@@ -1750,6 +1796,15 @@ impl eframe::App for C41Gui {
                                 .clicked()
                             {
                                 opts.output_stage = OutputStage::Ra4;
+                            }
+                            if ui
+                                .selectable_label(
+                                    matches!(opts.output_stage, OutputStage::FilmPrint),
+                                    "Film Print",
+                                )
+                                .clicked()
+                            {
+                                opts.output_stage = OutputStage::FilmPrint;
                             }
                             if ui
                                 .selectable_label(
@@ -1798,6 +1853,119 @@ impl eframe::App for C41Gui {
                                 ui.label("White");
                                 ui.add(egui::Slider::new(&mut opts.curve_white, -1.0..=2.0));
                             });
+                        });
+                    }
+
+                    if matches!(opts.output_stage, OutputStage::FilmPrint) {
+                        ui.collapsing("Film Print settings", |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Per-channel RA-4 curves with dye-layer crosstalk and vibrance.\n\
+                                     Base offset/gamma/pivot shared with RA-4; per-channel deltas add character."
+                                )
+                                .small()
+                                .weak(),
+                            );
+
+                            ui.horizontal(|ui| {
+                                ui.label("Offset");
+                                ui.add(
+                                    drag_decimal_f32(&mut opts.curve_offset)
+                                        .range(-2.0..=2.0)
+                                        .speed(0.05),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Gamma");
+                                ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Pivot");
+                                ui.add(
+                                    drag_decimal_f32(&mut opts.curve_pivot)
+                                        .range(0.1..=10.0)
+                                        .speed(0.1),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("White");
+                                ui.add(egui::Slider::new(&mut opts.curve_white, -1.0..=2.0));
+                            });
+
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Per-channel offsets (exposure shift)").small());
+                            ui.horizontal(|ui| {
+                                ui.label("R");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.fp_offset_r, -0.5..=0.5)
+                                        .fixed_decimals(3),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("G");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.fp_offset_g, -0.5..=0.5)
+                                        .fixed_decimals(3),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("B");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.fp_offset_b, -0.5..=0.5)
+                                        .fixed_decimals(3),
+                                );
+                            });
+
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Per-channel gamma (contrast)").small());
+                            ui.horizontal(|ui| {
+                                ui.label("R");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.fp_gamma_r, 0.5..=2.0)
+                                        .fixed_decimals(2),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("G");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.fp_gamma_g, 0.5..=2.0)
+                                        .fixed_decimals(2),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("B");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.fp_gamma_b, 0.5..=2.0)
+                                        .fixed_decimals(2),
+                                );
+                            });
+
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Color bleed");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.fp_color_bleed, 0.0..=0.5)
+                                        .fixed_decimals(2),
+                                );
+                            });
+                            ui.label(
+                                egui::RichText::new("Dye-layer crosstalk: mixes density channels before the curve.")
+                                    .small()
+                                    .weak(),
+                            );
+
+                            ui.horizontal(|ui| {
+                                ui.label("Vibrance");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.fp_vibrance, 0.0..=2.0)
+                                        .fixed_decimals(2),
+                                );
+                            });
+                            ui.label(
+                                egui::RichText::new("Luminance-aware saturation: boosts muted colors more than saturated ones.")
+                                    .small()
+                                    .weak(),
+                            );
                         });
                     }
 
