@@ -30,12 +30,13 @@ use eframe::egui;
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
 const THUMB_MAX_SIZE: u32 = 64;
+const PREVIEW_DEBOUNCE_MS: u64 = 180;
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
-const ICON_CLOSE_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/X-d67d1f11-dfa7-4ff3-b0d4-a40cae1c357b.png";
-const ICON_ROTATE_RIGHT_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/rotate_right-c83fec20-39c3-4f05-b7b7-dadb525de8c5.png";
-const ICON_ROTATE_LEFT_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/rotate_left-ebbb0f40-9849-4e0e-91dd-48945ff59e2c.png";
-const ICON_LOGO_PATH: &str = "/Users/ludvigstrom/.cursor/projects/Users-ludvigstrom-Documents-Rust-Raw/assets/logo-6001e4ef-8453-4eb6-8ed5-c7622d9a8d7b.png";
+const ICON_CLOSE_PATH: &str = "X.png";
+const ICON_ROTATE_RIGHT_PATH: &str = "rotate_right.png";
+const ICON_ROTATE_LEFT_PATH: &str = "rotate_left.png";
+const ICON_LOGO_PATH: &str = "logo.png";
 
 fn app_icon_data() -> Option<egui::IconData> {
     let bytes = include_bytes!("../img/logo.png");
@@ -66,6 +67,8 @@ fn main() -> eframe::Result<()> {
             .with_titlebar_shown(false)
             .with_title_shown(false); // hide OS title so only our white title in the dark bar shows
         o
+    } else if cfg!(target_os = "windows") {
+        eframe::NativeOptions::default()
     } else {
         eframe::NativeOptions::default()
     };
@@ -174,6 +177,11 @@ struct C41Gui {
     /// Camera IDT profiles loaded from camera_idt/ (path, profile).
     idt_profiles: Vec<(PathBuf, c41_raw_tool::aces::IdtProfile)>,
     ui_icons: UiIcons,
+    /// Suppresses preview reprocessing while the user is dragging a rect handle (crop / d-min).
+    rect_dragging: bool,
+    /// Debounce state for preview refreshes: (image index, options hash) currently waiting to settle.
+    pending_preview_key: Option<(usize, u64)>,
+    pending_preview_since: Option<Instant>,
 }
 
 impl Default for C41Gui {
@@ -199,6 +207,9 @@ impl Default for C41Gui {
             flat_field_image: None,
             idt_profiles: Vec::new(),
             ui_icons: UiIcons::default(),
+            rect_dragging: false,
+            pending_preview_key: None,
+            pending_preview_since: None,
         }
     }
 }
@@ -482,16 +493,195 @@ fn parse_decimal_f64(input: &str) -> Option<f64> {
     normalized.parse::<f64>().ok()
 }
 
+fn dmin_values_to_clipboard_text(opts: &PipelineOptions) -> Option<String> {
+    if let Some((r, g, b)) = opts.dmin_fixed {
+        return Some(format!(
+            "dmin:fixed:{:.6},{:.6},{:.6};neutral_only={}",
+            r,
+            g,
+            b,
+            if opts.dmin_neutral_only { 1 } else { 0 }
+        ));
+    }
+    if let Some(rect) = opts.dmin_rect {
+        return Some(format!(
+            "dmin:rect:{},{},{},{};neutral_only={}",
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            if opts.dmin_neutral_only { 1 } else { 0 }
+        ));
+    }
+    None
+}
+
+fn parse_dmin_clipboard_text(text: &str) -> Option<(Option<(f32, f32, f32)>, Option<Rect>, Option<bool>)> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+
+    // Parse optional `neutral_only` suffix.
+    let mut neutral_only: Option<bool> = None;
+    if let Some(idx) = t.find(';') {
+        let suffix = t[idx + 1..].trim();
+        if let Some(v) = suffix.strip_prefix("neutral_only=") {
+            neutral_only = match v.trim() {
+                "1" | "true" | "True" | "TRUE" => Some(true),
+                "0" | "false" | "False" | "FALSE" => Some(false),
+                _ => None,
+            };
+        }
+    }
+
+    // Preferred tagged formats copied by this app:
+    // dmin:fixed:r,g,b[;neutral_only=0|1]
+    // dmin:rect:x,y,w,h[;neutral_only=0|1]
+    let main = t.split(';').next().unwrap_or(t).trim();
+    if let Some(values) = main.strip_prefix("dmin:fixed:") {
+        let nums: Vec<&str> = values.split(',').map(|s| s.trim()).collect();
+        if nums.len() == 3 {
+            let r = nums[0].parse::<f32>().ok()?;
+            let g = nums[1].parse::<f32>().ok()?;
+            let b = nums[2].parse::<f32>().ok()?;
+            if r.is_finite()
+                && g.is_finite()
+                && b.is_finite()
+                && (0.0..=1.0).contains(&r)
+                && (0.0..=1.0).contains(&g)
+                && (0.0..=1.0).contains(&b)
+            {
+                return Some((Some((r, g, b)), None, neutral_only));
+            }
+        }
+        return None;
+    }
+    if let Some(values) = main.strip_prefix("dmin:rect:") {
+        let nums: Vec<&str> = values.split(',').map(|s| s.trim()).collect();
+        if nums.len() == 4 {
+            let x = nums[0].parse::<u32>().ok()?;
+            let y = nums[1].parse::<u32>().ok()?;
+            let w = nums[2].parse::<u32>().ok()?;
+            let h = nums[3].parse::<u32>().ok()?;
+            if w > 0 && h > 0 {
+                return Some((
+                    None,
+                    Some(Rect {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    }),
+                    neutral_only,
+                ));
+            }
+        }
+        return None;
+    }
+
+    // Back-compat convenience: plain "r,g,b"
+    let csv: Vec<&str> = t.split(',').map(|s| s.trim()).collect();
+    if csv.len() == 3 {
+        let r = csv[0].parse::<f32>().ok()?;
+        let g = csv[1].parse::<f32>().ok()?;
+        let b = csv[2].parse::<f32>().ok()?;
+        if r.is_finite()
+            && g.is_finite()
+            && b.is_finite()
+            && (0.0..=1.0).contains(&r)
+            && (0.0..=1.0).contains(&g)
+            && (0.0..=1.0).contains(&b)
+        {
+            return Some((Some((r, g, b)), None, neutral_only));
+        }
+    }
+
+    None
+}
+
 fn drag_decimal_f32<'a>(value: &'a mut f32) -> egui::DragValue<'a> {
     egui::DragValue::new(value).custom_parser(|s| parse_decimal_f64(s))
 }
 
-fn load_icon_texture(ctx: &egui::Context, texture_name: &str, path: &str) -> Option<egui::TextureHandle> {
-    let image = image::open(path).ok()?.to_rgba8();
+fn icon_candidate_paths(path_hint: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let hint_path = PathBuf::from(path_hint);
+    let file_name = hint_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path_hint.to_string());
+
+    if hint_path.is_absolute() {
+        candidates.push(hint_path.clone());
+    }
+
+    // Relative to current process working directory.
+    candidates.push(PathBuf::from(path_hint));
+    candidates.push(PathBuf::from("assets").join(&file_name));
+    candidates.push(PathBuf::from("src").join("img").join(&file_name));
+
+    // Relative to crate root (works in both dev + packaged runs).
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(crate_root.join(path_hint));
+    candidates.push(crate_root.join("assets").join(&file_name));
+    candidates.push(crate_root.join("src").join("img").join(&file_name));
+
+    // Relative to executable directory.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join(path_hint));
+            candidates.push(exe_dir.join("assets").join(&file_name));
+            candidates.push(exe_dir.join("src").join("img").join(&file_name));
+        }
+    }
+
+    candidates
+}
+
+fn load_icon_texture(ctx: &egui::Context, texture_name: &str, path_hint: &str) -> Option<egui::TextureHandle> {
+    let image = icon_candidate_paths(path_hint)
+        .into_iter()
+        .find_map(|candidate| image::open(candidate).ok())?
+        .to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     let pixels = image.into_vec();
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
     Some(ctx.load_texture(texture_name.to_string(), color_image, egui::TextureOptions::default()))
+}
+
+fn make_thumbnail_from_rgb(rgb: &[u8], src_w: u32, src_h: u32, max_side: u32) -> Option<egui::ColorImage> {
+    if src_w == 0 || src_h == 0 || max_side == 0 {
+        return None;
+    }
+    if rgb.len() != (src_w as usize) * (src_h as usize) * 3 {
+        return None;
+    }
+
+    let scale = (max_side as f32 / src_w as f32)
+        .min(max_side as f32 / src_h as f32)
+        .min(1.0);
+    let dst_w = ((src_w as f32 * scale).round().max(1.0)) as usize;
+    let dst_h = ((src_h as f32 * scale).round().max(1.0)) as usize;
+
+    let mut pixels = Vec::with_capacity(dst_w * dst_h);
+    for y in 0..dst_h {
+        let sy = ((y as f32 + 0.5) * src_h as f32 / dst_h as f32)
+            .floor()
+            .clamp(0.0, src_h.saturating_sub(1) as f32) as usize;
+        for x in 0..dst_w {
+            let sx = ((x as f32 + 0.5) * src_w as f32 / dst_w as f32)
+                .floor()
+                .clamp(0.0, src_w.saturating_sub(1) as f32) as usize;
+            let i = (sy * src_w as usize + sx) * 3;
+            pixels.push(egui::Color32::from_rgb(rgb[i], rgb[i + 1], rgb[i + 2]));
+        }
+    }
+
+    Some(egui::ColorImage {
+        size: [dst_w, dst_h],
+        pixels,
+    })
 }
 
 impl C41Gui {
@@ -535,6 +725,8 @@ impl eframe::App for C41Gui {
         style.visuals.selection.bg_fill = egui::Color32::from_gray(70); // selected tabs/items: gray instead of blue
         style.spacing.button_padding = egui::vec2(10.0, 4.0); // extra left/right and top/bottom around button text
         ctx.set_style(style);
+
+        self.rect_dragging = false;
 
         if self.ui_icons.close.is_none() {
             self.ui_icons.close = load_icon_texture(ctx, "ui_icon_close", ICON_CLOSE_PATH);
@@ -619,6 +811,22 @@ impl eframe::App for C41Gui {
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_hash = hash;
                         self.images[idx].preview_input_size = Some([input_w, input_h]);
+                        if let Some(thumb_image) = make_thumbnail_from_rgb(&rgb, w, h, THUMB_MAX_SIZE) {
+                            let thumb_tex = ctx.load_texture(
+                                format!(
+                                    "thumb_{}",
+                                    self.images[idx]
+                                        .path
+                                        .display()
+                                        .to_string()
+                                        .replace('\\', "_")
+                                        .replace('/', "_")
+                                ),
+                                thumb_image,
+                                egui::TextureOptions::default(),
+                            );
+                            self.images[idx].thumbnail_texture = Some(thumb_tex);
+                        }
                         if self.images[idx].options.dmin_rect.is_some() {
                             self.images[idx].options.dmin_rect_reference_size =
                                 Some((input_w, input_h));
@@ -642,18 +850,6 @@ impl eframe::App for C41Gui {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
-                }
-            }
-        }
-
-        // If selected image has no preview or options changed, request a new one.
-        if let Some(idx) = self.selected_index {
-            if idx < self.images.len() && self.preview_receiver.is_none() {
-                let hash_now = options_hash_for(&self.images[idx].path, &self.images[idx].options);
-                let need_new = self.images[idx].preview_texture.is_none()
-                    || self.images[idx].preview_hash != hash_now;
-                if need_new {
-                    self.request_preview_for(idx, ctx);
                 }
             }
         }
@@ -766,6 +962,7 @@ impl eframe::App for C41Gui {
                     const NAME_MAX_CHARS: usize = 10;
                     const X_BUTTON_SIZE: f32 = 22.0;
                     const CARD_PADDING: f32 = 4.0;
+                    const CARD_GAP: f32 = 8.0;
 
                     egui::ScrollArea::horizontal().show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -870,6 +1067,10 @@ impl eframe::App for C41Gui {
                                 } else if interact_resp.clicked() {
                                     self.selected_index = Some(i);
                                 }
+
+                                if i + 1 < self.images.len() {
+                                    ui.add_space(CARD_GAP);
+                                }
                             }
                         });
                     });
@@ -904,10 +1105,6 @@ impl eframe::App for C41Gui {
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
-                    if let Some(logo) = &self.ui_icons.logo {
-                        ui.image((logo.id(), egui::vec2(24.0, 24.0)));
-                        ui.add_space(6.0);
-                    }
                     ui.selectable_value(&mut self.mode, UIMode::Process, "Process");
                     ui.selectable_value(&mut self.mode, UIMode::Calibrate, "Color calibration");
                     ui.selectable_value(
@@ -1168,6 +1365,68 @@ impl eframe::App for C41Gui {
                     ui.checkbox(&mut opts.apply_dmin, "D-min");
                     if opts.apply_dmin {
                     ui.collapsing("D-min settings", |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy D-min").clicked() {
+                                if let Some(text) = dmin_values_to_clipboard_text(opts) {
+                                    ui.ctx().copy_text(text.clone());
+                                    self.status = format!("D-min copied: {}", text);
+                                } else {
+                                    self.status =
+                                        "No D-min values to copy (enable fixed or rectangle first).".to_string();
+                                }
+                            }
+                            if ui.button("Paste D-min").clicked() {
+                                match arboard::Clipboard::new()
+                                    .and_then(|mut cb| cb.get_text())
+                                {
+                                    Ok(text) => {
+                                        if let Some((fixed, rect, neutral_only)) =
+                                            parse_dmin_clipboard_text(&text)
+                                        {
+                                            if let Some((r, g, b)) = fixed {
+                                                opts.apply_dmin = true;
+                                                opts.dmin_fixed = Some((r, g, b));
+                                                opts.dmin_rect = None;
+                                                opts.dmin_rect_reference_size = None;
+                                                if let Some(v) = neutral_only {
+                                                    opts.dmin_neutral_only = v;
+                                                }
+                                                self.status = format!(
+                                                    "Applied pasted D-min fixed values: {:.6}, {:.6}, {:.6}",
+                                                    r, g, b
+                                                );
+                                            } else if let Some(rect) = rect {
+                                                opts.apply_dmin = true;
+                                                opts.dmin_fixed = None;
+                                                opts.dmin_rect = Some(rect);
+                                                opts.dmin_rect_reference_size = None;
+                                                if let Some(v) = neutral_only {
+                                                    opts.dmin_neutral_only = v;
+                                                }
+                                                self.status = format!(
+                                                    "Applied pasted D-min rectangle: {},{},{},{}",
+                                                    rect.x, rect.y, rect.width, rect.height
+                                                );
+                                            } else {
+                                                self.status = "Clipboard has no valid D-min payload.".to_string();
+                                            }
+                                        } else {
+                                            self.status = "Clipboard text is not a valid D-min value.".to_string();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Could not read clipboard: {}", e);
+                                    }
+                                }
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("Format: dmin:fixed:r,g,b or dmin:rect:x,y,w,h")
+                                .small()
+                                .weak(),
+                        );
+                        ui.add_space(4.0);
+
                         // Option 1: classic D-min (fixed or crop) when no flat-field override is set.
                         let mut use_fixed = opts.dmin_fixed.is_some();
                         ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
@@ -1298,22 +1557,22 @@ impl eframe::App for C41Gui {
                         });
                     }
 
-                    ui.checkbox(&mut opts.apply_white_balance, "White balance");
+                    ui.checkbox(&mut opts.auto_wb, "Auto white balance");
+                    ui.label(
+                        egui::RichText::new(
+                            if opts.auto_wb {
+                                "Per-channel gamma correction: D x (mean_D / ch_median). Preserves black point."
+                            } else {
+                                "Auto WB disabled."
+                            },
+                        )
+                        .small()
+                        .weak(),
+                    );
+
+                    ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
                     if opts.apply_white_balance {
                     ui.collapsing("White balance settings", |ui| {
-                        ui.checkbox(&mut opts.auto_wb, "Auto WB (multiplicative)");
-                        ui.label(
-                            egui::RichText::new(
-                                if opts.auto_wb {
-                                    "Per-channel γ correction: D × (mean_D / ch_median). Preserves black point."
-                                } else {
-                                    "Manual only. Sliders scale density per channel."
-                                }
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.separator();
                         let mut use_temp = opts.temp_k.is_some();
                         ui.checkbox(&mut use_temp, "Use color temperature (K)");
                         if use_temp {
@@ -1863,16 +2122,10 @@ impl eframe::App for C41Gui {
             let show_loader = has_inflight
                 && self
                     .preview_started_at
-                    .map(|t| t.elapsed() >= Duration::from_millis(250))
+                    .map(|t| t.elapsed() >= Duration::from_millis(2500))
                     .unwrap_or(true);
 
-            if show_loader {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() / 2.0 - 40.0);
-                    ui.spinner();
-                    ui.label("Loading preview…");
-                });
-            } else if let Some(idx) = self.selected_index {
+            if let Some(idx) = self.selected_index {
                 if idx < self.images.len() {
                     if let Some(ref tex) = self.images[idx].preview_texture {
                         let size = tex.size();
@@ -1895,6 +2148,24 @@ impl eframe::App for C41Gui {
                         }).inner;
                         let image_rect = image_resp.rect;
                         ui.add_space(IMAGE_PREVIEW_BOTTOM_PADDING);
+
+                        // Keep the previous preview visible while a new render is in-flight.
+                        // Only show loading overlay for unusually slow renders.
+                        if show_loader {
+                            let overlay_painter = ui.painter_at(image_rect);
+                            overlay_painter.rect_filled(
+                                image_rect,
+                                0.0,
+                                egui::Color32::from_rgba_premultiplied(0, 0, 0, 80),
+                            );
+                            let spinner_rect =
+                                egui::Rect::from_center_size(image_rect.center(), egui::vec2(22.0, 22.0));
+                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(spinner_rect), |ui| {
+                                ui.centered_and_justified(|ui| {
+                                    ui.spinner();
+                                });
+                            });
+                        }
 
                         // In Calibrate mode, draw and allow interaction with the
                         // 4-point overlay and the interpolated 24 patch boxes.
@@ -2045,6 +2316,7 @@ impl eframe::App for C41Gui {
                                                 if resp.dragged() {
                                                     let delta = resp.drag_delta();
                                                     rect_changed = true;
+                                                    self.rect_dragging = true;
                                                     match corner_idx {
                                                         0 => {
                                                             left += delta.x;
@@ -2112,6 +2384,7 @@ impl eframe::App for C41Gui {
                                                     top += dy;
                                                     bottom = top + rect_h;
                                                     rect_changed = true;
+                                                    self.rect_dragging = true;
                                                 }
                                             }
 
@@ -2232,6 +2505,7 @@ impl eframe::App for C41Gui {
                                                 if resp.dragged() {
                                                     let delta = resp.drag_delta();
                                                     rect_changed = true;
+                                                    self.rect_dragging = true;
                                                     match corner_idx {
                                                         0 => {
                                                             left += delta.x;
@@ -2297,6 +2571,7 @@ impl eframe::App for C41Gui {
                                                     top += dy;
                                                     bottom = top + rect_h;
                                                     rect_changed = true;
+                                                    self.rect_dragging = true;
                                                 }
                                             }
 
@@ -2548,58 +2823,14 @@ impl eframe::App for C41Gui {
                             );
                             let painter = ui.painter_at(hist_rect);
                             let rect = hist_rect;
+                            let draw_rect = rect.shrink(1.0);
 
                             let max_r = r_hist.iter().copied().max().unwrap_or(1) as f32;
                             let max_g = g_hist.iter().copied().max().unwrap_or(1) as f32;
                             let max_b = b_hist.iter().copied().max().unwrap_or(1) as f32;
-                            let max_total = r_hist
-                                .iter()
-                                .zip(g_hist.iter())
-                                .zip(b_hist.iter())
-                                .map(|((&r, &g), &b)| r + g + b)
-                                .max()
-                                .unwrap_or(1) as f32;
-                            let max_all = max_r.max(max_g).max(max_b).max(max_total).max(1.0);
-                            let w_bin = rect.width() / 256.0;
+                            let max_all = max_r.max(max_g).max(max_b).max(1.0);
 
-                            // Draw combined + channel histograms as vertical lines.
-                            for i in 0..256 {
-                                let x = rect.left() + (i as f32 + 0.5) * w_bin;
-                                let y_base = rect.bottom();
-
-                                let draw_channel = |count: u32, color: egui::Color32, painter: &egui::Painter| {
-                                    if count == 0 {
-                                        return;
-                                    }
-                                    let h_norm = (count as f32 / max_all).clamp(0.0, 1.0);
-                                    let y_top = y_base - rect.height() * h_norm;
-                                    painter.line_segment(
-                                        [egui::pos2(x, y_base), egui::pos2(x, y_top)],
-                                        egui::Stroke::new(1.0, color),
-                                    );
-                                };
-
-                                // Combined (R+G+B) in gray, drawn first.
-                                let total = r_hist[i] + g_hist[i] + b_hist[i];
-                                if total > 0 {
-                                    let h_norm = (total as f32 / max_all).clamp(0.0, 1.0);
-                                    let y_top = y_base - rect.height() * h_norm;
-                                    painter.line_segment(
-                                        [egui::pos2(x, y_base), egui::pos2(x, y_top)],
-                                        egui::Stroke::new(
-                                            2.0,
-                                            egui::Color32::from_rgba_premultiplied(200, 200, 200, 220),
-                                        ),
-                                    );
-                                }
-
-                                // Individual channels on top.
-                                draw_channel(r_hist[i], egui::Color32::RED, &painter);
-                                draw_channel(g_hist[i], egui::Color32::GREEN, &painter);
-                                draw_channel(b_hist[i], egui::Color32::BLUE, &painter);
-                            }
-
-                            // Axes: X (bottom) and Y (left).
+                            // Axes: X (bottom) and Y (left). Draw first so bin 0 is not hidden by Y-axis.
                             let axis_color = egui::Color32::from_gray(100);
                             let stroke = egui::Stroke::new(1.0, axis_color);
                             painter.line_segment(
@@ -2610,12 +2841,79 @@ impl eframe::App for C41Gui {
                                 [egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.left(), rect.top())],
                                 stroke,
                             );
+
+                            // Photoshop/Resolve-style histogram rendering:
+                            // per-channel curve (2px) + semi-transparent fill under each curve.
+                            let draw_channel =
+                                |hist: &[u32; 256],
+                                 line_color: egui::Color32,
+                                 fill_color: egui::Color32,
+                                 painter: &egui::Painter| {
+                                    let mut curve_points = Vec::with_capacity(256);
+                                    let w = draw_rect.width().max(1.0);
+                                    for i in 0..256 {
+                                        let x = draw_rect.left()
+                                            + (i as f32 / 255.0) * w;
+                                        let h_norm =
+                                            (hist[i] as f32 / max_all).clamp(0.0, 1.0);
+                                        let y = (draw_rect.bottom()
+                                            - draw_rect.height() * h_norm)
+                                            .clamp(draw_rect.top(), draw_rect.bottom());
+                                        curve_points.push(egui::pos2(x, y));
+                                    }
+
+                                    // Per-bin vertical quads: straight down from curve to baseline.
+                                    let y_base = draw_rect.bottom();
+                                    for i in 0..255 {
+                                        let p0 = curve_points[i];
+                                        let p1 = curve_points[i + 1];
+                                        let quad = vec![
+                                            egui::pos2(p0.x, y_base),
+                                            p0,
+                                            p1,
+                                            egui::pos2(p1.x, y_base),
+                                        ];
+                                        painter.add(egui::Shape::convex_polygon(
+                                            quad,
+                                            fill_color,
+                                            egui::Stroke::NONE,
+                                        ));
+                                    }
+
+                                    painter.add(egui::Shape::line(
+                                        curve_points,
+                                        egui::Stroke::new(2.0, line_color),
+                                    ));
+                                };
+
+                            draw_channel(
+                                r_hist,
+                                egui::Color32::from_rgb(255, 80, 80),
+                                egui::Color32::from_rgba_premultiplied(255, 0, 0, 5),
+                                &painter,
+                            );
+                            draw_channel(
+                                g_hist,
+                                egui::Color32::from_rgb(110, 255, 110),
+                                egui::Color32::from_rgba_premultiplied(0, 255, 0, 5),
+                                &painter,
+                            );
+                            draw_channel(
+                                b_hist,
+                                egui::Color32::from_rgb(110, 160, 255),
+                                egui::Color32::from_rgba_premultiplied(0, 90, 255, 5),
+                                &painter,
+                            );
                         }
                         return;
                     }
                 }
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 2.0 - 20.0);
+                    if show_loader {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                    }
                     ui.label("Preview not ready yet.");
                 });
             } else {
@@ -2625,6 +2923,45 @@ impl eframe::App for C41Gui {
                 });
             }
         });
+
+        // If selected image has no preview or options changed, request a new one.
+        // Runs after UI interactions so drag/release state is available for debounce.
+        if let Some(idx) = self.selected_index {
+            if idx < self.images.len() {
+                let hash_now = options_hash_for(&self.images[idx].path, &self.images[idx].options);
+                let need_new = self.images[idx].preview_texture.is_none()
+                    || self.images[idx].preview_hash != hash_now;
+                if need_new {
+                    let now = Instant::now();
+                    let key = (idx, hash_now);
+                    if self.pending_preview_key != Some(key) {
+                        self.pending_preview_key = Some(key);
+                        self.pending_preview_since = Some(now);
+                    }
+
+                    let pointer_down = ctx.input(|i| i.pointer.any_down());
+                    let waiting_for_release = self.rect_dragging || pointer_down;
+                    let settled = self
+                        .pending_preview_since
+                        .map(|t| now.saturating_duration_since(t) >= Duration::from_millis(PREVIEW_DEBOUNCE_MS))
+                        .unwrap_or(false);
+
+                    if self.preview_receiver.is_none() && !waiting_for_release && settled {
+                        self.request_preview_for(idx, ctx);
+                        self.pending_preview_since = None;
+                    } else {
+                        // Keep ticking while debounce/release conditions are pending.
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    }
+                } else if self.pending_preview_key.map(|(i, _)| i) == Some(idx) {
+                    self.pending_preview_key = None;
+                    self.pending_preview_since = None;
+                }
+            }
+        } else {
+            self.pending_preview_key = None;
+            self.pending_preview_since = None;
+        }
     }
 }
 

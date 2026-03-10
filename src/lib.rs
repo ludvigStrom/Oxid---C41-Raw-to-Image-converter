@@ -575,7 +575,9 @@ pub fn process_files(
                     options.dmin_neutral_only,
                 )?;
             }
-            image.mapv_inplace(|v| v.clamp(0.0, 1.0));
+            // Preserve highlight headroom after D-min / flat-field: only clamp
+            // negative values, allow T > 1.0 to pass through for later density/curve.
+            image.mapv_inplace(|v| v.max(0.0));
         }
 
         // Step 4: T → D → WB (multiplicative) → Film γ
@@ -584,7 +586,7 @@ pub fn process_files(
 
             // Auto WB: multiplicative density scaling (per-channel γ correction).
             let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.apply_dmin {
-                let stats = channel_stats(&image);
+                let stats = wb_channel_stats(&image, options);
                 let med_r = stats[0].2.max(1e-4);
                 let med_g = stats[1].2.max(1e-4);
                 let med_b = stats[2].2.max(1e-4);
@@ -780,6 +782,25 @@ fn channel_stats(image: &Array3<f32>) -> [(f32, f32, f32); 3] {
     stats
 }
 
+/// Channel stats source for Auto WB.
+/// When crop is enabled, evaluate statistics inside the crop only.
+fn wb_channel_stats(image: &Array3<f32>, options: &PipelineOptions) -> [(f32, f32, f32); 3] {
+    if options.apply_crop {
+        if let Some(rect) = options.crop_rect {
+            let (h, w, _) = image.dim();
+            let (x, y, rw, rh) = scale_dmin_rect(
+                rect,
+                options.crop_rect_reference_size,
+                w as u32,
+                h as u32,
+            );
+            let cropped = crop_array3(image, x, y, rw, rh);
+            return channel_stats(&cropped);
+        }
+    }
+    channel_stats(image)
+}
+
 fn fmt_stats(label: &str, stats: &[(f32, f32, f32); 3]) -> String {
     format!(
         "{}\n  R: min={:.6} max={:.6} med={:.6}\n  G: min={:.6} max={:.6} med={:.6}\n  B: min={:.6} max={:.6} med={:.6}\n",
@@ -919,7 +940,8 @@ pub fn process_one_to_preview(
             }
             dmin::neutralize(&mut image, x, y, rw, rh, options.dmin_neutral_only)?;
         }
-        image.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        // Same as export path: keep >1.0 transmittance for highlight headroom.
+        image.mapv_inplace(|v| v.max(0.0));
         if options.verbose_debug {
             let _ = write!(dbg, "{}", fmt_stats("Step 3 (after D-min, clamped [0,1]):", &channel_stats(&image)));
         }
@@ -951,7 +973,7 @@ pub fn process_one_to_preview(
         // 4b: Auto WB — multiplicative equalization of per-channel density medians.
         //     D *= mean_D / ch_median_D  (equivalent to per-channel gamma correction).
         let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.apply_dmin {
-            let stats = channel_stats(&image);
+            let stats = wb_channel_stats(&image, options);
             let med_r = stats[0].2.max(1e-4);
             let med_g = stats[1].2.max(1e-4);
             let med_b = stats[2].2.max(1e-4);

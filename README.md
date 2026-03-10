@@ -2,7 +2,7 @@
 
 A high-performance, command-line and GUI RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically grounded log-density math with explicit, ordered operations (including camera IDT to ACEScg, D-min/flat-field normalization, density-domain calibration, and RA-4 print curve). Auto white balance is optional and explicit (toggleable), with no hidden tone/base curves.
 
-**Target cameras:** Any rawloader-supported Bayer RAW (Sony, Nikon, Canon, Fuji, Panasonic, Adobe DNG, etc.). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
+**Target cameras:** Any rawloader-supported Bayer RAW (Sony, Nikon, Canon, Fuji, Panasonic). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
 
 ---
 
