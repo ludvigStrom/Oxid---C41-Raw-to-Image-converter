@@ -184,7 +184,10 @@ pub fn write_cube(lut: &Lut3d, path: &Path) -> std::io::Result<()> {
     std::fs::write(path, cube_to_string(lut))
 }
 
-/// Read a .cube file. Supports LUT_3D_SIZE and optional DOMAIN_MAX; data must be red-major (R fastest).
+/// Read a .cube file (Adobe/Resolve CUBE format).
+/// Supports headers: `TITLE`, `LUT_3D_SIZE`, `DOMAIN_MIN`, `DOMAIN_MAX`, `LUT_1D_SIZE`,
+/// and comment lines starting with `#`. Unknown keyword lines are skipped.
+/// Data must be red-major (R fastest).
 pub fn read_cube(path: &Path) -> anyhow::Result<Lut3d> {
     let text = std::fs::read_to_string(path)?;
     let mut size: Option<usize> = None;
@@ -197,26 +200,49 @@ pub fn read_cube(path: &Path) -> anyhow::Result<Lut3d> {
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
-            // Could be header (LUT_3D_SIZE 17) or data (r g b)
-            if parts[0] == "LUT_3D_SIZE" && parts.len() >= 2 {
-                size = parts[1].parse().ok();
+        if parts.is_empty() {
+            continue;
+        }
+
+        // Known header keywords — consume and continue.
+        match parts[0] {
+            "LUT_3D_SIZE" => {
+                if parts.len() >= 2 {
+                    size = parts[1].parse().ok();
+                }
                 continue;
             }
-            if parts[0] == "DOMAIN_MAX" && parts.len() >= 4 {
+            "DOMAIN_MAX" if parts.len() >= 4 => {
                 let r: f32 = parts[1].parse().unwrap_or(1.0);
                 let g: f32 = parts[2].parse().unwrap_or(1.0);
                 let b: f32 = parts[3].parse().unwrap_or(1.0);
                 d_max = r.max(g).max(b).max(1e-6);
                 continue;
             }
-            // Data line: three floats
-            let r: f32 = parts[0].parse().map_err(|_| anyhow::anyhow!("Invalid number in .cube"))?;
-            let g: f32 = parts[1].parse().map_err(|_| anyhow::anyhow!("Invalid number in .cube"))?;
-            let b: f32 = parts[2].parse().map_err(|_| anyhow::anyhow!("Invalid number in .cube"))?;
+            "TITLE" | "DOMAIN_MIN" | "LUT_1D_SIZE" | "LUT_1D_INPUT_RANGE"
+            | "LUT_3D_INPUT_RANGE" => {
+                continue;
+            }
+            _ => {}
+        }
+
+        // Skip any line whose first token is not a number (unknown keyword).
+        if parts[0].parse::<f32>().is_err() {
+            continue;
+        }
+
+        // Data line: three floats.
+        if parts.len() >= 3 {
+            let r: f32 = parts[0]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid number in .cube data"))?;
+            let g: f32 = parts[1]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid number in .cube data"))?;
+            let b: f32 = parts[2]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid number in .cube data"))?;
             data.push([r, g, b]);
-        } else if parts.len() == 2 && parts[0] == "LUT_3D_SIZE" {
-            size = parts[1].parse().ok();
         }
     }
 

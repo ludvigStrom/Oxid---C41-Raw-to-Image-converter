@@ -24,6 +24,8 @@ use c41_raw_tool::{
     PipelineOptions,
     Rect,
     TiffFormat,
+    OutputStage,
+    OutputLutEncoding,
 };
 use eframe::egui;
 
@@ -368,6 +370,9 @@ fn default_options() -> PipelineOptions {
         export_aces_exr: false,
         write_aces2065_only: false,
         lut3d_path: None,
+        output_stage: OutputStage::Ra4,
+        output_lut_cube: None,
+        output_lut_encoding: OutputLutEncoding::CineonLog,
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
@@ -418,6 +423,12 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
         }
     }
     opts.lut3d_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
+    opts.output_stage.hash(&mut h);
+    opts.output_lut_cube
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .hash(&mut h);
+    opts.output_lut_encoding.hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
@@ -1609,45 +1620,181 @@ impl eframe::App for C41Gui {
                         ui.add(egui::Slider::new(&mut opts.film_gamma, 0.3..=1.2).text("γ"));
                     });
 
+                    // Output stage / curve selection.
                     let mut apply_curve = !opts.no_curve;
-                    ui.checkbox(&mut apply_curve, "Print curve");
-                    opts.no_curve = !apply_curve;
-                    if apply_curve {
-                    ui.collapsing("Print curve settings", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Offset");
-                            ui.add(
-                                drag_decimal_f32(&mut opts.curve_offset)
-                                    .range(-2.0..=2.0)
-                                    .speed(0.05),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Gamma");
-                            ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Pivot");
-                            ui.add(
-                                drag_decimal_f32(&mut opts.curve_pivot)
-                                    .range(0.1..=10.0)
-                                    .speed(0.1),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("White");
-                            ui.add(egui::Slider::new(&mut opts.curve_white, -1.0..=2.0));
-                        });
-                    });
+                    if ui.checkbox(&mut apply_curve, "Output curve").changed() {
+                        if apply_curve {
+                            // Re-enable output stage: if we were in "None", default back to RA-4.
+                            if matches!(opts.output_stage, OutputStage::None) {
+                                opts.output_stage = OutputStage::Ra4;
+                            }
+                            opts.no_curve = false;
+                        } else {
+                            // Disable output stage completely.
+                            opts.no_curve = true;
+                            opts.output_stage = OutputStage::None;
+                        }
                     }
 
-                    // Pipeline: inversion (1-x). Only applies when Print curve is off.
+                    if apply_curve {
+                    let current_label = match opts.output_stage {
+                        OutputStage::Ra4 => "RA-4 print emulation",
+                        OutputStage::Lut2383 => "3D LUT (display-space)",
+                        OutputStage::None => "No curve",
+                    };
+
+                    egui::ComboBox::from_label("Output stage")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    matches!(opts.output_stage, OutputStage::Ra4),
+                                    "RA-4 print emulation",
+                                )
+                                .clicked()
+                            {
+                                opts.output_stage = OutputStage::Ra4;
+                            }
+                            if ui
+                                .selectable_label(
+                                    matches!(opts.output_stage, OutputStage::Lut2383),
+                                    "3D LUT (display-space)",
+                                )
+                                .clicked()
+                            {
+                                opts.output_stage = OutputStage::Lut2383;
+                            }
+                            if ui
+                                .selectable_label(
+                                    matches!(opts.output_stage, OutputStage::None),
+                                    "No curve",
+                                )
+                                .clicked()
+                            {
+                                opts.output_stage = OutputStage::None;
+                                opts.no_curve = true;
+                            }
+                        });
+
+                    if matches!(opts.output_stage, OutputStage::Ra4) {
+                        ui.collapsing("RA-4 curve settings", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Offset");
+                                ui.add(
+                                    drag_decimal_f32(&mut opts.curve_offset)
+                                        .range(-2.0..=2.0)
+                                        .speed(0.05),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Gamma");
+                                ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Pivot");
+                                ui.add(
+                                    drag_decimal_f32(&mut opts.curve_pivot)
+                                        .range(0.1..=10.0)
+                                        .speed(0.1),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("White");
+                                ui.add(egui::Slider::new(&mut opts.curve_white, -1.0..=2.0));
+                            });
+                        });
+                    }
+
+                    if matches!(opts.output_stage, OutputStage::Lut2383) {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Resolve-style Kodak 2383 cubes expect Cineon log input.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+
+                        let enc_label = match opts.output_lut_encoding {
+                            OutputLutEncoding::CineonLog => "Cineon log (D ÷ 2.046)",
+                            OutputLutEncoding::LinearDensity => "Linear (D ÷ 2.5)",
+                        };
+                        egui::ComboBox::from_label("LUT input encoding")
+                            .selected_text(enc_label)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            opts.output_lut_encoding,
+                                            OutputLutEncoding::CineonLog
+                                        ),
+                                        "Cineon log (D ÷ 2.046)",
+                                    )
+                                    .clicked()
+                                {
+                                    opts.output_lut_encoding = OutputLutEncoding::CineonLog;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            opts.output_lut_encoding,
+                                            OutputLutEncoding::LinearDensity
+                                        ),
+                                        "Linear (D ÷ 2.5)",
+                                    )
+                                    .clicked()
+                                {
+                                    opts.output_lut_encoding = OutputLutEncoding::LinearDensity;
+                                }
+                            });
+
+                        ui.add_space(4.0);
+                        if ui.button("Browse output LUT…").clicked() {
+                            let picked = rfd::FileDialog::new()
+                                .add_filter("3D LUT (.cube)", &["cube", "CUBE"])
+                                .add_filter("All files", &["*"])
+                                .pick_file();
+                            match picked {
+                                Some(path) => {
+                                    match c41_raw_tool::lut3d::read_cube(&path) {
+                                        Ok(lut) => {
+                                            let msg = format!(
+                                                "Loaded output LUT: {} ({}³ grid)",
+                                                path.display(),
+                                                lut.size,
+                                            );
+                                            opts.output_lut_cube = Some(path);
+                                            self.status = msg;
+                                        }
+                                        Err(e) => {
+                                            self.status = format!(
+                                                "Failed to parse output LUT {}: {}",
+                                                path.display(),
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    self.status = "Output LUT: file dialog cancelled.".into();
+                                }
+                            }
+                        }
+                        if let Some(ref p) = opts.output_lut_cube {
+                            ui.label(egui::RichText::new(p.display().to_string()).small());
+                        } else {
+                            ui.label(egui::RichText::new("No output LUT loaded").small().weak());
+                        }
+                    }
+                    }
+
+                    // Pipeline: inversion (1-x). Only applies when no curve stage is used.
                     ui.add_enabled(
                         opts.no_curve,
                         egui::Checkbox::new(&mut opts.no_invert, "Skip color inversion"),
                     );
                     if !opts.no_curve {
-                        ui.label(egui::RichText::new("(Applies when Print curve is off)").small());
+                        ui.label(egui::RichText::new("(Applies when Output curve is off)").small());
                     }
                 }
 

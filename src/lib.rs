@@ -33,6 +33,29 @@ pub struct Rect {
     pub height: u32,
 }
 
+/// Final render/output stage selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputStage {
+    /// RA-4 print emulation (current behavior).
+    Ra4,
+    /// Generic display-space 3D LUT (e.g. Cineon→Kodak 2383 D65 cube).
+    Lut2383,
+    /// No print/display stage; density or linear mapping out.
+    None,
+}
+
+/// Encoding expected by the output LUT. Determines the pre-transform
+/// applied to density values before feeding them into the cube.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputLutEncoding {
+    /// Cineon log: printing density ÷ 2.046 (10-bit Cineon full-scale).
+    /// Use with Resolve-style "Kodak 2383" cubes whose input is Cineon Film Log.
+    CineonLog,
+    /// Linear normalized density: D ÷ D_max (2.5).
+    /// Use with generic cubes that expect linear 0–1 RGB.
+    LinearDensity,
+}
+
 /// All pipeline options (CLI flags / GUI state).
 #[derive(Debug, Clone)]
 pub struct PipelineOptions {
@@ -89,6 +112,14 @@ pub struct PipelineOptions {
     /// Optional 3D LUT (density domain) used instead of the density matrix when set.
     /// If present, applied after T→D, before D→RA-4. Generated via "Generate 3D LUT" from current matrix.
     pub lut3d_path: Option<PathBuf>,
+    /// Output stage: RA-4 curve, generic display-space 3D LUT, or raw density/no-curve display.
+    pub output_stage: OutputStage,
+    /// Generic display-space 3D LUT (normalized 0–1 RGB in/out) applied in the
+    /// final output stage when `output_stage == OutputStage::Lut2383`.
+    pub output_lut_cube: Option<PathBuf>,
+    /// Encoding expected by `output_lut_cube`. Determines the density→code-value
+    /// pre-transform before the cube is applied.
+    pub output_lut_encoding: OutputLutEncoding,
     /// Output rotation in degrees: 0, 90, 180, or 270 (applied after load/demosaic).
     pub rotation_degrees: i32,
     /// Debug: only run pipeline up to this step (1..=6). Preview and export use this. See TODO_DEBUG.md.
@@ -141,6 +172,9 @@ impl Default for PipelineOptions {
             export_aces_exr: false,
             write_aces2065_only: false,
             lut3d_path: None,
+            output_stage: OutputStage::Ra4,
+            output_lut_cube: None,
+            output_lut_encoding: OutputLutEncoding::CineonLog,
             rotation_degrees: 0,
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
@@ -476,6 +510,35 @@ fn linear_to_srgb_u8(v: f32) -> u8 {
     (y.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+/// Convert a density image to normalized code values based on the chosen
+/// output-LUT encoding, then apply the cube in-place.
+///
+/// * `CineonLog`: D ÷ 2.046 → \[0, 1\] (10-bit Cineon printing density range).
+/// * `LinearDensity`: D ÷ 2.5 → \[0, 1\].
+fn apply_output_lut_with_encoding(
+    image: &mut Array3<f32>,
+    lut: &lut3d::Lut3d,
+    encoding: OutputLutEncoding,
+) {
+    let d_max = match encoding {
+        OutputLutEncoding::CineonLog => 2.046_f32,
+        OutputLutEncoding::LinearDensity => 2.5_f32,
+    };
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    for y in 0..h {
+        for x in 0..w {
+            let r = (image[[y, x, 0]] / d_max).clamp(0.0, 1.0);
+            let g = (image[[y, x, 1]] / d_max).clamp(0.0, 1.0);
+            let b = (image[[y, x, 2]] / d_max).clamp(0.0, 1.0);
+            let [or, og, ob] = lut.sample_normalized(r, g, b);
+            image[[y, x, 0]] = or;
+            image[[y, x, 1]] = og;
+            image[[y, x, 2]] = ob;
+        }
+    }
+}
+
 /// **Pipeline order (do not reorder without updating this comment).**
 ///
 /// Internal colorspace is always ACEScg.
@@ -497,6 +560,11 @@ pub fn process_files(
 
     let lut3d = options
         .lut3d_path
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
+
+    let output_lut_cube = options
+        .output_lut_cube
         .as_ref()
         .and_then(|p| lut3d::read_cube(p).ok());
 
@@ -708,46 +776,87 @@ pub fn process_files(
 
         let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
 
-        // Step 6: RA-4 curve (from density) or direct density output.
-        if options.debug_pipeline_step >= 6 && !options.no_curve {
-            let image_u16 = curve::apply_ra4_from_density(&image, ra4_params, 4.0, options.curve_white);
-            if !options.write_jpeg_only {
-                tiff_export::write_tiff_u16(&image_u16, &out_path)?;
-            }
-            if options.write_exr {
-                exr_export::write_exr_u16(&image_u16, &exr_path)?;
-            }
-            if write_jpeg_this {
-                let (height, width, _) = image_u16.dim();
-                let mut buf = Vec::with_capacity(height * width * 3);
-                for chunk in image_u16.iter() {
-                    buf.push((*chunk >> 8) as u8);
+        // Step 6: render/output stage.
+        if options.debug_pipeline_step >= 6 {
+            match options.output_stage {
+                OutputStage::Ra4 => {
+                    // RA-4 print emulation from density (existing behavior).
+                    let image_u16 =
+                        curve::apply_ra4_from_density(&image, ra4_params, 4.0, options.curve_white);
+                    if !options.write_jpeg_only {
+                        tiff_export::write_tiff_u16(&image_u16, &out_path)?;
+                    }
+                    if options.write_exr {
+                        exr_export::write_exr_u16(&image_u16, &exr_path)?;
+                    }
+                    if write_jpeg_this {
+                        let (height, width, _) = image_u16.dim();
+                        let mut buf = Vec::with_capacity(height * width * 3);
+                        for chunk in image_u16.iter() {
+                            buf.push((*chunk >> 8) as u8);
+                        }
+                        let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                            .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                        img.save(&jpg_path)?;
+                    }
                 }
-                let img = RgbImage::from_raw(width as u32, height as u32, buf)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                img.save(&jpg_path)?;
-            }
-        } else if options.debug_pipeline_step >= 6 {
-            // No-curve: output density values (positive: D/D_max → [0,1]).
-            if !options.no_invert {
-                const D_DISP_MAX: f32 = 2.5;
-                image.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
-            }
-            if !options.write_jpeg_only {
-                tiff_export::write_tiff(&image, &out_path, options.format)?;
-            }
-            if options.write_exr {
-                exr_export::write_exr_f32(&image, &exr_path)?;
-            }
-            if write_jpeg_this {
-                let (height, width, _) = image.dim();
-                let mut buf = Vec::with_capacity(height * width * 3);
-                for v in image.iter() {
-                    buf.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                OutputStage::None => {
+                    // No print curve: direct density → display mapping (existing no-curve path).
+                    let mut display = image.clone();
+                    if !options.no_invert {
+                        const D_DISP_MAX: f32 = 2.5;
+                        display.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+                    }
+                    if !options.write_jpeg_only {
+                        tiff_export::write_tiff(&display, &out_path, options.format)?;
+                    }
+                    if options.write_exr {
+                        exr_export::write_exr_f32(&display, &exr_path)?;
+                    }
+                    if write_jpeg_this {
+                        let (height, width, _) = display.dim();
+                        let mut buf = Vec::with_capacity(height * width * 3);
+                        for v in display.iter() {
+                            buf.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                        }
+                        let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                            .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                        img.save(&jpg_path)?;
+                    }
                 }
-                let img = RgbImage::from_raw(width as u32, height as u32, buf)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                img.save(&jpg_path)?;
+                OutputStage::Lut2383 => {
+                    // Encode density to LUT input space, apply display-space cube, then export.
+                    let mut display = image.clone();
+                    if let Some(ref lut) = output_lut_cube {
+                        apply_output_lut_with_encoding(
+                            &mut display,
+                            lut,
+                            options.output_lut_encoding,
+                        );
+                    } else {
+                        const D_DISP_MAX: f32 = 2.5;
+                        display.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+                    }
+
+                    if !options.write_jpeg_only {
+                        // Quantize to 16-bit and write TIFF.
+                        tiff_export::write_tiff(&display, &out_path, TiffFormat::U16)?;
+                    }
+                    if options.write_exr {
+                        // Write linear display-space EXR.
+                        exr_export::write_exr_f32(&display, &exr_path)?;
+                    }
+                    if write_jpeg_this {
+                        let (height, width, _) = display.dim();
+                        let mut buf = Vec::with_capacity(height * width * 3);
+                        for v in display.iter() {
+                            buf.push((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                        }
+                        let img = RgbImage::from_raw(width as u32, height as u32, buf)
+                            .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                        img.save(&jpg_path)?;
+                    }
+                }
             }
         } else {
             // Steps 1–5: output density (or transmittance if step < 4).
@@ -1098,69 +1207,113 @@ pub fn process_one_to_preview(
     let orig_h = orig_h as u32;
 
     // ──────────────────────────────────────────────────────────────────────
-    // Step 6: RA-4 print curve (density → positive) or linear density map.
-    //         Image is already in density domain; the curve applies the
-    //         virtual enlarger exposure + Michaelis-Menten S-curve.
+    // Step 6: render/output stage.
     // ──────────────────────────────────────────────────────────────────────
-    let rgb_u8: Vec<u8> = if options.debug_pipeline_step >= 6 && !options.no_curve {
-        let params = curve::PrintCurveParams {
-            offset: options.curve_offset,
-            gamma: options.curve_gamma,
-            pivot: options.curve_pivot,
-        };
-        let _ = writeln!(
-            dbg,
-            "Step 6: RA-4 curve (offset={:.3} gamma={:.3} pivot={:.3} white={:.4})",
-            params.offset, params.gamma, params.pivot, options.curve_white
-        );
-        if options.verbose_debug {
-            let _ = write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&image)));
-        }
-        let u16_img = curve::apply_ra4_from_density(&image, params, 4.0, options.curve_white);
-        if options.verbose_debug {
-            let u16_stats: [(u16, u16, u16); 3] = {
-                let mut s = [(0u16, 0u16, 0u16); 3];
-                for ch in 0..3 {
-                    let slice = u16_img.slice(ndarray::s![.., .., ch]);
-                    let mut vals: Vec<u16> = slice.iter().copied().collect();
-                    vals.sort_unstable();
-                    s[ch] = (
-                        vals.first().copied().unwrap_or(0),
-                        vals.last().copied().unwrap_or(0),
-                        if vals.is_empty() { 0 } else { vals[vals.len() / 2] },
+    let rgb_u8: Vec<u8> = if options.debug_pipeline_step >= 6 {
+        match options.output_stage {
+            OutputStage::Ra4 => {
+                let params = curve::PrintCurveParams {
+                    offset: options.curve_offset,
+                    gamma: options.curve_gamma,
+                    pivot: options.curve_pivot,
+                };
+                let _ = writeln!(
+                    dbg,
+                    "Step 6: RA-4 curve (offset={:.3} gamma={:.3} pivot={:.3} white={:.4})",
+                    params.offset, params.gamma, params.pivot, options.curve_white
+                );
+                if options.verbose_debug {
+                    let _ =
+                        write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&image)));
+                }
+                let u16_img =
+                    curve::apply_ra4_from_density(&image, params, 4.0, options.curve_white);
+                if options.verbose_debug {
+                    let u16_stats: [(u16, u16, u16); 3] = {
+                        let mut s = [(0u16, 0u16, 0u16); 3];
+                        for ch in 0..3 {
+                            let slice = u16_img.slice(ndarray::s![.., .., ch]);
+                            let mut vals: Vec<u16> = slice.iter().copied().collect();
+                            vals.sort_unstable();
+                            s[ch] = (
+                                vals.first().copied().unwrap_or(0),
+                                vals.last().copied().unwrap_or(0),
+                                if vals.is_empty() { 0 } else { vals[vals.len() / 2] },
+                            );
+                        }
+                        s
+                    };
+                    let _ = writeln!(dbg, "  u16 output:");
+                    let _ = writeln!(
+                        dbg,
+                        "    R: min={} max={} med={}",
+                        u16_stats[0].0, u16_stats[0].1, u16_stats[0].2
+                    );
+                    let _ = writeln!(
+                        dbg,
+                        "    G: min={} max={} med={}",
+                        u16_stats[1].0, u16_stats[1].1, u16_stats[1].2
+                    );
+                    let _ = writeln!(
+                        dbg,
+                        "    B: min={} max={} med={}",
+                        u16_stats[2].0, u16_stats[2].1, u16_stats[2].2
                     );
                 }
-                s
-            };
-            let _ = writeln!(dbg, "  u16 output:");
-            let _ = writeln!(dbg, "    R: min={} max={} med={}", u16_stats[0].0, u16_stats[0].1, u16_stats[0].2);
-            let _ = writeln!(dbg, "    G: min={} max={} med={}", u16_stats[1].0, u16_stats[1].1, u16_stats[1].2);
-            let _ = writeln!(dbg, "    B: min={} max={} med={}", u16_stats[2].0, u16_stats[2].1, u16_stats[2].2);
+                u16_img
+                    .iter()
+                    .map(|v| ((*v as u32) >> 8).min(255) as u8)
+                    .collect()
+            }
+            OutputStage::None => {
+                // No-curve positive: density → linear brightness.
+                let _ = writeln!(dbg, "Step 6: linear density inversion (no curve)");
+                if options.verbose_debug {
+                    let _ = write!(dbg, "{}", fmt_stats("  density:", &channel_stats(&image)));
+                }
+                const D_DISP_MAX: f32 = 2.5;
+                image
+                    .iter()
+                    .map(|v| ((*v / D_DISP_MAX).clamp(0.0, 1.0) * 255.0).round() as u8)
+                    .collect()
+            }
+            OutputStage::Lut2383 => {
+                let enc_label = match options.output_lut_encoding {
+                    OutputLutEncoding::CineonLog => "Cineon log (D/2.046)",
+                    OutputLutEncoding::LinearDensity => "Linear (D/2.5)",
+                };
+                let _ = writeln!(
+                    dbg,
+                    "Step 6: output LUT (encoding={}, cube={})",
+                    enc_label,
+                    options
+                        .output_lut_cube
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "none".into()),
+                );
+                let mut display = image.clone();
+                if let Some(output_lut) = options
+                    .output_lut_cube
+                    .as_ref()
+                    .and_then(|p| lut3d::read_cube(p).ok())
+                {
+                    apply_output_lut_with_encoding(
+                        &mut display,
+                        &output_lut,
+                        options.output_lut_encoding,
+                    );
+                } else {
+                    const D_DISP_MAX: f32 = 2.5;
+                    display.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+                }
+
+                display
+                    .iter()
+                    .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+                    .collect()
+            }
         }
-        u16_img
-            .iter()
-            .map(|v| ((*v as u32) >> 8).min(255) as u8)
-            .collect()
-    } else if options.debug_pipeline_step >= 6 && options.no_invert {
-        // Debug: output raw density as grayscale (D/4 → [0,1]).
-        let _ = writeln!(dbg, "Step 6: raw density output (no curve, no invert)");
-        const D_DISP_MAX: f32 = 4.0;
-        image
-            .iter()
-            .map(|v| ((*v / D_DISP_MAX).clamp(0.0, 1.0) * 255.0).round() as u8)
-            .collect()
-    } else if options.debug_pipeline_step >= 6 {
-        // No-curve positive: density → linear brightness.
-        // Higher density = more dye = brighter subject = brighter output.
-        let _ = writeln!(dbg, "Step 6: linear density inversion (no curve)");
-        if options.verbose_debug {
-            let _ = write!(dbg, "{}", fmt_stats("  density:", &channel_stats(&image)));
-        }
-        const D_DISP_MAX: f32 = 2.5;
-        image
-            .iter()
-            .map(|v| ((*v / D_DISP_MAX).clamp(0.0, 1.0) * 255.0).round() as u8)
-            .collect()
     } else {
         // Pipeline stopped early: density still in image, map for display.
         let _ = writeln!(dbg, "Steps 1-5 only: density → display");

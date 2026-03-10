@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 
-use c41_raw_tool::{process_files, PipelineOptions, Rect, TiffFormat};
+use c41_raw_tool::{process_files, PipelineOptions, Rect, TiffFormat, OutputStage, OutputLutEncoding};
 use c41_raw_tool::raw_reader;
 
 #[derive(Parser, Debug)]
@@ -246,6 +246,13 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         export_aces_exr: cli.export_aces_exr,
         write_aces2065_only: false,
         lut3d_path: None,
+        output_stage: if cli.no_curve {
+            OutputStage::None
+        } else {
+            OutputStage::Ra4
+        },
+        output_lut_cube: None,
+        output_lut_encoding: OutputLutEncoding::CineonLog,
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
