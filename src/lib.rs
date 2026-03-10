@@ -131,6 +131,12 @@ pub struct PipelineOptions {
     pub rotation_degrees: i32,
     /// Debug: only run pipeline up to this step (1..=6). Preview and export use this. See TODO_DEBUG.md.
     pub debug_pipeline_step: u32,
+    /// Density-domain saturation boost applied before the RA-4 curve.
+    /// Scales per-channel density deviation from the neutral axis:
+    ///   D_ch = D_mean + sat * (D_ch - D_mean)
+    /// 1.0 = neutral (no change), >1.0 = more saturated. Default 1.2.
+    /// Compensates for the S-curve's tendency to compress channel differences.
+    pub saturation: f32,
     /// Debug preview mode: for RAW files, show only a simple bilinear demosaic
     /// (plus optional rotation) and skip the rest of the pipeline.
     pub debug_preview_simple_debayer: bool,
@@ -184,6 +190,7 @@ impl Default for PipelineOptions {
             output_lut_encoding: OutputLutEncoding::CineonLog,
             lut_in_black: 0.0,
             lut_in_white: 1.0,
+            saturation: 1.2,
             rotation_degrees: 0,
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
@@ -569,6 +576,33 @@ fn density_to_rec709_leveled(
     }
 }
 
+/// Density-domain saturation boost: scale per-channel deviation from the
+/// neutral axis (equal-density gray line).
+///
+///   D_mean  = (D_r + D_g + D_b) / 3
+///   D_ch' = D_mean + saturation * (D_ch - D_mean)
+///
+/// sat > 1 widens channel spread → more colorful output after the S-curve.
+/// sat = 1 is identity. Values are clamped to ≥ 0 after boosting.
+fn apply_density_saturation(image: &mut Array3<f32>, saturation: f32) {
+    if (saturation - 1.0).abs() < 1e-6 {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    for y in 0..h {
+        for x in 0..w {
+            let dr = image[[y, x, 0]];
+            let dg = image[[y, x, 1]];
+            let db = image[[y, x, 2]];
+            let d_mean = (dr + dg + db) * (1.0 / 3.0);
+            image[[y, x, 0]] = (d_mean + saturation * (dr - d_mean)).max(0.0);
+            image[[y, x, 1]] = (d_mean + saturation * (dg - d_mean)).max(0.0);
+            image[[y, x, 2]] = (d_mean + saturation * (db - d_mean)).max(0.0);
+        }
+    }
+}
+
 /// Apply a display-space 3D LUT to an image already in [0, 1].
 fn apply_output_cube_rgb(image: &mut Array3<f32>, lut: &lut3d::Lut3d) {
     let (h, w, c) = image.dim();
@@ -782,6 +816,11 @@ pub fn process_files(
                 }
             }
             image.mapv_inplace(|v| v.max(0.0));
+        }
+
+        // Step 5.5: Density-domain saturation boost (before RA-4 curve).
+        if options.debug_pipeline_step >= 5 {
+            apply_density_saturation(&mut image, options.saturation);
         }
 
         // Optional crop (export path only): keep only selected region.
@@ -1269,6 +1308,16 @@ pub fn process_one_to_preview(
         }
     } else {
         let _ = writeln!(dbg, "Step 5: SKIPPED (pipeline_step < 5)");
+    }
+    let _ = writeln!(dbg);
+
+    // Step 5.5: Density-domain saturation boost (before RA-4 curve).
+    if options.debug_pipeline_step >= 5 {
+        apply_density_saturation(&mut image, options.saturation);
+        if options.verbose_debug {
+            let _ = writeln!(dbg, "Step 5.5: saturation boost = {:.2}", options.saturation);
+            let _ = write!(dbg, "{}", fmt_stats("  after saturation boost:", &channel_stats(&image)));
+        }
     }
     let _ = writeln!(dbg);
 

@@ -257,13 +257,12 @@ pub fn build_density_to_ra4_lut(params: PrintCurveParams, d_max: f32) -> Vec<u16
 
             // Soft highlight shoulder: gently compress values near white before 16-bit
             // quantization to avoid harsh clipping in very bright regions (clouds, speculars).
-            // Below `shoulder_start` the curve is unchanged; above it we remap into [0,1]
-            // and apply a smooth roll-off.
-            const SHOULDER_START: f32 = 0.85;
+            // Starts at 0.93 to preserve saturation in the upper midtones/highlights where
+            // channel separation matters most for color punch.
+            const SHOULDER_START: f32 = 0.93;
             if y > SHOULDER_START {
                 let t = (y - SHOULDER_START) / (1.0 - SHOULDER_START);
-                // Exponent > 1.0 yields a flatter shoulder near 1.0.
-                let t_shaped = 1.0 - (1.0 - t).powf(2.0);
+                let t_shaped = 1.0 - (1.0 - t).powf(1.5);
                 y = SHOULDER_START + t_shaped * (1.0 - SHOULDER_START);
             }
 

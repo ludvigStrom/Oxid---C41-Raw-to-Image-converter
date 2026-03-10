@@ -184,6 +184,9 @@ struct C41Gui {
     /// Debounce state for preview refreshes: (image index, options hash) currently waiting to settle.
     pending_preview_key: Option<(usize, u64)>,
     pending_preview_since: Option<Instant>,
+    /// Deferred file dialog flag: open the output LUT browser outside the egui render loop
+    /// to avoid macOS NSOpenPanel re-entrance crashes.
+    pending_output_lut_browse: bool,
 }
 
 impl Default for C41Gui {
@@ -212,6 +215,7 @@ impl Default for C41Gui {
             rect_dragging: false,
             pending_preview_key: None,
             pending_preview_since: None,
+            pending_output_lut_browse: false,
         }
     }
 }
@@ -375,6 +379,7 @@ fn default_options() -> PipelineOptions {
         output_lut_encoding: OutputLutEncoding::CineonLog,
         lut_in_black: 0.0,
         lut_in_white: 1.0,
+        saturation: 1.2,
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
@@ -389,6 +394,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.apply_white_balance.hash(&mut h);
     opts.auto_wb.hash(&mut h);
     opts.film_gamma.to_bits().hash(&mut h);
+    opts.saturation.to_bits().hash(&mut h);
     opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
     opts.apply_crop.hash(&mut h);
@@ -754,6 +760,43 @@ impl eframe::App for C41Gui {
         }
         if self.ui_icons.logo.is_none() {
             self.ui_icons.logo = load_icon_texture(ctx, "ui_icon_logo", ICON_LOGO_PATH);
+        }
+
+        // Deferred output-LUT file dialog (runs outside the egui panel render loop
+        // to avoid macOS NSOpenPanel re-entrance crashes on repeated opens).
+        if self.pending_output_lut_browse {
+            self.pending_output_lut_browse = false;
+            let picked = rfd::FileDialog::new()
+                .add_filter("3D LUT (.cube)", &["cube", "CUBE"])
+                .add_filter("All files", &["*"])
+                .pick_file();
+            if let Some(idx) = self.selected_index {
+                if idx < self.images.len() {
+                    let opts = &mut self.images[idx].options;
+                    match picked {
+                        Some(path) => match c41_raw_tool::lut3d::read_cube(&path) {
+                            Ok(lut) => {
+                                self.status = format!(
+                                    "Loaded output LUT: {} ({}³ grid)",
+                                    path.display(),
+                                    lut.size,
+                                );
+                                opts.output_lut_cube = Some(path);
+                            }
+                            Err(e) => {
+                                self.status = format!(
+                                    "Failed to parse output LUT {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
+                        },
+                        None => {
+                            self.status = "Output LUT: file dialog cancelled.".into();
+                        }
+                    }
+                }
+            }
         }
 
         // Poll preview worker
@@ -1624,6 +1667,22 @@ impl eframe::App for C41Gui {
                         ui.add(egui::Slider::new(&mut opts.film_gamma, 0.3..=1.2).text("γ"));
                     });
 
+                    ui.collapsing("Saturation", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Density-domain chroma boost before the output curve.\n\
+                                 Amplifies per-channel density differences. 1.0 = neutral."
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut opts.saturation, 0.5..=2.5)
+                                .fixed_decimals(2)
+                                .text("Sat"),
+                        );
+                    });
+
                     ui.collapsing("Levels (black / white point)", |ui| {
                         ui.label(
                             egui::RichText::new(
@@ -1800,35 +1859,7 @@ impl eframe::App for C41Gui {
 
                         ui.add_space(4.0);
                         if ui.button("Browse output LUT…").clicked() {
-                            let picked = rfd::FileDialog::new()
-                                .add_filter("3D LUT (.cube)", &["cube", "CUBE"])
-                                .add_filter("All files", &["*"])
-                                .pick_file();
-                            match picked {
-                                Some(path) => {
-                                    match c41_raw_tool::lut3d::read_cube(&path) {
-                                        Ok(lut) => {
-                                            let msg = format!(
-                                                "Loaded output LUT: {} ({}³ grid)",
-                                                path.display(),
-                                                lut.size,
-                                            );
-                                            opts.output_lut_cube = Some(path);
-                                            self.status = msg;
-                                        }
-                                        Err(e) => {
-                                            self.status = format!(
-                                                "Failed to parse output LUT {}: {}",
-                                                path.display(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                                None => {
-                                    self.status = "Output LUT: file dialog cancelled.".into();
-                                }
-                            }
+                            self.pending_output_lut_browse = true;
                         }
                         if let Some(ref p) = opts.output_lut_cube {
                             ui.label(egui::RichText::new(p.display().to_string()).small());
