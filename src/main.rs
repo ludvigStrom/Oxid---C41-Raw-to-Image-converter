@@ -253,6 +253,8 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         },
         output_lut_cube: None,
         output_lut_encoding: OutputLutEncoding::CineonLog,
+        lut_in_black: 0.0,
+        lut_in_white: 1.0,
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,

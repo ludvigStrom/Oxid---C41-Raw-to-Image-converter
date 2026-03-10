@@ -373,6 +373,8 @@ fn default_options() -> PipelineOptions {
         output_stage: OutputStage::Ra4,
         output_lut_cube: None,
         output_lut_encoding: OutputLutEncoding::CineonLog,
+        lut_in_black: 0.0,
+        lut_in_white: 1.0,
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
@@ -429,6 +431,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
         .map(|p| p.display().to_string())
         .hash(&mut h);
     opts.output_lut_encoding.hash(&mut h);
+    opts.lut_in_black.to_bits().hash(&mut h);
+    opts.lut_in_white.to_bits().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
@@ -1620,6 +1624,39 @@ impl eframe::App for C41Gui {
                         ui.add(egui::Slider::new(&mut opts.film_gamma, 0.3..=1.2).text("γ"));
                     });
 
+                    ui.collapsing("Levels (black / white point)", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Remap density before the output stage: [black, white] → [0, 1].\n\
+                                 Applied after density calibration (step 5), before the output curve.\n\
+                                 Default 0–1 = full range. Narrow the range to set exposure/contrast.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Black");
+                            ui.add(
+                                egui::Slider::new(&mut opts.lut_in_black, 0.0..=1.0)
+                                    .fixed_decimals(3),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("White");
+                            ui.add(
+                                egui::Slider::new(&mut opts.lut_in_white, 0.0..=1.0)
+                                    .fixed_decimals(3),
+                            );
+                        });
+                        if opts.lut_in_black >= opts.lut_in_white {
+                            ui.label(
+                                egui::RichText::new("Warning: Black must be less than White")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(255, 160, 0)),
+                            );
+                        }
+                    });
+
                     // Output stage / curve selection.
                     let mut apply_curve = !opts.no_curve;
                     if ui.checkbox(&mut apply_curve, "Output curve").changed() {
@@ -1717,11 +1754,24 @@ impl eframe::App for C41Gui {
 
                         let enc_label = match opts.output_lut_encoding {
                             OutputLutEncoding::CineonLog => "Cineon log (D ÷ 2.046)",
+                            OutputLutEncoding::Rec709 => "Rec.709 (sRGB gamma)",
                             OutputLutEncoding::LinearDensity => "Linear (D ÷ 2.5)",
                         };
                         egui::ComboBox::from_label("LUT input encoding")
                             .selected_text(enc_label)
                             .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(
+                                        matches!(
+                                            opts.output_lut_encoding,
+                                            OutputLutEncoding::Rec709
+                                        ),
+                                        "Rec.709 (sRGB gamma)",
+                                    )
+                                    .clicked()
+                                {
+                                    opts.output_lut_encoding = OutputLutEncoding::Rec709;
+                                }
                                 if ui
                                     .selectable_label(
                                         matches!(

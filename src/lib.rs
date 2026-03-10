@@ -51,6 +51,9 @@ pub enum OutputLutEncoding {
     /// Cineon log: printing density ÷ 2.046 (10-bit Cineon full-scale).
     /// Use with Resolve-style "Kodak 2383" cubes whose input is Cineon Film Log.
     CineonLog,
+    /// Rec.709 / sRGB: density → linear scene → ACEScg-to-Rec.709 primaries → sRGB OETF.
+    /// Use with cubes that expect gamma-encoded Rec.709 input (e.g. "Rec709 Kodak 2383 D55").
+    Rec709,
     /// Linear normalized density: D ÷ D_max (2.5).
     /// Use with generic cubes that expect linear 0–1 RGB.
     LinearDensity,
@@ -120,6 +123,10 @@ pub struct PipelineOptions {
     /// Encoding expected by `output_lut_cube`. Determines the density→code-value
     /// pre-transform before the cube is applied.
     pub output_lut_encoding: OutputLutEncoding,
+    /// Pre-LUT levels: black point (input density that maps to 0). Default 0.0.
+    pub lut_in_black: f32,
+    /// Pre-LUT levels: white point (input density that maps to 1). Default 1.0.
+    pub lut_in_white: f32,
     /// Output rotation in degrees: 0, 90, 180, or 270 (applied after load/demosaic).
     pub rotation_degrees: i32,
     /// Debug: only run pipeline up to this step (1..=6). Preview and export use this. See TODO_DEBUG.md.
@@ -175,6 +182,8 @@ impl Default for PipelineOptions {
             output_stage: OutputStage::Ra4,
             output_lut_cube: None,
             output_lut_encoding: OutputLutEncoding::CineonLog,
+            lut_in_black: 0.0,
+            lut_in_white: 1.0,
             rotation_degrees: 0,
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
@@ -510,27 +519,65 @@ fn linear_to_srgb_u8(v: f32) -> u8 {
     (y.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// Convert a density image to normalized code values based on the chosen
-/// output-LUT encoding, then apply the cube in-place.
-///
-/// * `CineonLog`: D ÷ 2.046 → \[0, 1\] (10-bit Cineon printing density range).
-/// * `LinearDensity`: D ÷ 2.5 → \[0, 1\].
-fn apply_output_lut_with_encoding(
-    image: &mut Array3<f32>,
-    lut: &lut3d::Lut3d,
-    encoding: OutputLutEncoding,
-) {
-    let d_max = match encoding {
-        OutputLutEncoding::CineonLog => 2.046_f32,
-        OutputLutEncoding::LinearDensity => 2.5_f32,
-    };
+/// Normalize density to [0, 1] with levels remap: D/d_max → [0,1], then
+/// stretch [black, white] → [0, 1]. Identity when black=0, white=1.
+fn apply_density_levels(image: &mut Array3<f32>, d_max: f32, in_black: f32, in_white: f32) {
+    let range = (in_white - in_black).max(1e-6);
     let (h, w, c) = image.dim();
     assert_eq!(c, 3);
     for y in 0..h {
         for x in 0..w {
-            let r = (image[[y, x, 0]] / d_max).clamp(0.0, 1.0);
-            let g = (image[[y, x, 1]] / d_max).clamp(0.0, 1.0);
-            let b = (image[[y, x, 2]] / d_max).clamp(0.0, 1.0);
+            for ch in 0..3 {
+                let v = (image[[y, x, ch]] / d_max).clamp(0.0, 1.0);
+                image[[y, x, ch]] = ((v - in_black) / range).clamp(0.0, 1.0);
+            }
+        }
+    }
+}
+
+/// sRGB / Rec.709 OETF (linear → gamma-encoded).
+#[inline]
+fn linear_to_srgb(v: f32) -> f32 {
+    let x = v.clamp(0.0, 1.0);
+    if x <= 0.003_130_8 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Normalize density to [0, 1] with sRGB/Rec.709 gamma, then levels remap.
+/// The LUT handles the neg→pos inversion (print emulation), so we keep
+/// density orientation: D / d_max → gamma-encode → levels.
+fn density_to_rec709_leveled(
+    image: &mut Array3<f32>,
+    in_black: f32,
+    in_white: f32,
+) {
+    const D_MAX: f32 = 2.5;
+    let range = (in_white - in_black).max(1e-6);
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..3 {
+                let norm = (image[[y, x, ch]] / D_MAX).clamp(0.0, 1.0);
+                let gamma = linear_to_srgb(norm);
+                image[[y, x, ch]] = ((gamma - in_black) / range).clamp(0.0, 1.0);
+            }
+        }
+    }
+}
+
+/// Apply a display-space 3D LUT to an image already in [0, 1].
+fn apply_output_cube_rgb(image: &mut Array3<f32>, lut: &lut3d::Lut3d) {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    for y in 0..h {
+        for x in 0..w {
+            let r = image[[y, x, 0]].clamp(0.0, 1.0);
+            let g = image[[y, x, 1]].clamp(0.0, 1.0);
+            let b = image[[y, x, 2]].clamp(0.0, 1.0);
             let [or, og, ob] = lut.sample_normalized(r, g, b);
             image[[y, x, 0]] = or;
             image[[y, x, 1]] = og;
@@ -780,9 +827,18 @@ pub fn process_files(
         if options.debug_pipeline_step >= 6 {
             match options.output_stage {
                 OutputStage::Ra4 => {
-                    // RA-4 print emulation from density (existing behavior).
+                    let mut leveled = image.clone();
+                    if options.lut_in_black != 0.0 || options.lut_in_white != 1.0 {
+                        apply_density_levels(
+                            &mut leveled,
+                            4.0,
+                            options.lut_in_black,
+                            options.lut_in_white,
+                        );
+                        leveled.mapv_inplace(|v| v * 4.0);
+                    }
                     let image_u16 =
-                        curve::apply_ra4_from_density(&image, ra4_params, 4.0, options.curve_white);
+                        curve::apply_ra4_from_density(&leveled, ra4_params, 4.0, options.curve_white);
                     if !options.write_jpeg_only {
                         tiff_export::write_tiff_u16(&image_u16, &out_path)?;
                     }
@@ -825,17 +881,31 @@ pub fn process_files(
                     }
                 }
                 OutputStage::Lut2383 => {
-                    // Encode density to LUT input space, apply display-space cube, then export.
                     let mut display = image.clone();
+                    match options.output_lut_encoding {
+                        OutputLutEncoding::Rec709 => {
+                            density_to_rec709_leveled(
+                                &mut display,
+                                options.lut_in_black,
+                                options.lut_in_white,
+                            );
+                        }
+                        enc => {
+                            let d_max = match enc {
+                                OutputLutEncoding::CineonLog => 2.046_f32,
+                                OutputLutEncoding::LinearDensity => 2.5_f32,
+                                OutputLutEncoding::Rec709 => unreachable!(),
+                            };
+                            apply_density_levels(
+                                &mut display,
+                                d_max,
+                                options.lut_in_black,
+                                options.lut_in_white,
+                            );
+                        }
+                    }
                     if let Some(ref lut) = output_lut_cube {
-                        apply_output_lut_with_encoding(
-                            &mut display,
-                            lut,
-                            options.output_lut_encoding,
-                        );
-                    } else {
-                        const D_DISP_MAX: f32 = 2.5;
-                        display.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+                        apply_output_cube_rgb(&mut display, lut);
                     }
 
                     if !options.write_jpeg_only {
@@ -1219,15 +1289,26 @@ pub fn process_one_to_preview(
                 };
                 let _ = writeln!(
                     dbg,
-                    "Step 6: RA-4 curve (offset={:.3} gamma={:.3} pivot={:.3} white={:.4})",
-                    params.offset, params.gamma, params.pivot, options.curve_white
+                    "Step 6: RA-4 curve (offset={:.3} gamma={:.3} pivot={:.3} white={:.4} levels=[{:.3}, {:.3}])",
+                    params.offset, params.gamma, params.pivot, options.curve_white,
+                    options.lut_in_black, options.lut_in_white,
                 );
+                let mut leveled = image.clone();
+                if options.lut_in_black != 0.0 || options.lut_in_white != 1.0 {
+                    apply_density_levels(
+                        &mut leveled,
+                        4.0,
+                        options.lut_in_black,
+                        options.lut_in_white,
+                    );
+                    leveled.mapv_inplace(|v| v * 4.0);
+                }
                 if options.verbose_debug {
                     let _ =
-                        write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&image)));
+                        write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&leveled)));
                 }
                 let u16_img =
-                    curve::apply_ra4_from_density(&image, params, 4.0, options.curve_white);
+                    curve::apply_ra4_from_density(&leveled, params, 4.0, options.curve_white);
                 if options.verbose_debug {
                     let u16_stats: [(u16, u16, u16); 3] = {
                         let mut s = [(0u16, 0u16, 0u16); 3];
@@ -1280,12 +1361,15 @@ pub fn process_one_to_preview(
             OutputStage::Lut2383 => {
                 let enc_label = match options.output_lut_encoding {
                     OutputLutEncoding::CineonLog => "Cineon log (D/2.046)",
+                    OutputLutEncoding::Rec709 => "Rec.709 (D→linear→sRGB OETF)",
                     OutputLutEncoding::LinearDensity => "Linear (D/2.5)",
                 };
                 let _ = writeln!(
                     dbg,
-                    "Step 6: output LUT (encoding={}, cube={})",
+                    "Step 6: output LUT (encoding={}, levels=[{:.3}, {:.3}], cube={})",
                     enc_label,
+                    options.lut_in_black,
+                    options.lut_in_white,
                     options
                         .output_lut_cube
                         .as_ref()
@@ -1293,19 +1377,34 @@ pub fn process_one_to_preview(
                         .unwrap_or_else(|| "none".into()),
                 );
                 let mut display = image.clone();
+                match options.output_lut_encoding {
+                    OutputLutEncoding::Rec709 => {
+                        density_to_rec709_leveled(
+                            &mut display,
+                            options.lut_in_black,
+                            options.lut_in_white,
+                        );
+                    }
+                    enc => {
+                        let d_max = match enc {
+                            OutputLutEncoding::CineonLog => 2.046_f32,
+                            OutputLutEncoding::LinearDensity => 2.5_f32,
+                            OutputLutEncoding::Rec709 => unreachable!(),
+                        };
+                        apply_density_levels(
+                            &mut display,
+                            d_max,
+                            options.lut_in_black,
+                            options.lut_in_white,
+                        );
+                    }
+                }
                 if let Some(output_lut) = options
                     .output_lut_cube
                     .as_ref()
                     .and_then(|p| lut3d::read_cube(p).ok())
                 {
-                    apply_output_lut_with_encoding(
-                        &mut display,
-                        &output_lut,
-                        options.output_lut_encoding,
-                    );
-                } else {
-                    const D_DISP_MAX: f32 = 2.5;
-                    display.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+                    apply_output_cube_rgb(&mut display, &output_lut);
                 }
 
                 display
