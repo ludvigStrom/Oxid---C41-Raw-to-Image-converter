@@ -554,6 +554,53 @@ fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f
     out
 }
 
+/// Downsample an RGB image for preview to fit within `max_width`×`max_height`,
+/// preserving aspect ratio. Used for non-RAW (PNG) previews so the full C-41
+/// pipeline only runs on a smaller working resolution.
+fn downsample_rgb_for_preview(
+    image: &Array3<f32>,
+    max_width: u32,
+    max_height: u32,
+) -> Array3<f32> {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let w_u32 = w as u32;
+    let h_u32 = h as u32;
+    if w_u32 <= max_width && h_u32 <= max_height {
+        return image.clone();
+    }
+
+    let scale_w = max_width as f32 / w_u32 as f32;
+    let scale_h = max_height as f32 / h_u32 as f32;
+    let scale = scale_w.min(scale_h).min(1.0);
+    let new_w = (w_u32 as f32 * scale).round().max(1.0) as u32;
+    let new_h = (h_u32 as f32 * scale).round().max(1.0) as u32;
+
+    let mut img = Rgb32FImage::new(w_u32, h_u32);
+    for y in 0..h {
+        for x in 0..w {
+            let r = image[(y, x, 0)];
+            let g = image[(y, x, 1)];
+            let b = image[(y, x, 2)];
+            img.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+        }
+    }
+
+    let resized = imageops::resize(&img, new_w, new_h, FilterType::CatmullRom);
+
+    let mut out = Array3::<f32>::zeros((new_h as usize, new_w as usize, 3));
+    for (x, y, pixel) in resized.enumerate_pixels() {
+        let [r, g, b] = pixel.0;
+        let yi = y as usize;
+        let xi = x as usize;
+        out[(yi, xi, 0)] = r;
+        out[(yi, xi, 1)] = g;
+        out[(yi, xi, 2)] = b;
+    }
+
+    out
+}
+
 #[inline]
 fn linear_to_srgb_u8(v: f32) -> u8 {
     let x = v.clamp(0.0, 1.0);
@@ -1248,7 +1295,10 @@ pub fn process_one_to_preview(
             img.mapv_inplace(|v| v.max(0.0));
             img
         }
-        "png" => png_reader::load_png_as_ndarray(path)?,
+        "png" => {
+            let img = png_reader::load_png_as_ndarray(path)?;
+            downsample_rgb_for_preview(&img, max_width, max_height)
+        }
         _ => anyhow::bail!("Unsupported extension for preview"),
     };
 
@@ -1712,13 +1762,8 @@ pub fn process_one_to_preview(
     let img = RgbImage::from_raw(orig_w, orig_h, rgb_u8)
         .ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
 
-    let scale = (max_width as f32 / orig_w as f32)
-        .min(max_height as f32 / orig_h as f32)
-        .min(1.0);
-    let new_w = (orig_w as f32 * scale).round().max(1.0) as u32;
-    let new_h = (orig_h as f32 * scale).round().max(1.0) as u32;
-
-    let resized = imageops::resize(&img, new_w, new_h, FilterType::CatmullRom);
-    let out = resized.into_raw();
-    Ok((orig_w, orig_h, new_w, new_h, out, dbg))
+    // Keep full preview resolution (already limited by max_width/max_height at RAW load time).
+    // GUI handles zoom/crop/fit-to-window from this buffer.
+    let out = img.into_raw();
+    Ok((orig_w, orig_h, orig_w, orig_h, out, dbg))
 }

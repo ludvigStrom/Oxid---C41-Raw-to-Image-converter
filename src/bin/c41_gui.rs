@@ -28,6 +28,8 @@ use c41_raw_tool::{
     OutputLutEncoding,
 };
 use eframe::egui;
+use image::imageops::{self, FilterType};
+use image::RgbImage;
 
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
@@ -94,10 +96,19 @@ fn main() -> eframe::Result<()> {
 struct ImageEntry {
     path: PathBuf,
     options: PipelineOptions,
+    /// Current preview texture for the visible ROI (re-built when zoom/pan/size changes).
     preview_texture: Option<egui::TextureHandle>,
+    /// Hash of `PipelineOptions` at the time of last full preview processing.
     preview_hash: u64,
+    /// Full processed preview buffer (post-curve) at `preview_full_size`.
+    /// Used for zoom/pan ROI rendering without re-running the pipeline.
+    preview_full_rgb: Option<(u32, u32, Vec<u8>)>,
     /// Dimensions of the image at the stage where D-min/flat-field are applied (before preview downscale).
     preview_input_size: Option<[u32; 2]>,
+    /// Zoom factor for preview: 1.0 = full-frame fit, >1.0 = zoom in.
+    preview_zoom: f32,
+    /// Preview pan in normalized image space [0, 1] (center of the view).
+    preview_pan: egui::Vec2,
     /// Small thumbnail for the image strip (generated when loading).
     thumbnail_texture: Option<egui::TextureHandle>,
     // Per-channel histograms (R, G, B) over 0–255
@@ -645,6 +656,93 @@ fn drag_decimal_f32<'a>(value: &'a mut f32) -> egui::DragValue<'a> {
     egui::DragValue::new(value).custom_parser(|s| parse_decimal_f64(s))
 }
 
+/// High-level exposure wrapper, inspired by negPy. This re-parameterizes
+/// existing curve/levels controls into more photographic terms.
+#[derive(Debug, Clone, Copy)]
+struct ExposureParams {
+    /// Overall print exposure. 1.0 = neutral (curve_offset = 0).
+    pub density: f32,
+    /// Paper grade / contrast in normalized units. 1.0 ≈ default curve_gamma.
+    pub grade: f32,
+    /// Black point lift in density space (maps to lut_in_black).
+    pub shadows: f32,
+    /// Highlight compression / pull-in (maps to lut_in_white / curve_white).
+    pub highlights: f32,
+    /// Midtone hardness (maps to lut_in_mid / effective contrast around mid-gray).
+    pub hardness: f32,
+}
+
+fn exposure_from_opts(opts: &PipelineOptions) -> ExposureParams {
+    // Inverse of `apply_exposure_to_opts` mapping so the sliders reflect
+    // whatever the user last set via either Exposure or raw Levels/curve.
+    let density = 1.0 + opts.curve_offset;
+    let grade = if opts.curve_gamma > 0.0 {
+        opts.curve_gamma / 2.5
+    } else {
+        1.0
+    };
+
+    ExposureParams {
+        density,
+        grade,
+        shadows: opts.lut_in_black,
+        highlights: 1.0 - opts.lut_in_white,
+        hardness: opts.lut_in_mid,
+    }
+}
+
+fn apply_exposure_to_opts(exp: &ExposureParams, opts: &mut PipelineOptions) {
+    // Clamp user-facing slider domain to a sane photographic range.
+    let density = exp.density.clamp(0.0, 2.0);
+    let grade = exp.grade.clamp(0.2, 3.0);
+    let shadows = exp.shadows.clamp(0.0, 1.0);
+    let highlights = exp.highlights.clamp(0.0, 1.0);
+    let hardness = exp.hardness.clamp(0.1, 4.0);
+
+    // Map back into the underlying curve/levels parameters.
+    opts.curve_offset = density - 1.0;
+    opts.curve_gamma = 2.5 * grade;
+
+    opts.lut_in_black = shadows;
+    opts.lut_in_white = 1.0 - highlights;
+    opts.lut_in_mid = hardness;
+
+    // Tie RA-4 white pull-in slightly to highlight compression so the
+    // Exposure slider naturally protects highlights.
+    opts.curve_white = 1.0 - 0.5 * highlights;
+}
+
+/// CMY-style print balance wrapper for FilmPrint per-channel offsets.
+#[derive(Debug, Clone, Copy)]
+struct PrintBalance {
+    pub cyan: f32,
+    pub magenta: f32,
+    pub yellow: f32,
+}
+
+fn print_balance_from_opts(opts: &PipelineOptions) -> PrintBalance {
+    const SCALE: f32 = 0.3;
+    PrintBalance {
+        // Cyan is the complement of red: positive C reduces red channel offset.
+        cyan: (-opts.fp_offset_r) / SCALE,
+        // Magenta is the complement of green.
+        magenta: (-opts.fp_offset_g) / SCALE,
+        // Yellow is the complement of blue.
+        yellow: (-opts.fp_offset_b) / SCALE,
+    }
+}
+
+fn apply_print_balance_to_opts(pb: &PrintBalance, opts: &mut PipelineOptions) {
+    const SCALE: f32 = 0.3;
+    let c = pb.cyan.clamp(-1.0, 1.0);
+    let m = pb.magenta.clamp(-1.0, 1.0);
+    let y = pb.yellow.clamp(-1.0, 1.0);
+
+    opts.fp_offset_r = -c * SCALE;
+    opts.fp_offset_g = -m * SCALE;
+    opts.fp_offset_b = -y * SCALE;
+}
+
 fn icon_candidate_paths(path_hint: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let hint_path = PathBuf::from(path_hint);
@@ -879,15 +977,13 @@ impl eframe::App for C41Gui {
                             }
                             pixels.push(egui::Color32::from_rgb(c[0], c[1], c[2]));
                         }
-                        let image = egui::ColorImage { size, pixels };
-                        let tex = ctx.load_texture(
-                            format!("preview_{}", idx),
-                            image,
-                            egui::TextureOptions::default(),
-                        );
+                        let _image = egui::ColorImage { size, pixels };
+                        // Histogram is computed above; we now keep the full preview RGB buffer
+                        // and rebuild the visible ROI texture on demand (zoom/pan) in the UI.
                         let hash = options_hash_for(&self.images[idx].path, &self.images[idx].options);
-                        self.images[idx].preview_texture = Some(tex);
+                        self.images[idx].preview_texture = None;
                         self.images[idx].preview_hash = hash;
+                        self.images[idx].preview_full_rgb = Some((w, h, rgb.clone()));
                         self.images[idx].preview_input_size = Some([input_w, input_h]);
                         if let Some(thumb_image) = make_thumbnail_from_rgb(&rgb, w, h, THUMB_MAX_SIZE) {
                             let thumb_tex = ctx.load_texture(
@@ -1014,7 +1110,10 @@ impl eframe::App for C41Gui {
                                             options: default_options(),
                                             preview_texture: None,
                                             preview_hash: 0,
+                            preview_full_rgb: None,
                                             preview_input_size: None,
+                            preview_zoom: 1.0,
+                            preview_pan: egui::vec2(0.5, 0.5),
                                             thumbnail_texture: None,
                                             histogram: None,
                                             export_format: ExportFormat::Tiff16,
@@ -1718,6 +1817,117 @@ impl eframe::App for C41Gui {
                                 .fixed_decimals(2)
                                 .text("Warmth"),
                         );
+                    });
+
+                    ui.collapsing("Exposure", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "High-level exposure controls mapped onto Levels + RA-4 curve.\n\
+                                 Use these as a neg-style wrapper; Levels still expose the raw knobs."
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+
+                        let mut exp = exposure_from_opts(opts);
+                        let mut changed = false;
+
+                        ui.horizontal(|ui| {
+                            ui.label("Density");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut exp.density, 0.0..=2.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Grade");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut exp.grade, 0.2..=3.0)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Shadows");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut exp.shadows, 0.0..=1.0)
+                                        .fixed_decimals(3),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Highlights");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut exp.highlights, 0.0..=1.0)
+                                        .fixed_decimals(3),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Hardness");
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut exp.hardness, 0.1..=4.0)
+                                        .logarithmic(true)
+                                        .fixed_decimals(2),
+                                )
+                                .changed();
+                        });
+
+                        if changed {
+                            apply_exposure_to_opts(&exp, opts);
+                        }
+
+                        if matches!(opts.output_stage, OutputStage::FilmPrint) {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Print balance (CMY, Film Print only).\n\
+                                     Adjusts per-channel exposure in the print stage."
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            let mut pb = print_balance_from_opts(opts);
+                            let mut pb_changed = false;
+                            ui.horizontal(|ui| {
+                                ui.label("C");
+                                pb_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut pb.cyan, -1.0..=1.0)
+                                            .fixed_decimals(2),
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("M");
+                                pb_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut pb.magenta, -1.0..=1.0)
+                                            .fixed_decimals(2),
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Y");
+                                pb_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut pb.yellow, -1.0..=1.0)
+                                            .fixed_decimals(2),
+                                    )
+                                    .changed();
+                            });
+
+                            if pb_changed {
+                                apply_print_balance_to_opts(&pb, opts);
+                            }
+                        }
                     });
 
                     ui.collapsing("Levels (black / white point)", |ui| {
@@ -2523,25 +2733,89 @@ impl eframe::App for C41Gui {
 
             if let Some(idx) = self.selected_index {
                 if idx < self.images.len() {
-                    if let Some(ref tex) = self.images[idx].preview_texture {
-                        let size = tex.size();
-                        let (w, h) = (size[0] as f32, size[1] as f32);
+                    if let Some((full_w, full_h, full_rgb)) =
+                        self.images[idx].preview_full_rgb.clone()
+                    {
                         let available = ui.available_rect_before_wrap();
                         const CONTROL_ROW_HEIGHT: f32 = 28.0;
                         const HISTOGRAM_HEIGHT: f32 = 72.0;
                         const BOTTOM_PADDING: f32 = 8.0;
                         const IMAGE_PREVIEW_BOTTOM_PADDING: f32 = 16.0; // padding below the image
-                        let reserved_bottom = IMAGE_PREVIEW_BOTTOM_PADDING + CONTROL_ROW_HEIGHT + BOTTOM_PADDING + HISTOGRAM_HEIGHT + BOTTOM_PADDING;
+                        const TOP_PADDING: f32 = 12.0;
+
+                        let full_w_f = full_w as f32;
+                        let full_h_f = full_h as f32;
+
+                        let reserved_bottom = IMAGE_PREVIEW_BOTTOM_PADDING
+                            + CONTROL_ROW_HEIGHT
+                            + BOTTOM_PADDING
+                            + HISTOGRAM_HEIGHT
+                            + BOTTOM_PADDING;
                         let area_for_image = (available.height() - reserved_bottom).max(60.0);
-                        let scale = (available.width() / w).min(area_for_image / h).min(1.0);
-                        let display_size = egui::vec2(w * scale, h * scale);
+
+                        // Display size is based on fitting the full frame; zoom only affects ROI.
+                        let fit_scale = (available.width() / full_w_f)
+                            .min(area_for_image / full_h_f)
+                            .min(1.0);
+                        let display_size = egui::vec2(full_w_f * fit_scale, full_h_f * fit_scale);
                         let margin_x = (available.width() - display_size.x) / 2.0;
-                        let margin_y = (area_for_image - display_size.y) / 2.0;
+                        let margin_y = (area_for_image - display_size.y) / 2.0 + TOP_PADDING;
                         ui.add_space(margin_y);
-                        let image_resp = ui.horizontal(|ui| {
-                            ui.add_space(margin_x);
-                            ui.image((tex.id(), display_size))
-                        }).inner;
+
+                        // Compute ROI in source image based on zoom/pan.
+                        let entry = &mut self.images[idx];
+                        let zoom = entry.preview_zoom.max(1.0);
+                        let roi_w = (full_w_f / zoom).clamp(1.0, full_w_f);
+                        let roi_h = (full_h_f / zoom).clamp(1.0, full_h_f);
+
+                        let cx = entry.preview_pan.x.clamp(0.0, 1.0) * (full_w_f - 1.0);
+                        let cy = entry.preview_pan.y.clamp(0.0, 1.0) * (full_h_f - 1.0);
+                        let mut src_x = (cx - roi_w * 0.5).floor();
+                        let mut src_y = (cy - roi_h * 0.5).floor();
+                        src_x = src_x.clamp(0.0, full_w_f - roi_w);
+                        src_y = src_y.clamp(0.0, full_h_f - roi_h);
+
+                        // Build ROI image and resize to display size.
+                        let mut img = RgbImage::from_raw(full_w, full_h, full_rgb).unwrap();
+                        let cropped = imageops::crop_imm(
+                            &mut img,
+                            src_x as u32,
+                            src_y as u32,
+                            roi_w.round().max(1.0) as u32,
+                            roi_h.round().max(1.0) as u32,
+                        );
+                        let cropped_img = cropped.to_image();
+                        let resized = imageops::resize(
+                            &cropped_img,
+                            display_size.x.round().max(1.0) as u32,
+                            display_size.y.round().max(1.0) as u32,
+                            FilterType::CatmullRom,
+                        );
+
+                        let tex = {
+                            let size = [resized.width() as usize, resized.height() as usize];
+                            let pixels: Vec<egui::Color32> = resized
+                                .pixels()
+                                .map(|p| {
+                                    let [r, g, b] = p.0;
+                                    egui::Color32::from_rgb(r, g, b)
+                                })
+                                .collect();
+                            let image = egui::ColorImage { size, pixels };
+                            ui.ctx().load_texture(
+                                format!("preview_roi_{}", idx),
+                                image,
+                                egui::TextureOptions::default(),
+                            )
+                        };
+                        self.images[idx].preview_texture = Some(tex.clone());
+
+                        let image_resp = ui
+                            .horizontal(|ui| {
+                                ui.add_space(margin_x);
+                                ui.image((tex.id(), display_size))
+                            })
+                            .inner;
                         let image_rect = image_resp.rect;
                         ui.add_space(IMAGE_PREVIEW_BOTTOM_PADDING);
 
@@ -2561,6 +2835,62 @@ impl eframe::App for C41Gui {
                                     ui.spinner();
                                 });
                             });
+                        }
+
+                        // Zoom with mouse wheel (no modifier).
+                        if image_resp.hovered()
+                            && ui.input(|i| i.raw_scroll_delta.y != 0.0 && !i.modifiers.shift)
+                        {
+                            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                            let factor = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                            let entry = &mut self.images[idx];
+                            let old_zoom = entry.preview_zoom.max(1.0);
+                            let new_zoom = (old_zoom * factor).clamp(1.0, 8.0);
+
+                            if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                                let u = ((mouse_pos.x - image_rect.left()) / image_rect.width())
+                                    .clamp(0.0, 1.0);
+                                let v = ((mouse_pos.y - image_rect.top()) / image_rect.height())
+                                    .clamp(0.0, 1.0);
+                                entry.preview_pan.x = u;
+                                entry.preview_pan.y = v;
+                            }
+
+                            entry.preview_zoom = new_zoom;
+                        }
+
+                        // Pan with drag on the image (no modifier), unless a rect is being dragged.
+                        if image_resp.dragged() && !self.rect_dragging {
+                            let delta = image_resp.drag_delta();
+                            let entry = &mut self.images[idx];
+                            let dx_norm = delta.x / image_rect.width();
+                            let dy_norm = delta.y / image_rect.height();
+                            entry.preview_pan.x =
+                                (entry.preview_pan.x - dx_norm).clamp(0.0, 1.0);
+                            entry.preview_pan.y =
+                                (entry.preview_pan.y - dy_norm).clamp(0.0, 1.0);
+                        }
+
+                        // Zoom/readout text in lower-left above histogram.
+                        if let Some((full_w, full_h, _)) = self.images[idx].preview_full_rgb {
+                            let entry = &self.images[idx];
+                            let zoom_pct = (entry.preview_zoom * 100.0).round();
+                            let crop_w = (full_w as f32 / entry.preview_zoom).round() as u32;
+                            let crop_h = (full_h as f32 / entry.preview_zoom).round() as u32;
+                            let label = format!(
+                                "{:.0}%  resolution: {}px × {}px  crop: {}px × {}px",
+                                zoom_pct, full_w, full_h, crop_w, crop_h
+                            );
+                            let label_pos =
+                                egui::pos2(image_rect.left() + 4.0, image_rect.bottom() + 4.0);
+                            let painter = ui.painter_at(image_rect);
+                            painter.text(
+                                label_pos,
+                                egui::Align2::LEFT_TOP,
+                                label,
+                                egui::TextStyle::Small.resolve(ui.style()),
+                                egui::Color32::LIGHT_GRAY,
+                            );
                         }
 
                         // In Calibrate mode, draw and allow interaction with the
@@ -2673,17 +3003,44 @@ impl eframe::App for C41Gui {
                                     {
                                         if input_w > 0 && input_h > 0 {
                                             let painter = ui.painter_at(image_rect);
-                                            let norm_x = rect.x as f32 / input_w as f32;
-                                            let norm_y = rect.y as f32 / input_h as f32;
-                                            let norm_w = rect.width as f32 / input_w as f32;
-                                            let norm_h = rect.height as f32 / input_h as f32;
 
-                                            let mut left =
-                                                image_rect.left() + norm_x * image_rect.width();
-                                            let mut top =
-                                                image_rect.top() + norm_y * image_rect.height();
-                                            let mut right = left + norm_w * image_rect.width();
-                                            let mut bottom = top + norm_h * image_rect.height();
+                                            // Map image-space rect into current ROI (zoom/pan).
+                                            let zoom = entry.preview_zoom.max(1.0);
+                                            let full_w_f = input_w as f32;
+                                            let full_h_f = input_h as f32;
+                                            let roi_w = (full_w_f / zoom).clamp(1.0, full_w_f);
+                                            let roi_h = (full_h_f / zoom).clamp(1.0, full_h_f);
+                                            let cx = entry.preview_pan.x.clamp(0.0, 1.0)
+                                                * (full_w_f - 1.0);
+                                            let cy = entry.preview_pan.y.clamp(0.0, 1.0)
+                                                * (full_h_f - 1.0);
+                                            let mut src_x = (cx - roi_w * 0.5).floor();
+                                            let mut src_y = (cy - roi_h * 0.5).floor();
+                                            src_x = src_x.clamp(0.0, full_w_f - roi_w);
+                                            src_y = src_y.clamp(0.0, full_h_f - roi_h);
+
+                                            let rect_x0 = rect.x as f32;
+                                            let rect_y0 = rect.y as f32;
+                                            let rect_x1 = rect_x0 + rect.width as f32;
+                                            let rect_y1 = rect_y0 + rect.height as f32;
+
+                                            let roi_norm_left =
+                                                (rect_x0 - src_x) / roi_w;
+                                            let roi_norm_top =
+                                                (rect_y0 - src_y) / roi_h;
+                                            let roi_norm_right =
+                                                (rect_x1 - src_x) / roi_w;
+                                            let roi_norm_bottom =
+                                                (rect_y1 - src_y) / roi_h;
+
+                                            let mut left = image_rect.left()
+                                                + roi_norm_left * image_rect.width();
+                                            let mut top = image_rect.top()
+                                                + roi_norm_top * image_rect.height();
+                                            let mut right = image_rect.left()
+                                                + roi_norm_right * image_rect.width();
+                                            let mut bottom = image_rect.top()
+                                                + roi_norm_bottom * image_rect.height();
 
                                             // Draggable corner handles for direct D-min crop editing.
                                             let handle_radius = 5.0;
@@ -2748,40 +3105,6 @@ impl eframe::App for C41Gui {
                                                     .clamp(left + min_screen_size, image_rect.right());
                                                 bottom = bottom
                                                     .clamp(top + min_screen_size, image_rect.bottom());
-                                            } else {
-                                                let screen_rect =
-                                                    egui::Rect::from_min_max(
-                                                        egui::pos2(left, top),
-                                                        egui::pos2(right, bottom),
-                                                    );
-                                                let move_id =
-                                                    ui.make_persistent_id(("dmin_rect_move", idx));
-                                                let move_resp = ui.interact(
-                                                    screen_rect,
-                                                    move_id,
-                                                    egui::Sense::click_and_drag(),
-                                                );
-                                                if move_resp.dragged() {
-                                                    let delta = move_resp.drag_delta();
-                                                    let rect_w = right - left;
-                                                    let rect_h = bottom - top;
-
-                                                    let mut dx = delta.x;
-                                                    let mut dy = delta.y;
-                                                    dx = dx
-                                                        .max(image_rect.left() - left)
-                                                        .min(image_rect.right() - right);
-                                                    dy = dy
-                                                        .max(image_rect.top() - top)
-                                                        .min(image_rect.bottom() - bottom);
-
-                                                    left += dx;
-                                                    right = left + rect_w;
-                                                    top += dy;
-                                                    bottom = top + rect_h;
-                                                    rect_changed = true;
-                                                    self.rect_dragging = true;
-                                                }
                                             }
 
                                             let screen_rect = egui::Rect::from_min_max(
@@ -2810,36 +3133,56 @@ impl eframe::App for C41Gui {
                                             }
 
                                             if rect_changed {
-                                                let img_w = image_rect.width().max(1.0);
-                                                let img_h = image_rect.height().max(1.0);
+                                                // Map back from screen space → ROI → image space.
+                                                let roi_norm_left =
+                                                    (left - image_rect.left())
+                                                        / image_rect.width();
+                                                let roi_norm_top =
+                                                    (top - image_rect.top())
+                                                        / image_rect.height();
+                                                let roi_norm_right =
+                                                    (right - image_rect.left())
+                                                        / image_rect.width();
+                                                let roi_norm_bottom =
+                                                    (bottom - image_rect.top())
+                                                        / image_rect.height();
 
-                                                let norm_left = (left - image_rect.left()) / img_w;
-                                                let norm_top = (top - image_rect.top()) / img_h;
-                                                let norm_width = (right - left) / img_w;
-                                                let norm_height = (bottom - top) / img_h;
+                                                let new_x = (src_x
+                                                    + roi_norm_left * roi_w)
+                                                    .round()
+                                                    .clamp(0.0, full_w_f - 1.0)
+                                                    as u32;
+                                                let new_y = (src_y
+                                                    + roi_norm_top * roi_h)
+                                                    .round()
+                                                    .clamp(0.0, full_h_f - 1.0)
+                                                    as u32;
+                                                let new_x1 = (src_x
+                                                    + roi_norm_right * roi_w)
+                                                    .round()
+                                                    .clamp(0.0, full_w_f)
+                                                    as u32;
+                                                let new_y1 = (src_y
+                                                    + roi_norm_bottom * roi_h)
+                                                    .round()
+                                                    .clamp(0.0, full_h_f)
+                                                    as u32;
 
-                                                let x = (norm_left * input_w as f32)
-                                                    .round()
-                                                    .clamp(0.0, input_w.saturating_sub(1) as f32)
-                                                    as u32;
-                                                let y = (norm_top * input_h as f32)
-                                                    .round()
-                                                    .clamp(0.0, input_h.saturating_sub(1) as f32)
-                                                    as u32;
                                                 let mut w_px =
-                                                    (norm_width * input_w as f32).round().max(1.0) as u32;
+                                                    new_x1.saturating_sub(new_x).max(1);
                                                 let mut h_px =
-                                                    (norm_height * input_h as f32).round().max(1.0) as u32;
-                                                w_px = w_px.min(input_w.saturating_sub(x).max(1));
-                                                h_px = h_px.min(input_h.saturating_sub(y).max(1));
+                                                    new_y1.saturating_sub(new_y).max(1);
+                                                w_px = w_px.min(input_w.saturating_sub(new_x).max(1));
+                                                h_px = h_px.min(input_h.saturating_sub(new_y).max(1));
 
                                                 opts.dmin_rect = Some(Rect {
-                                                    x,
-                                                    y,
+                                                    x: new_x,
+                                                    y: new_y,
                                                     width: w_px,
                                                     height: h_px,
                                                 });
-                                                opts.dmin_rect_reference_size = Some((input_w, input_h));
+                                                opts.dmin_rect_reference_size =
+                                                    Some((input_w, input_h));
                                             }
                                         }
                                     }
