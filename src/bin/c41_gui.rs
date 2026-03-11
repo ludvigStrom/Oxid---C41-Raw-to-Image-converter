@@ -28,8 +28,6 @@ use c41_raw_tool::{
     OutputLutEncoding,
 };
 use eframe::egui;
-use image::imageops::{self, FilterType};
-use image::RgbImage;
 
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
@@ -2738,70 +2736,78 @@ impl eframe::App for C41Gui {
                             + BOTTOM_PADDING;
                         let area_for_image = (available.height() - reserved_bottom).max(60.0);
 
-                        // Display size is based on fitting the full frame; zoom only affects ROI.
+                        // Canvas fills the entire available area, preserving aspect ratio.
                         let fit_scale = (available.width() / full_w_f)
-                            .min(area_for_image / full_h_f)
-                            .min(1.0);
+                            .min(area_for_image / full_h_f);
                         let display_size = egui::vec2(full_w_f * fit_scale, full_h_f * fit_scale);
                         let margin_x = (available.width() - display_size.x) / 2.0;
                         let margin_y = (area_for_image - display_size.y) / 2.0 + TOP_PADDING;
                         ui.add_space(margin_y);
 
-                        // Compute ROI in source image based on zoom/pan.
-                        let entry = &mut self.images[idx];
-                        let zoom = entry.preview_zoom.max(1.0);
-                        let roi_w = (full_w_f / zoom).clamp(1.0, full_w_f);
-                        let roi_h = (full_h_f / zoom).clamp(1.0, full_h_f);
-
-                        let cx = entry.preview_pan.x.clamp(0.0, 1.0) * (full_w_f - 1.0);
-                        let cy = entry.preview_pan.y.clamp(0.0, 1.0) * (full_h_f - 1.0);
-                        let mut src_x = (cx - roi_w * 0.5).floor();
-                        let mut src_y = (cy - roi_h * 0.5).floor();
-                        src_x = src_x.clamp(0.0, full_w_f - roi_w);
-                        src_y = src_y.clamp(0.0, full_h_f - roi_h);
-
-                        // Build ROI image and resize to display size.
-                        let mut img = RgbImage::from_raw(full_w, full_h, full_rgb).unwrap();
-                        let cropped = imageops::crop_imm(
-                            &mut img,
-                            src_x as u32,
-                            src_y as u32,
-                            roi_w.round().max(1.0) as u32,
-                            roi_h.round().max(1.0) as u32,
-                        );
-                        let cropped_img = cropped.to_image();
-                        let resized = imageops::resize(
-                            &cropped_img,
-                            display_size.x.round().max(1.0) as u32,
-                            display_size.y.round().max(1.0) as u32,
-                            FilterType::CatmullRom,
-                        );
-
+                        // Upload full-frame texture once (reuse across zoom/pan).
                         let tex = {
-                            let size = [resized.width() as usize, resized.height() as usize];
-                            let pixels: Vec<egui::Color32> = resized
-                                .pixels()
-                                .map(|p| {
-                                    let [r, g, b] = p.0;
-                                    egui::Color32::from_rgb(r, g, b)
-                                })
+                            let size = [full_w as usize, full_h as usize];
+                            let pixels: Vec<egui::Color32> = full_rgb
+                                .chunks_exact(3)
+                                .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
                                 .collect();
                             let image = egui::ColorImage { size, pixels };
                             ui.ctx().load_texture(
-                                format!("preview_roi_{}", idx),
+                                format!("preview_full_{}", idx),
                                 image,
-                                egui::TextureOptions::default(),
+                                egui::TextureOptions::LINEAR,
                             )
                         };
                         self.images[idx].preview_texture = Some(tex.clone());
 
+                        // Camera: compute UV rect from zoom/pan.
+                        let entry = &mut self.images[idx];
+                        let zoom = entry.preview_zoom.max(1.0);
+                        let uv_w = (1.0 / zoom).clamp(0.0, 1.0);
+                        let uv_h = (1.0 / zoom).clamp(0.0, 1.0);
+                        let uv_cx = entry.preview_pan.x.clamp(0.0, 1.0);
+                        let uv_cy = entry.preview_pan.y.clamp(0.0, 1.0);
+                        let mut uv_x0 = uv_cx - uv_w * 0.5;
+                        let mut uv_y0 = uv_cy - uv_h * 0.5;
+                        uv_x0 = uv_x0.clamp(0.0, 1.0 - uv_w);
+                        uv_y0 = uv_y0.clamp(0.0, 1.0 - uv_h);
+                        let uv_rect = egui::Rect::from_min_max(
+                            egui::pos2(uv_x0, uv_y0),
+                            egui::pos2(uv_x0 + uv_w, uv_y0 + uv_h),
+                        );
+
+                        // Draw image with UV rect so zoom/pan is GPU-side.
                         let image_resp = ui
                             .horizontal(|ui| {
                                 ui.add_space(margin_x);
-                                ui.image((tex.id(), display_size))
+                                ui.add(
+                                    egui::Image::new((tex.id(), display_size))
+                                        .uv(uv_rect)
+                                        .sense(egui::Sense::click_and_drag()),
+                                )
                             })
                             .inner;
                         let image_rect = image_resp.rect;
+
+                        // Camera helpers: map between image-pixel coords and screen coords.
+                        // image_to_screen: (px, py) in image pixels → screen pos.
+                        let cam_uv_x0 = uv_x0;
+                        let cam_uv_y0 = uv_y0;
+                        let cam_uv_w = uv_w;
+                        let cam_uv_h = uv_h;
+                        let cam_ir = image_rect;
+                        let image_to_screen = |px: f32, py: f32| -> egui::Pos2 {
+                            let u = px / full_w_f;
+                            let v = py / full_h_f;
+                            let sx = cam_ir.left() + ((u - cam_uv_x0) / cam_uv_w) * cam_ir.width();
+                            let sy = cam_ir.top()  + ((v - cam_uv_y0) / cam_uv_h) * cam_ir.height();
+                            egui::pos2(sx, sy)
+                        };
+                        let screen_to_image = |sx: f32, sy: f32| -> (f32, f32) {
+                            let u = cam_uv_x0 + ((sx - cam_ir.left()) / cam_ir.width()) * cam_uv_w;
+                            let v = cam_uv_y0 + ((sy - cam_ir.top())  / cam_ir.height()) * cam_uv_h;
+                            (u * full_w_f, v * full_h_f)
+                        };
                         ui.add_space(IMAGE_PREVIEW_BOTTOM_PADDING);
 
                         // Keep the previous preview visible while a new render is in-flight.
@@ -2822,7 +2828,7 @@ impl eframe::App for C41Gui {
                             });
                         }
 
-                        // Zoom with mouse wheel (no modifier).
+                        // Zoom with mouse wheel — always works, even when crop tool is active.
                         if image_resp.hovered()
                             && ui.input(|i| i.raw_scroll_delta.y != 0.0 && !i.modifiers.shift)
                         {
@@ -2830,13 +2836,12 @@ impl eframe::App for C41Gui {
                             let factor = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
                             let entry = &mut self.images[idx];
                             let old_zoom = entry.preview_zoom.max(1.0);
-                            let new_zoom = (old_zoom * factor).clamp(1.0, 8.0);
+                            let new_zoom = (old_zoom * factor).clamp(1.0, 16.0);
 
                             if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                                let u = ((mouse_pos.x - image_rect.left()) / image_rect.width())
-                                    .clamp(0.0, 1.0);
-                                let v = ((mouse_pos.y - image_rect.top()) / image_rect.height())
-                                    .clamp(0.0, 1.0);
+                                let (img_px, img_py) = screen_to_image(mouse_pos.x, mouse_pos.y);
+                                let u = (img_px / full_w_f).clamp(0.0, 1.0);
+                                let v = (img_py / full_h_f).clamp(0.0, 1.0);
                                 entry.preview_pan.x = u;
                                 entry.preview_pan.y = v;
                             }
@@ -2844,12 +2849,14 @@ impl eframe::App for C41Gui {
                             entry.preview_zoom = new_zoom;
                         }
 
-                        // Pan with drag on the image (no modifier), unless a rect is being dragged.
-                        if image_resp.dragged() && !self.rect_dragging {
+                        // Pan with middle-mouse drag (always works) or left drag when no rect handle hit.
+                        let middle_drag = ui.input(|i| i.pointer.middle_down()) && image_resp.dragged();
+                        let left_drag = image_resp.dragged() && !self.rect_dragging;
+                        if middle_drag || left_drag {
                             let delta = image_resp.drag_delta();
                             let entry = &mut self.images[idx];
-                            let dx_norm = delta.x / image_rect.width();
-                            let dy_norm = delta.y / image_rect.height();
+                            let dx_norm = (delta.x / image_rect.width()) * cam_uv_w;
+                            let dy_norm = (delta.y / image_rect.height()) * cam_uv_h;
                             entry.preview_pan.x =
                                 (entry.preview_pan.x - dx_norm).clamp(0.0, 1.0);
                             entry.preview_pan.y =
@@ -2974,8 +2981,7 @@ impl eframe::App for C41Gui {
                             }
                         }
 
-                        // In Process mode, when D-min is active and using a rectangle (no flat-field /
-                        // fixed D-min), draw the D-min sampling rectangle over the preview.
+                        // D-min overlay: project image-space rect through camera.
                         if self.mode == UIMode::Process {
                             if let Some(entry) = self.images.get_mut(idx) {
                                 let opts = &mut entry.options;
@@ -2989,47 +2995,17 @@ impl eframe::App for C41Gui {
                                         if input_w > 0 && input_h > 0 {
                                             let painter = ui.painter_at(image_rect);
 
-                                            // Map image-space rect into current ROI (zoom/pan).
-                                            let zoom = entry.preview_zoom.max(1.0);
-                                            let full_w_f = input_w as f32;
-                                            let full_h_f = input_h as f32;
-                                            let roi_w = (full_w_f / zoom).clamp(1.0, full_w_f);
-                                            let roi_h = (full_h_f / zoom).clamp(1.0, full_h_f);
-                                            let cx = entry.preview_pan.x.clamp(0.0, 1.0)
-                                                * (full_w_f - 1.0);
-                                            let cy = entry.preview_pan.y.clamp(0.0, 1.0)
-                                                * (full_h_f - 1.0);
-                                            let mut src_x = (cx - roi_w * 0.5).floor();
-                                            let mut src_y = (cy - roi_h * 0.5).floor();
-                                            src_x = src_x.clamp(0.0, full_w_f - roi_w);
-                                            src_y = src_y.clamp(0.0, full_h_f - roi_h);
+                                            let scr_tl = image_to_screen(rect.x as f32, rect.y as f32);
+                                            let scr_br = image_to_screen(
+                                                (rect.x + rect.width) as f32,
+                                                (rect.y + rect.height) as f32,
+                                            );
+                                            let mut left = scr_tl.x;
+                                            let mut top = scr_tl.y;
+                                            let mut right = scr_br.x;
+                                            let mut bottom = scr_br.y;
 
-                                            let rect_x0 = rect.x as f32;
-                                            let rect_y0 = rect.y as f32;
-                                            let rect_x1 = rect_x0 + rect.width as f32;
-                                            let rect_y1 = rect_y0 + rect.height as f32;
-
-                                            let roi_norm_left =
-                                                (rect_x0 - src_x) / roi_w;
-                                            let roi_norm_top =
-                                                (rect_y0 - src_y) / roi_h;
-                                            let roi_norm_right =
-                                                (rect_x1 - src_x) / roi_w;
-                                            let roi_norm_bottom =
-                                                (rect_y1 - src_y) / roi_h;
-
-                                            let mut left = image_rect.left()
-                                                + roi_norm_left * image_rect.width();
-                                            let mut top = image_rect.top()
-                                                + roi_norm_top * image_rect.height();
-                                            let mut right = image_rect.left()
-                                                + roi_norm_right * image_rect.width();
-                                            let mut bottom = image_rect.top()
-                                                + roi_norm_bottom * image_rect.height();
-
-                                            // Draggable corner handles for direct D-min crop editing.
                                             let handle_radius = 5.0;
-                                            let min_screen_size = 8.0;
                                             let mut rect_changed = false;
 
                                             let corners = [
@@ -3038,58 +3014,25 @@ impl eframe::App for C41Gui {
                                                 egui::pos2(left, bottom),
                                                 egui::pos2(right, bottom),
                                             ];
-
-                                            for (corner_idx, corner_pos) in corners.iter().enumerate() {
-                                                let handle_rect = egui::Rect::from_center_size(
-                                                    *corner_pos,
+                                            for (ci, cp) in corners.iter().enumerate() {
+                                                let hr = egui::Rect::from_center_size(
+                                                    *cp,
                                                     egui::vec2(handle_radius * 2.0, handle_radius * 2.0),
                                                 );
-                                                let id =
-                                                    ui.make_persistent_id(("dmin_rect_handle", idx, corner_idx));
-                                                let resp = ui.interact(
-                                                    handle_rect,
-                                                    id,
-                                                    egui::Sense::click_and_drag(),
-                                                );
+                                                let id = ui.make_persistent_id(("dmin_handle", idx, ci));
+                                                let resp = ui.interact(hr, id, egui::Sense::click_and_drag());
                                                 if resp.dragged() {
-                                                    let delta = resp.drag_delta();
+                                                    let d = resp.drag_delta();
                                                     rect_changed = true;
                                                     self.rect_dragging = true;
-                                                    match corner_idx {
-                                                        0 => {
-                                                            left += delta.x;
-                                                            top += delta.y;
-                                                        }
-                                                        1 => {
-                                                            right += delta.x;
-                                                            top += delta.y;
-                                                        }
-                                                        2 => {
-                                                            left += delta.x;
-                                                            bottom += delta.y;
-                                                        }
-                                                        3 => {
-                                                            right += delta.x;
-                                                            bottom += delta.y;
-                                                        }
+                                                    match ci {
+                                                        0 => { left += d.x; top += d.y; }
+                                                        1 => { right += d.x; top += d.y; }
+                                                        2 => { left += d.x; bottom += d.y; }
+                                                        3 => { right += d.x; bottom += d.y; }
                                                         _ => {}
                                                     }
                                                 }
-                                            }
-
-                                            if rect_changed {
-                                                left = left.clamp(
-                                                    image_rect.left(),
-                                                    image_rect.right() - min_screen_size,
-                                                );
-                                                top = top.clamp(
-                                                    image_rect.top(),
-                                                    image_rect.bottom() - min_screen_size,
-                                                );
-                                                right = right
-                                                    .clamp(left + min_screen_size, image_rect.right());
-                                                bottom = bottom
-                                                    .clamp(top + min_screen_size, image_rect.bottom());
                                             }
 
                                             let screen_rect = egui::Rect::from_min_max(
@@ -3097,77 +3040,31 @@ impl eframe::App for C41Gui {
                                                 egui::pos2(right, bottom),
                                             );
                                             painter.rect_stroke(
-                                                screen_rect,
-                                                0.0,
-                                                egui::Stroke::new(
-                                                    1.5,
-                                                    egui::Color32::from_rgb(255, 200, 0),
-                                                ),
+                                                screen_rect, 0.0,
+                                                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 200, 0)),
                                             );
                                             for p in [
-                                                egui::pos2(left, top),
-                                                egui::pos2(right, top),
-                                                egui::pos2(left, bottom),
-                                                egui::pos2(right, bottom),
+                                                egui::pos2(left, top), egui::pos2(right, top),
+                                                egui::pos2(left, bottom), egui::pos2(right, bottom),
                                             ] {
-                                                painter.circle_filled(
-                                                    p,
-                                                    handle_radius,
-                                                    egui::Color32::from_rgb(255, 200, 0),
-                                                );
+                                                painter.circle_filled(p, handle_radius, egui::Color32::from_rgb(255, 200, 0));
                                             }
 
                                             if rect_changed {
-                                                // Map back from screen space → ROI → image space.
-                                                let roi_norm_left =
-                                                    (left - image_rect.left())
-                                                        / image_rect.width();
-                                                let roi_norm_top =
-                                                    (top - image_rect.top())
-                                                        / image_rect.height();
-                                                let roi_norm_right =
-                                                    (right - image_rect.left())
-                                                        / image_rect.width();
-                                                let roi_norm_bottom =
-                                                    (bottom - image_rect.top())
-                                                        / image_rect.height();
-
-                                                let new_x = (src_x
-                                                    + roi_norm_left * roi_w)
-                                                    .round()
-                                                    .clamp(0.0, full_w_f - 1.0)
-                                                    as u32;
-                                                let new_y = (src_y
-                                                    + roi_norm_top * roi_h)
-                                                    .round()
-                                                    .clamp(0.0, full_h_f - 1.0)
-                                                    as u32;
-                                                let new_x1 = (src_x
-                                                    + roi_norm_right * roi_w)
-                                                    .round()
-                                                    .clamp(0.0, full_w_f)
-                                                    as u32;
-                                                let new_y1 = (src_y
-                                                    + roi_norm_bottom * roi_h)
-                                                    .round()
-                                                    .clamp(0.0, full_h_f)
-                                                    as u32;
-
-                                                let mut w_px =
-                                                    new_x1.saturating_sub(new_x).max(1);
-                                                let mut h_px =
-                                                    new_y1.saturating_sub(new_y).max(1);
-                                                w_px = w_px.min(input_w.saturating_sub(new_x).max(1));
-                                                h_px = h_px.min(input_h.saturating_sub(new_y).max(1));
-
-                                                opts.dmin_rect = Some(Rect {
-                                                    x: new_x,
-                                                    y: new_y,
-                                                    width: w_px,
-                                                    height: h_px,
-                                                });
-                                                opts.dmin_rect_reference_size =
-                                                    Some((input_w, input_h));
+                                                let (ix0, iy0) = screen_to_image(left, top);
+                                                let (ix1, iy1) = screen_to_image(right, bottom);
+                                                let iw = input_w as f32;
+                                                let ih = input_h as f32;
+                                                let nx = ix0.round().clamp(0.0, iw - 1.0) as u32;
+                                                let ny = iy0.round().clamp(0.0, ih - 1.0) as u32;
+                                                let nx1 = ix1.round().clamp(0.0, iw) as u32;
+                                                let ny1 = iy1.round().clamp(0.0, ih) as u32;
+                                                let mut wp = nx1.saturating_sub(nx).max(1);
+                                                let mut hp = ny1.saturating_sub(ny).max(1);
+                                                wp = wp.min(input_w.saturating_sub(nx).max(1));
+                                                hp = hp.min(input_h.saturating_sub(ny).max(1));
+                                                opts.dmin_rect = Some(Rect { x: nx, y: ny, width: wp, height: hp });
+                                                opts.dmin_rect_reference_size = Some((input_w, input_h));
                                             }
                                         }
                                     }
@@ -3175,8 +3072,8 @@ impl eframe::App for C41Gui {
                             }
                         }
 
-                        // In Process mode, draw/edit crop overlay (optional):
-                        // darken outside region and allow drag handles.
+                        // Crop overlay: project image-space crop rect through camera.
+                        // Corner handles for resize; no body-move interaction so pan always works.
                         if self.mode == UIMode::Process {
                             if let Some(entry) = self.images.get_mut(idx) {
                                 let opts = &mut entry.options;
@@ -3192,20 +3089,18 @@ impl eframe::App for C41Gui {
                                                 input_w,
                                                 input_h,
                                             );
-                                            let norm_x = crop.x as f32 / input_w as f32;
-                                            let norm_y = crop.y as f32 / input_h as f32;
-                                            let norm_w = crop.width as f32 / input_w as f32;
-                                            let norm_h = crop.height as f32 / input_h as f32;
 
-                                            let mut left =
-                                                image_rect.left() + norm_x * image_rect.width();
-                                            let mut top =
-                                                image_rect.top() + norm_y * image_rect.height();
-                                            let mut right = left + norm_w * image_rect.width();
-                                            let mut bottom = top + norm_h * image_rect.height();
+                                            let scr_tl = image_to_screen(crop.x as f32, crop.y as f32);
+                                            let scr_br = image_to_screen(
+                                                (crop.x + crop.width) as f32,
+                                                (crop.y + crop.height) as f32,
+                                            );
+                                            let mut left = scr_tl.x;
+                                            let mut top = scr_tl.y;
+                                            let mut right = scr_br.x;
+                                            let mut bottom = scr_br.y;
 
                                             let handle_radius = 5.0;
-                                            let min_screen_size = 8.0;
                                             let mut rect_changed = false;
 
                                             let corners = [
@@ -3214,234 +3109,103 @@ impl eframe::App for C41Gui {
                                                 egui::pos2(left, bottom),
                                                 egui::pos2(right, bottom),
                                             ];
-                                            for (corner_idx, corner_pos) in corners.iter().enumerate() {
-                                                let handle_rect = egui::Rect::from_center_size(
-                                                    *corner_pos,
+                                            for (ci, cp) in corners.iter().enumerate() {
+                                                let hr = egui::Rect::from_center_size(
+                                                    *cp,
                                                     egui::vec2(handle_radius * 2.0, handle_radius * 2.0),
                                                 );
-                                                let id =
-                                                    ui.make_persistent_id(("crop_rect_handle", idx, corner_idx));
-                                                let resp = ui.interact(
-                                                    handle_rect,
-                                                    id,
-                                                    egui::Sense::click_and_drag(),
-                                                );
+                                                let id = ui.make_persistent_id(("crop_handle", idx, ci));
+                                                let resp = ui.interact(hr, id, egui::Sense::click_and_drag());
                                                 if resp.dragged() {
-                                                    let delta = resp.drag_delta();
+                                                    let d = resp.drag_delta();
                                                     rect_changed = true;
                                                     self.rect_dragging = true;
-                                                    match corner_idx {
-                                                        0 => {
-                                                            left += delta.x;
-                                                            top += delta.y;
-                                                        }
-                                                        1 => {
-                                                            right += delta.x;
-                                                            top += delta.y;
-                                                        }
-                                                        2 => {
-                                                            left += delta.x;
-                                                            bottom += delta.y;
-                                                        }
-                                                        3 => {
-                                                            right += delta.x;
-                                                            bottom += delta.y;
-                                                        }
+                                                    match ci {
+                                                        0 => { left += d.x; top += d.y; }
+                                                        1 => { right += d.x; top += d.y; }
+                                                        2 => { left += d.x; bottom += d.y; }
+                                                        3 => { right += d.x; bottom += d.y; }
                                                         _ => {}
                                                     }
                                                 }
                                             }
 
-                                            if rect_changed {
-                                                left = left.clamp(
-                                                    image_rect.left(),
-                                                    image_rect.right() - min_screen_size,
-                                                );
-                                                top = top.clamp(
-                                                    image_rect.top(),
-                                                    image_rect.bottom() - min_screen_size,
-                                                );
-                                                right = right
-                                                    .clamp(left + min_screen_size, image_rect.right());
-                                                bottom = bottom
-                                                    .clamp(top + min_screen_size, image_rect.bottom());
-                                            } else {
-                                                let screen_rect =
-                                                    egui::Rect::from_min_max(
-                                                        egui::pos2(left, top),
-                                                        egui::pos2(right, bottom),
-                                                    );
-                                                let move_id =
-                                                    ui.make_persistent_id(("crop_rect_move", idx));
-                                                let move_resp = ui.interact(
-                                                    screen_rect,
-                                                    move_id,
-                                                    egui::Sense::click_and_drag(),
-                                                );
-                                                if move_resp.dragged() {
-                                                    let delta = move_resp.drag_delta();
-                                                    let rect_w = right - left;
-                                                    let rect_h = bottom - top;
-                                                    let mut dx = delta.x;
-                                                    let mut dy = delta.y;
-                                                    dx = dx
-                                                        .max(image_rect.left() - left)
-                                                        .min(image_rect.right() - right);
-                                                    dy = dy
-                                                        .max(image_rect.top() - top)
-                                                        .min(image_rect.bottom() - bottom);
-                                                    left += dx;
-                                                    right = left + rect_w;
-                                                    top += dy;
-                                                    bottom = top + rect_h;
-                                                    rect_changed = true;
-                                                    self.rect_dragging = true;
-                                                }
-                                            }
-
-                                            let screen_rect = egui::Rect::from_min_max(
-                                                egui::pos2(left, top),
-                                                egui::pos2(right, bottom),
-                                            );
+                                            // Darken outside crop area.
                                             let overlay = egui::Color32::from_black_alpha(128);
                                             painter.rect_filled(
-                                                egui::Rect::from_min_max(
-                                                    image_rect.min,
-                                                    egui::pos2(image_rect.max.x, top),
-                                                ),
-                                                0.0,
-                                                overlay,
+                                                egui::Rect::from_min_max(image_rect.min, egui::pos2(image_rect.max.x, top)),
+                                                0.0, overlay,
                                             );
                                             painter.rect_filled(
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(image_rect.min.x, bottom),
-                                                    image_rect.max,
-                                                ),
-                                                0.0,
-                                                overlay,
+                                                egui::Rect::from_min_max(egui::pos2(image_rect.min.x, bottom), image_rect.max),
+                                                0.0, overlay,
                                             );
                                             painter.rect_filled(
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(image_rect.min.x, top),
-                                                    egui::pos2(left, bottom),
-                                                ),
-                                                0.0,
-                                                overlay,
+                                                egui::Rect::from_min_max(egui::pos2(image_rect.min.x, top), egui::pos2(left, bottom)),
+                                                0.0, overlay,
                                             );
                                             painter.rect_filled(
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(right, top),
-                                                    egui::pos2(image_rect.max.x, bottom),
-                                                ),
-                                                0.0,
-                                                overlay,
+                                                egui::Rect::from_min_max(egui::pos2(right, top), egui::pos2(image_rect.max.x, bottom)),
+                                                0.0, overlay,
                                             );
 
+                                            let crop_screen = egui::Rect::from_min_max(
+                                                egui::pos2(left, top),
+                                                egui::pos2(right, bottom),
+                                            );
                                             painter.rect_stroke(
-                                                screen_rect,
-                                                0.0,
-                                                egui::Stroke::new(
-                                                    2.0,
-                                                    egui::Color32::from_rgb(120, 230, 120),
-                                                ),
+                                                crop_screen, 0.0,
+                                                egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 230, 120)),
                                             );
                                             for p in [
-                                                egui::pos2(left, top),
-                                                egui::pos2(right, top),
-                                                egui::pos2(left, bottom),
-                                                egui::pos2(right, bottom),
+                                                egui::pos2(left, top), egui::pos2(right, top),
+                                                egui::pos2(left, bottom), egui::pos2(right, bottom),
                                             ] {
-                                                painter.circle_filled(
-                                                    p,
-                                                    handle_radius,
-                                                    egui::Color32::from_rgb(120, 230, 120),
-                                                );
+                                                painter.circle_filled(p, handle_radius, egui::Color32::from_rgb(120, 230, 120));
                                             }
 
-                                            // Keep D-min visuals above crop dark overlay.
+                                            // Redraw D-min overlay above the darkened crop region.
                                             if opts.apply_dmin
                                                 && opts.dmin_fixed.is_none()
                                                 && self.flat_field_path.is_none()
                                             {
                                                 if let Some(dmin_rect) = opts.dmin_rect {
                                                     let dmin_rect = scale_rect_to_size(
-                                                        dmin_rect,
-                                                        opts.dmin_rect_reference_size,
-                                                        input_w,
-                                                        input_h,
+                                                        dmin_rect, opts.dmin_rect_reference_size, input_w, input_h,
                                                     );
-                                                    let dmin_norm_x =
-                                                        dmin_rect.x as f32 / input_w as f32;
-                                                    let dmin_norm_y =
-                                                        dmin_rect.y as f32 / input_h as f32;
-                                                    let dmin_norm_w =
-                                                        dmin_rect.width as f32 / input_w as f32;
-                                                    let dmin_norm_h =
-                                                        dmin_rect.height as f32 / input_h as f32;
-                                                    let dmin_left = image_rect.left()
-                                                        + dmin_norm_x * image_rect.width();
-                                                    let dmin_top = image_rect.top()
-                                                        + dmin_norm_y * image_rect.height();
-                                                    let dmin_right =
-                                                        dmin_left + dmin_norm_w * image_rect.width();
-                                                    let dmin_bottom =
-                                                        dmin_top + dmin_norm_h * image_rect.height();
-                                                    let dmin_screen_rect = egui::Rect::from_min_max(
-                                                        egui::pos2(dmin_left, dmin_top),
-                                                        egui::pos2(dmin_right, dmin_bottom),
+                                                    let dtl = image_to_screen(dmin_rect.x as f32, dmin_rect.y as f32);
+                                                    let dbr = image_to_screen(
+                                                        (dmin_rect.x + dmin_rect.width) as f32,
+                                                        (dmin_rect.y + dmin_rect.height) as f32,
                                                     );
+                                                    let dsr = egui::Rect::from_min_max(dtl, dbr);
                                                     painter.rect_stroke(
-                                                        dmin_screen_rect,
-                                                        0.0,
-                                                        egui::Stroke::new(
-                                                            1.5,
-                                                            egui::Color32::from_rgb(255, 200, 0),
-                                                        ),
+                                                        dsr, 0.0,
+                                                        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 200, 0)),
                                                     );
                                                     for p in [
-                                                        egui::pos2(dmin_left, dmin_top),
-                                                        egui::pos2(dmin_right, dmin_top),
-                                                        egui::pos2(dmin_left, dmin_bottom),
-                                                        egui::pos2(dmin_right, dmin_bottom),
+                                                        egui::pos2(dtl.x, dtl.y), egui::pos2(dbr.x, dtl.y),
+                                                        egui::pos2(dtl.x, dbr.y), egui::pos2(dbr.x, dbr.y),
                                                     ] {
-                                                        painter.circle_filled(
-                                                            p,
-                                                            5.0,
-                                                            egui::Color32::from_rgb(255, 200, 0),
-                                                        );
+                                                        painter.circle_filled(p, 5.0, egui::Color32::from_rgb(255, 200, 0));
                                                     }
                                                 }
                                             }
 
                                             if rect_changed {
-                                                let img_w = image_rect.width().max(1.0);
-                                                let img_h = image_rect.height().max(1.0);
-                                                let norm_left = (left - image_rect.left()) / img_w;
-                                                let norm_top = (top - image_rect.top()) / img_h;
-                                                let norm_width = (right - left) / img_w;
-                                                let norm_height = (bottom - top) / img_h;
-
-                                                let x = (norm_left * input_w as f32)
-                                                    .round()
-                                                    .clamp(0.0, input_w.saturating_sub(1) as f32)
-                                                    as u32;
-                                                let y = (norm_top * input_h as f32)
-                                                    .round()
-                                                    .clamp(0.0, input_h.saturating_sub(1) as f32)
-                                                    as u32;
-                                                let mut w_px =
-                                                    (norm_width * input_w as f32).round().max(1.0) as u32;
-                                                let mut h_px =
-                                                    (norm_height * input_h as f32).round().max(1.0) as u32;
-                                                w_px = w_px.min(input_w.saturating_sub(x).max(1));
-                                                h_px = h_px.min(input_h.saturating_sub(y).max(1));
-
-                                                opts.crop_rect = Some(Rect {
-                                                    x,
-                                                    y,
-                                                    width: w_px,
-                                                    height: h_px,
-                                                });
+                                                let (ix0, iy0) = screen_to_image(left, top);
+                                                let (ix1, iy1) = screen_to_image(right, bottom);
+                                                let iw = input_w as f32;
+                                                let ih = input_h as f32;
+                                                let x = ix0.round().clamp(0.0, iw - 1.0) as u32;
+                                                let y = iy0.round().clamp(0.0, ih - 1.0) as u32;
+                                                let x1 = ix1.round().clamp(0.0, iw) as u32;
+                                                let y1 = iy1.round().clamp(0.0, ih) as u32;
+                                                let mut wp = x1.saturating_sub(x).max(1);
+                                                let mut hp = y1.saturating_sub(y).max(1);
+                                                wp = wp.min(input_w.saturating_sub(x).max(1));
+                                                hp = hp.min(input_h.saturating_sub(y).max(1));
+                                                opts.crop_rect = Some(Rect { x, y, width: wp, height: hp });
                                                 opts.crop_rect_reference_size = Some((input_w, input_h));
                                             }
                                         }
