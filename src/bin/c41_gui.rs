@@ -2734,15 +2734,8 @@ impl eframe::App for C41Gui {
                             + BOTTOM_PADDING
                             + HISTOGRAM_HEIGHT
                             + BOTTOM_PADDING;
-                        let area_for_image = (available.height() - reserved_bottom).max(60.0);
-
-                        // Canvas fills the entire available area, preserving aspect ratio.
-                        let fit_scale = (available.width() / full_w_f)
-                            .min(area_for_image / full_h_f);
-                        let display_size = egui::vec2(full_w_f * fit_scale, full_h_f * fit_scale);
-                        let margin_x = (available.width() - display_size.x) / 2.0;
-                        let margin_y = (area_for_image - display_size.y) / 2.0 + TOP_PADDING;
-                        ui.add_space(margin_y);
+                        let canvas_h = (available.height() - reserved_bottom).max(60.0);
+                        let canvas_w = available.width();
 
                         // Upload full-frame texture once (reuse across zoom/pan).
                         let tex = {
@@ -2760,67 +2753,79 @@ impl eframe::App for C41Gui {
                         };
                         self.images[idx].preview_texture = Some(tex.clone());
 
-                        // Camera: compute UV rect from zoom/pan.
+                        // Allocate the full canvas area — like Photoshop's gray workspace.
+                        ui.add_space(TOP_PADDING);
+                        let (canvas_rect, canvas_resp) = ui.allocate_exact_size(
+                            egui::vec2(canvas_w, canvas_h),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let canvas_painter = ui.painter_at(canvas_rect);
+                        canvas_painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_gray(30));
+
+                        // Base scale: image size at zoom=1.0 to fit within canvas.
+                        let base_scale = (canvas_w / full_w_f).min(canvas_h / full_h_f);
+
                         let entry = &mut self.images[idx];
                         let zoom = entry.preview_zoom.max(1.0);
-                        let uv_w = (1.0 / zoom).clamp(0.0, 1.0);
-                        let uv_h = (1.0 / zoom).clamp(0.0, 1.0);
-                        let uv_cx = entry.preview_pan.x.clamp(0.0, 1.0);
-                        let uv_cy = entry.preview_pan.y.clamp(0.0, 1.0);
-                        let mut uv_x0 = uv_cx - uv_w * 0.5;
-                        let mut uv_y0 = uv_cy - uv_h * 0.5;
-                        uv_x0 = uv_x0.clamp(0.0, 1.0 - uv_w);
-                        uv_y0 = uv_y0.clamp(0.0, 1.0 - uv_h);
-                        let uv_rect = egui::Rect::from_min_max(
-                            egui::pos2(uv_x0, uv_y0),
-                            egui::pos2(uv_x0 + uv_w, uv_y0 + uv_h),
+                        let img_w = full_w_f * base_scale * zoom;
+                        let img_h = full_h_f * base_scale * zoom;
+
+                        // Pan: which image-normalized point sits at canvas center.
+                        let pan_x = entry.preview_pan.x.clamp(0.0, 1.0);
+                        let pan_y = entry.preview_pan.y.clamp(0.0, 1.0);
+
+                        // Virtual image rect: where the full image lives in screen coords.
+                        let vir_left = canvas_rect.center().x - pan_x * img_w;
+                        let vir_top  = canvas_rect.center().y - pan_y * img_h;
+                        let vir_rect = egui::Rect::from_min_size(
+                            egui::pos2(vir_left, vir_top),
+                            egui::vec2(img_w, img_h),
                         );
 
-                        // Draw image with UV rect so zoom/pan is GPU-side.
-                        let image_resp = ui
-                            .horizontal(|ui| {
-                                ui.add_space(margin_x);
-                                ui.add(
-                                    egui::Image::new((tex.id(), display_size))
-                                        .uv(uv_rect)
-                                        .sense(egui::Sense::click_and_drag()),
-                                )
-                            })
-                            .inner;
-                        let image_rect = image_resp.rect;
+                        // Draw only the visible intersection of image and canvas.
+                        let vis_rect = vir_rect.intersect(canvas_rect);
+                        if vis_rect.width() > 0.0 && vis_rect.height() > 0.0 {
+                            let uv_l = (vis_rect.left()   - vir_rect.left()) / img_w;
+                            let uv_t = (vis_rect.top()    - vir_rect.top())  / img_h;
+                            let uv_r = (vis_rect.right()  - vir_rect.left()) / img_w;
+                            let uv_b = (vis_rect.bottom() - vir_rect.top())  / img_h;
+                            let uv = egui::Rect::from_min_max(
+                                egui::pos2(uv_l, uv_t),
+                                egui::pos2(uv_r, uv_b),
+                            );
+                            canvas_painter.image(tex.id(), vis_rect, uv, egui::Color32::WHITE);
+                        }
 
-                        // Camera helpers: map between image-pixel coords and screen coords.
-                        // image_to_screen: (px, py) in image pixels → screen pos.
-                        let cam_uv_x0 = uv_x0;
-                        let cam_uv_y0 = uv_y0;
-                        let cam_uv_w = uv_w;
-                        let cam_uv_h = uv_h;
-                        let cam_ir = image_rect;
+                        // image_rect = canvas_rect so overlays can paint across the full canvas.
+                        let image_rect = canvas_rect;
+
+                        // Camera helpers using the virtual image rect.
+                        let vir_left_c = vir_rect.left();
+                        let vir_top_c  = vir_rect.top();
+                        let img_w_c = img_w;
+                        let img_h_c = img_h;
                         let image_to_screen = |px: f32, py: f32| -> egui::Pos2 {
-                            let u = px / full_w_f;
-                            let v = py / full_h_f;
-                            let sx = cam_ir.left() + ((u - cam_uv_x0) / cam_uv_w) * cam_ir.width();
-                            let sy = cam_ir.top()  + ((v - cam_uv_y0) / cam_uv_h) * cam_ir.height();
-                            egui::pos2(sx, sy)
+                            egui::pos2(
+                                vir_left_c + (px / full_w_f) * img_w_c,
+                                vir_top_c  + (py / full_h_f) * img_h_c,
+                            )
                         };
                         let screen_to_image = |sx: f32, sy: f32| -> (f32, f32) {
-                            let u = cam_uv_x0 + ((sx - cam_ir.left()) / cam_ir.width()) * cam_uv_w;
-                            let v = cam_uv_y0 + ((sy - cam_ir.top())  / cam_ir.height()) * cam_uv_h;
-                            (u * full_w_f, v * full_h_f)
+                            (
+                                ((sx - vir_left_c) / img_w_c) * full_w_f,
+                                ((sy - vir_top_c)  / img_h_c) * full_h_f,
+                            )
                         };
                         ui.add_space(IMAGE_PREVIEW_BOTTOM_PADDING);
 
-                        // Keep the previous preview visible while a new render is in-flight.
-                        // Only show loading overlay for unusually slow renders.
+                        // Loading spinner overlay.
                         if show_loader {
-                            let overlay_painter = ui.painter_at(image_rect);
-                            overlay_painter.rect_filled(
-                                image_rect,
-                                0.0,
+                            canvas_painter.rect_filled(
+                                canvas_rect, 0.0,
                                 egui::Color32::from_rgba_premultiplied(0, 0, 0, 80),
                             );
                             let spinner_rect =
-                                egui::Rect::from_center_size(image_rect.center(), egui::vec2(22.0, 22.0));
+                                egui::Rect::from_center_size(canvas_rect.center(), egui::vec2(22.0, 22.0));
                             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(spinner_rect), |ui| {
                                 ui.centered_and_justified(|ui| {
                                     ui.spinner();
@@ -2828,43 +2833,45 @@ impl eframe::App for C41Gui {
                             });
                         }
 
-                        // Zoom with mouse wheel — always works, even when crop tool is active.
-                        if image_resp.hovered()
+                        // Zoom with scroll wheel — always works.
+                        if canvas_resp.hovered()
                             && ui.input(|i| i.raw_scroll_delta.y != 0.0 && !i.modifiers.shift)
                         {
                             let scroll = ui.input(|i| i.raw_scroll_delta.y);
                             let factor = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
                             let entry = &mut self.images[idx];
-                            let old_zoom = entry.preview_zoom.max(1.0);
-                            let new_zoom = (old_zoom * factor).clamp(1.0, 16.0);
+                            let new_zoom = (entry.preview_zoom.max(1.0) * factor).clamp(1.0, 16.0);
+                            let new_img_w = full_w_f * base_scale * new_zoom;
+                            let new_img_h = full_h_f * base_scale * new_zoom;
 
-                            if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                                let (img_px, img_py) = screen_to_image(mouse_pos.x, mouse_pos.y);
+                            if let Some(mp) = ui.input(|i| i.pointer.hover_pos()) {
+                                let (img_px, img_py) = screen_to_image(mp.x, mp.y);
                                 let u = (img_px / full_w_f).clamp(0.0, 1.0);
                                 let v = (img_py / full_h_f).clamp(0.0, 1.0);
-                                entry.preview_pan.x = u;
-                                entry.preview_pan.y = v;
+                                // Keep point under cursor fixed after zoom.
+                                entry.preview_pan.x =
+                                    (u - (mp.x - canvas_rect.center().x) / new_img_w).clamp(0.0, 1.0);
+                                entry.preview_pan.y =
+                                    (v - (mp.y - canvas_rect.center().y) / new_img_h).clamp(0.0, 1.0);
                             }
 
                             entry.preview_zoom = new_zoom;
                         }
 
-                        // Pan with middle-mouse drag (always works) or left drag when no rect handle hit.
-                        let middle_drag = ui.input(|i| i.pointer.middle_down()) && image_resp.dragged();
-                        let left_drag = image_resp.dragged() && !self.rect_dragging;
+                        // Pan with left drag (when no rect handle hit) or middle drag.
+                        let middle_drag = ui.input(|i| i.pointer.middle_down()) && canvas_resp.dragged();
+                        let left_drag = canvas_resp.dragged() && !self.rect_dragging;
                         if middle_drag || left_drag {
-                            let delta = image_resp.drag_delta();
+                            let delta = canvas_resp.drag_delta();
                             let entry = &mut self.images[idx];
-                            let dx_norm = (delta.x / image_rect.width()) * cam_uv_w;
-                            let dy_norm = (delta.y / image_rect.height()) * cam_uv_h;
                             entry.preview_pan.x =
-                                (entry.preview_pan.x - dx_norm).clamp(0.0, 1.0);
+                                (entry.preview_pan.x - delta.x / img_w).clamp(0.0, 1.0);
                             entry.preview_pan.y =
-                                (entry.preview_pan.y - dy_norm).clamp(0.0, 1.0);
+                                (entry.preview_pan.y - delta.y / img_h).clamp(0.0, 1.0);
                         }
 
-                        // Zoom/readout text in lower-left above histogram.
-                        if let Some((full_w, full_h, _)) = self.images[idx].preview_full_rgb {
+                        // Zoom/readout text.
+                        {
                             let entry = &self.images[idx];
                             let zoom_pct = (entry.preview_zoom * 100.0).round();
                             let crop_w = (full_w as f32 / entry.preview_zoom).round() as u32;
@@ -2874,9 +2881,8 @@ impl eframe::App for C41Gui {
                                 zoom_pct, full_w, full_h, crop_w, crop_h
                             );
                             let label_pos =
-                                egui::pos2(image_rect.left() + 4.0, image_rect.bottom() + 4.0);
-                            let painter = ui.painter_at(image_rect);
-                            painter.text(
+                                egui::pos2(canvas_rect.left() + 4.0, canvas_rect.bottom() + 4.0);
+                            canvas_painter.text(
                                 label_pos,
                                 egui::Align2::LEFT_TOP,
                                 label,
