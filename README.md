@@ -141,7 +141,7 @@ The tool supports two kinds of calibration, each with a clear role.
 ---
 
 ## Processing pipeline
-
+ 
 Order of operations:
 
 1. **Load and linearize**  

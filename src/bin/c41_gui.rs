@@ -2887,16 +2887,24 @@ impl eframe::App for C41Gui {
 
                         // Upload full-frame texture once (reuse across zoom/pan).
                         let tex = {
+                            let entry = &self.images[idx];
                             let size = [full_w as usize, full_h as usize];
                             let pixels: Vec<egui::Color32> = full_rgb
                                 .chunks_exact(3)
                                 .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
                                 .collect();
                             let image = egui::ColorImage { size, pixels };
+                            let tex_opts = if entry.preview_zoom > 1.0 {
+                                // >100%: nearest-neighbour so you see true pixel structure.
+                                egui::TextureOptions::NEAREST
+                            } else {
+                                // < =100%: linear sampling for smoother downscale.
+                                egui::TextureOptions::LINEAR
+                            };
                             ui.ctx().load_texture(
                                 format!("preview_full_{}", idx),
                                 image,
-                                egui::TextureOptions::LINEAR,
+                                tex_opts,
                             )
                         };
                         self.images[idx].preview_texture = Some(tex.clone());
