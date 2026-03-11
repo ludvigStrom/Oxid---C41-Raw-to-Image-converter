@@ -1967,36 +1967,21 @@ impl eframe::App for C41Gui {
                     ui.collapsing("Levels (black / white point)", |ui| {
                         ui.label(
                             egui::RichText::new(
-                                "Remap density before the output stage: [black, white] → [0, 1].\n\
-                                 Applied after density calibration (step 5), before the output curve.\n\
-                                 Default 0–1 = full range. Narrow the range to set exposure/contrast.",
+                                "Levels are driven by the Exposure block. This section is read-only for inspection.",
                             )
                             .small()
                             .weak(),
                         );
-                        ui.horizontal(|ui| {
-                            ui.label("Black");
-                            ui.add(
-                                egui::Slider::new(&mut opts.lut_in_black, 0.0..=1.0)
-                                    .fixed_decimals(3),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("White");
-                            ui.add(
-                                egui::Slider::new(&mut opts.lut_in_white, 0.0..=1.0)
-                                    .fixed_decimals(3),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Mid");
-                            ui.add(
-                                egui::Slider::new(&mut opts.lut_in_mid, 0.1..=4.0)
-                                    .logarithmic(true)
-                                    .fixed_decimals(2),
-                            );
-                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Black:  {:.4}\nWhite:  {:.4}\nMidtone: {:.3}",
+                                opts.lut_in_black, opts.lut_in_white, opts.lut_in_mid
+                            ))
+                            .small(),
+                        );
                         if opts.lut_in_black >= opts.lut_in_white {
+                            ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new("Warning: Black must be less than White")
                                     .small()
@@ -2073,18 +2058,14 @@ impl eframe::App for C41Gui {
 
                     if matches!(opts.output_stage, OutputStage::Ra4) {
                         ui.collapsing("RA-4 curve settings", |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Offset");
-                                ui.add(
-                                    drag_decimal_f32(&mut opts.curve_offset)
-                                        .range(-2.0..=2.0)
-                                        .speed(0.05),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Gamma");
-                                ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
-                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "Base RA-4 curve is driven by Exposure. Pivot remains as an advanced control."
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 ui.label("Pivot");
                                 ui.add(
@@ -2092,10 +2073,6 @@ impl eframe::App for C41Gui {
                                         .range(0.1..=10.0)
                                         .speed(0.1),
                                 );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("White");
-                                ui.add(egui::Slider::new(&mut opts.curve_white, -1.0..=2.0));
                             });
                         });
                     }
@@ -2104,38 +2081,12 @@ impl eframe::App for C41Gui {
                         ui.collapsing("Film Print settings", |ui| {
                             ui.label(
                                 egui::RichText::new(
-                                    "Per-channel RA-4 curves with dye-layer crosstalk and vibrance.\n\
-                                     Base offset/gamma/pivot shared with RA-4; per-channel deltas add character."
+                                    "Film Print builds on the Exposure curve. Use these controls for per-channel character."
                                 )
                                 .small()
                                 .weak(),
                             );
-
-                            ui.horizontal(|ui| {
-                                ui.label("Offset");
-                                ui.add(
-                                    drag_decimal_f32(&mut opts.curve_offset)
-                                        .range(-2.0..=2.0)
-                                        .speed(0.05),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Gamma");
-                                ui.add(egui::Slider::new(&mut opts.curve_gamma, 0.5..=5.0));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Pivot");
-                                ui.add(
-                                    drag_decimal_f32(&mut opts.curve_pivot)
-                                        .range(0.1..=10.0)
-                                        .speed(0.1),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("White");
-                                ui.add(egui::Slider::new(&mut opts.curve_white, -1.0..=2.0));
-                            });
-
+                            ui.add_space(4.0);
                             ui.add_space(6.0);
                             ui.label(egui::RichText::new("Per-channel offsets (exposure shift)").small());
                             ui.horizontal(|ui| {
