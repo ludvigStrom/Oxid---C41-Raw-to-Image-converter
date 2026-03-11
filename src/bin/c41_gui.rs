@@ -35,6 +35,8 @@ use eframe::egui;
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
 const THUMB_MAX_SIZE: u32 = 64;
+const HIST_MAX_WIDTH: u32 = 4096;
+const HIST_MAX_HEIGHT: u32 = 4096;
 const PREVIEW_DEBOUNCE_MS: u64 = 180;
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
@@ -179,6 +181,9 @@ struct C41Gui {
     /// Thumbnails for the image strip: (path, Ok((w, h, rgb)) or Err).
     thumbnail_receiver: Option<mpsc::Receiver<(PathBuf, anyhow::Result<(u32, u32, Vec<u8>)>)>>,
     thumbnail_pending: HashSet<PathBuf>,
+    /// Background histogram computation for higher-resolution data.
+    histogram_receiver: Option<mpsc::Receiver<(usize, [u32; 256], [u32; 256], [u32; 256])>>,
+    histogram_in_flight: Option<usize>,
     mode: UIMode,
     calibration_overlay: CalibrationOverlay,
     calibration_result: Option<([[f32; 3]; 3], f32)>, // (matrix, mse)
@@ -215,6 +220,8 @@ impl Default for C41Gui {
             capture_pipeline_debug_next: false,
             thumbnail_receiver: None,
             thumbnail_pending: HashSet::new(),
+            histogram_receiver: None,
+            histogram_in_flight: None,
             mode: UIMode::Process,
             calibration_overlay: CalibrationOverlay::default(),
             calibration_result: None,
@@ -1056,6 +1063,84 @@ impl eframe::App for C41Gui {
                         // Do not overwrite dmin/crop reference sizes here; they stay in the
                         // coordinate space where the user last edited them.
                         self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
+
+                        // Kick off a background, higher-resolution histogram computation using
+                        // a larger preview size. This refines the histogram without blocking UI.
+                        if self.histogram_receiver.is_none() && self.histogram_in_flight.is_none() {
+                            let path = self.images[idx].path.clone();
+                            let opts = self.images[idx].options.clone();
+                            let idx_for_hist = idx;
+                            let (htx, hrx) =
+                                mpsc::channel::<(usize, [u32; 256], [u32; 256], [u32; 256])>();
+                            self.histogram_receiver = Some(hrx);
+                            self.histogram_in_flight = Some(idx_for_hist);
+                            thread::spawn(move || {
+                                let res = process_one_to_preview(
+                                    &path,
+                                    &opts,
+                                    HIST_MAX_WIDTH,
+                                    HIST_MAX_HEIGHT,
+                                )
+                                .map(|(_in_w, _in_h, w_h, h_h, rgb_h, _dbg)| {
+                                    let w = w_h;
+                                    let h = h_h;
+                                    let mut r_hist = [0u32; 256];
+                                    let mut g_hist = [0u32; 256];
+                                    let mut b_hist = [0u32; 256];
+                                    let size = [w as usize, h as usize];
+
+                                    let crop_in_preview = {
+                                        if opts.apply_crop {
+                                            if let Some(crop_rect) = opts.crop_rect {
+                                                let scaled = scale_rect_to_size(
+                                                    crop_rect,
+                                                    opts.crop_rect_reference_size,
+                                                    _in_w,
+                                                    _in_h,
+                                                );
+                                                Some(scale_rect_to_size(
+                                                    scaled,
+                                                    Some((_in_w, _in_h)),
+                                                    w,
+                                                    h,
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    };
+
+                                    for (i, c) in rgb_h.chunks_exact(3).enumerate() {
+                                        let x = (i % size[0]) as u32;
+                                        let y = (i / size[0]) as u32;
+                                        let in_hist_crop = if let Some(rect) = crop_in_preview {
+                                            let x0 = rect.x.min(w.saturating_sub(1));
+                                            let y0 = rect.y.min(h.saturating_sub(1));
+                                            let x1 = (rect.x + rect.width).min(w).max(x0 + 1);
+                                            let y1 = (rect.y + rect.height).min(h).max(y0 + 1);
+                                            x >= x0 && x < x1 && y >= y0 && y < y1
+                                        } else {
+                                            true
+                                        };
+                                        if in_hist_crop {
+                                            let r = c[0] as usize;
+                                            let g = c[1] as usize;
+                                            let b = c[2] as usize;
+                                            r_hist[r] += 1;
+                                            g_hist[g] += 1;
+                                            b_hist[b] += 1;
+                                        }
+                                    }
+
+                                    (idx_for_hist, r_hist, g_hist, b_hist)
+                                });
+                                if let Ok((i, r, g, b)) = res {
+                                    let _ = htx.send((i, r, g, b));
+                                }
+                            });
+                        }
                         if captured_debug {
                             self.images[idx].pipeline_debug_log = Some(dbg_log);
                         }
@@ -1070,6 +1155,24 @@ impl eframe::App for C41Gui {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
+                }
+            }
+        }
+
+        // Poll background histogram worker (if any) and replace preview histogram when ready.
+        if let Some(hrx) = self.histogram_receiver.as_ref() {
+            match hrx.try_recv() {
+                Ok((idx, r_hist, g_hist, b_hist)) => {
+                    if idx < self.images.len() {
+                        self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
+                    }
+                    self.histogram_receiver = None;
+                    self.histogram_in_flight = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.histogram_receiver = None;
+                    self.histogram_in_flight = None;
                 }
             }
         }
