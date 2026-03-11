@@ -26,6 +26,9 @@ use c41_raw_tool::{
     TiffFormat,
     OutputStage,
     OutputLutEncoding,
+    CachedSensor,
+    load_sensor_from_path,
+    compute_dmin_from_sensor,
 };
 use eframe::egui;
 
@@ -116,6 +119,8 @@ struct ImageEntry {
     raw_debug_report: Option<String>,
     /// Pipeline debug log from the most recent preview render.
     pipeline_debug_log: Option<String>,
+    /// Cached full-resolution sensor data (Bayer or RGB) for fast previews/exports.
+    cached_sensor: Option<Arc<CachedSensor>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -831,21 +836,59 @@ impl C41Gui {
             return;
         }
         let path = self.images[index].path.clone();
-        let mut options = self.images[index].options.clone();
+        let entry = &mut self.images[index];
+
+        // Ensure we have cached sensor data for this image.
+        if entry.cached_sensor.is_none() {
+            match load_sensor_from_path(&path) {
+                Ok(sensor) => {
+                    entry.cached_sensor = Some(Arc::new(sensor));
+                }
+                Err(e) => {
+                    self.status = format!("Failed to load sensor data: {}", e);
+                    return;
+                }
+            }
+        }
+
+        let mut options = entry.options.clone();
         options.flat_field_path = self.flat_field_path.clone();
+
+        // If D-min uses a rectangle, recompute fixed medians from full-res sensor.
+        if options.apply_dmin {
+            if let (Some(rect), Some(sensor)) = (options.dmin_rect, entry.cached_sensor.as_ref()) {
+                if let Ok((r, g, b)) = compute_dmin_from_sensor(
+                    sensor.as_ref(),
+                    rect,
+                    options.dmin_rect_reference_size,
+                    &options.idt_matrix,
+                    options.dmin_neutral_only,
+                ) {
+                    options.dmin_fixed = Some((r, g, b));
+                }
+            }
+        }
+
         let capture_debug = self.capture_pipeline_debug_next;
         self.capture_pipeline_debug_next = false;
         options.verbose_debug = capture_debug;
+
+        // Adaptive preview resolution based on zoom: higher zoom → higher working resolution,
+        // up to a reasonable cap to avoid processing near-full 40MP frames for every tweak.
+        let zoom = entry.preview_zoom.max(1.0);
+        let scale = zoom.min(4.0); // up to 4× base preview resolution
+        let max_width = (PREVIEW_MAX_WIDTH as f32 * scale)
+            .round()
+            .max(PREVIEW_MAX_WIDTH as f32) as u32;
+        let max_height = (PREVIEW_MAX_HEIGHT as f32 * scale)
+            .round()
+            .max(PREVIEW_MAX_HEIGHT as f32) as u32;
+
         let (tx, rx) = mpsc::channel();
         self.preview_receiver = Some(rx);
         self.preview_started_at = Some(Instant::now());
         thread::spawn(move || {
-            let res = process_one_to_preview(
-                &path,
-                &options,
-                PREVIEW_MAX_WIDTH,
-                PREVIEW_MAX_HEIGHT,
-            )
+            let res = process_one_to_preview(&path, &options, max_width, max_height)
             .map(|(input_w, input_h, w, h, rgb, dbg_log)| {
                 (index, input_w, input_h, w, h, rgb, dbg_log, capture_debug)
             });
@@ -982,7 +1025,13 @@ impl eframe::App for C41Gui {
                         let _image = egui::ColorImage { size, pixels };
                         // Histogram is computed above; we now keep the full preview RGB buffer
                         // and rebuild the visible ROI texture on demand (zoom/pan) in the UI.
-                        let hash = options_hash_for(&self.images[idx].path, &self.images[idx].options);
+                        // Preview hash also incorporates zoom so changing zoom triggers re-render.
+                        let base_hash =
+                            options_hash_for(&self.images[idx].path, &self.images[idx].options);
+                        let mut hh = DefaultHasher::new();
+                        base_hash.hash(&mut hh);
+                        self.images[idx].preview_zoom.to_bits().hash(&mut hh);
+                        let hash = hh.finish();
                         self.images[idx].preview_texture = None;
                         self.images[idx].preview_hash = hash;
                         self.images[idx].preview_full_rgb = Some((w, h, rgb.clone()));
@@ -1112,15 +1161,16 @@ impl eframe::App for C41Gui {
                                             options: default_options(),
                                             preview_texture: None,
                                             preview_hash: 0,
-                            preview_full_rgb: None,
+                                            preview_full_rgb: None,
                                             preview_input_size: None,
-                            preview_zoom: 1.0,
-                            preview_pan: egui::vec2(0.5, 0.5),
+                                            preview_zoom: 1.0,
+                                            preview_pan: egui::vec2(0.5, 0.5),
                                             thumbnail_texture: None,
                                             histogram: None,
                                             export_format: ExportFormat::Tiff16,
                                             raw_debug_report: None,
                                             pipeline_debug_log: None,
+                                            cached_sensor: None,
                                         });
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);
@@ -3422,7 +3472,12 @@ impl eframe::App for C41Gui {
         // Runs after UI interactions so drag/release state is available for debounce.
         if let Some(idx) = self.selected_index {
             if idx < self.images.len() {
-                let hash_now = options_hash_for(&self.images[idx].path, &self.images[idx].options);
+                // Recompute hash including zoom so zoom changes trigger a new preview render.
+                let base_hash = options_hash_for(&self.images[idx].path, &self.images[idx].options);
+                let mut hh = DefaultHasher::new();
+                base_hash.hash(&mut hh);
+                self.images[idx].preview_zoom.to_bits().hash(&mut hh);
+                let hash_now = hh.finish();
                 let need_new = self.images[idx].preview_texture.is_none()
                     || self.images[idx].preview_hash != hash_now;
                 if need_new {
