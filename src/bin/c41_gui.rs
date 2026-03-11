@@ -862,6 +862,7 @@ impl C41Gui {
                     rect,
                     options.dmin_rect_reference_size,
                     &options.idt_matrix,
+                    options.rotation_degrees,
                     options.dmin_neutral_only,
                 ) {
                     options.dmin_fixed = Some((r, g, b));

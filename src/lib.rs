@@ -654,6 +654,7 @@ pub fn compute_dmin_from_sensor(
     rect: Rect,
     reference_size: Option<(u32, u32)>,
     idt_matrix: &[[f32; 3]; 3],
+    rotation_degrees: i32,
     neutral_only: bool,
 ) -> anyhow::Result<(f32, f32, f32)> {
     // 1) Get an RGB image from the cached sensor data.
@@ -666,13 +667,18 @@ pub fn compute_dmin_from_sensor(
         CachedSensor::Rgb(image) => image.clone(),
     };
 
-    // 2) Apply IDT if present, same as main pipeline.
+    // 2) Apply rotation so coordinates match the user's view.
+    if rotation_degrees != 0 {
+        rgb = apply_rotation(&rgb, rotation_degrees);
+    }
+
+    // 3) Apply IDT if present, same as main pipeline.
     if !aces::is_identity(idt_matrix) {
         aces::apply_idt(&mut rgb, idt_matrix);
         rgb.mapv_inplace(|v| v.max(0.0));
     }
 
-    // 3) Scale rect to current image size.
+    // 4) Scale rect to current image size.
     let (h, w, c) = rgb.dim();
     if c != 3 {
         anyhow::bail!("compute_dmin_from_sensor expects RGB image with 3 channels");
