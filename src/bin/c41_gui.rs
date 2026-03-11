@@ -1052,14 +1052,8 @@ impl eframe::App for C41Gui {
                             );
                             self.images[idx].thumbnail_texture = Some(thumb_tex);
                         }
-                        if self.images[idx].options.dmin_rect.is_some() {
-                            self.images[idx].options.dmin_rect_reference_size =
-                                Some((input_w, input_h));
-                        }
-                        if self.images[idx].options.crop_rect.is_some() {
-                            self.images[idx].options.crop_rect_reference_size =
-                                Some((input_w, input_h));
-                        }
+                        // Do not overwrite dmin/crop reference sizes here; they stay in the
+                        // coordinate space where the user last edited them.
                         self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
                         if captured_debug {
                             self.images[idx].pipeline_debug_log = Some(dbg_log);
@@ -3041,20 +3035,26 @@ impl eframe::App for C41Gui {
                         if self.mode == UIMode::Process {
                             if let Some(entry) = self.images.get_mut(idx) {
                                 let opts = &mut entry.options;
-                                if opts.apply_dmin
-                                    && opts.dmin_fixed.is_none()
-                                    && self.flat_field_path.is_none()
-                                {
+                                if opts.apply_dmin && self.flat_field_path.is_none() {
                                     if let (Some(rect), Some([input_w, input_h])) =
                                         (opts.dmin_rect, entry.preview_input_size)
                                     {
                                         if input_w > 0 && input_h > 0 {
                                             let painter = ui.painter_at(image_rect);
 
-                                            let scr_tl = image_to_screen(rect.x as f32, rect.y as f32);
+                                            // Scale from rect's reference space (where it was last edited)
+                                            // into the current preview working resolution.
+                                            let scaled = scale_rect_to_size(
+                                                rect,
+                                                opts.dmin_rect_reference_size,
+                                                input_w,
+                                                input_h,
+                                            );
+
+                                            let scr_tl = image_to_screen(scaled.x as f32, scaled.y as f32);
                                             let scr_br = image_to_screen(
-                                                (rect.x + rect.width) as f32,
-                                                (rect.y + rect.height) as f32,
+                                                (scaled.x + scaled.width) as f32,
+                                                (scaled.y + scaled.height) as f32,
                                             );
                                             let mut left = scr_tl.x;
                                             let mut top = scr_tl.y;
