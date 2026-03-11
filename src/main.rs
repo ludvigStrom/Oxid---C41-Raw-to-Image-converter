@@ -266,6 +266,8 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         fp_vibrance: 0.3,
         saturation: 1.2,
         highlight_warmth: 0.4,
+        apply_lab: false,
+        lab_separation: 0.0,
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,

@@ -401,6 +401,8 @@ fn default_options() -> PipelineOptions {
         fp_vibrance: 0.3,
         saturation: 1.2,
         highlight_warmth: 0.4,
+        apply_lab: false,
+        lab_separation: 0.0,
         rotation_degrees: 0,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
@@ -417,6 +419,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.film_gamma.to_bits().hash(&mut h);
     opts.saturation.to_bits().hash(&mut h);
     opts.highlight_warmth.to_bits().hash(&mut h);
+    opts.apply_lab.hash(&mut h);
+    opts.lab_separation.to_bits().hash(&mut h);
     opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
     opts.apply_crop.hash(&mut h);
@@ -1817,6 +1821,36 @@ impl eframe::App for C41Gui {
                                 .fixed_decimals(2)
                                 .text("Warmth"),
                         );
+                    });
+
+                    ui.collapsing("Lab (display space)", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Optional Lab adjustments after the print/display stage.\n\
+                                 Separation increases color separation in a/b while keeping neutrals stable."
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+
+                        ui.checkbox(&mut opts.apply_lab, "Enable Lab stage");
+                        ui.add_enabled_ui(opts.apply_lab, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Separation");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.lab_separation, -1.0..=1.0)
+                                        .fixed_decimals(2),
+                                );
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "Positive values push mid-chroma colors apart; negative values gently compress them."
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
                     });
 
                     ui.collapsing("Exposure", |ui| {

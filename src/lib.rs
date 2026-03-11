@@ -166,6 +166,11 @@ pub struct PipelineOptions {
     /// colors (blue sky, red etc.) untouched.
     /// 0.0 = neutral, 0.3–0.6 = subtle lab-scan warmth. Default 0.4.
     pub highlight_warmth: f32,
+    /// Enable display-space Lab adjustments (separation, future vibrance).
+    pub apply_lab: bool,
+    /// Lab-space separation strength (0 = off). Boosts mid-chroma colors in
+    /// the a/b plane to increase color separation without affecting neutrals.
+    pub lab_separation: f32,
     /// Debug preview mode: for RAW files, show only a simple bilinear demosaic
     /// (plus optional rotation) and skip the rest of the pipeline.
     pub debug_preview_simple_debayer: bool,
@@ -230,6 +235,8 @@ impl Default for PipelineOptions {
             fp_vibrance: 0.3,
             saturation: 1.2,
             highlight_warmth: 0.4,
+            apply_lab: false,
+            lab_separation: 0.0,
             rotation_degrees: 0,
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
@@ -646,6 +653,179 @@ fn linear_to_srgb(v: f32) -> f32 {
     }
 }
 
+#[inline]
+fn srgb_to_linear(v: f32) -> f32 {
+    let x = v.clamp(0.0, 1.0);
+    if x <= 0.04045 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+// ───────────────────────────── Lab helpers ─────────────────────────────
+
+#[inline]
+fn rgb_linear_to_xyz(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    // sRGB/Rec.709 primaries, D65 white.
+    let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
+    let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+    let z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
+    (x, y, z)
+}
+
+#[inline]
+fn xyz_to_rgb_linear(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+    // Inverse of rgb_linear_to_xyz for sRGB/Rec.709, D65.
+    let r = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+    let g = -0.9692660 * x + 1.8760108 * y + 0.0415560 * z;
+    let b = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+    (r, g, b)
+}
+
+#[inline]
+fn xyz_to_lab(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+    // D65 reference white (sRGB).
+    const XN: f32 = 0.95047;
+    const YN: f32 = 1.0;
+    const ZN: f32 = 1.08883;
+
+    let xr = x / XN;
+    let yr = y / YN;
+    let zr = z / ZN;
+
+    #[inline]
+    fn f(t: f32) -> f32 {
+        const EPS: f32 = 216.0 / 24389.0; // ~0.008856
+        const KAPPA: f32 = 24389.0 / 27.0; // ~903.3
+        if t > EPS {
+            t.cbrt()
+        } else {
+            (KAPPA * t + 16.0) / 116.0
+        }
+    }
+
+    let fx = f(xr);
+    let fy = f(yr);
+    let fz = f(zr);
+
+    let l = 116.0 * fy - 16.0;
+    let a = 500.0 * (fx - fy);
+    let b = 200.0 * (fy - fz);
+    (l, a, b)
+}
+
+#[inline]
+fn lab_to_xyz(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
+    const XN: f32 = 0.95047;
+    const YN: f32 = 1.0;
+    const ZN: f32 = 1.08883;
+
+    let fy = (l + 16.0) / 116.0;
+    let fx = fy + a / 500.0;
+    let fz = fy - b / 200.0;
+
+    #[inline]
+    fn f_inv(t: f32) -> f32 {
+        const EPS: f32 = 216.0 / 24389.0;
+        const KAPPA: f32 = 24389.0 / 27.0;
+        let t3 = t * t * t;
+        if t3 > EPS {
+            t3
+        } else {
+            (116.0 * t - 16.0) / KAPPA
+        }
+    }
+
+    let xr = f_inv(fx);
+    let yr = f_inv(fy);
+    let zr = f_inv(fz);
+
+    (xr * XN, yr * YN, zr * ZN)
+}
+
+/// Apply Lab-space separation on an f32 RGB image in [0, 1]. Strength is
+/// typically 0.0–1.0. Neutrals (low chroma) are largely preserved; mid-chroma
+/// colors are pushed outward in the a/b plane to increase separation.
+fn apply_lab_separation_f32(image: &mut Array3<f32>, strength: f32) {
+    if strength.abs() < 1e-6 {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let s = strength.clamp(-2.0, 2.0);
+
+    for y in 0..h {
+        for x in 0..w {
+            let sr = image[[y, x, 0]].clamp(0.0, 1.0);
+            let sg = image[[y, x, 1]].clamp(0.0, 1.0);
+            let sb = image[[y, x, 2]].clamp(0.0, 1.0);
+
+            let r_lin = srgb_to_linear(sr);
+            let g_lin = srgb_to_linear(sg);
+            let b_lin = srgb_to_linear(sb);
+
+            let (xv, yv, zv) = rgb_linear_to_xyz(r_lin, g_lin, b_lin);
+            let (l, a, b) = xyz_to_lab(xv, yv, zv);
+
+            let c_ab = (a * a + b * b).sqrt();
+            if c_ab < 1e-4 {
+                // Near-neutral; keep as-is.
+                continue;
+            }
+            let c_norm = (c_ab / 100.0).clamp(0.0, 1.0);
+            // Bell-shaped mid-chroma emphasis over 0..1.
+            let mid_boost = 1.0 + s * (c_norm * (1.0 - c_norm)) * 2.0;
+            // Soften boost near very high chroma to avoid clipping.
+            let edge_soften = 1.0 + 0.2 * s * (1.0 - c_norm);
+            let gain = (mid_boost * edge_soften).max(0.0);
+
+            let scale = gain;
+            let a2 = a * scale;
+            let b2 = b * scale;
+
+            let (x2, y2, z2) = lab_to_xyz(l, a2, b2);
+            let (r_lin2, g_lin2, b_lin2) = xyz_to_rgb_linear(x2, y2, z2);
+
+            image[[y, x, 0]] = linear_to_srgb(r_lin2).clamp(0.0, 1.0);
+            image[[y, x, 1]] = linear_to_srgb(g_lin2).clamp(0.0, 1.0);
+            image[[y, x, 2]] = linear_to_srgb(b_lin2).clamp(0.0, 1.0);
+        }
+    }
+}
+
+/// Apply Lab separation to a u16 RGB image (0–65535) in-place by converting
+/// to f32, running `apply_lab_separation_f32`, then quantizing back.
+fn apply_lab_separation_u16(image: &mut Array3<u16>, strength: f32) {
+    if strength.abs() < 1e-6 {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let inv = 1.0 / 65535.0_f32;
+
+    // Convert to f32 in [0,1]
+    let mut fimg = Array3::<f32>::zeros((h, w, c));
+    for y in 0..h {
+        for x in 0..w {
+            fimg[[y, x, 0]] = image[[y, x, 0]] as f32 * inv;
+            fimg[[y, x, 1]] = image[[y, x, 1]] as f32 * inv;
+            fimg[[y, x, 2]] = image[[y, x, 2]] as f32 * inv;
+        }
+    }
+
+    apply_lab_separation_f32(&mut fimg, strength);
+
+    // Quantize back.
+    for y in 0..h {
+        for x in 0..w {
+            image[[y, x, 0]] = (fimg[[y, x, 0]].clamp(0.0, 1.0) * 65535.0).round() as u16;
+            image[[y, x, 1]] = (fimg[[y, x, 1]].clamp(0.0, 1.0) * 65535.0).round() as u16;
+            image[[y, x, 2]] = (fimg[[y, x, 2]].clamp(0.0, 1.0) * 65535.0).round() as u16;
+        }
+    }
+}
+
 /// Normalize density to [0, 1] with sRGB/Rec.709 gamma, then levels remap + midpoint.
 /// The LUT handles the neg→pos inversion (print emulation), so we keep
 /// density orientation: D / d_max → gamma-encode → levels → midpoint.
@@ -743,9 +923,9 @@ fn apply_highlight_warmth_u16(image: &mut Array3<u16>, warmth: f32) {
 
     for y in 0..h {
         for x in 0..w {
-            let r = image[[y, x, 0]] as f32 * scale;
-            let g = image[[y, x, 1]] as f32 * scale;
-            let b = image[[y, x, 2]] as f32 * scale;
+            let mut r = image[[y, x, 0]] as f32 * scale;
+            let mut g = image[[y, x, 1]] as f32 * scale;
+            let mut b = image[[y, x, 2]] as f32 * scale;
 
             let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
             let chroma = r.max(g).max(b) - r.min(g).min(b);
@@ -757,13 +937,28 @@ fn apply_highlight_warmth_u16(image: &mut Array3<u16>, warmth: f32) {
 
             let strength = highlight_ramp * neutrality * warmth;
 
-            let r_new = (r + strength * 0.035).clamp(0.0, 1.0);
-            let g_new = (g + strength * 0.015).clamp(0.0, 1.0);
-            let b_new = (b - strength * 0.055).clamp(0.0, 1.0);
+            r = (r + strength * 0.035).clamp(0.0, 1.0);
+            g = (g + strength * 0.015).clamp(0.0, 1.0);
+            b = (b - strength * 0.055).clamp(0.0, 1.0);
 
-            image[[y, x, 0]] = (r_new * 65535.0).round() as u16;
-            image[[y, x, 1]] = (g_new * 65535.0).round() as u16;
-            image[[y, x, 2]] = (b_new * 65535.0).round() as u16;
+            // Extra safety: in very bright highlights, limit extreme chroma
+            // so clipped channels do not produce colored speckles (e.g. pure blue)
+            // on otherwise neutral speculars.
+            let luma2 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let chroma2 = r.max(g).max(b) - r.min(g).min(b);
+            if luma2 > 0.96 && chroma2 > 0.10 {
+                let t = smoothstep(0.96, 1.0, luma2);
+                let max_chroma = 0.10;
+                let reduce = ((chroma2 - max_chroma) / chroma2).clamp(0.0, 1.0) * t;
+                // Pull channels toward neutral luma by `reduce` fraction.
+                r = r + (luma2 - r) * reduce;
+                g = g + (luma2 - g) * reduce;
+                b = b + (luma2 - b) * reduce;
+            }
+
+            image[[y, x, 0]] = (r * 65535.0).round() as u16;
+            image[[y, x, 1]] = (g * 65535.0).round() as u16;
+            image[[y, x, 2]] = (b * 65535.0).round() as u16;
         }
     }
 }
@@ -778,9 +973,9 @@ fn apply_highlight_warmth_f32(image: &mut Array3<f32>, warmth: f32) {
 
     for y in 0..h {
         for x in 0..w {
-            let r = image[[y, x, 0]].clamp(0.0, 1.0);
-            let g = image[[y, x, 1]].clamp(0.0, 1.0);
-            let b = image[[y, x, 2]].clamp(0.0, 1.0);
+            let mut r = image[[y, x, 0]].clamp(0.0, 1.0);
+            let mut g = image[[y, x, 1]].clamp(0.0, 1.0);
+            let mut b = image[[y, x, 2]].clamp(0.0, 1.0);
 
             let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
             let chroma = r.max(g).max(b) - r.min(g).min(b);
@@ -789,9 +984,24 @@ fn apply_highlight_warmth_f32(image: &mut Array3<f32>, warmth: f32) {
             let neutrality = 1.0 - smoothstep(0.04, 0.18, chroma);
             let strength = highlight_ramp * neutrality * warmth;
 
-            image[[y, x, 0]] = (r + strength * 0.035).clamp(0.0, 1.0);
-            image[[y, x, 1]] = (g + strength * 0.015).clamp(0.0, 1.0);
-            image[[y, x, 2]] = (b - strength * 0.055).clamp(0.0, 1.0);
+            r = (r + strength * 0.035).clamp(0.0, 1.0);
+            g = (g + strength * 0.015).clamp(0.0, 1.0);
+            b = (b - strength * 0.055).clamp(0.0, 1.0);
+
+            let luma2 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let chroma2 = r.max(g).max(b) - r.min(g).min(b);
+            if luma2 > 0.96 && chroma2 > 0.10 {
+                let t = smoothstep(0.96, 1.0, luma2);
+                let max_chroma = 0.10;
+                let reduce = ((chroma2 - max_chroma) / chroma2).clamp(0.0, 1.0) * t;
+                r = r + (luma2 - r) * reduce;
+                g = g + (luma2 - g) * reduce;
+                b = b + (luma2 - b) * reduce;
+            }
+
+            image[[y, x, 0]] = r;
+            image[[y, x, 1]] = g;
+            image[[y, x, 2]] = b;
         }
     }
 }
@@ -1075,6 +1285,9 @@ pub fn process_files(
                     }
                     let mut image_u16 =
                         curve::apply_ra4_from_density(&leveled, ra4_params, 4.0, options.curve_white);
+                    if options.apply_lab {
+                        apply_lab_separation_u16(&mut image_u16, options.lab_separation);
+                    }
                     apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
                     if !options.write_jpeg_only {
                         tiff_export::write_tiff_u16(&image_u16, &out_path)?;
@@ -1111,6 +1324,9 @@ pub fn process_files(
                     }
                     let mut image_u16 =
                         curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
+                    if options.apply_lab {
+                        apply_lab_separation_u16(&mut image_u16, options.lab_separation);
+                    }
                     apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
                     if !options.write_jpeg_only {
                         tiff_export::write_tiff_u16(&image_u16, &out_path)?;
@@ -1181,6 +1397,9 @@ pub fn process_files(
                     }
                     if let Some(ref lut) = output_lut_cube {
                         apply_output_cube_rgb(&mut display, lut);
+                    }
+                    if options.apply_lab {
+                        apply_lab_separation_f32(&mut display, options.lab_separation);
                     }
                     apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
 
@@ -1602,6 +1821,9 @@ pub fn process_one_to_preview(
                 }
                 let mut u16_img =
                     curve::apply_ra4_from_density(&leveled, params, 4.0, options.curve_white);
+                if options.apply_lab {
+                    apply_lab_separation_u16(&mut u16_img, options.lab_separation);
+                }
                 apply_highlight_warmth_u16(&mut u16_img, options.highlight_warmth);
                 if options.verbose_debug {
                     let u16_stats: [(u16, u16, u16); 3] = {
@@ -1670,6 +1892,9 @@ pub fn process_one_to_preview(
                 }
                 let mut u16_img =
                     curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
+                if options.apply_lab {
+                    apply_lab_separation_u16(&mut u16_img, options.lab_separation);
+                }
                 apply_highlight_warmth_u16(&mut u16_img, options.highlight_warmth);
                 u16_img
                     .iter()
@@ -1737,6 +1962,9 @@ pub fn process_one_to_preview(
                     .and_then(|p| lut3d::read_cube(p).ok())
                 {
                     apply_output_cube_rgb(&mut display, &output_lut);
+                }
+                if options.apply_lab {
+                    apply_lab_separation_f32(&mut display, options.lab_separation);
                 }
                 apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
 
