@@ -195,8 +195,6 @@ struct C41Gui {
     /// Luminance calibration: path and linearized flat-field image (RAW → demosaic only).
     flat_field_path: Option<PathBuf>,
     flat_field_image: Option<ndarray::Array3<f32>>,
-    /// Camera IDT profiles loaded from camera_idt/ (path, profile).
-    idt_profiles: Vec<(PathBuf, c41_raw_tool::aces::IdtProfile)>,
     ui_icons: UiIcons,
     /// Suppresses preview reprocessing while the user is dragging a rect handle (crop / d-min).
     rect_dragging: bool,
@@ -231,7 +229,6 @@ impl Default for C41Gui {
             selected_profile_idx: None,
             flat_field_path: None,
             flat_field_image: None,
-            idt_profiles: Vec::new(),
             ui_icons: UiIcons::default(),
             rect_dragging: false,
             pending_preview_key: None,
@@ -391,7 +388,6 @@ fn default_options() -> PipelineOptions {
             [0.0, 0.0, 1.0],
         ],
         flat_field_path: None,
-        idt_matrix: c41_raw_tool::aces::IDT_IDENTITY,
         export_aces_exr: false,
         write_aces2065_only: false,
         lut3d_path: None,
@@ -461,11 +457,6 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.flat_field_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
     opts.export_aces_exr.hash(&mut h);
     opts.write_aces2065_only.hash(&mut h);
-    for row in &opts.idt_matrix {
-        for v in row {
-            v.to_bits().hash(&mut h);
-        }
-    }
     opts.lut3d_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
     opts.output_stage.hash(&mut h);
     opts.output_lut_cube
@@ -709,8 +700,8 @@ fn apply_exposure_to_opts(exp: &ExposureParams, opts: &mut PipelineOptions) {
     // Clamp user-facing slider domain to a sane photographic range.
     let density = exp.density.clamp(0.0, 2.0);
     let grade = exp.grade.clamp(0.2, 3.0);
-    let shadows = exp.shadows.clamp(0.0, 1.0);
-    let highlights = exp.highlights.clamp(0.0, 1.0);
+    let shadows = exp.shadows.clamp(-0.3, 0.3);
+    let highlights = exp.highlights.clamp(-0.3, 0.3);
     let hardness = exp.hardness.clamp(0.1, 4.0);
 
     // Map back into the underlying curve/levels parameters.
@@ -868,7 +859,6 @@ impl C41Gui {
                     sensor.as_ref(),
                     rect,
                     options.dmin_rect_reference_size,
-                    &options.idt_matrix,
                     options.rotation_degrees,
                     options.dmin_neutral_only,
                 ) {
@@ -917,6 +907,17 @@ impl eframe::App for C41Gui {
         style.visuals.selection.bg_fill = egui::Color32::from_gray(70); // selected tabs/items: gray instead of blue
         style.spacing.button_padding = egui::vec2(10.0, 4.0); // extra left/right and top/bottom around button text
         ctx.set_style(style);
+
+        // Global shortcut: Ctrl+Shift+D toggles Debug mode visibility.
+        let debug_shortcut =
+            ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::D));
+        if debug_shortcut {
+            self.mode = if self.mode == UIMode::Debug {
+                UIMode::Process
+            } else {
+                UIMode::Debug
+            };
+        }
 
         self.rect_dragging = false;
 
@@ -1529,7 +1530,7 @@ impl eframe::App for C41Gui {
                     });
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("1: load+demosaic+rot · 2: +IDT · 3: +D-min · 4: +WB · 6: full (curve/invert)")
+                        egui::RichText::new("1: load+demosaic+rot · 3: +D-min · 4: +WB · 6: full (curve/invert)")
                             .small(),
                     );
                     ui.add_space(8.0);
@@ -1639,56 +1640,6 @@ impl eframe::App for C41Gui {
                     }
                 } else if self.mode != UIMode::LuminanceCalibrate {
                     // D-min, White balance, and Print curve apply only to normal processing.
-                    ui.label("Camera IDT profile");
-                    let current_label = if opts.idt_matrix == c41_raw_tool::aces::IDT_IDENTITY {
-                        "Identity"
-                    } else if let Some((_, p)) = self.idt_profiles.iter().find(|(_, p)| {
-                        p.matrix.iter().zip(opts.idt_matrix.iter()).all(|(a, b)| {
-                            a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5)
-                        })
-                    }) {
-                        p.name.as_str()
-                    } else {
-                        "Custom"
-                    };
-                    egui::ComboBox::from_label("IDT profile")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            let base_dir = std::env::current_dir()
-                                .unwrap_or_else(|_| PathBuf::from("."))
-                                .join("camera_idt");
-                            if let Ok(list) = c41_raw_tool::aces::load_idt_profiles_from_dir(&base_dir) {
-                                self.idt_profiles = list;
-                            }
-                            if ui.selectable_label(
-                                opts.idt_matrix == c41_raw_tool::aces::IDT_IDENTITY,
-                                "Identity",
-                            ).clicked()
-                            {
-                                opts.idt_matrix = c41_raw_tool::aces::IDT_IDENTITY;
-                            }
-                            for (_, profile) in &self.idt_profiles {
-                                let selected = opts.idt_matrix
-                                    .iter()
-                                    .zip(profile.matrix.iter())
-                                    .all(|(a, b)| a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5));
-                                if ui.selectable_label(selected, &profile.name).clicked() {
-                                    opts.idt_matrix = profile.matrix;
-                                }
-                            }
-                        });
-                    ui.collapsing("IDT matrix (custom edit)", |ui| {
-                        let m = &mut opts.idt_matrix;
-                        ui.horizontal(|ui| {
-                            for row in 0..3 {
-                                for col in 0..3 {
-                                    ui.add(drag_decimal_f32(&mut m[row][col]).speed(0.05));
-                                }
-                            }
-                        });
-                    });
-                    ui.separator();
-
                     ui.checkbox(&mut opts.apply_dmin, "D-min");
                     if opts.apply_dmin {
                     ui.collapsing("D-min settings", |ui| {
@@ -2035,7 +1986,7 @@ impl eframe::App for C41Gui {
                             ui.label("Shadows");
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut exp.shadows, 0.0..=1.0)
+                                    egui::Slider::new(&mut exp.shadows, -0.3..=0.3)
                                         .fixed_decimals(3),
                                 )
                                 .changed();
@@ -2044,7 +1995,7 @@ impl eframe::App for C41Gui {
                             ui.label("Highlights");
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut exp.highlights, 0.0..=1.0)
+                                    egui::Slider::new(&mut exp.highlights, -0.3..=0.3)
                                         .fixed_decimals(3),
                                 )
                                 .changed();

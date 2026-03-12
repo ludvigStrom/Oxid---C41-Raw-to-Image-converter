@@ -122,8 +122,6 @@ pub struct PipelineOptions {
     pub density_matrix: [[f32; 3]; 3],
     /// Path to a RAW flat-field (unexposed) frame for luminance calibration. Optional.
     pub flat_field_path: Option<PathBuf>,
-    /// 3×3 IDT matrix (camera linear RGB → ACEScg). Default identity; optional profiles in camera_idt/.
-    pub idt_matrix: [[f32; 3]; 3],
     /// When true, also write a linear ACES2065-1 EXR alongside display output.
     pub export_aces_exr: bool,
     /// When true, output is only ACES2065-1 EXR (32-bit float); no TIFF/JPEG.
@@ -229,7 +227,6 @@ impl Default for PipelineOptions {
                 [0.0, 0.0, 1.0],
             ],
             flat_field_path: None,
-            idt_matrix: aces::IDT_IDENTITY,
             export_aces_exr: false,
             write_aces2065_only: false,
             lut3d_path: None,
@@ -647,17 +644,13 @@ pub fn load_sensor_from_path(path: &Path) -> anyhow::Result<CachedSensor> {
 ///
 /// - Uses the same D-min rect + reference-size semantics as the main pipeline.
 /// - For Bayer sources, demosaics the full frame, then samples the rect.
-/// - Applies IDT to the RGB data before measuring medians, so results match the
-///   main pipeline's working space.
 pub fn compute_dmin_from_sensor(
     sensor: &CachedSensor,
     rect: Rect,
     reference_size: Option<(u32, u32)>,
-    idt_matrix: &[[f32; 3]; 3],
     rotation_degrees: i32,
     neutral_only: bool,
 ) -> anyhow::Result<(f32, f32, f32)> {
-    // 1) Get an RGB image from the cached sensor data.
     let mut rgb: Array3<f32> = match sensor {
         CachedSensor::Bayer { data, pattern } => {
             let mut img = demosaic::demosaic_quality(data, *pattern)?;
@@ -667,18 +660,11 @@ pub fn compute_dmin_from_sensor(
         CachedSensor::Rgb(image) => image.clone(),
     };
 
-    // 2) Apply rotation so coordinates match the user's view.
     if rotation_degrees != 0 {
         rgb = apply_rotation(&rgb, rotation_degrees);
     }
 
-    // 3) Apply IDT if present, same as main pipeline.
-    if !aces::is_identity(idt_matrix) {
-        aces::apply_idt(&mut rgb, idt_matrix);
-        rgb.mapv_inplace(|v| v.max(0.0));
-    }
-
-    // 4) Scale rect to current image size.
+    // Scale rect to current image size.
     let (h, w, c) = rgb.dim();
     if c != 3 {
         anyhow::bail!("compute_dmin_from_sensor expects RGB image with 3 channels");
@@ -1004,6 +990,44 @@ fn density_to_rec709_leveled(
 ///   D_mean  = (D_r + D_g + D_b) / 3
 ///   D_ch' = D_mean + saturation * (D_ch - D_mean)
 ///
+/// Detect and compress density-domain "speckle" pixels where one channel is
+/// an extreme outlier while the other two are close together.  Normal
+/// saturated colors have channels that are roughly evenly spaced (e.g.
+/// 0.3, 0.5, 0.7) and are left untouched.  Speckles have a skewed
+/// distribution (e.g. 1.0, 1.0, 2.5) and get pulled toward the mean.
+fn limit_highlight_density_spread(image: &mut Array3<f32>) {
+    let (h, w, _) = image.dim();
+    for y in 0..h {
+        for x in 0..w {
+            let r = image[[y, x, 0]];
+            let g = image[[y, x, 1]];
+            let b = image[[y, x, 2]];
+
+            let mut lo = r;
+            let mut mid = g;
+            let mut hi = b;
+            if lo > mid { std::mem::swap(&mut lo, &mut mid); }
+            if mid > hi { std::mem::swap(&mut mid, &mut hi); }
+            if lo > mid { std::mem::swap(&mut lo, &mut mid); }
+
+            let range = hi - lo;
+            if range < 0.02 { continue; }
+
+            let mid_pos = (mid - lo) / range;
+            let outlier = (0.5 - mid_pos).abs() * 2.0;
+            if outlier < 0.5 { continue; }
+
+            let excess = (outlier - 0.5) / 0.5;
+            let blend = excess * 0.85;
+            let mean = (r + g + b) * (1.0 / 3.0);
+
+            image[[y, x, 0]] = r + (mean - r) * blend;
+            image[[y, x, 1]] = g + (mean - g) * blend;
+            image[[y, x, 2]] = b + (mean - b) * blend;
+        }
+    }
+}
+
 /// sat > 1 widens channel spread → more colorful output after the S-curve.
 /// sat = 1 is identity. Values are clamped to ≥ 0 after boosting.
 fn apply_density_saturation(image: &mut Array3<f32>, saturation: f32) {
@@ -1167,15 +1191,11 @@ fn apply_output_cube_rgb(image: &mut Array3<f32>, lut: &lut3d::Lut3d) {
 
 /// **Pipeline order (do not reorder without updating this comment).**
 ///
-/// Internal colorspace is always ACEScg.
-///
-/// 1. **Load** RAW (linear Bayer) or PNG → demosaic → **linear camera RGB**.
-/// 2. **IDT**: linear camera RGB → **ACEScg** (identity or camera profile from camera_idt/).
-///    Flat-field map is converted with the same IDT.
+/// 1. **Load** RAW (linear Bayer) or PNG → demosaic → **linear RGB**.
 /// 3. **D-min / flat-field** (optional).
 /// 4. **White balance** (optional).
-/// 5. **Optional ACES2065-1 export**: clone ACEScg image, convert to AP0, write EXR.
-/// 6. **Display path**: If curve: T→D → density matrix (in ACEScg) → RA-4. If no curve: direct density map.
+/// 5. **Optional ACES2065-1 export**: clone image, convert to AP0, write EXR.
+/// 6. **Display path**: If curve: T→D → density matrix → RA-4. If no curve: direct density map.
 pub fn process_files(
     paths: &[PathBuf],
     output_dir: &Path,
@@ -1201,15 +1221,9 @@ pub fn process_files(
         pivot: options.curve_pivot,
     };
 
-    // Optional flat-field map (Step 3 input). If IDT is active, transform the map to ACEScg once
-    // so flat-field division stays in the same space as the main image.
     let flat_field_map: Option<Array3<f32>> =
         if let Some(ref flat_path) = options.flat_field_path {
-            let mut ff = load_flat_field_map(flat_path)?;
-            if options.debug_pipeline_step >= 2 && !aces::is_identity(&options.idt_matrix) {
-                aces::apply_idt(&mut ff, &options.idt_matrix);
-                ff.mapv_inplace(|v| v.max(0.0));
-            }
+            let ff = load_flat_field_map(flat_path)?;
             Some(ff)
         } else {
             None
@@ -1235,15 +1249,6 @@ pub fn process_files(
 
         if options.rotation_degrees != 0 {
             image = apply_rotation(&image, options.rotation_degrees);
-        }
-
-        // Step 2: Camera RGB -> ACEScg via IDT.
-        if options.debug_pipeline_step >= 2 {
-            if !aces::is_identity(&options.idt_matrix) {
-                aces::apply_idt(&mut image, &options.idt_matrix);
-                // Density pipeline expects non-negative transmittance values.
-                image.mapv_inplace(|v| v.max(0.0));
-            }
         }
 
         // Step 3: D-min / flat-field (skipped if apply_dmin is false).
@@ -1276,7 +1281,7 @@ pub fn process_files(
 
         // Step 4: T → D → WB (multiplicative) → Film γ
         if options.debug_pipeline_step >= 4 {
-            image.mapv_inplace(|t| -(t.max(1e-10_f32)).log10());
+            image.mapv_inplace(|t| (-(t.max(1e-10_f32)).log10()).max(0.0));
 
             // Auto WB: multiplicative density scaling (per-channel γ correction).
             let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.apply_dmin {
@@ -1361,6 +1366,7 @@ pub fn process_files(
                 }
             }
             image.mapv_inplace(|v| v.max(0.0));
+            limit_highlight_density_spread(&mut image);
         }
 
         // Step 5.5: Density-domain saturation boost (before RA-4 curve).
@@ -1628,7 +1634,7 @@ fn fmt_stats(label: &str, stats: &[(f32, f32, f32); 3]) -> String {
 }
 
 /// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
-/// IDT → D-min/flat-field → WB → curve or no-curve.
+/// D-min/flat-field → WB → curve or no-curve.
 ///
 /// Returns `(input_w, input_h, preview_w, preview_h, rgb_u8, debug_log)`.
 pub fn process_one_to_preview(
@@ -1707,30 +1713,10 @@ pub fn process_one_to_preview(
         return Ok((orig_w, orig_h, new_w, new_h, out, dbg));
     }
 
-    // Step 2: Camera RGB -> ACEScg via IDT.
-    if options.debug_pipeline_step >= 2 {
-        let idt_is_identity = aces::is_identity(&options.idt_matrix);
-        let _ = writeln!(dbg, "Step 2: IDT (identity={})", idt_is_identity);
-        if !idt_is_identity {
-            aces::apply_idt(&mut image, &options.idt_matrix);
-            image.mapv_inplace(|v| v.max(0.0));
-        }
-        if options.verbose_debug {
-            let _ = write!(dbg, "{}", fmt_stats("Step 2 (after IDT):", &channel_stats(&image)));
-        }
-    } else {
-        let _ = writeln!(dbg, "Step 2: SKIPPED (pipeline_step < 2)");
-    }
-    let _ = writeln!(dbg);
-
     // Step 3: D-min / flat-field.
     if options.debug_pipeline_step >= 3 && options.apply_dmin {
         if let Some(ref flat_path) = options.flat_field_path {
-            let mut flat_map = load_flat_field_map(flat_path)?;
-            if options.debug_pipeline_step >= 2 && !aces::is_identity(&options.idt_matrix) {
-                aces::apply_idt(&mut flat_map, &options.idt_matrix);
-                flat_map.mapv_inplace(|v| v.max(0.0));
-            }
+            let flat_map = load_flat_field_map(flat_path)?;
             apply_flat_field_division(&mut image, &flat_map);
             let _ = writeln!(dbg, "D-min mode: flat-field ({})", flat_path.display());
         } else if let Some((r, g, b)) = options.dmin_fixed {
@@ -1783,8 +1769,8 @@ pub fn process_one_to_preview(
     //   Film γ decompresses the density range by the film's characteristic curve slope.
     // ──────────────────────────────────────────────────────────────────────
     if options.debug_pipeline_step >= 4 {
-        // 4a: T → D
-        image.mapv_inplace(|t| -(t.max(1e-10_f32)).log10());
+        // 4a: T → D  (clamp D >= 0: T > 1 after D-min is noise, not signal)
+        image.mapv_inplace(|t| (-(t.max(1e-10_f32)).log10()).max(0.0));
         if options.verbose_debug {
             let _ = write!(dbg, "{}", fmt_stats("Step 4a (T→D, density):", &channel_stats(&image)));
         }
@@ -1904,6 +1890,7 @@ pub fn process_one_to_preview(
             }
         }
         image.mapv_inplace(|v| v.max(0.0));
+        limit_highlight_density_spread(&mut image);
         if options.verbose_debug {
             let _ = write!(dbg, "{}", fmt_stats("Step 5 (after density matrix):", &channel_stats(&image)));
         }
