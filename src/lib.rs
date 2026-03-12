@@ -196,6 +196,10 @@ pub struct PipelineOptions {
     /// colors (blue sky, red etc.) untouched.
     /// 0.0 = neutral, 0.3–0.6 = subtle lab-scan warmth. Default 0.4.
     pub highlight_warmth: f32,
+    /// Post-curve soft knee for specular highlights (display space).
+    /// Value in [0.6, 0.99]: lower = earlier/stronger rolloff, higher = later/subtler.
+    /// 0.0 or >= 0.999 = effectively disabled.
+    pub soft_clip: f32,
     /// Enable display-space Lab adjustments (separation, future vibrance).
     pub apply_lab: bool,
     /// Lab-space separation strength (0 = off). Boosts mid-chroma colors in
@@ -269,6 +273,7 @@ impl Default for PipelineOptions {
             zone_shadows: 0.0,
             zone_highlights: 0.0,
             highlight_warmth: 0.4,
+            soft_clip: 0.93,
             apply_lab: false,
             lab_separation: 0.0,
             rotation_degrees: 0,
@@ -1338,6 +1343,39 @@ fn apply_highlight_warmth_u16(image: &mut Array3<u16>, warmth: f32) {
     }
 }
 
+/// Scalar soft-knee mapping in [0, 1], inspired by film-like highlight roll-off.
+/// `s` is the knee start: below `s` the curve is identity, above it rolls toward 1.0.
+#[inline]
+fn soft_knee_scalar(x: f32, s: f32) -> f32 {
+    let s = s.clamp(0.0, 0.9999);
+    if x <= s {
+        x
+    } else {
+        let one_minus_s = 1.0 - s;
+        let t = -(x - s) / one_minus_s;
+        s + (1.0 - t.exp()) * one_minus_s
+    }
+}
+
+/// Apply a post-curve soft knee to u16 RA-4 output.
+fn apply_soft_knee_u16(image: &mut Array3<u16>, soft_clip: f32) {
+    if !(0.0..0.999).contains(&soft_clip) {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let inv = 1.0 / 65535.0_f32;
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..3 {
+                let v = image[[y, x, ch]] as f32 * inv;
+                let v_knee = soft_knee_scalar(v, soft_clip);
+                image[[y, x, ch]] = (v_knee.clamp(0.0, 1.0) * 65535.0).round() as u16;
+            }
+        }
+    }
+}
+
 /// Same as `apply_highlight_warmth_u16` but operates on normalized f32 [0, 1] RGB.
 fn apply_highlight_warmth_f32(image: &mut Array3<f32>, warmth: f32) {
     if warmth.abs() < 1e-6 {
@@ -1377,6 +1415,23 @@ fn apply_highlight_warmth_f32(image: &mut Array3<f32>, warmth: f32) {
             image[[y, x, 0]] = r;
             image[[y, x, 1]] = g;
             image[[y, x, 2]] = b;
+        }
+    }
+}
+
+/// Apply a post-curve soft knee to display-space f32 RGB in [0, 1].
+fn apply_soft_knee_f32(image: &mut Array3<f32>, soft_clip: f32) {
+    if !(0.0..0.999).contains(&soft_clip) {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..3 {
+                let v = image[[y, x, ch]].clamp(0.0, 1.0);
+                image[[y, x, ch]] = soft_knee_scalar(v, soft_clip);
+            }
         }
     }
 }
@@ -1651,6 +1706,7 @@ pub fn process_files(
                     apply_toe_shoulder(&mut leveled, options.toe_strength, options.shoulder_strength, 4.0);
                     let mut image_u16 =
                         curve::apply_ra4_from_density(&leveled, ra4_params, 4.0, options.curve_white);
+                    apply_soft_knee_u16(&mut image_u16, options.soft_clip);
                     if options.apply_lab {
                         apply_lab_separation_u16(&mut image_u16, options.lab_separation);
                     }
@@ -1693,6 +1749,7 @@ pub fn process_files(
                     apply_toe_shoulder(&mut leveled, options.toe_strength, options.shoulder_strength, 4.0);
                     let mut image_u16 =
                         curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
+                    apply_soft_knee_u16(&mut image_u16, options.soft_clip);
                     if options.apply_lab {
                         apply_lab_separation_u16(&mut image_u16, options.lab_separation);
                     }
@@ -1770,6 +1827,7 @@ pub fn process_files(
                     if options.apply_lab {
                         apply_lab_separation_f32(&mut display, options.lab_separation);
                     }
+                    apply_soft_knee_f32(&mut display, options.soft_clip);
                     apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
 
                     if !options.write_jpeg_only {
@@ -2330,6 +2388,7 @@ pub fn process_one_to_preview(
                 if options.apply_lab {
                     apply_lab_separation_f32(&mut display, options.lab_separation);
                 }
+                apply_soft_knee_f32(&mut display, options.soft_clip);
                 apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
 
                 display

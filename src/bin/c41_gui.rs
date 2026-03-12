@@ -412,6 +412,7 @@ fn default_options() -> PipelineOptions {
         zone_shadows: 0.0,
         zone_highlights: 0.0,
         highlight_warmth: 0.4,
+        soft_clip: 0.93,
         apply_lab: false,
         lab_separation: 0.0,
         rotation_degrees: 0,
@@ -472,6 +473,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.lut_in_black.to_bits().hash(&mut h);
     opts.lut_in_white.to_bits().hash(&mut h);
     opts.lut_in_mid.to_bits().hash(&mut h);
+    opts.soft_clip.to_bits().hash(&mut h);
     opts.toe_strength.to_bits().hash(&mut h);
     opts.shoulder_strength.to_bits().hash(&mut h);
     opts.fp_offset_r.to_bits().hash(&mut h);
