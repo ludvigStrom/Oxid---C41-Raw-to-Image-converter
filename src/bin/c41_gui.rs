@@ -406,6 +406,8 @@ fn default_options() -> PipelineOptions {
         fp_color_bleed: 0.08,
         fp_vibrance: 0.3,
         saturation: 1.2,
+        toe_strength: 0.0,
+        shoulder_strength: 0.0,
         shadow_cast_strength: 0.0,
         zone_shadows: 0.0,
         zone_highlights: 0.0,
@@ -470,6 +472,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.lut_in_black.to_bits().hash(&mut h);
     opts.lut_in_white.to_bits().hash(&mut h);
     opts.lut_in_mid.to_bits().hash(&mut h);
+    opts.toe_strength.to_bits().hash(&mut h);
+    opts.shoulder_strength.to_bits().hash(&mut h);
     opts.fp_offset_r.to_bits().hash(&mut h);
     opts.fp_offset_g.to_bits().hash(&mut h);
     opts.fp_offset_b.to_bits().hash(&mut h);
@@ -1640,343 +1644,13 @@ impl eframe::App for C41Gui {
                         );
                     }
                 } else if self.mode != UIMode::LuminanceCalibrate {
-                    // D-min, White balance, and Print curve apply only to normal processing.
-                    ui.checkbox(&mut opts.apply_dmin, "D-min");
-                    if opts.apply_dmin {
-                    ui.collapsing("D-min settings", |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("Copy D-min").clicked() {
-                                if let Some(text) = dmin_values_to_clipboard_text(opts) {
-                                    ui.ctx().copy_text(text.clone());
-                                    self.status = format!("D-min copied: {}", text);
-                                } else {
-                                    self.status =
-                                        "No D-min values to copy (enable fixed or rectangle first).".to_string();
-                                }
-                            }
-                            if ui.button("Paste D-min").clicked() {
-                                match arboard::Clipboard::new()
-                                    .and_then(|mut cb| cb.get_text())
-                                {
-                                    Ok(text) => {
-                                        if let Some((fixed, rect, neutral_only)) =
-                                            parse_dmin_clipboard_text(&text)
-                                        {
-                                            if let Some((r, g, b)) = fixed {
-                                                opts.apply_dmin = true;
-                                                opts.dmin_fixed = Some((r, g, b));
-                                                opts.dmin_rect = None;
-                                                opts.dmin_rect_reference_size = None;
-                                                if let Some(v) = neutral_only {
-                                                    opts.dmin_neutral_only = v;
-                                                }
-                                                self.status = format!(
-                                                    "Applied pasted D-min fixed values: {:.6}, {:.6}, {:.6}",
-                                                    r, g, b
-                                                );
-                                            } else if let Some(rect) = rect {
-                                                opts.apply_dmin = true;
-                                                opts.dmin_fixed = None;
-                                                opts.dmin_rect = Some(rect);
-                                                opts.dmin_rect_reference_size = None;
-                                                if let Some(v) = neutral_only {
-                                                    opts.dmin_neutral_only = v;
-                                                }
-                                                self.status = format!(
-                                                    "Applied pasted D-min rectangle: {},{},{},{}",
-                                                    rect.x, rect.y, rect.width, rect.height
-                                                );
-                                            } else {
-                                                self.status = "Clipboard has no valid D-min payload.".to_string();
-                                            }
-                                        } else {
-                                            self.status = "Clipboard text is not a valid D-min value.".to_string();
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.status = format!("Could not read clipboard: {}", e);
-                                    }
-                                }
-                            }
-                        });
-                        ui.label(
-                            egui::RichText::new("Format: dmin:fixed:r,g,b or dmin:rect:x,y,w,h")
-                                .small()
-                                .weak(),
-                        );
-                        ui.add_space(4.0);
 
-                        // Option 1: classic D-min (fixed or crop) when no flat-field override is set.
-                        let mut use_fixed = opts.dmin_fixed.is_some();
-                        ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
-                        if use_fixed {
-                            if opts.dmin_fixed.is_none() {
-                                opts.dmin_fixed = Some((0.222537, 0.108183, 0.054116));
-                            }
-                            let (mut r, mut g, mut b) = opts.dmin_fixed.unwrap();
-                            ui.horizontal(|ui| {
-                                ui.label("R");
-                                ui.add(
-                                    drag_decimal_f32(&mut r)
-                                        .range(0.0..=1.0)
-                                        .speed(0.01),
-                                );
-                                ui.label("G");
-                                ui.add(
-                                    drag_decimal_f32(&mut g)
-                                        .range(0.0..=1.0)
-                                        .speed(0.01),
-                                );
-                                ui.label("B");
-                                ui.add(
-                                    drag_decimal_f32(&mut b)
-                                        .range(0.0..=1.0)
-                                        .speed(0.01),
-                                );
-                            });
-                            opts.dmin_fixed = Some((r, g, b));
-                            opts.dmin_rect = None;
-                            opts.dmin_rect_reference_size = None;
-                        } else {
-                            if opts.dmin_rect.is_none() {
-                                opts.dmin_rect = Some(Rect {
-                                    x: 35,
-                                    y: 15,
-                                    width: 20,
-                                    height: 20,
-                                });
-                            }
-                            if let Some(rect) = opts.dmin_rect.as_mut() {
-                                ui.horizontal(|ui| {
-                                    ui.label("x,y,w,h");
-                                    ui.add(egui::DragValue::new(&mut rect.x).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.y).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.width).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.height).speed(1));
-                                });
-                            }
-                            opts.dmin_fixed = None;
-                        }
-
-                        ui.separator();
-                        ui.label("Flat-field override (luminance calibration)");
-                        ui.horizontal(|ui| {
-                            if ui.button("Load flat-field map…").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter(
-                                        "Flat field",
-                                        &[
-                                            "tif", "tiff", // 32f TIFF profiles
-                                            "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf",
-                                            "orf", "rw2", // RAW empty-frame
-                                            "png",
-                                        ],
-                                    )
-                                    .pick_file()
-                                {
-                                    self.flat_field_path = Some(path.clone());
-                                    // When flat-field is active, disable per-image D-min.
-                                    opts.dmin_fixed = None;
-                                    opts.dmin_rect = None;
-                                    opts.dmin_rect_reference_size = None;
-                                    self.status = format!(
-                                        "Using flat-field map from {} (overrides D-min).",
-                                        path.display()
-                                    );
-                                }
-                            }
-
-                            if self.flat_field_path.is_some()
-                                && ui.button("Clear flat-field override").clicked()
-                            {
-                                self.flat_field_path = None;
-                                opts.dmin_rect_reference_size = None;
-                                self.status =
-                                    "Flat-field override cleared; D-min settings are active again."
-                                        .to_string();
-                            }
-                        });
-                        if let Some(ref p) = self.flat_field_path {
-                            ui.label(
-                                egui::RichText::new(format!("Flat-field: {}", p.display())).small(),
-                            );
-                        } else {
-                            ui.label(egui::RichText::new("No flat-field override set.").small());
-                        }
-                    });
-                    }
-
-                    ui.checkbox(&mut opts.apply_crop, "Crop");
-                    if opts.apply_crop {
-                        if opts.crop_rect.is_none() {
-                            opts.crop_rect = Some(Rect {
-                                x: 40,
-                                y: 40,
-                                width: 240,
-                                height: 240,
-                            });
-                        }
-                        ui.collapsing("Crop settings", |ui| {
-                            if let Some(rect) = opts.crop_rect.as_mut() {
-                                ui.horizontal(|ui| {
-                                    ui.label("x,y,w,h");
-                                    ui.add(egui::DragValue::new(&mut rect.x).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.y).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.width).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.height).speed(1));
-                                });
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "Preview darkens outside crop. Histogram + export use inside only.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        });
-                    }
-
-                    ui.checkbox(&mut opts.auto_wb, "Auto white balance");
-                    ui.label(
-                        egui::RichText::new(
-                            if opts.auto_wb {
-                                "Per-channel gamma correction: D x (mean_D / ch_median). Preserves black point."
-                            } else {
-                                "Auto WB disabled."
-                            },
-                        )
-                        .small()
-                        .weak(),
-                    );
-
-                    ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
-                    if opts.apply_white_balance {
-                    ui.collapsing("White balance settings", |ui| {
-                        let mut use_temp = opts.temp_k.is_some();
-                        ui.checkbox(&mut use_temp, "Use color temperature (K)");
-                        if use_temp {
-                            let mut k = opts.temp_k.unwrap_or(5500.0);
-                            ui.add(egui::Slider::new(&mut k, 2000.0..=12000.0).suffix(" K"));
-                            opts.temp_k = Some(k);
-                        } else {
-                            opts.temp_k = None;
-                        }
-                        ui.label(egui::RichText::new("Density scale (1.0 = neutral, >1 = more color)").small().weak());
-                        ui.horizontal(|ui| {
-                            ui.label("R");
-                            ui.add(egui::Slider::new(&mut opts.wb_r, 0.5..=2.0));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("G");
-                            ui.add(egui::Slider::new(&mut opts.wb_g, 0.5..=2.0));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("B");
-                            ui.add(egui::Slider::new(&mut opts.wb_b, 0.5..=2.0));
-                        });
-                    });
-                    }
-
-                    ui.collapsing("Shadow cast correction", |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Auto-neutralize residual color in shadows.\n\
-                                 0 = off, 1 = full correction."
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut opts.shadow_cast_strength, 0.0..=1.5)
-                                .fixed_decimals(2),
-                        );
-                    });
-
-                    ui.collapsing("Film gamma", |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "C-41 γ ≈ 0.55–0.75. Converts density → scene log-exposure: D/γ"
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add(egui::Slider::new(&mut opts.film_gamma, 0.3..=1.2).text("γ"));
-                    });
-
-                    ui.collapsing("Saturation", |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Density-domain chroma boost before the output curve.\n\
-                                 Amplifies per-channel density differences. 1.0 = neutral."
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut opts.saturation, 0.5..=2.5)
-                                .fixed_decimals(2)
-                                .text("Sat"),
-                        );
-                    });
-
-                    ui.collapsing("Highlight warmth", |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Golden tint in neutral highlights (Noritsu/Frontier style).\n\
-                                 Saturated colors (blue sky, reds) are left untouched.\n\
-                                 0.0 = neutral, 0.3–0.6 = subtle lab warmth."
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut opts.highlight_warmth, 0.0..=1.5)
-                                .fixed_decimals(2)
-                                .text("Warmth"),
-                        );
-                    });
-
-                    ui.collapsing("Lab (display space)", |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Optional Lab adjustments after the print/display stage.\n\
-                                 Separation increases color separation in a/b while keeping neutrals stable."
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add_space(4.0);
-
-                        ui.checkbox(&mut opts.apply_lab, "Enable Lab stage");
-                        ui.add_enabled_ui(opts.apply_lab, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Separation");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.lab_separation, -1.0..=1.0)
-                                        .fixed_decimals(2),
-                                );
-                            });
-                            ui.label(
-                                egui::RichText::new(
-                                    "Positive values push mid-chroma colors apart; negative values gently compress them."
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        });
-                    });
-
-                    ui.collapsing("Exposure", |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "High-level exposure controls mapped onto Levels + RA-4 curve.\n\
-                                 Use these as a neg-style wrapper; Levels still expose the raw knobs."
-                            )
-                            .small()
-                            .weak(),
-                        );
-                        ui.add_space(4.0);
-
+                    // ════════════════════════════════════════════════════════
+                    // GROUP 1 — Exposure  (primary editing controls)
+                    // ════════════════════════════════════════════════════════
+                    ui.label(egui::RichText::new("Exposure").strong());
+                    ui.add_space(2.0);
+                    {
                         let mut exp = exposure_from_opts(opts);
                         let mut changed = false;
 
@@ -2032,14 +1706,11 @@ impl eframe::App for C41Gui {
                         }
 
                         if matches!(opts.output_stage, OutputStage::FilmPrint) {
-                            ui.add_space(6.0);
+                            ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new(
-                                    "Print balance (CMY, Film Print only).\n\
-                                     Adjusts per-channel exposure in the print stage."
-                                )
-                                .small()
-                                .weak(),
+                                egui::RichText::new("Print balance (CMY)")
+                                    .small()
+                                    .weak(),
                             );
                             let mut pb = print_balance_from_opts(opts);
                             let mut pb_changed = false;
@@ -2070,289 +1741,614 @@ impl eframe::App for C41Gui {
                                     )
                                     .changed();
                             });
-
                             if pb_changed {
                                 apply_print_balance_to_opts(&pb, opts);
                             }
                         }
-                    });
+                    }
+                    ui.add_space(6.0);
+                    ui.separator();
 
-                    ui.collapsing("Levels (black / white point)", |ui| {
+                    // ════════════════════════════════════════════════════════
+                    // GROUP 2 — Tone Shaping  (advanced shadow/highlight)
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("Tone shaping", |ui| {
                         ui.label(
                             egui::RichText::new(
-                                "Levels are driven by the Exposure block. This section is read-only for inspection.",
+                                "Fine control of shadow and highlight rolloff."
                             )
                             .small()
                             .weak(),
                         );
                         ui.add_space(4.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Toe");
+                            ui.add(
+                                egui::Slider::new(&mut opts.toe_strength, -1.0..=1.0)
+                                    .fixed_decimals(2),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Shoulder");
+                            ui.add(
+                                egui::Slider::new(&mut opts.shoulder_strength, -1.0..=1.0)
+                                    .fixed_decimals(2),
+                            );
+                        });
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Black:  {:.4}\nWhite:  {:.4}\nMidtone: {:.3}",
-                                opts.lut_in_black, opts.lut_in_white, opts.lut_in_mid
-                            ))
-                            .small(),
+                            egui::RichText::new(
+                                "Toe > 0 = softer shadows. Shoulder > 0 = softer highlights."
+                            )
+                            .small()
+                            .weak(),
                         );
-                        if opts.lut_in_black >= opts.lut_in_white {
-                            ui.add_space(4.0);
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Shadow cast");
+                            ui.add(
+                                egui::Slider::new(&mut opts.shadow_cast_strength, 0.0..=1.5)
+                                    .fixed_decimals(2),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Auto-neutralize residual color cast in shadows."
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    });
+
+                    // ════════════════════════════════════════════════════════
+                    // GROUP 3 — White Balance & Color Neutrality
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("White balance", |ui| {
+                        ui.checkbox(&mut opts.auto_wb, "Auto white balance");
+                        ui.label(
+                            egui::RichText::new(
+                                if opts.auto_wb {
+                                    "Per-channel gamma: D × (mean_D / ch_median). Preserves black point."
+                                } else {
+                                    "Auto WB disabled."
+                                },
+                            )
+                            .small()
+                            .weak(),
+                        );
+
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
+                        if opts.apply_white_balance {
+                            let mut use_temp = opts.temp_k.is_some();
+                            ui.checkbox(&mut use_temp, "Color temperature (K)");
+                            if use_temp {
+                                let mut k = opts.temp_k.unwrap_or(5500.0);
+                                ui.add(egui::Slider::new(&mut k, 2000.0..=12000.0).suffix(" K"));
+                                opts.temp_k = Some(k);
+                            } else {
+                                opts.temp_k = None;
+                            }
+                            ui.label(egui::RichText::new("Density scale (1.0 = neutral, >1 = more color)").small().weak());
+                            ui.horizontal(|ui| {
+                                ui.label("R");
+                                ui.add(egui::Slider::new(&mut opts.wb_r, 0.5..=2.0));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("G");
+                                ui.add(egui::Slider::new(&mut opts.wb_g, 0.5..=2.0));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("B");
+                                ui.add(egui::Slider::new(&mut opts.wb_b, 0.5..=2.0));
+                            });
+                        }
+                    });
+
+                    // ════════════════════════════════════════════════════════
+                    // GROUP 4 — Color Character & Separation
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("Color", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Saturation");
+                            ui.add(
+                                egui::Slider::new(&mut opts.saturation, 0.5..=2.5)
+                                    .fixed_decimals(2),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Density-domain chroma boost. 1.0 = neutral."
+                            )
+                            .small()
+                            .weak(),
+                        );
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Warmth");
+                            ui.add(
+                                egui::Slider::new(&mut opts.highlight_warmth, 0.0..=1.5)
+                                    .fixed_decimals(2),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Golden tint in neutral highlights (Noritsu/Frontier style)."
+                            )
+                            .small()
+                            .weak(),
+                        );
+
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut opts.apply_lab, "Lab separation");
+                        ui.add_enabled_ui(opts.apply_lab, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Separation");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.lab_separation, -1.0..=1.0)
+                                        .fixed_decimals(2),
+                                );
+                            });
                             ui.label(
-                                egui::RichText::new("Warning: Black must be less than White")
+                                egui::RichText::new(
+                                    "Pushes mid-chroma colors apart in Lab a/b plane."
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
+                    });
+
+                    // ════════════════════════════════════════════════════════
+                    // GROUP 5 — Input & Film  (per-roll / scan-session)
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("Input & film", |ui| {
+                        ui.checkbox(&mut opts.apply_dmin, "D-min");
+                        if opts.apply_dmin {
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy D-min").clicked() {
+                                    if let Some(text) = dmin_values_to_clipboard_text(opts) {
+                                        ui.ctx().copy_text(text.clone());
+                                        self.status = format!("D-min copied: {}", text);
+                                    } else {
+                                        self.status =
+                                            "No D-min values to copy (enable fixed or rectangle first).".to_string();
+                                    }
+                                }
+                                if ui.button("Paste D-min").clicked() {
+                                    match arboard::Clipboard::new()
+                                        .and_then(|mut cb| cb.get_text())
+                                    {
+                                        Ok(text) => {
+                                            if let Some((fixed, rect, neutral_only)) =
+                                                parse_dmin_clipboard_text(&text)
+                                            {
+                                                if let Some((r, g, b)) = fixed {
+                                                    opts.apply_dmin = true;
+                                                    opts.dmin_fixed = Some((r, g, b));
+                                                    opts.dmin_rect = None;
+                                                    opts.dmin_rect_reference_size = None;
+                                                    if let Some(v) = neutral_only {
+                                                        opts.dmin_neutral_only = v;
+                                                    }
+                                                    self.status = format!(
+                                                        "Applied pasted D-min fixed values: {:.6}, {:.6}, {:.6}",
+                                                        r, g, b
+                                                    );
+                                                } else if let Some(rect) = rect {
+                                                    opts.apply_dmin = true;
+                                                    opts.dmin_fixed = None;
+                                                    opts.dmin_rect = Some(rect);
+                                                    opts.dmin_rect_reference_size = None;
+                                                    if let Some(v) = neutral_only {
+                                                        opts.dmin_neutral_only = v;
+                                                    }
+                                                    self.status = format!(
+                                                        "Applied pasted D-min rectangle: {},{},{},{}",
+                                                        rect.x, rect.y, rect.width, rect.height
+                                                    );
+                                                } else {
+                                                    self.status = "Clipboard has no valid D-min payload.".to_string();
+                                                }
+                                            } else {
+                                                self.status = "Clipboard text is not a valid D-min value.".to_string();
+                                            }
+                                        }
+                                        Err(e) => {
+                                            self.status = format!("Could not read clipboard: {}", e);
+                                        }
+                                    }
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new("Format: dmin:fixed:r,g,b or dmin:rect:x,y,w,h")
                                     .small()
-                                    .color(egui::Color32::from_rgb(255, 160, 0)),
+                                    .weak(),
+                            );
+                            ui.add_space(4.0);
+
+                            let mut use_fixed = opts.dmin_fixed.is_some();
+                            ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
+                            if use_fixed {
+                                if opts.dmin_fixed.is_none() {
+                                    opts.dmin_fixed = Some((0.222537, 0.108183, 0.054116));
+                                }
+                                let (mut r, mut g, mut b) = opts.dmin_fixed.unwrap();
+                                ui.horizontal(|ui| {
+                                    ui.label("R");
+                                    ui.add(
+                                        drag_decimal_f32(&mut r)
+                                            .range(0.0..=1.0)
+                                            .speed(0.01),
+                                    );
+                                    ui.label("G");
+                                    ui.add(
+                                        drag_decimal_f32(&mut g)
+                                            .range(0.0..=1.0)
+                                            .speed(0.01),
+                                    );
+                                    ui.label("B");
+                                    ui.add(
+                                        drag_decimal_f32(&mut b)
+                                            .range(0.0..=1.0)
+                                            .speed(0.01),
+                                    );
+                                });
+                                opts.dmin_fixed = Some((r, g, b));
+                                opts.dmin_rect = None;
+                                opts.dmin_rect_reference_size = None;
+                            } else {
+                                if opts.dmin_rect.is_none() {
+                                    opts.dmin_rect = Some(Rect {
+                                        x: 35,
+                                        y: 15,
+                                        width: 20,
+                                        height: 20,
+                                    });
+                                }
+                                if let Some(rect) = opts.dmin_rect.as_mut() {
+                                    ui.horizontal(|ui| {
+                                        ui.label("x,y,w,h");
+                                        ui.add(egui::DragValue::new(&mut rect.x).speed(1));
+                                        ui.add(egui::DragValue::new(&mut rect.y).speed(1));
+                                        ui.add(egui::DragValue::new(&mut rect.width).speed(1));
+                                        ui.add(egui::DragValue::new(&mut rect.height).speed(1));
+                                    });
+                                }
+                                opts.dmin_fixed = None;
+                            }
+
+                            ui.separator();
+                            ui.label("Flat-field override (luminance calibration)");
+                            ui.horizontal(|ui| {
+                                if ui.button("Load flat-field map…").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter(
+                                            "Flat field",
+                                            &[
+                                                "tif", "tiff",
+                                                "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf",
+                                                "orf", "rw2",
+                                                "png",
+                                            ],
+                                        )
+                                        .pick_file()
+                                    {
+                                        self.flat_field_path = Some(path.clone());
+                                        opts.dmin_fixed = None;
+                                        opts.dmin_rect = None;
+                                        opts.dmin_rect_reference_size = None;
+                                        self.status = format!(
+                                            "Using flat-field map from {} (overrides D-min).",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                                if self.flat_field_path.is_some()
+                                    && ui.button("Clear flat-field override").clicked()
+                                {
+                                    self.flat_field_path = None;
+                                    opts.dmin_rect_reference_size = None;
+                                    self.status =
+                                        "Flat-field override cleared; D-min settings are active again."
+                                            .to_string();
+                                }
+                            });
+                            if let Some(ref p) = self.flat_field_path {
+                                ui.label(
+                                    egui::RichText::new(format!("Flat-field: {}", p.display())).small(),
+                                );
+                            } else {
+                                ui.label(egui::RichText::new("No flat-field override set.").small());
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Film γ");
+                            ui.add(egui::Slider::new(&mut opts.film_gamma, 0.3..=1.2));
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "C-41 γ ≈ 0.55–0.75. Converts density → scene log-exposure."
+                            )
+                            .small()
+                            .weak(),
+                        );
+
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut opts.apply_crop, "Crop");
+                        if opts.apply_crop {
+                            if opts.crop_rect.is_none() {
+                                opts.crop_rect = Some(Rect {
+                                    x: 40,
+                                    y: 40,
+                                    width: 240,
+                                    height: 240,
+                                });
+                            }
+                            if let Some(rect) = opts.crop_rect.as_mut() {
+                                ui.horizontal(|ui| {
+                                    ui.label("x,y,w,h");
+                                    ui.add(egui::DragValue::new(&mut rect.x).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.y).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.width).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.height).speed(1));
+                                });
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Preview darkens outside crop. Histogram + export use inside only.",
+                                )
+                                .small()
+                                .weak(),
                             );
                         }
                     });
 
-                    // Output stage / curve selection.
-                    let mut apply_curve = !opts.no_curve;
-                    if ui.checkbox(&mut apply_curve, "Output curve").changed() {
-                        if apply_curve {
-                            // Re-enable output stage: if we were in "None", default back to RA-4.
-                            if matches!(opts.output_stage, OutputStage::None) {
-                                opts.output_stage = OutputStage::Ra4;
-                            }
-                            opts.no_curve = false;
-                        } else {
-                            // Disable output stage completely.
-                            opts.no_curve = true;
-                            opts.output_stage = OutputStage::None;
-                        }
-                    }
-
-                    if apply_curve {
-                    let current_label = match opts.output_stage {
-                        OutputStage::Ra4 => "RA-4 print emulation",
-                        OutputStage::FilmPrint => "Film Print",
-                        OutputStage::Lut2383 => "3D LUT (display-space)",
-                        OutputStage::None => "No curve",
-                    };
-
-                    egui::ComboBox::from_label("Output stage")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(
-                                    matches!(opts.output_stage, OutputStage::Ra4),
-                                    "RA-4 print emulation",
-                                )
-                                .clicked()
-                            {
-                                opts.output_stage = OutputStage::Ra4;
-                            }
-                            if ui
-                                .selectable_label(
-                                    matches!(opts.output_stage, OutputStage::FilmPrint),
-                                    "Film Print",
-                                )
-                                .clicked()
-                            {
-                                opts.output_stage = OutputStage::FilmPrint;
-                            }
-                            if ui
-                                .selectable_label(
-                                    matches!(opts.output_stage, OutputStage::Lut2383),
-                                    "3D LUT (display-space)",
-                                )
-                                .clicked()
-                            {
-                                opts.output_stage = OutputStage::Lut2383;
-                            }
-                            if ui
-                                .selectable_label(
-                                    matches!(opts.output_stage, OutputStage::None),
-                                    "No curve",
-                                )
-                                .clicked()
-                            {
-                                opts.output_stage = OutputStage::None;
+                    // ════════════════════════════════════════════════════════
+                    // GROUP 6 — Curve / LUT & Output
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("Output", |ui| {
+                        let mut apply_curve = !opts.no_curve;
+                        if ui.checkbox(&mut apply_curve, "Output curve").changed() {
+                            if apply_curve {
+                                if matches!(opts.output_stage, OutputStage::None) {
+                                    opts.output_stage = OutputStage::Ra4;
+                                }
+                                opts.no_curve = false;
+                            } else {
                                 opts.no_curve = true;
+                                opts.output_stage = OutputStage::None;
+                            }
+                        }
+
+                        if apply_curve {
+                            let current_label = match opts.output_stage {
+                                OutputStage::Ra4 => "RA-4 print emulation",
+                                OutputStage::FilmPrint => "Film Print",
+                                OutputStage::Lut2383 => "3D LUT (display-space)",
+                                OutputStage::None => "No curve",
+                            };
+
+                            egui::ComboBox::from_label("Output stage")
+                                .selected_text(current_label)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            matches!(opts.output_stage, OutputStage::Ra4),
+                                            "RA-4 print emulation",
+                                        )
+                                        .clicked()
+                                    {
+                                        opts.output_stage = OutputStage::Ra4;
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(opts.output_stage, OutputStage::FilmPrint),
+                                            "Film Print",
+                                        )
+                                        .clicked()
+                                    {
+                                        opts.output_stage = OutputStage::FilmPrint;
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(opts.output_stage, OutputStage::Lut2383),
+                                            "3D LUT (display-space)",
+                                        )
+                                        .clicked()
+                                    {
+                                        opts.output_stage = OutputStage::Lut2383;
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            matches!(opts.output_stage, OutputStage::None),
+                                            "No curve",
+                                        )
+                                        .clicked()
+                                    {
+                                        opts.output_stage = OutputStage::None;
+                                        opts.no_curve = true;
+                                    }
+                                });
+
+                            if matches!(opts.output_stage, OutputStage::Ra4) {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Pivot");
+                                    ui.add(
+                                        drag_decimal_f32(&mut opts.curve_pivot)
+                                            .range(0.1..=10.0)
+                                            .speed(0.1),
+                                    );
+                                });
+                            }
+
+                            if matches!(opts.output_stage, OutputStage::FilmPrint) {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Per-channel offsets (exposure shift)").small());
+                                ui.horizontal(|ui| {
+                                    ui.label("R");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.fp_offset_r, -0.5..=0.5)
+                                            .fixed_decimals(3),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("G");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.fp_offset_g, -0.5..=0.5)
+                                            .fixed_decimals(3),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("B");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.fp_offset_b, -0.5..=0.5)
+                                            .fixed_decimals(3),
+                                    );
+                                });
+
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Per-channel gamma (contrast)").small());
+                                ui.horizontal(|ui| {
+                                    ui.label("R");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.fp_gamma_r, 0.5..=2.0)
+                                            .fixed_decimals(2),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("G");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.fp_gamma_g, 0.5..=2.0)
+                                            .fixed_decimals(2),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("B");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.fp_gamma_b, 0.5..=2.0)
+                                            .fixed_decimals(2),
+                                    );
+                                });
+
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Color bleed");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.fp_color_bleed, 0.0..=0.5)
+                                            .fixed_decimals(2),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Vibrance");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.fp_vibrance, 0.0..=2.0)
+                                            .fixed_decimals(2),
+                                    );
+                                });
+                            }
+
+                            if matches!(opts.output_stage, OutputStage::Lut2383) {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Resolve-style Kodak 2383 cubes expect Cineon log input.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+
+                                let enc_label = match opts.output_lut_encoding {
+                                    OutputLutEncoding::CineonLog => "Cineon log (D ÷ 2.046)",
+                                    OutputLutEncoding::Rec709 => "Rec.709 (sRGB gamma)",
+                                    OutputLutEncoding::LinearDensity => "Linear (D ÷ 2.5)",
+                                };
+                                egui::ComboBox::from_label("LUT input encoding")
+                                    .selected_text(enc_label)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                matches!(
+                                                    opts.output_lut_encoding,
+                                                    OutputLutEncoding::Rec709
+                                                ),
+                                                "Rec.709 (sRGB gamma)",
+                                            )
+                                            .clicked()
+                                        {
+                                            opts.output_lut_encoding = OutputLutEncoding::Rec709;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                matches!(
+                                                    opts.output_lut_encoding,
+                                                    OutputLutEncoding::CineonLog
+                                                ),
+                                                "Cineon log (D ÷ 2.046)",
+                                            )
+                                            .clicked()
+                                        {
+                                            opts.output_lut_encoding = OutputLutEncoding::CineonLog;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                matches!(
+                                                    opts.output_lut_encoding,
+                                                    OutputLutEncoding::LinearDensity
+                                                ),
+                                                "Linear (D ÷ 2.5)",
+                                            )
+                                            .clicked()
+                                        {
+                                            opts.output_lut_encoding = OutputLutEncoding::LinearDensity;
+                                        }
+                                    });
+
+                                ui.add_space(4.0);
+                                if ui.button("Browse output LUT…").clicked() {
+                                    self.pending_output_lut_browse = true;
+                                }
+                                if let Some(ref p) = opts.output_lut_cube {
+                                    ui.label(egui::RichText::new(p.display().to_string()).small());
+                                } else {
+                                    ui.label(egui::RichText::new("No output LUT loaded").small().weak());
+                                }
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        ui.add_enabled(
+                            opts.no_curve,
+                            egui::Checkbox::new(&mut opts.no_invert, "Skip color inversion"),
+                        );
+                        if !opts.no_curve {
+                            ui.label(egui::RichText::new("(Applies when Output curve is off)").small());
+                        }
+
+                        ui.add_space(4.0);
+                        ui.collapsing("Levels (read-only)", |ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Black:  {:.4}\nWhite:  {:.4}\nMidtone: {:.3}",
+                                    opts.lut_in_black, opts.lut_in_white, opts.lut_in_mid
+                                ))
+                                .small(),
+                            );
+                            if opts.lut_in_black >= opts.lut_in_white {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("Warning: Black must be less than White")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(255, 160, 0)),
+                                );
                             }
                         });
-
-                    if matches!(opts.output_stage, OutputStage::Ra4) {
-                        ui.collapsing("RA-4 curve settings", |ui| {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Base RA-4 curve is driven by Exposure. Pivot remains as an advanced control."
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label("Pivot");
-                                ui.add(
-                                    drag_decimal_f32(&mut opts.curve_pivot)
-                                        .range(0.1..=10.0)
-                                        .speed(0.1),
-                                );
-                            });
-                        });
-                    }
-
-                    if matches!(opts.output_stage, OutputStage::FilmPrint) {
-                        ui.collapsing("Film Print settings", |ui| {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Film Print builds on the Exposure curve. Use these controls for per-channel character."
-                                )
-                                .small()
-                                .weak(),
-                            );
-                            ui.add_space(4.0);
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new("Per-channel offsets (exposure shift)").small());
-                            ui.horizontal(|ui| {
-                                ui.label("R");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.fp_offset_r, -0.5..=0.5)
-                                        .fixed_decimals(3),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("G");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.fp_offset_g, -0.5..=0.5)
-                                        .fixed_decimals(3),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("B");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.fp_offset_b, -0.5..=0.5)
-                                        .fixed_decimals(3),
-                                );
-                            });
-
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new("Per-channel gamma (contrast)").small());
-                            ui.horizontal(|ui| {
-                                ui.label("R");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.fp_gamma_r, 0.5..=2.0)
-                                        .fixed_decimals(2),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("G");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.fp_gamma_g, 0.5..=2.0)
-                                        .fixed_decimals(2),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("B");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.fp_gamma_b, 0.5..=2.0)
-                                        .fixed_decimals(2),
-                                );
-                            });
-
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label("Color bleed");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.fp_color_bleed, 0.0..=0.5)
-                                        .fixed_decimals(2),
-                                );
-                            });
-                            ui.label(
-                                egui::RichText::new("Dye-layer crosstalk: mixes density channels before the curve.")
-                                    .small()
-                                    .weak(),
-                            );
-
-                            ui.horizontal(|ui| {
-                                ui.label("Vibrance");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.fp_vibrance, 0.0..=2.0)
-                                        .fixed_decimals(2),
-                                );
-                            });
-                            ui.label(
-                                egui::RichText::new("Luminance-aware saturation: boosts muted colors more than saturated ones.")
-                                    .small()
-                                    .weak(),
-                            );
-                        });
-                    }
-
-                    if matches!(opts.output_stage, OutputStage::Lut2383) {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Resolve-style Kodak 2383 cubes expect Cineon log input.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-
-                        let enc_label = match opts.output_lut_encoding {
-                            OutputLutEncoding::CineonLog => "Cineon log (D ÷ 2.046)",
-                            OutputLutEncoding::Rec709 => "Rec.709 (sRGB gamma)",
-                            OutputLutEncoding::LinearDensity => "Linear (D ÷ 2.5)",
-                        };
-                        egui::ComboBox::from_label("LUT input encoding")
-                            .selected_text(enc_label)
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(
-                                        matches!(
-                                            opts.output_lut_encoding,
-                                            OutputLutEncoding::Rec709
-                                        ),
-                                        "Rec.709 (sRGB gamma)",
-                                    )
-                                    .clicked()
-                                {
-                                    opts.output_lut_encoding = OutputLutEncoding::Rec709;
-                                }
-                                if ui
-                                    .selectable_label(
-                                        matches!(
-                                            opts.output_lut_encoding,
-                                            OutputLutEncoding::CineonLog
-                                        ),
-                                        "Cineon log (D ÷ 2.046)",
-                                    )
-                                    .clicked()
-                                {
-                                    opts.output_lut_encoding = OutputLutEncoding::CineonLog;
-                                }
-                                if ui
-                                    .selectable_label(
-                                        matches!(
-                                            opts.output_lut_encoding,
-                                            OutputLutEncoding::LinearDensity
-                                        ),
-                                        "Linear (D ÷ 2.5)",
-                                    )
-                                    .clicked()
-                                {
-                                    opts.output_lut_encoding = OutputLutEncoding::LinearDensity;
-                                }
-                            });
-
-                        ui.add_space(4.0);
-                        if ui.button("Browse output LUT…").clicked() {
-                            self.pending_output_lut_browse = true;
-                        }
-                        if let Some(ref p) = opts.output_lut_cube {
-                            ui.label(egui::RichText::new(p.display().to_string()).small());
-                        } else {
-                            ui.label(egui::RichText::new("No output LUT loaded").small().weak());
-                        }
-                    }
-                    }
-
-                    // Pipeline: inversion (1-x). Only applies when no curve stage is used.
-                    ui.add_enabled(
-                        opts.no_curve,
-                        egui::Checkbox::new(&mut opts.no_invert, "Skip color inversion"),
-                    );
-                    if !opts.no_curve {
-                        ui.label(egui::RichText::new("(Applies when Output curve is off)").small());
-                    }
+                    });
                 }
 
                 if self.mode == UIMode::Calibrate {

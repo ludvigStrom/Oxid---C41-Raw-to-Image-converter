@@ -173,6 +173,13 @@ pub struct PipelineOptions {
     /// 1.0 = neutral (no change), >1.0 = more saturated. Default 1.2.
     /// Compensates for the S-curve's tendency to compress channel differences.
     pub saturation: f32,
+    /// Toe shaping strength for the RA-4 curve. Positive = softer toe (opens
+    /// shadows), negative = harder toe (deeper blacks). Dimensionless -1..1.
+    pub toe_strength: f32,
+    /// Shoulder shaping strength for the RA-4 curve. Positive = softer
+    /// shoulder (protects highlights), negative = harder shoulder (snappier
+    /// highlights). Dimensionless -1..1.
+    pub shoulder_strength: f32,
     /// Shadow cast auto-correction strength. Detects residual per-channel color
     /// imbalance in the shadow (low-density) zone and corrects toward neutral.
     /// 0.0 = off, 1.0 = full correction. Applied after WB, before density matrix.
@@ -256,6 +263,8 @@ impl Default for PipelineOptions {
             fp_color_bleed: 0.08,
             fp_vibrance: 0.3,
             saturation: 1.2,
+            toe_strength: 0.0,
+            shoulder_strength: 0.0,
             shadow_cast_strength: 0.0,
             zone_shadows: 0.0,
             zone_highlights: 0.0,
@@ -1137,6 +1146,72 @@ fn apply_shadow_cast_correction(
     }
 }
 
+/// Toe/shoulder shaping in density space before the RA-4 curve.
+///
+/// Normalizes per-channel density to [0, 1] using the **actual data range**
+/// (robust max = 99.9th percentile), so the shoulder mask always reaches the
+/// real highlights regardless of whether levels rescaling is active.
+///
+/// `toe_strength` and `shoulder_strength` are in [-1, 1]:
+/// - toe  > 0: softer toe (opens shadows, gentler rolloff)
+/// - toe  < 0: harder toe (deeper blacks)
+/// - sh   > 0: softer shoulder (protect highlights)
+/// - sh   < 0: harder shoulder (snappier highlights)
+fn apply_toe_shoulder(
+    image: &mut Array3<f32>,
+    toe_strength: f32,
+    shoulder_strength: f32,
+    _d_max: f32,
+) {
+    let toe = toe_strength.clamp(-1.0, 1.0);
+    let shoulder = shoulder_strength.clamp(-1.0, 1.0);
+    if toe.abs() < 1e-6 && shoulder.abs() < 1e-6 {
+        return;
+    }
+
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+
+    // Find the effective data range so normalization adapts to the actual
+    // density distribution. Use a robust max (sort all values, take 99.9th
+    // percentile) to avoid single-pixel outliers stretching the range.
+    let mut all_vals: Vec<f32> = image.iter().copied().filter(|v| *v > 0.0).collect();
+    if all_vals.is_empty() {
+        return;
+    }
+    all_vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx_999 = ((all_vals.len() as f64) * 0.999).ceil() as usize;
+    let effective_max = all_vals[idx_999.min(all_vals.len() - 1)].max(0.01);
+
+    // Make the effect of the UI sliders clearly visible in the GUI by:
+    // - slightly widening the active regions for toe/shoulder masks
+    // - increasing the scale so ±1.0 on the sliders produces a noticeable change.
+    const TOE_SCALE: f32 = 0.60;
+    const SHOULDER_SCALE: f32 = 0.90;
+
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..3 {
+                let d = image[[y, x, ch]].max(0.0);
+                let mut v = (d / effective_max).clamp(0.0, 1.0);
+
+                // Toe: emphasize the lower half of the range, starting a bit closer to black.
+                let toe_mask = 1.0 - smoothstep(0.07, 0.60, v);
+                // Shoulder: start earlier in the midtones and reach full strength
+                // closer to pure white so highlights react more clearly.
+                let shoulder_mask = smoothstep(0.45, 0.95, v);
+
+                let mid = 0.5;
+                let toe_offset = toe * toe_mask * (mid - v) * TOE_SCALE;
+                let shoulder_offset = shoulder * shoulder_mask * (mid - v) * SHOULDER_SCALE;
+                v = (v + toe_offset + shoulder_offset).clamp(0.0, 1.0);
+
+                image[[y, x, ch]] = v * effective_max;
+            }
+        }
+    }
+}
+
 /// Gaussian-masked zone density adjustments: apply shadow and highlight offsets
 /// that only affect their respective tonal zone, leaving midtones untouched.
 ///
@@ -1572,6 +1647,8 @@ pub fn process_files(
                         );
                         leveled.mapv_inplace(|v| v * 4.0);
                     }
+                    // Toe/shoulder shaping in density space before RA-4 curve.
+                    apply_toe_shoulder(&mut leveled, options.toe_strength, options.shoulder_strength, 4.0);
                     let mut image_u16 =
                         curve::apply_ra4_from_density(&leveled, ra4_params, 4.0, options.curve_white);
                     if options.apply_lab {
@@ -1611,6 +1688,9 @@ pub fn process_files(
                         );
                         leveled.mapv_inplace(|v| v * 4.0);
                     }
+                    // Toe/shoulder shaping also applies in FilmPrint mode, using
+                    // the same density range.
+                    apply_toe_shoulder(&mut leveled, options.toe_strength, options.shoulder_strength, 4.0);
                     let mut image_u16 =
                         curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
                     if options.apply_lab {
@@ -2095,6 +2175,8 @@ pub fn process_one_to_preview(
                     );
                     leveled.mapv_inplace(|v| v * 4.0);
                 }
+                // Toe/shoulder shaping in density space before RA-4 curve (preview path).
+                apply_toe_shoulder(&mut leveled, options.toe_strength, options.shoulder_strength, 4.0);
                 if options.verbose_debug {
                     let _ =
                         write!(dbg, "{}", fmt_stats("  pre-curve density:", &channel_stats(&leveled)));
@@ -2170,6 +2252,8 @@ pub fn process_one_to_preview(
                     );
                     leveled.mapv_inplace(|v| v * 4.0);
                 }
+                // Toe/shoulder shaping for FilmPrint preview as well.
+                apply_toe_shoulder(&mut leveled, options.toe_strength, options.shoulder_strength, 4.0);
                 let mut u16_img =
                     curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
                 if options.apply_lab {
