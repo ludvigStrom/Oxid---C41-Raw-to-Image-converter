@@ -173,6 +173,13 @@ pub struct PipelineOptions {
     /// 1.0 = neutral (no change), >1.0 = more saturated. Default 1.2.
     /// Compensates for the S-curve's tendency to compress channel differences.
     pub saturation: f32,
+    /// Gaussian-masked shadow zone density offset. Positive = brighten shadows
+    /// (adds density in low-D region → brighter through RA-4), negative = darken.
+    /// Applied per-pixel weighted by a Gaussian centered on the shadow zone.
+    pub zone_shadows: f32,
+    /// Gaussian-masked highlight zone density offset. Positive = brighten highlights
+    /// (adds density in high-D region), negative = darken highlights.
+    pub zone_highlights: f32,
     /// Post-curve highlight warmth (Noritsu/Frontier style).
     /// Adds a golden/warm tint to neutral highlights while leaving saturated
     /// colors (blue sky, red etc.) untouched.
@@ -245,6 +252,8 @@ impl Default for PipelineOptions {
             fp_color_bleed: 0.08,
             fp_vibrance: 0.3,
             saturation: 1.2,
+            zone_shadows: 0.0,
+            zone_highlights: 0.0,
             highlight_warmth: 0.4,
             apply_lab: false,
             lab_separation: 0.0,
@@ -1049,6 +1058,52 @@ fn apply_density_saturation(image: &mut Array3<f32>, saturation: f32) {
     }
 }
 
+/// Gaussian-masked zone density adjustments: apply shadow and highlight offsets
+/// that only affect their respective tonal zone, leaving midtones untouched.
+///
+/// Operates in density space (higher D = brighter output through RA-4).
+/// `shadows` > 0 adds density to the shadow zone (brightens shadows).
+/// `highlights` < 0 subtracts density from the highlight zone (darkens highlights).
+///
+/// Each pixel's mean density determines its zone membership via a Gaussian mask.
+/// The shadow mask is centered on low-density values, the highlight mask on high.
+fn apply_zone_density_adjustments(image: &mut Array3<f32>, shadows: f32, highlights: f32) {
+    if shadows.abs() < 1e-6 && highlights.abs() < 1e-6 {
+        return;
+    }
+    let (h, w, _) = image.dim();
+
+    const S_CENTER: f32 = 0.4;
+    const S_INV_2S2: f32 = 1.0 / 0.25;
+    const H_CENTER: f32 = 2.2;
+    const H_INV_2S2: f32 = 1.0 / 0.50;
+    const SCALE: f32 = 2.0;
+
+    let s_amount = shadows * SCALE;
+    let h_amount = highlights * SCALE;
+
+    for y in 0..h {
+        for x in 0..w {
+            let dr = image[[y, x, 0]];
+            let dg = image[[y, x, 1]];
+            let db = image[[y, x, 2]];
+            let d_mean = (dr + dg + db) * (1.0 / 3.0);
+
+            let s_diff = d_mean - S_CENTER;
+            let s_mask = (-s_diff * s_diff * S_INV_2S2).exp();
+
+            let h_diff = d_mean - H_CENTER;
+            let h_mask = (-h_diff * h_diff * H_INV_2S2).exp();
+
+            let offset = s_amount * s_mask + h_amount * h_mask;
+
+            image[[y, x, 0]] = (dr + offset).max(0.0);
+            image[[y, x, 1]] = (dg + offset).max(0.0);
+            image[[y, x, 2]] = (db + offset).max(0.0);
+        }
+    }
+}
+
 /// Build `FilmPrintParams` from `PipelineOptions`.
 fn build_film_print_params(opts: &PipelineOptions) -> curve::FilmPrintParams {
     curve::FilmPrintParams {
@@ -1372,6 +1427,7 @@ pub fn process_files(
         // Step 5.5: Density-domain saturation boost (before RA-4 curve).
         if options.debug_pipeline_step >= 5 {
             apply_density_saturation(&mut image, options.saturation);
+            apply_zone_density_adjustments(&mut image, options.zone_shadows, options.zone_highlights);
         }
 
         // Optional crop (export path only): keep only selected region.
@@ -1902,9 +1958,11 @@ pub fn process_one_to_preview(
     // Step 5.5: Density-domain saturation boost (before RA-4 curve).
     if options.debug_pipeline_step >= 5 {
         apply_density_saturation(&mut image, options.saturation);
+        apply_zone_density_adjustments(&mut image, options.zone_shadows, options.zone_highlights);
         if options.verbose_debug {
-            let _ = writeln!(dbg, "Step 5.5: saturation boost = {:.2}", options.saturation);
-            let _ = write!(dbg, "{}", fmt_stats("  after saturation boost:", &channel_stats(&image)));
+            let _ = writeln!(dbg, "Step 5.5: saturation={:.2}  zone_shadows={:.3}  zone_highlights={:.3}",
+                options.saturation, options.zone_shadows, options.zone_highlights);
+            let _ = write!(dbg, "{}", fmt_stats("  after saturation+zones:", &channel_stats(&image)));
         }
     }
     let _ = writeln!(dbg);

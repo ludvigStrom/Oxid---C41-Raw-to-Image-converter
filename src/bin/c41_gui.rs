@@ -406,6 +406,8 @@ fn default_options() -> PipelineOptions {
         fp_color_bleed: 0.08,
         fp_vibrance: 0.3,
         saturation: 1.2,
+        zone_shadows: 0.0,
+        zone_highlights: 0.0,
         highlight_warmth: 0.4,
         apply_lab: false,
         lab_separation: 0.0,
@@ -475,6 +477,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.fp_gamma_b.to_bits().hash(&mut h);
     opts.fp_color_bleed.to_bits().hash(&mut h);
     opts.fp_vibrance.to_bits().hash(&mut h);
+    opts.zone_shadows.to_bits().hash(&mut h);
+    opts.zone_highlights.to_bits().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
@@ -669,9 +673,9 @@ struct ExposureParams {
     pub density: f32,
     /// Paper grade / contrast in normalized units. 1.0 ≈ default curve_gamma.
     pub grade: f32,
-    /// Black point lift in density space (maps to lut_in_black).
+    /// Zone-masked shadow density offset. Positive = brighten shadows.
     pub shadows: f32,
-    /// Highlight compression / pull-in (maps to lut_in_white / curve_white).
+    /// Zone-masked highlight density offset. Positive = brighten highlights.
     pub highlights: f32,
     /// Midtone hardness (maps to lut_in_mid / effective contrast around mid-gray).
     pub hardness: f32,
@@ -690,8 +694,8 @@ fn exposure_from_opts(opts: &PipelineOptions) -> ExposureParams {
     ExposureParams {
         density,
         grade,
-        shadows: opts.lut_in_black,
-        highlights: 1.0 - opts.lut_in_white,
+        shadows: opts.zone_shadows,
+        highlights: opts.zone_highlights,
         hardness: opts.lut_in_mid,
     }
 }
@@ -704,17 +708,12 @@ fn apply_exposure_to_opts(exp: &ExposureParams, opts: &mut PipelineOptions) {
     let highlights = exp.highlights.clamp(-0.3, 0.3);
     let hardness = exp.hardness.clamp(0.1, 4.0);
 
-    // Map back into the underlying curve/levels parameters.
     opts.curve_offset = density - 1.0;
     opts.curve_gamma = 2.5 * grade;
-
-    opts.lut_in_black = shadows;
-    opts.lut_in_white = 1.0 - highlights;
     opts.lut_in_mid = hardness;
 
-    // Tie RA-4 white pull-in slightly to highlight compression so the
-    // Exposure slider naturally protects highlights.
-    opts.curve_white = 1.0 - 0.5 * highlights;
+    opts.zone_shadows = shadows;
+    opts.zone_highlights = highlights;
 }
 
 /// CMY-style print balance wrapper for FilmPrint per-channel offsets.
