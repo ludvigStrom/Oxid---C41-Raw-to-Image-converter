@@ -173,6 +173,10 @@ pub struct PipelineOptions {
     /// 1.0 = neutral (no change), >1.0 = more saturated. Default 1.2.
     /// Compensates for the S-curve's tendency to compress channel differences.
     pub saturation: f32,
+    /// Shadow cast auto-correction strength. Detects residual per-channel color
+    /// imbalance in the shadow (low-density) zone and corrects toward neutral.
+    /// 0.0 = off, 1.0 = full correction. Applied after WB, before density matrix.
+    pub shadow_cast_strength: f32,
     /// Gaussian-masked shadow zone density offset. Positive = brighten shadows
     /// (adds density in low-D region → brighter through RA-4), negative = darken.
     /// Applied per-pixel weighted by a Gaussian centered on the shadow zone.
@@ -252,6 +256,7 @@ impl Default for PipelineOptions {
             fp_color_bleed: 0.08,
             fp_vibrance: 0.3,
             saturation: 1.2,
+            shadow_cast_strength: 0.0,
             zone_shadows: 0.0,
             zone_highlights: 0.0,
             highlight_warmth: 0.4,
@@ -1058,6 +1063,80 @@ fn apply_density_saturation(image: &mut Array3<f32>, saturation: f32) {
     }
 }
 
+/// Analyze shadow cast: measure per-channel color imbalance in the low-density
+/// (shadow) zone. Returns a correction vector (dr, dg, db) that pulls the shadow
+/// average toward neutral gray. All zeros if no shadow pixels found.
+fn analyze_shadow_cast(image: &Array3<f32>, threshold: f32) -> (f32, f32, f32) {
+    let (h, w, _) = image.dim();
+    let mut sum_r = 0.0_f64;
+    let mut sum_g = 0.0_f64;
+    let mut sum_b = 0.0_f64;
+    let mut count = 0u64;
+
+    for y in 0..h {
+        for x in 0..w {
+            let dr = image[[y, x, 0]];
+            let dg = image[[y, x, 1]];
+            let db = image[[y, x, 2]];
+            let d_mean = (dr + dg + db) * (1.0 / 3.0);
+            if d_mean < threshold {
+                sum_r += dr as f64;
+                sum_g += dg as f64;
+                sum_b += db as f64;
+                count += 1;
+            }
+        }
+    }
+
+    if count == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+
+    let avg_r = (sum_r / count as f64) as f32;
+    let avg_g = (sum_g / count as f64) as f32;
+    let avg_b = (sum_b / count as f64) as f32;
+    let target = (avg_r + avg_g + avg_b) * (1.0 / 3.0);
+
+    (target - avg_r, target - avg_g, target - avg_b)
+}
+
+/// Apply shadow cast correction: adds the correction vector weighted by a smooth
+/// ramp that is strongest near D=0 (deep shadows) and fades to zero by
+/// `threshold`. The exponent (1.5) makes the falloff nonlinear so midtones
+/// are barely affected.
+fn apply_shadow_cast_correction(
+    image: &mut Array3<f32>,
+    correction: (f32, f32, f32),
+    strength: f32,
+    threshold: f32,
+) {
+    if strength.abs() < 1e-6 {
+        return;
+    }
+    let (cr, cg, cb) = correction;
+    if cr.abs() < 1e-6 && cg.abs() < 1e-6 && cb.abs() < 1e-6 {
+        return;
+    }
+    let (h, w, _) = image.dim();
+    let inv_thresh = 1.0 / threshold.max(1e-6);
+
+    for y in 0..h {
+        for x in 0..w {
+            let dr = image[[y, x, 0]];
+            let dg = image[[y, x, 1]];
+            let db = image[[y, x, 2]];
+            let d_mean = (dr + dg + db) * (1.0 / 3.0);
+
+            let t = (1.0 - d_mean * inv_thresh).max(0.0);
+            let weight = t * t.sqrt() * strength; // t^1.5
+
+            image[[y, x, 0]] = (dr + cr * weight).max(0.0);
+            image[[y, x, 1]] = (dg + cg * weight).max(0.0);
+            image[[y, x, 2]] = (db + cb * weight).max(0.0);
+        }
+    }
+}
+
 /// Gaussian-masked zone density adjustments: apply shadow and highlight offsets
 /// that only affect their respective tonal zone, leaving midtones untouched.
 ///
@@ -1378,6 +1457,12 @@ pub fn process_files(
                 image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v + off_r);
                 image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v + off_g);
                 image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v + off_b);
+            }
+
+            // Step 4.5: Shadow cast correction (auto-neutralize shadow color cast).
+            if options.shadow_cast_strength > 0.0 {
+                let cast = analyze_shadow_cast(&image, 0.8);
+                apply_shadow_cast_correction(&mut image, cast, options.shadow_cast_strength, 0.8);
             }
         }
 
@@ -1882,8 +1967,16 @@ pub fn process_one_to_preview(
             image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v + off_b);
         }
 
+        // Step 4.5: Shadow cast correction (auto-neutralize shadow color cast).
+        if options.shadow_cast_strength > 0.0 {
+            let cast = analyze_shadow_cast(&image, 0.8);
+            apply_shadow_cast_correction(&mut image, cast, options.shadow_cast_strength, 0.8);
+            let _ = writeln!(dbg, "Shadow cast correction: vec=({:+.4}, {:+.4}, {:+.4}) strength={:.2}",
+                cast.0, cast.1, cast.2, options.shadow_cast_strength);
+        }
+
         if options.verbose_debug {
-            let _ = write!(dbg, "{}", fmt_stats("Step 4 (after WB + film γ):", &channel_stats(&image)));
+            let _ = write!(dbg, "{}", fmt_stats("Step 4 (after WB + film γ + shadow cast):", &channel_stats(&image)));
         }
     } else {
         let _ = writeln!(dbg, "Step 4: SKIPPED (pipeline_step < 4)");

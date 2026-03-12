@@ -406,6 +406,7 @@ fn default_options() -> PipelineOptions {
         fp_color_bleed: 0.08,
         fp_vibrance: 0.3,
         saturation: 1.2,
+        shadow_cast_strength: 0.0,
         zone_shadows: 0.0,
         zone_highlights: 0.0,
         highlight_warmth: 0.4,
@@ -477,6 +478,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.fp_gamma_b.to_bits().hash(&mut h);
     opts.fp_color_bleed.to_bits().hash(&mut h);
     opts.fp_vibrance.to_bits().hash(&mut h);
+    opts.shadow_cast_strength.to_bits().hash(&mut h);
     opts.zone_shadows.to_bits().hash(&mut h);
     opts.zone_highlights.to_bits().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
@@ -1874,6 +1876,21 @@ impl eframe::App for C41Gui {
                         });
                     });
                     }
+
+                    ui.collapsing("Shadow cast correction", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Auto-neutralize residual color in shadows.\n\
+                                 0 = off, 1 = full correction."
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut opts.shadow_cast_strength, 0.0..=1.5)
+                                .fixed_decimals(2),
+                        );
+                    });
 
                     ui.collapsing("Film gamma", |ui| {
                         ui.label(
