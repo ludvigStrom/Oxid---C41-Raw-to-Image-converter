@@ -2871,19 +2871,14 @@ impl eframe::App for C41Gui {
 
             if let Some(idx) = self.selected_index {
                 if idx < self.images.len() {
-                    if let Some((full_w, full_h, full_rgb)) =
-                        self.images[idx].preview_full_rgb.clone()
                     {
                         let available = ui.available_rect_before_wrap();
                         const CONTROL_ROW_HEIGHT: f32 = 28.0;
                         const HISTOGRAM_HEIGHT: f32 = 72.0;
                         const BOTTOM_PADDING: f32 = 8.0;
-                        const IMAGE_PREVIEW_BOTTOM_PADDING: f32 = 16.0; // padding below the image
+                        const IMAGE_PREVIEW_BOTTOM_PADDING: f32 = 16.0;
                         const TOP_PADDING: f32 = 12.0;
                         const INFO_ROW_HEIGHT: f32 = 18.0;
-
-                        let full_w_f = full_w as f32;
-                        let full_h_f = full_h as f32;
 
                         let reserved_bottom = IMAGE_PREVIEW_BOTTOM_PADDING
                             + INFO_ROW_HEIGHT
@@ -2894,31 +2889,47 @@ impl eframe::App for C41Gui {
                         let canvas_h = (available.height() - reserved_bottom).max(60.0);
                         let canvas_w = available.width();
 
-                        // Upload full-frame texture once (reuse across zoom/pan).
-                        let tex = {
-                            let entry = &self.images[idx];
-                            let size = [full_w as usize, full_h as usize];
-                            let pixels: Vec<egui::Color32> = full_rgb
-                                .chunks_exact(3)
-                                .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
-                                .collect();
-                            let image = egui::ColorImage { size, pixels };
-                            let tex_opts = if entry.preview_zoom > 1.0 {
-                                // >100%: nearest-neighbour so you see true pixel structure.
-                                egui::TextureOptions::NEAREST
-                            } else {
-                                // < =100%: linear sampling for smoother downscale.
-                                egui::TextureOptions::LINEAR
-                            };
-                            ui.ctx().load_texture(
-                                format!("preview_full_{}", idx),
-                                image,
-                                tex_opts,
-                            )
+                        // Extract image dims with fallback so the layout is stable before
+                        // the first preview arrives (no jump when data loads in).
+                        let full_rgb_opt = self.images[idx].preview_full_rgb.clone();
+                        let (full_w, full_h) = if let Some((w, h, _)) = &full_rgb_opt {
+                            (*w, *h)
+                        } else {
+                            self.images[idx].preview_input_size
+                                .map(|s| (s[0], s[1]))
+                                .unwrap_or((canvas_w as u32, (canvas_w * 2.0 / 3.0) as u32))
                         };
-                        self.images[idx].preview_texture = Some(tex.clone());
+                        let full_w_f = (full_w as f32).max(1.0);
+                        let full_h_f = (full_h as f32).max(1.0);
 
-                        // Allocate the full canvas area — like Photoshop's gray workspace.
+                        // Upload texture only when RGB data is available.
+                        let tex_opt: Option<egui::TextureHandle> =
+                            if let Some((fw, fh, full_rgb)) = &full_rgb_opt {
+                                let entry = &self.images[idx];
+                                let size = [*fw as usize, *fh as usize];
+                                let pixels: Vec<egui::Color32> = full_rgb
+                                    .chunks_exact(3)
+                                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                    .collect();
+                                let image = egui::ColorImage { size, pixels };
+                                let tex_opts = if entry.preview_zoom > 1.0 {
+                                    egui::TextureOptions::NEAREST
+                                } else {
+                                    egui::TextureOptions::LINEAR
+                                };
+                                Some(ui.ctx().load_texture(
+                                    format!("preview_full_{}", idx),
+                                    image,
+                                    tex_opts,
+                                ))
+                            } else {
+                                None
+                            };
+                        if let Some(tex) = &tex_opt {
+                            self.images[idx].preview_texture = Some(tex.clone());
+                        }
+
+                        // Allocate the full canvas area — always, so the layout never jumps.
                         ui.add_space(TOP_PADDING);
                         let (canvas_rect, canvas_resp) = ui.allocate_exact_size(
                             egui::vec2(canvas_w, canvas_h),
@@ -2947,18 +2958,20 @@ impl eframe::App for C41Gui {
                             egui::vec2(img_w, img_h),
                         );
 
-                        // Draw only the visible intersection of image and canvas.
-                        let vis_rect = vir_rect.intersect(canvas_rect);
-                        if vis_rect.width() > 0.0 && vis_rect.height() > 0.0 {
-                            let uv_l = (vis_rect.left()   - vir_rect.left()) / img_w;
-                            let uv_t = (vis_rect.top()    - vir_rect.top())  / img_h;
-                            let uv_r = (vis_rect.right()  - vir_rect.left()) / img_w;
-                            let uv_b = (vis_rect.bottom() - vir_rect.top())  / img_h;
-                            let uv = egui::Rect::from_min_max(
-                                egui::pos2(uv_l, uv_t),
-                                egui::pos2(uv_r, uv_b),
-                            );
-                            canvas_painter.image(tex.id(), vis_rect, uv, egui::Color32::WHITE);
+                        // Draw image only when texture is ready.
+                        if let Some(tex) = &tex_opt {
+                            let vis_rect = vir_rect.intersect(canvas_rect);
+                            if vis_rect.width() > 0.0 && vis_rect.height() > 0.0 {
+                                let uv_l = (vis_rect.left()   - vir_rect.left()) / img_w;
+                                let uv_t = (vis_rect.top()    - vir_rect.top())  / img_h;
+                                let uv_r = (vis_rect.right()  - vir_rect.left()) / img_w;
+                                let uv_b = (vis_rect.bottom() - vir_rect.top())  / img_h;
+                                let uv = egui::Rect::from_min_max(
+                                    egui::pos2(uv_l, uv_t),
+                                    egui::pos2(uv_r, uv_b),
+                                );
+                                canvas_painter.image(tex.id(), vis_rect, uv, egui::Color32::WHITE);
+                            }
                         }
 
                         // image_rect = canvas_rect so overlays can paint across the full canvas.
@@ -2983,19 +2996,35 @@ impl eframe::App for C41Gui {
                         };
                         ui.add_space(IMAGE_PREVIEW_BOTTOM_PADDING);
 
-                        // Loading spinner overlay.
-                        if show_loader {
+                        // Loading spinner overlay — drawn entirely via canvas_painter so it
+                        // never touches the UI layout cursor (which would shift the histogram).
+                        // Also show when no preview data is available yet (first load).
+                        if show_loader || full_rgb_opt.is_none() {
                             canvas_painter.rect_filled(
-                                canvas_rect, 0.0,
-                                egui::Color32::from_rgba_premultiplied(0, 0, 0, 80),
+                                canvas_rect,
+                                0.0,
+                                egui::Color32::from_rgba_premultiplied(0, 0, 0, 90),
                             );
-                            let spinner_rect =
-                                egui::Rect::from_center_size(canvas_rect.center(), egui::vec2(22.0, 22.0));
-                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(spinner_rect), |ui| {
-                                ui.centered_and_justified(|ui| {
-                                    ui.spinner();
-                                });
-                            });
+                            let center = canvas_rect.center();
+                            let radius = 11.0;
+                            let t = ctx.input(|i| i.time) as f32;
+                            let start = t * std::f32::consts::TAU * 0.8;
+                            let arc = std::f32::consts::PI * 1.5;
+                            let steps = 28usize;
+                            let pts: Vec<egui::Pos2> = (0..=steps)
+                                .map(|i| {
+                                    let a = start + arc * i as f32 / steps as f32;
+                                    egui::pos2(
+                                        center.x + a.cos() * radius,
+                                        center.y + a.sin() * radius,
+                                    )
+                                })
+                                .collect();
+                            canvas_painter.add(egui::Shape::line(
+                                pts,
+                                egui::Stroke::new(2.5, egui::Color32::from_gray(210)),
+                            ));
+                            ctx.request_repaint();
                         }
 
                         // Zoom with scroll wheel — always works.
@@ -3679,17 +3708,8 @@ impl eframe::App for C41Gui {
                                 &painter,
                             );
                         }
-                        return;
                     }
                 }
-                ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() / 2.0 - 20.0);
-                    if show_loader {
-                        ui.spinner();
-                        ui.add_space(8.0);
-                    }
-                    ui.label("Preview not ready yet.");
-                });
             } else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 2.0 - 20.0);
