@@ -107,8 +107,12 @@ struct ImageEntry {
     /// Full processed preview buffer (post-curve) at `preview_full_size`.
     /// Used for zoom/pan ROI rendering without re-running the pipeline.
     preview_full_rgb: Option<(u32, u32, Vec<u8>)>,
-    /// Dimensions of the image at the stage where D-min/flat-field are applied (before preview downscale).
+    /// Dimensions of the preview working image (downscaled). Used as the coordinate reference
+    /// space for crop/dmin rect overlays.
     preview_input_size: Option<[u32; 2]>,
+    /// True source resolution of the imported file (full sensor/image dimensions).
+    /// Used only for display in the info bar.
+    raw_source_size: Option<[u32; 2]>,
     /// Zoom factor for preview: 1.0 = full-frame fit, >1.0 = zoom in.
     preview_zoom: f32,
     /// Preview pan in normalized image space [0, 1] (center of the view).
@@ -1016,7 +1020,10 @@ impl eframe::App for C41Gui {
                         self.images[idx].preview_texture = None;
                         self.images[idx].preview_hash = hash;
                         self.images[idx].preview_full_rgb = Some((w, h, rgb.clone()));
-                        self.images[idx].preview_input_size = Some([input_w, input_h]);
+                        // preview_input_size = preview working dims (crop/dmin coord reference).
+                        self.images[idx].preview_input_size = Some([w, h]);
+                        // raw_source_size = true sensor/file dims (info bar display only).
+                        self.images[idx].raw_source_size = Some([input_w, input_h]);
                         if let Some(thumb_image) = make_thumbnail_from_rgb(&rgb, w, h, THUMB_MAX_SIZE) {
                             let thumb_tex = ctx.load_texture(
                                 format!(
@@ -1233,6 +1240,7 @@ impl eframe::App for C41Gui {
                                             preview_hash: 0,
                                             preview_full_rgb: None,
                                             preview_input_size: None,
+                                            raw_source_size: None,
                                             preview_zoom: 1.0,
                                             preview_pan: egui::vec2(0.5, 0.5),
                                             thumbnail_texture: None,
@@ -2872,11 +2880,13 @@ impl eframe::App for C41Gui {
                         const BOTTOM_PADDING: f32 = 8.0;
                         const IMAGE_PREVIEW_BOTTOM_PADDING: f32 = 16.0; // padding below the image
                         const TOP_PADDING: f32 = 12.0;
+                        const INFO_ROW_HEIGHT: f32 = 18.0;
 
                         let full_w_f = full_w as f32;
                         let full_h_f = full_h as f32;
 
                         let reserved_bottom = IMAGE_PREVIEW_BOTTOM_PADDING
+                            + INFO_ROW_HEIGHT
                             + CONTROL_ROW_HEIGHT
                             + BOTTOM_PADDING
                             + HISTOGRAM_HEIGHT
@@ -3025,26 +3035,6 @@ impl eframe::App for C41Gui {
                                 (entry.preview_pan.y - delta.y / img_h).clamp(0.0, 1.0);
                         }
 
-                        // Zoom/readout text.
-                        {
-                            let entry = &self.images[idx];
-                            let zoom_pct = (entry.preview_zoom * 100.0).round();
-                            let crop_w = (full_w as f32 / entry.preview_zoom).round() as u32;
-                            let crop_h = (full_h as f32 / entry.preview_zoom).round() as u32;
-                            let label = format!(
-                                "{:.0}%  resolution: {}px × {}px  crop: {}px × {}px",
-                                zoom_pct, full_w, full_h, crop_w, crop_h
-                            );
-                            let label_pos =
-                                egui::pos2(canvas_rect.left() + 4.0, canvas_rect.bottom() + 4.0);
-                            canvas_painter.text(
-                                label_pos,
-                                egui::Align2::LEFT_TOP,
-                                label,
-                                egui::TextStyle::Small.resolve(ui.style()),
-                                egui::Color32::LIGHT_GRAY,
-                            );
-                        }
 
                         // In Calibrate mode, draw and allow interaction with the
                         // 4-point overlay and the interpolated 24 patch boxes.
@@ -3454,8 +3444,62 @@ impl eframe::App for C41Gui {
                             }
                         }
 
+                        // Info row: total resolution · crop resolution (if active) · zoom %
+                        {
+                            let entry = &self.images[idx];
+                            let opts = &entry.options;
+
+                            // True source resolution (full sensor dims, not preview working size).
+                            let (src_w, src_h) = entry
+                                .raw_source_size
+                                .map(|s| (s[0], s[1]))
+                                .unwrap_or((full_w, full_h));
+
+                            // Crop resolution in source-pixel space (only when crop is active).
+                            let crop_dims = if opts.apply_crop {
+                                opts.crop_rect.map(|r| {
+                                    let scaled = scale_rect_to_size(
+                                        r,
+                                        opts.crop_rect_reference_size,
+                                        src_w,
+                                        src_h,
+                                    );
+                                    (scaled.width.max(1), scaled.height.max(1))
+                                })
+                            } else {
+                                None
+                            };
+
+                            // Photoshop-style zoom: 100 % = 1 image pixel : 1 screen pixel.
+                            let zoom_pct = base_scale * entry.preview_zoom * 100.0;
+
+                            let info_text = if let Some((cw, ch)) = crop_dims {
+                                format!(
+                                    "{} × {}  →  {} × {}  ·  {:.0}%",
+                                    src_w, src_h, cw, ch, zoom_pct
+                                )
+                            } else {
+                                format!("{} × {}  ·  {:.0}%", src_w, src_h, zoom_pct)
+                            };
+
+                            ui.allocate_ui(
+                                egui::vec2(ui.available_width(), INFO_ROW_HEIGHT),
+                                |ui| {
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(info_text)
+                                                    .small()
+                                                    .color(egui::Color32::from_gray(130)),
+                                            );
+                                        },
+                                    );
+                                },
+                            );
+                        }
+
                         // Row under the image: full filename (left, truncated) + Rotate icon buttons (right)
-                        ui.add_space(BOTTOM_PADDING);
                         ui.horizontal(|ui| {
                             let full_name = self.images[idx].path.display().to_string();
                             let max_filename_w = (ui.available_width() - 150.0).max(80.0); // leave room for rotate icons
@@ -3553,9 +3597,11 @@ impl eframe::App for C41Gui {
                             let rect = hist_rect;
                             let draw_rect = rect.shrink(1.0);
 
-                            let max_r = r_hist.iter().copied().max().unwrap_or(1) as f32;
-                            let max_g = g_hist.iter().copied().max().unwrap_or(1) as f32;
-                            let max_b = b_hist.iter().copied().max().unwrap_or(1) as f32;
+                            // Exclude the clipping bins (0 = pure black, 255 = pure white) from
+                            // the scale so that clipped pixels don't crush the rest of the curve.
+                            let max_r = r_hist[1..255].iter().copied().max().unwrap_or(1) as f32;
+                            let max_g = g_hist[1..255].iter().copied().max().unwrap_or(1) as f32;
+                            let max_b = b_hist[1..255].iter().copied().max().unwrap_or(1) as f32;
                             let max_all = max_r.max(max_g).max(max_b).max(1.0);
 
                             // Axes: X (bottom) and Y (left). Draw first so bin 0 is not hidden by Y-axis.
@@ -3610,26 +3656,26 @@ impl eframe::App for C41Gui {
 
                                     painter.add(egui::Shape::line(
                                         curve_points,
-                                        egui::Stroke::new(2.0, line_color),
+                                        egui::Stroke::new(1.0, line_color),
                                     ));
                                 };
 
                             draw_channel(
                                 r_hist,
-                                egui::Color32::from_rgb(255, 80, 80),
-                                egui::Color32::from_rgba_premultiplied(255, 0, 0, 5),
+                                egui::Color32::from_rgba_unmultiplied(220, 70, 70, 140),
+                                egui::Color32::from_rgba_unmultiplied(200, 0, 0, 18),
                                 &painter,
                             );
                             draw_channel(
                                 g_hist,
-                                egui::Color32::from_rgb(110, 255, 110),
-                                egui::Color32::from_rgba_premultiplied(0, 255, 0, 5),
+                                egui::Color32::from_rgba_unmultiplied(80, 200, 80, 140),
+                                egui::Color32::from_rgba_unmultiplied(0, 200, 0, 18),
                                 &painter,
                             );
                             draw_channel(
                                 b_hist,
-                                egui::Color32::from_rgb(110, 160, 255),
-                                egui::Color32::from_rgba_premultiplied(0, 90, 255, 5),
+                                egui::Color32::from_rgba_unmultiplied(80, 130, 240, 140),
+                                egui::Color32::from_rgba_unmultiplied(0, 80, 220, 18),
                                 &painter,
                             );
                         }
