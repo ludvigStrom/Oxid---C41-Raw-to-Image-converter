@@ -147,7 +147,6 @@ enum UIMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessTab {
     Input,
-    Crop,
     Film,
 }
 
@@ -998,61 +997,13 @@ impl eframe::App for C41Gui {
                     self.preview_started_at = None;
                     if idx < self.images.len() {
                         let size = [w as usize, h as usize];
-                        let mut r_hist = [0u32; 256];
-                        let mut g_hist = [0u32; 256];
-                        let mut b_hist = [0u32; 256];
-                        let crop_in_preview = {
-                            let opts = &self.images[idx].options;
-                            if opts.apply_crop {
-                                if let Some(crop_rect) = opts.crop_rect {
-                                    let scaled = scale_rect_to_size(
-                                        crop_rect,
-                                        opts.crop_rect_reference_size,
-                                        input_w,
-                                        input_h,
-                                    );
-                                    Some(scale_rect_to_size(
-                                        scaled,
-                                        Some((input_w, input_h)),
-                                        w,
-                                        h,
-                                    ))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        };
-
                         let mut pixels: Vec<egui::Color32> = Vec::with_capacity(size[0] * size[1]);
-                        for (i, c) in rgb.chunks_exact(3).enumerate() {
-                            let x = (i % size[0]) as u32;
-                            let y = (i / size[0]) as u32;
-
-                            let in_hist_crop = if let Some(rect) = crop_in_preview {
-                                let x0 = rect.x.min(w.saturating_sub(1));
-                                let y0 = rect.y.min(h.saturating_sub(1));
-                                let x1 = (rect.x + rect.width).min(w).max(x0 + 1);
-                                let y1 = (rect.y + rect.height).min(h).max(y0 + 1);
-                                x >= x0 && x < x1 && y >= y0 && y < y1
-                            } else {
-                                true
-                            };
-
-                            if in_hist_crop {
-                                let r = c[0] as usize;
-                                let g = c[1] as usize;
-                                let b = c[2] as usize;
-                                r_hist[r] += 1;
-                                g_hist[g] += 1;
-                                b_hist[b] += 1;
-                            }
+                        for c in rgb.chunks_exact(3) {
                             pixels.push(egui::Color32::from_rgb(c[0], c[1], c[2]));
                         }
                         let _image = egui::ColorImage { size, pixels };
-                        // Histogram is computed above; we now keep the full preview RGB buffer
-                        // and rebuild the visible ROI texture on demand (zoom/pan) in the UI.
+                        // Histogram is computed in the background worker using a fixed-resolution
+                        // preview and the current crop; here we only update the preview buffers.
                         // Preview hash also incorporates zoom so changing zoom triggers re-render.
                         let base_hash =
                             options_hash_for(&self.images[idx].path, &self.images[idx].options);
@@ -1082,7 +1033,6 @@ impl eframe::App for C41Gui {
                         }
                         // Do not overwrite dmin/crop reference sizes here; they stay in the
                         // coordinate space where the user last edited them.
-                        self.images[idx].histogram = Some((r_hist, g_hist, b_hist));
 
                         // Kick off a background, higher-resolution histogram computation using
                         // a larger preview size. This refines the histogram without blocking UI.
@@ -1527,7 +1477,6 @@ impl eframe::App for C41Gui {
                 if self.mode == UIMode::Process {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.process_tab, ProcessTab::Input, "Input");
-                        ui.selectable_value(&mut self.process_tab, ProcessTab::Crop, "Crop");
                         ui.selectable_value(&mut self.process_tab, ProcessTab::Film, "Film");
                     });
                     ui.add_space(6.0);
@@ -2158,7 +2107,7 @@ impl eframe::App for C41Gui {
                         );
                   } // end Input tab guard
 
-                  if !in_process || self.process_tab == ProcessTab::Crop {
+                  if !in_process || self.process_tab == ProcessTab::Input {
                     // ════════════════════════════════════════════════════════
                     // Crop
                     // ════════════════════════════════════════════════════════
