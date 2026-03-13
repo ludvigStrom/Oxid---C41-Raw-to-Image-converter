@@ -28,12 +28,33 @@ pub enum BayerPattern {
     Bggr,
 }
 
-/// Demosaic a single-channel Bayer image into linear RGB (H, W, 3) using
+/// Top-level CFA descriptor passed through the pipeline.
+///
+/// Wraps either a standard 2×2 Bayer variant or a Fujifilm 6×6 X-Trans tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfaPattern {
+    /// Standard 2×2 Bayer (RGGB / GRBG / GBRG / BGGR).
+    Bayer(BayerPattern),
+    /// Fujifilm X-Trans 6×6 CFA.
+    ///
+    /// `pattern[r][c]` gives channel (0=R, 1=G, 2=B) for any cropped-image pixel
+    /// at row `y` and column `x`, where `r = y % 6` and `c = x % 6`.
+    XTrans([[u8; 6]; 6]),
+}
+
+/// Demosaic a single-channel CFA image into linear RGB (H, W, 3) using
 /// plain bilinear interpolation. Kept as a reference implementation and
-/// fallback for non-RGGB patterns.
+/// fallback for non-RGGB patterns. Supports both standard Bayer and X-Trans.
 ///
 /// Input must be shape (H, W, 1). Output is (H, W, 3) with channels in R, G, B order.
-pub fn demosaic_bilinear(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
+pub fn demosaic_bilinear(bayer: &Array3<f32>, pattern: CfaPattern) -> Result<Array3<f32>> {
+    match pattern {
+        CfaPattern::Bayer(p) => demosaic_bilinear_bayer(bayer, p),
+        CfaPattern::XTrans(xt) => demosaic_xtrans(bayer, xt),
+    }
+}
+
+fn demosaic_bilinear_bayer(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
     let (height, width, c) = bayer.dim();
     if c != 1 {
         bail!("Demosaic expects (H, W, 1), got channels {}", c);
@@ -63,17 +84,24 @@ pub fn demosaic_bilinear(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<A
     Ok(rgb)
 }
 
-/// Demosaic a Bayer image using a simple edge-aware scheme:
+/// Demosaic a CFA image using a simple edge-aware scheme:
 ///
-/// - For RGGB, the green channel at R/B sites is interpolated directionally
+/// - For RGGB Bayer, the green channel at R/B sites is interpolated directionally
 ///   based on local gradients (horizontal vs vertical), which greatly reduces
 ///   zippering along edges while keeping math linear.
 /// - Red/blue at all sites still use bilinear interpolation.
-/// - For non-RGGB patterns we currently fall back to `demosaic_bilinear`.
-pub fn demosaic_edge_aware(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
-    // For now, only RGGB gets the edge-aware green treatment.
+/// - For non-RGGB Bayer patterns falls back to `demosaic_bilinear_bayer`.
+/// - For X-Trans, delegates to `demosaic_xtrans`.
+pub fn demosaic_edge_aware(bayer: &Array3<f32>, pattern: CfaPattern) -> Result<Array3<f32>> {
+    match pattern {
+        CfaPattern::Bayer(p) => demosaic_edge_aware_bayer(bayer, p),
+        CfaPattern::XTrans(xt) => demosaic_xtrans(bayer, xt),
+    }
+}
+
+fn demosaic_edge_aware_bayer(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
     if !matches!(pattern, BayerPattern::Rggb) {
-        return demosaic_bilinear(bayer, pattern);
+        return demosaic_bilinear_bayer(bayer, pattern);
     }
 
     let (height, width, c) = bayer.dim();
@@ -106,16 +134,23 @@ pub fn demosaic_edge_aware(bayer: &Array3<f32>, pattern: BayerPattern) -> Result
     Ok(rgb)
 }
 
-/// Best-in-class demosaic for RGGB: edge-aware green plus **color-difference**
-/// (R−G, B−G) interpolation for red and blue.
+/// Best-in-class demosaic: edge-aware green plus **color-difference** (R−G, B−G)
+/// interpolation for red and blue on RGGB Bayer; for other Bayer patterns falls
+/// back to `demosaic_edge_aware_bayer`; for X-Trans delegates to `demosaic_xtrans`.
 ///
 /// High-frequency content in R and B is highly correlated with G. Interpolating
 /// (R−G) and (B−G) instead of R and B directly sharply reduces false color and
-/// zippering while preserving detail and grain. For non-RGGB patterns falls back
-/// to `demosaic_edge_aware`.
-pub fn demosaic_quality(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
+/// zippering while preserving detail and grain.
+pub fn demosaic_quality(bayer: &Array3<f32>, pattern: CfaPattern) -> Result<Array3<f32>> {
+    match pattern {
+        CfaPattern::Bayer(p) => demosaic_quality_bayer(bayer, p),
+        CfaPattern::XTrans(xt) => demosaic_xtrans(bayer, xt),
+    }
+}
+
+fn demosaic_quality_bayer(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Array3<f32>> {
     if !matches!(pattern, BayerPattern::Rggb) {
-        return demosaic_edge_aware(bayer, pattern);
+        return demosaic_edge_aware_bayer(bayer, pattern);
     }
 
     let (height, width, c) = bayer.dim();
@@ -157,6 +192,76 @@ pub fn demosaic_quality(bayer: &Array3<f32>, pattern: BayerPattern) -> Result<Ar
                 *ptr.add(base) = r;
                 *ptr.add(base + 1) = g;
                 *ptr.add(base + 2) = b;
+            }
+        }
+    });
+
+    Ok(rgb)
+}
+
+/// X-Trans 6×6 demosaic via inverse-distance-squared weighted interpolation.
+///
+/// For each output pixel the native channel is read directly. The two missing
+/// channels are computed as a 1/d² weighted average of all same-colour pixels
+/// within a ±3-pixel search window (7×7 = 49 candidates). Because the 6×6
+/// X-Trans tile fits inside that window, every colour is guaranteed to appear
+/// at least once for any interior pixel. Border pixels within 3 pixels of an
+/// edge may have fewer samples but are typically cropped out of the final image.
+///
+/// This is equivalent in quality to bilinear for standard Bayer and is a solid
+/// foundation; a Markesteijn-style green-first pass can be added later.
+fn demosaic_xtrans(bayer: &Array3<f32>, xtrans: [[u8; 6]; 6]) -> Result<Array3<f32>> {
+    let (height, width, c) = bayer.dim();
+    if c != 1 {
+        bail!("Demosaic expects (H, W, 1), got channels {}", c);
+    }
+
+    let bayer_2d = bayer.slice(ndarray::s![.., .., 0]);
+    let h = height as i32;
+    let w = width as i32;
+
+    let mut rgb = Array3::<f32>::zeros((height, width, 3));
+    let ptr_base = rgb.as_mut_ptr() as usize;
+
+    (0..height).into_par_iter().for_each(|y| {
+        let ptr = ptr_base as *mut f32;
+        let y_i = y as i32;
+        for x in 0..width {
+            let x_i = x as i32;
+            let native_ch = xtrans[y % 6][x % 6] as usize;
+
+            let mut sum = [0f32; 3];
+            let mut wt = [0f32; 3];
+
+            // Native pixel — exact value, weight 1.
+            sum[native_ch] += bayer_2d[[y, x]];
+            wt[native_ch] += 1.0;
+
+            // Search ±3 (7×7 window) for the two missing channels.
+            for dy in -3i32..=3 {
+                for dx in -3i32..=3 {
+                    if dy == 0 && dx == 0 {
+                        continue;
+                    }
+                    let sy = y_i + dy;
+                    let sx = x_i + dx;
+                    if sy < 0 || sy >= h || sx < 0 || sx >= w {
+                        continue;
+                    }
+                    let sy = sy as usize;
+                    let sx = sx as usize;
+                    let ch = xtrans[sy % 6][sx % 6] as usize;
+                    let inv_d2 = 1.0 / (dy * dy + dx * dx) as f32;
+                    sum[ch] += bayer_2d[[sy, sx]] * inv_d2;
+                    wt[ch] += inv_d2;
+                }
+            }
+
+            let base = y * width * 3 + x * 3;
+            unsafe {
+                *ptr.add(base) = if wt[0] > 0.0 { sum[0] / wt[0] } else { bayer_2d[[y, x]] };
+                *ptr.add(base + 1) = if wt[1] > 0.0 { sum[1] / wt[1] } else { bayer_2d[[y, x]] };
+                *ptr.add(base + 2) = if wt[2] > 0.0 { sum[2] / wt[2] } else { bayer_2d[[y, x]] };
             }
         }
     });

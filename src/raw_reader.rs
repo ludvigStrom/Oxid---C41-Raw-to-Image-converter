@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use ndarray::{Array2, Array3, Axis};
 use rawloader::RawImageData;
 
-use crate::demosaic::BayerPattern;
+use crate::demosaic::{BayerPattern, CfaPattern};
 
 /// Check that the CFA at `(origin_row, origin_col)` is a valid 2×2 Bayer pattern
 /// by verifying the 2×2 block repeats consistently over a 6×6 area.
@@ -31,6 +31,45 @@ fn is_bayer_cfa(cfa: &rawloader::CFA, origin_row: usize, origin_col: usize) -> b
         }
     }
     true
+}
+
+/// Check whether the CFA at `(origin_row, origin_col)` is an X-Trans 6×6 pattern
+/// by verifying the 6×6 tile repeats correctly over a 12×12 area (two periods).
+fn is_xtrans_cfa(cfa: &rawloader::CFA, origin_row: usize, origin_col: usize) -> bool {
+    // Read the 6×6 reference tile.
+    let mut tile = [[0usize; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 {
+            tile[r][c] = cfa.color_at(origin_row + r, origin_col + c);
+        }
+    }
+    // Verify it repeats over a 12×12 area.
+    for r in 0..12 {
+        for c in 0..12 {
+            if cfa.color_at(origin_row + r, origin_col + c) != tile[r % 6][c % 6] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Extract the 6×6 X-Trans tile as seen from the crop origin `(crop_top, crop_left)`.
+///
+/// The returned tile satisfies `tile[y % 6][x % 6] == cfa.color_at(crop_top + y, crop_left + x)`
+/// for any cropped-image coordinate `(y, x)`.
+fn extract_xtrans_tile(
+    cfa: &rawloader::CFA,
+    crop_top: usize,
+    crop_left: usize,
+) -> [[u8; 6]; 6] {
+    let mut tile = [[0u8; 6]; 6];
+    for r in 0..6 {
+        for c in 0..6 {
+            tile[r][c] = cfa.color_at(crop_top + r, crop_left + c) as u8;
+        }
+    }
+    tile
 }
 
 /// Detect the Bayer pattern by checking a 2×2 block at the given (row, col) origin.
@@ -63,7 +102,7 @@ fn detect_bayer_pattern_at(cfa: &rawloader::CFA, row: usize, col: usize) -> Opti
 /// 5. Detect and validate the CFA pattern (rejects X-Trans / non-Bayer sensors).
 ///
 /// Returns `(bayer_array, detected_pattern)`.
-pub fn load_raw_as_ndarray(path: &Path) -> Result<(Array3<f32>, BayerPattern)> {
+pub fn load_raw_as_ndarray(path: &Path) -> Result<(Array3<f32>, CfaPattern)> {
     let raw_image = rawloader::decode_file(path)
         .with_context(|| format!("rawloader failed to decode {}", path.display()))?;
 
@@ -96,17 +135,21 @@ pub fn load_raw_as_ndarray(path: &Path) -> Result<(Array3<f32>, BayerPattern)> {
 
     let cfa = &raw_image.cfa;
 
-    // Validate that this is a 2×2 Bayer sensor (not X-Trans or other exotic CFA).
-    if !is_bayer_cfa(cfa, crop_top, crop_left) {
+    // Detect the CFA type: standard 2×2 Bayer or Fujifilm 6×6 X-Trans.
+    let pattern: CfaPattern = if is_bayer_cfa(cfa, crop_top, crop_left) {
+        let bayer = detect_bayer_pattern_at(cfa, crop_top, crop_left)
+            .unwrap_or(BayerPattern::Rggb);
+        CfaPattern::Bayer(bayer)
+    } else if is_xtrans_cfa(cfa, crop_top, crop_left) {
+        let tile = extract_xtrans_tile(cfa, crop_top, crop_left);
+        CfaPattern::XTrans(tile)
+    } else {
         bail!(
-            "Non-Bayer CFA detected (e.g. Fuji X-Trans). Only standard 2×2 Bayer \
-             sensors (RGGB/GRBG/GBRG/BGGR) are supported. File: {}",
+            "Unsupported CFA pattern in {}. Only standard 2×2 Bayer \
+             (RGGB/GRBG/GBRG/BGGR) and Fujifilm X-Trans 6×6 are supported.",
             path.display()
         );
-    }
-
-    let pattern = detect_bayer_pattern_at(cfa, crop_top, crop_left)
-        .unwrap_or(BayerPattern::Rggb);
+    };
 
     let blacks = raw_image.blacklevels.map(|v| v as f32);
     let whites = raw_image.whitelevels.map(|v| v as f32);

@@ -75,15 +75,15 @@ pub enum OutputLutEncoding {
     LinearDensity,
 }
 
-use crate::demosaic::BayerPattern;
+use crate::demosaic::CfaPattern;
 
 /// Raw sensor data cached for fast previews/exports.
 #[derive(Debug, Clone)]
 pub enum CachedSensor {
-    /// Single-channel Bayer mosaic plus its pattern.
+    /// Single-channel CFA mosaic (Bayer or X-Trans) plus its pattern descriptor.
     Bayer {
         data: Array3<f32>,
-        pattern: BayerPattern,
+        pattern: CfaPattern,
     },
     /// Linear RGB image (e.g. PNG or already-demosaiced source).
     Rgb(Array3<f32>),
@@ -559,6 +559,53 @@ fn rotate_array3_90_cw(image: &Array3<f32>) -> Array3<f32> {
         }
     }
     out
+}
+
+/// Downsample a single-channel X-Trans array for preview, preserving the 6×6
+/// tile period so the CFA pattern survives the downscale intact.
+fn downsample_xtrans_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f32> {
+    let (h, w, c) = bayer.dim();
+    assert_eq!(c, 1, "Expected single-channel CFA for preview");
+
+    if w as u32 <= max_width {
+        return bayer.clone();
+    }
+
+    let n_super_w = w / 6;
+    let n_super_h = h / 6;
+    let max_super_w = (max_width as usize / 6).max(1);
+    let step = ((n_super_w as f32 / max_super_w as f32).ceil() as usize).max(1);
+
+    let out_super_w = n_super_w / step;
+    let out_super_h = n_super_h / step;
+    let out_w = out_super_w * 6;
+    let out_h = out_super_h * 6;
+
+    let mut out = Array3::<f32>::zeros((out_h, out_w, 1));
+    for sy in 0..out_super_h {
+        for sx in 0..out_super_w {
+            let src_sy = sy * step * 6;
+            let src_sx = sx * step * 6;
+            for dy in 0..6 {
+                for dx in 0..6 {
+                    out[(sy * 6 + dy, sx * 6 + dx, 0)] = bayer[(src_sy + dy, src_sx + dx, 0)];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Dispatch to the correct CFA-aware preview downsampler.
+fn downsample_raw_for_preview(
+    bayer: &Array3<f32>,
+    pattern: CfaPattern,
+    max_width: u32,
+) -> Array3<f32> {
+    match pattern {
+        CfaPattern::Bayer(_) => downsample_bayer_for_preview(bayer, max_width),
+        CfaPattern::XTrans(_) => downsample_xtrans_for_preview(bayer, max_width),
+    }
 }
 
 /// Apply rotation (0, 90, 180, 270) to an image. Returns a new Array3.
@@ -1924,7 +1971,7 @@ pub fn process_one_to_preview(
             let (bh, bw, _) = bayer.dim();
             true_src_w = bw as u32;
             true_src_h = bh as u32;
-            let small_bayer = downsample_bayer_for_preview(&bayer, max_width);
+            let small_bayer = downsample_raw_for_preview(&bayer, pattern, max_width);
             let mut img = if options.debug_preview_simple_debayer {
                 demosaic::demosaic_bilinear(&small_bayer, pattern)?
             } else {
