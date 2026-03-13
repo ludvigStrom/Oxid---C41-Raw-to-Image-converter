@@ -715,7 +715,8 @@ fn exposure_from_opts(opts: &PipelineOptions) -> ExposureParams {
         grade,
         shadows: opts.zone_shadows,
         highlights: opts.zone_highlights,
-        hardness: opts.lut_in_mid,
+        // Expose hardness as a delta around neutral (lut_in_mid = 1.0).
+        hardness: opts.lut_in_mid - 1.0,
     }
 }
 
@@ -724,12 +725,13 @@ fn apply_exposure_to_opts(exp: &ExposureParams, opts: &mut PipelineOptions) {
     let density = exp.density.clamp(0.0, 2.0);
     let grade = exp.grade.clamp(0.2, 3.0);
     let shadows = exp.shadows.clamp(-0.3, 0.3);
-    let highlights = exp.highlights.clamp(-0.3, 0.3);
-    let hardness = exp.hardness.clamp(0.1, 4.0);
+    let highlights = exp.highlights.clamp(-0.5, 0.5);
+    let hardness = exp.hardness.clamp(-0.5, 0.5);
 
     opts.curve_offset = density - 1.0;
     opts.curve_gamma = 2.5 * grade;
-    opts.lut_in_mid = hardness;
+    // Map hardness delta back to lut_in_mid around neutral = 1.0.
+    opts.lut_in_mid = 1.0 + hardness;
 
     opts.zone_shadows = shadows;
     opts.zone_highlights = highlights;
@@ -1634,7 +1636,7 @@ impl eframe::App for C41Gui {
                             ui.label("Density");
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut exp.density, 0.0..=2.0)
+                                    egui::Slider::new(&mut exp.density, 0.5..=1.5)
                                         .fixed_decimals(2),
                                 )
                                 .changed();
@@ -1643,7 +1645,7 @@ impl eframe::App for C41Gui {
                             ui.label("Grade");
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut exp.grade, 0.2..=3.0)
+                                    egui::Slider::new(&mut exp.grade, 0.5..=2.0)
                                         .fixed_decimals(2),
                                 )
                                 .changed();
@@ -1661,7 +1663,7 @@ impl eframe::App for C41Gui {
                             ui.label("Highlights");
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut exp.highlights, -0.3..=0.3)
+                                    egui::Slider::new(&mut exp.highlights, -0.5..=0.5)
                                         .fixed_decimals(3),
                                 )
                                 .changed();
@@ -1670,9 +1672,8 @@ impl eframe::App for C41Gui {
                             ui.label("Hardness");
                             changed |= ui
                                 .add(
-                                    egui::Slider::new(&mut exp.hardness, 0.1..=4.0)
-                                        .logarithmic(true)
-                                        .fixed_decimals(2),
+                                    egui::Slider::new(&mut exp.hardness, -0.5..=0.5)
+                                        .fixed_decimals(3),
                                 )
                                 .changed();
                         });
@@ -1694,7 +1695,7 @@ impl eframe::App for C41Gui {
                                 ui.label("C");
                                 pb_changed |= ui
                                     .add(
-                                        egui::Slider::new(&mut pb.cyan, -1.0..=1.0)
+                                        egui::Slider::new(&mut pb.cyan, -0.5..=0.5)
                                             .fixed_decimals(2),
                                     )
                                     .changed();
@@ -1703,7 +1704,7 @@ impl eframe::App for C41Gui {
                                 ui.label("M");
                                 pb_changed |= ui
                                     .add(
-                                        egui::Slider::new(&mut pb.magenta, -1.0..=1.0)
+                                        egui::Slider::new(&mut pb.magenta, -0.5..=0.5)
                                             .fixed_decimals(2),
                                     )
                                     .changed();
@@ -1712,7 +1713,7 @@ impl eframe::App for C41Gui {
                                 ui.label("Y");
                                 pb_changed |= ui
                                     .add(
-                                        egui::Slider::new(&mut pb.yellow, -1.0..=1.0)
+                                        egui::Slider::new(&mut pb.yellow, -0.5..=0.5)
                                             .fixed_decimals(2),
                                     )
                                     .changed();
@@ -1741,14 +1742,14 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             ui.label("Toe");
                             ui.add(
-                                egui::Slider::new(&mut opts.toe_strength, -1.0..=1.0)
+                                egui::Slider::new(&mut opts.toe_strength, -0.5..=0.5)
                                     .fixed_decimals(2),
                             );
                         });
                         ui.horizontal(|ui| {
                             ui.label("Shoulder");
                             ui.add(
-                                egui::Slider::new(&mut opts.shoulder_strength, -1.0..=1.0)
+                                egui::Slider::new(&mut opts.shoulder_strength, -0.5..=0.5)
                                     .fixed_decimals(2),
                             );
                         });
@@ -1764,7 +1765,7 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             ui.label("Shadow cast");
                             ui.add(
-                                egui::Slider::new(&mut opts.shadow_cast_strength, 0.0..=1.5)
+                                egui::Slider::new(&mut opts.shadow_cast_strength, 0.0..=1.0)
                                     .fixed_decimals(2),
                             );
                         });
@@ -1801,7 +1802,7 @@ impl eframe::App for C41Gui {
                             ui.checkbox(&mut use_temp, "Color temperature (K)");
                             if use_temp {
                                 let mut k = opts.temp_k.unwrap_or(5500.0);
-                                ui.add(egui::Slider::new(&mut k, 2000.0..=12000.0).suffix(" K"));
+                                ui.add(egui::Slider::new(&mut k, 2500.0..=9000.0).suffix(" K"));
                                 opts.temp_k = Some(k);
                             } else {
                                 opts.temp_k = None;
@@ -1809,15 +1810,15 @@ impl eframe::App for C41Gui {
                             ui.label(egui::RichText::new("Density scale (1.0 = neutral, >1 = more color)").small().weak());
                             ui.horizontal(|ui| {
                                 ui.label("R");
-                                ui.add(egui::Slider::new(&mut opts.wb_r, 0.5..=2.0));
+                                ui.add(egui::Slider::new(&mut opts.wb_r, 0.7..=1.5));
                             });
                             ui.horizontal(|ui| {
                                 ui.label("G");
-                                ui.add(egui::Slider::new(&mut opts.wb_g, 0.5..=2.0));
+                                ui.add(egui::Slider::new(&mut opts.wb_g, 0.7..=1.5));
                             });
                             ui.horizontal(|ui| {
                                 ui.label("B");
-                                ui.add(egui::Slider::new(&mut opts.wb_b, 0.5..=2.0));
+                                ui.add(egui::Slider::new(&mut opts.wb_b, 0.7..=1.5));
                             });
                         }
                     });
@@ -1829,7 +1830,7 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             ui.label("Saturation");
                             ui.add(
-                                egui::Slider::new(&mut opts.saturation, 0.5..=2.5)
+                                egui::Slider::new(&mut opts.saturation, 0.7..=1.6)
                                     .fixed_decimals(2),
                             );
                         });
@@ -1845,7 +1846,7 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             ui.label("Warmth");
                             ui.add(
-                                egui::Slider::new(&mut opts.highlight_warmth, 0.0..=1.5)
+                                egui::Slider::new(&mut opts.highlight_warmth, 0.0..=0.6)
                                     .fixed_decimals(2),
                             );
                         });
@@ -1863,7 +1864,7 @@ impl eframe::App for C41Gui {
                             ui.horizontal(|ui| {
                                 ui.label("Separation");
                                 ui.add(
-                                    egui::Slider::new(&mut opts.lab_separation, -1.0..=1.0)
+                                    egui::Slider::new(&mut opts.lab_separation, -0.5..=0.5)
                                         .fixed_decimals(2),
                                 );
                             });
@@ -2034,7 +2035,7 @@ impl eframe::App for C41Gui {
                                 ui.horizontal(|ui| {
                                     ui.label("Border buffer");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.auto_norm_buffer, 0.0..=0.3)
+                                        egui::Slider::new(&mut opts.auto_norm_buffer, 0.1..=0.3)
                                             .fixed_decimals(2),
                                     );
                                 });
@@ -2096,7 +2097,7 @@ impl eframe::App for C41Gui {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label("Film γ");
-                            ui.add(egui::Slider::new(&mut opts.film_gamma, 0.3..=1.2));
+                            ui.add(egui::Slider::new(&mut opts.film_gamma, 0.4..=0.9));
                         });
                         ui.label(
                             egui::RichText::new(
@@ -2227,21 +2228,21 @@ impl eframe::App for C41Gui {
                                 ui.horizontal(|ui| {
                                     ui.label("R");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.fp_offset_r, -0.5..=0.5)
+                                        egui::Slider::new(&mut opts.fp_offset_r, -0.3..=0.3)
                                             .fixed_decimals(3),
                                     );
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("G");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.fp_offset_g, -0.5..=0.5)
+                                        egui::Slider::new(&mut opts.fp_offset_g, -0.3..=0.3)
                                             .fixed_decimals(3),
                                     );
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("B");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.fp_offset_b, -0.5..=0.5)
+                                        egui::Slider::new(&mut opts.fp_offset_b, -0.3..=0.3)
                                             .fixed_decimals(3),
                                     );
                                 });
@@ -2251,21 +2252,21 @@ impl eframe::App for C41Gui {
                                 ui.horizontal(|ui| {
                                     ui.label("R");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.fp_gamma_r, 0.5..=2.0)
+                                        egui::Slider::new(&mut opts.fp_gamma_r, 0.7..=1.5)
                                             .fixed_decimals(2),
                                     );
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("G");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.fp_gamma_g, 0.5..=2.0)
+                                        egui::Slider::new(&mut opts.fp_gamma_g, 0.7..=1.5)
                                             .fixed_decimals(2),
                                     );
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("B");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.fp_gamma_b, 0.5..=2.0)
+                                        egui::Slider::new(&mut opts.fp_gamma_b, 0.7..=1.5)
                                             .fixed_decimals(2),
                                     );
                                 });
@@ -2274,14 +2275,14 @@ impl eframe::App for C41Gui {
                                 ui.horizontal(|ui| {
                                     ui.label("Color bleed");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.fp_color_bleed, 0.0..=0.5)
+                                        egui::Slider::new(&mut opts.fp_color_bleed, 0.0..=0.3)
                                             .fixed_decimals(2),
                                     );
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Vibrance");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.fp_vibrance, 0.0..=2.0)
+                                        egui::Slider::new(&mut opts.fp_vibrance, 0.0..=1.0)
                                             .fixed_decimals(2),
                                     );
                                 });
@@ -3239,7 +3240,7 @@ impl eframe::App for C41Gui {
                         }
 
                         // Crop overlay: project image-space crop rect through camera.
-                        // Corner handles for resize; no body-move interaction so pan always works.
+                        // Always draw the mask; only draw interactive handles in the Input tab.
                         if self.mode == UIMode::Process {
                             if let Some(entry) = self.images.get_mut(idx) {
                                 let opts = &mut entry.options;
@@ -3266,112 +3267,186 @@ impl eframe::App for C41Gui {
                                             let mut right = scr_br.x;
                                             let mut bottom = scr_br.y;
 
-                                            let handle_radius = 5.0;
-                                            let mut rect_changed = false;
+                                            // Mask outside the crop. In the Film tab we use a fully
+                                            // opaque panel-fill color so the area behaves like a hard crop.
+                                            let overlay = if self.process_tab == ProcessTab::Film {
+                                                ui.visuals().panel_fill
+                                            } else {
+                                                egui::Color32::from_black_alpha(128)
+                                            };
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    image_rect.min,
+                                                    egui::pos2(image_rect.max.x, top),
+                                                ),
+                                                0.0,
+                                                overlay,
+                                            );
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(image_rect.min.x, bottom),
+                                                    image_rect.max,
+                                                ),
+                                                0.0,
+                                                overlay,
+                                            );
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(image_rect.min.x, top),
+                                                    egui::pos2(left, bottom),
+                                                ),
+                                                0.0,
+                                                overlay,
+                                            );
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(right, top),
+                                                    egui::pos2(image_rect.max.x, bottom),
+                                                ),
+                                                0.0,
+                                                overlay,
+                                            );
 
-                                            let corners = [
-                                                egui::pos2(left, top),
-                                                egui::pos2(right, top),
-                                                egui::pos2(left, bottom),
-                                                egui::pos2(right, bottom),
-                                            ];
-                                            for (ci, cp) in corners.iter().enumerate() {
-                                                let hr = egui::Rect::from_center_size(
-                                                    *cp,
-                                                    egui::vec2(handle_radius * 2.0, handle_radius * 2.0),
+                                            // When in the Input tab, show interactive handles and D-min rect
+                                            // *above* the overlay so the handles remain visible.
+                                            if self.process_tab == ProcessTab::Input {
+                                                let handle_radius = 5.0;
+                                                let mut rect_changed = false;
+
+                                                let corners = [
+                                                    egui::pos2(left, top),
+                                                    egui::pos2(right, top),
+                                                    egui::pos2(left, bottom),
+                                                    egui::pos2(right, bottom),
+                                                ];
+                                                for (ci, cp) in corners.iter().enumerate() {
+                                                    let hr = egui::Rect::from_center_size(
+                                                        *cp,
+                                                        egui::vec2(handle_radius * 2.0, handle_radius * 2.0),
+                                                    );
+                                                    let id = ui.make_persistent_id(("crop_handle", idx, ci));
+                                                    let resp =
+                                                        ui.interact(hr, id, egui::Sense::click_and_drag());
+                                                    if resp.dragged() {
+                                                        let d = resp.drag_delta();
+                                                        rect_changed = true;
+                                                        self.rect_dragging = true;
+                                                        match ci {
+                                                            0 => {
+                                                                left += d.x;
+                                                                top += d.y;
+                                                            }
+                                                            1 => {
+                                                                right += d.x;
+                                                                top += d.y;
+                                                            }
+                                                            2 => {
+                                                                left += d.x;
+                                                                bottom += d.y;
+                                                            }
+                                                            3 => {
+                                                                right += d.x;
+                                                                bottom += d.y;
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                }
+
+                                                let crop_screen = egui::Rect::from_min_max(
+                                                    egui::pos2(left, top),
+                                                    egui::pos2(right, bottom),
                                                 );
-                                                let id = ui.make_persistent_id(("crop_handle", idx, ci));
-                                                let resp = ui.interact(hr, id, egui::Sense::click_and_drag());
-                                                if resp.dragged() {
-                                                    let d = resp.drag_delta();
-                                                    rect_changed = true;
-                                                    self.rect_dragging = true;
-                                                    match ci {
-                                                        0 => { left += d.x; top += d.y; }
-                                                        1 => { right += d.x; top += d.y; }
-                                                        2 => { left += d.x; bottom += d.y; }
-                                                        3 => { right += d.x; bottom += d.y; }
-                                                        _ => {}
+                                                painter.rect_stroke(
+                                                    crop_screen,
+                                                    0.0,
+                                                    egui::Stroke::new(
+                                                        2.0,
+                                                        egui::Color32::from_rgb(120, 230, 120),
+                                                    ),
+                                                );
+                                                for p in [
+                                                    egui::pos2(left, top),
+                                                    egui::pos2(right, top),
+                                                    egui::pos2(left, bottom),
+                                                    egui::pos2(right, bottom),
+                                                ] {
+                                                    painter.circle_filled(
+                                                        p,
+                                                        handle_radius,
+                                                        egui::Color32::from_rgb(120, 230, 120),
+                                                    );
+                                                }
+
+                                                // Redraw D-min overlay above the darkened crop region.
+                                                if opts.dmin_mode == DminMode::SampleRegion
+                                                    && self.flat_field_path.is_none()
+                                                {
+                                                    if let Some(dmin_rect) = opts.dmin_rect {
+                                                        let dmin_rect = scale_rect_to_size(
+                                                            dmin_rect,
+                                                            opts.dmin_rect_reference_size,
+                                                            input_w,
+                                                            input_h,
+                                                        );
+                                                        let dtl = image_to_screen(
+                                                            dmin_rect.x as f32,
+                                                            dmin_rect.y as f32,
+                                                        );
+                                                        let dbr = image_to_screen(
+                                                            (dmin_rect.x + dmin_rect.width) as f32,
+                                                            (dmin_rect.y + dmin_rect.height) as f32,
+                                                        );
+                                                        let dsr = egui::Rect::from_min_max(dtl, dbr);
+                                                        painter.rect_stroke(
+                                                            dsr,
+                                                            0.0,
+                                                            egui::Stroke::new(
+                                                                1.5,
+                                                                egui::Color32::from_rgb(255, 200, 0),
+                                                            ),
+                                                        );
+                                                        for p in [
+                                                            egui::pos2(dtl.x, dtl.y),
+                                                            egui::pos2(dbr.x, dtl.y),
+                                                            egui::pos2(dtl.x, dbr.y),
+                                                            egui::pos2(dbr.x, dbr.y),
+                                                        ] {
+                                                            painter.circle_filled(
+                                                                p,
+                                                                5.0,
+                                                                egui::Color32::from_rgb(255, 200, 0),
+                                                            );
+                                                        }
                                                     }
                                                 }
-                                            }
 
-                                            // Darken outside crop area.
-                                            let overlay = egui::Color32::from_black_alpha(128);
-                                            painter.rect_filled(
-                                                egui::Rect::from_min_max(image_rect.min, egui::pos2(image_rect.max.x, top)),
-                                                0.0, overlay,
-                                            );
-                                            painter.rect_filled(
-                                                egui::Rect::from_min_max(egui::pos2(image_rect.min.x, bottom), image_rect.max),
-                                                0.0, overlay,
-                                            );
-                                            painter.rect_filled(
-                                                egui::Rect::from_min_max(egui::pos2(image_rect.min.x, top), egui::pos2(left, bottom)),
-                                                0.0, overlay,
-                                            );
-                                            painter.rect_filled(
-                                                egui::Rect::from_min_max(egui::pos2(right, top), egui::pos2(image_rect.max.x, bottom)),
-                                                0.0, overlay,
-                                            );
-
-                                            let crop_screen = egui::Rect::from_min_max(
-                                                egui::pos2(left, top),
-                                                egui::pos2(right, bottom),
-                                            );
-                                            painter.rect_stroke(
-                                                crop_screen, 0.0,
-                                                egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 230, 120)),
-                                            );
-                                            for p in [
-                                                egui::pos2(left, top), egui::pos2(right, top),
-                                                egui::pos2(left, bottom), egui::pos2(right, bottom),
-                                            ] {
-                                                painter.circle_filled(p, handle_radius, egui::Color32::from_rgb(120, 230, 120));
-                                            }
-
-                                            // Redraw D-min overlay above the darkened crop region.
-                                            if opts.dmin_mode == DminMode::SampleRegion
-                                                && self.flat_field_path.is_none()
-                                            {
-                                                if let Some(dmin_rect) = opts.dmin_rect {
-                                                    let dmin_rect = scale_rect_to_size(
-                                                        dmin_rect, opts.dmin_rect_reference_size, input_w, input_h,
-                                                    );
-                                                    let dtl = image_to_screen(dmin_rect.x as f32, dmin_rect.y as f32);
-                                                    let dbr = image_to_screen(
-                                                        (dmin_rect.x + dmin_rect.width) as f32,
-                                                        (dmin_rect.y + dmin_rect.height) as f32,
-                                                    );
-                                                    let dsr = egui::Rect::from_min_max(dtl, dbr);
-                                                    painter.rect_stroke(
-                                                        dsr, 0.0,
-                                                        egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 200, 0)),
-                                                    );
-                                                    for p in [
-                                                        egui::pos2(dtl.x, dtl.y), egui::pos2(dbr.x, dtl.y),
-                                                        egui::pos2(dtl.x, dbr.y), egui::pos2(dbr.x, dbr.y),
-                                                    ] {
-                                                        painter.circle_filled(p, 5.0, egui::Color32::from_rgb(255, 200, 0));
-                                                    }
+                                                if rect_changed {
+                                                    let (ix0, iy0) = screen_to_image(left, top);
+                                                    let (ix1, iy1) = screen_to_image(right, bottom);
+                                                    let iw = input_w as f32;
+                                                    let ih = input_h as f32;
+                                                    let x =
+                                                        ix0.round().clamp(0.0, iw - 1.0) as u32;
+                                                    let y =
+                                                        iy0.round().clamp(0.0, ih - 1.0) as u32;
+                                                    let x1 = ix1.round().clamp(0.0, iw) as u32;
+                                                    let y1 = iy1.round().clamp(0.0, ih) as u32;
+                                                    let mut wp = x1.saturating_sub(x).max(1);
+                                                    let mut hp = y1.saturating_sub(y).max(1);
+                                                    wp =
+                                                        wp.min(input_w.saturating_sub(x).max(1));
+                                                    hp =
+                                                        hp.min(input_h.saturating_sub(y).max(1));
+                                                    opts.crop_rect = Some(Rect {
+                                                        x,
+                                                        y,
+                                                        width: wp,
+                                                        height: hp,
+                                                    });
+                                                    opts.crop_rect_reference_size =
+                                                        Some((input_w, input_h));
                                                 }
-                                            }
-
-                                            if rect_changed {
-                                                let (ix0, iy0) = screen_to_image(left, top);
-                                                let (ix1, iy1) = screen_to_image(right, bottom);
-                                                let iw = input_w as f32;
-                                                let ih = input_h as f32;
-                                                let x = ix0.round().clamp(0.0, iw - 1.0) as u32;
-                                                let y = iy0.round().clamp(0.0, ih - 1.0) as u32;
-                                                let x1 = ix1.round().clamp(0.0, iw) as u32;
-                                                let y1 = iy1.round().clamp(0.0, ih) as u32;
-                                                let mut wp = x1.saturating_sub(x).max(1);
-                                                let mut hp = y1.saturating_sub(y).max(1);
-                                                wp = wp.min(input_w.saturating_sub(x).max(1));
-                                                hp = hp.min(input_h.saturating_sub(y).max(1));
-                                                opts.crop_rect = Some(Rect { x, y, width: wp, height: hp });
-                                                opts.crop_rect_reference_size = Some((input_w, input_h));
                                             }
                                         }
                                     }
