@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 
-use c41_raw_tool::{process_files, PipelineOptions, Rect, TiffFormat, OutputStage, OutputLutEncoding};
+use c41_raw_tool::{process_files, PipelineOptions, Rect, TiffFormat, OutputStage, OutputLutEncoding, DminMode};
 use c41_raw_tool::raw_reader;
 
 #[derive(Parser, Debug)]
@@ -205,8 +205,17 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
 
     println!("Found {} file(s) to process.", paths.len());
 
+    let dmin_mode = if cli.dmin_fixed.is_some() {
+        DminMode::Fixed
+    } else if cli.dmin_rect.is_some() {
+        DminMode::SampleRegion
+    } else {
+        DminMode::Fixed
+    };
+
     let options = PipelineOptions {
-        apply_dmin: true,
+        dmin_mode,
+        auto_norm_buffer: 0.05,
         apply_white_balance: true,
         auto_wb: true,
         film_gamma: 0.65,
@@ -266,6 +275,7 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         zone_shadows: 0.0,
         zone_highlights: 0.0,
         highlight_warmth: 0.4,
+        soft_clip: 0.0,
         apply_lab: false,
         lab_separation: 0.0,
         rotation_degrees: 0,

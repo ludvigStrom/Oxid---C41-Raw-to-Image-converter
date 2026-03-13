@@ -33,6 +33,20 @@ pub struct Rect {
     pub height: u32,
 }
 
+/// D-min method selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DminMode {
+    /// D-min correction disabled.
+    Off,
+    /// Fixed R, G, B values (manually entered or pasted).
+    Fixed,
+    /// Sample a rectangle region to compute per-channel medians.
+    SampleRegion,
+    /// Automatic per-channel percentile-based normalization (negPy style).
+    /// Finds D-min floor via low percentile in log-density space.
+    AutoPercentile,
+}
+
 /// Final render/output stage selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutputStage {
@@ -78,8 +92,10 @@ pub enum CachedSensor {
 /// All pipeline options (CLI flags / GUI state).
 #[derive(Debug, Clone)]
 pub struct PipelineOptions {
-    /// When false, D-min and flat-field correction are skipped.
-    pub apply_dmin: bool,
+    /// Which D-min method to use (Off / Fixed / SampleRegion / AutoPercentile).
+    pub dmin_mode: DminMode,
+    /// Border exclusion ratio for AutoPercentile mode (0.0–0.3).
+    pub auto_norm_buffer: f32,
     /// When false, white balance gains are not applied.
     pub apply_white_balance: bool,
     /// When true, automatically equalize per-channel density medians after D-min
@@ -217,7 +233,8 @@ pub struct PipelineOptions {
 impl Default for PipelineOptions {
     fn default() -> Self {
         Self {
-            apply_dmin: true,
+            dmin_mode: DminMode::Fixed,
+            auto_norm_buffer: 0.05,
             apply_white_balance: true,
             auto_wb: true,
             film_gamma: 0.65,
@@ -1515,31 +1532,37 @@ pub fn process_files(
             image = apply_rotation(&image, options.rotation_degrees);
         }
 
-        // Step 3: D-min / flat-field (skipped if apply_dmin is false).
-        if options.debug_pipeline_step >= 3 && options.apply_dmin {
+        // Step 3: D-min / flat-field.
+        if options.debug_pipeline_step >= 3 && options.dmin_mode != DminMode::Off {
             if let Some(ref flat) = flat_field_map {
                 apply_flat_field_division(&mut image, flat);
-            } else if let Some((r, g, b)) = options.dmin_fixed {
-                dmin::neutralize_with_medians(&mut image, r, g, b)?;
-            } else if let Some(rect) = options.dmin_rect {
-                let (h, w, _) = image.dim();
-                let (x, y, rw, rh) = scale_dmin_rect(
-                    rect,
-                    options.dmin_rect_reference_size,
-                    w as u32,
-                    h as u32,
-                );
-                dmin::neutralize(
-                    &mut image,
-                    x,
-                    y,
-                    rw,
-                    rh,
-                    options.dmin_neutral_only,
-                )?;
+            } else {
+                match options.dmin_mode {
+                    DminMode::Fixed => {
+                        if let Some((r, g, b)) = options.dmin_fixed {
+                            dmin::neutralize_with_medians(&mut image, r, g, b)?;
+                        }
+                    }
+                    DminMode::SampleRegion => {
+                        if let Some(rect) = options.dmin_rect {
+                            let (h, w, _) = image.dim();
+                            let (x, y, rw, rh) = scale_dmin_rect(
+                                rect,
+                                options.dmin_rect_reference_size,
+                                w as u32,
+                                h as u32,
+                            );
+                            dmin::neutralize(
+                                &mut image, x, y, rw, rh, options.dmin_neutral_only,
+                            )?;
+                        }
+                    }
+                    DminMode::AutoPercentile => {
+                        dmin::auto_percentile_normalize(&mut image, options.auto_norm_buffer)?;
+                    }
+                    DminMode::Off => {}
+                }
             }
-            // Preserve highlight headroom after D-min / flat-field: only clamp
-            // negative values, allow T > 1.0 to pass through for later density/curve.
             image.mapv_inplace(|v| v.max(0.0));
         }
 
@@ -1548,7 +1571,7 @@ pub fn process_files(
             image.mapv_inplace(|t| (-(t.max(1e-10_f32)).log10()).max(0.0));
 
             // Auto WB: multiplicative density scaling (per-channel γ correction).
-            let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.apply_dmin {
+            let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.dmin_mode != DminMode::Off {
                 let stats = wb_channel_stats(&image, options);
                 let med_r = stats[0].2.max(1e-4);
                 let med_g = stats[1].2.max(1e-4);
@@ -1993,44 +2016,57 @@ pub fn process_one_to_preview(
     }
 
     // Step 3: D-min / flat-field.
-    if options.debug_pipeline_step >= 3 && options.apply_dmin {
+    if options.debug_pipeline_step >= 3 && options.dmin_mode != DminMode::Off {
         if let Some(ref flat_path) = options.flat_field_path {
             let flat_map = load_flat_field_map(flat_path)?;
             apply_flat_field_division(&mut image, &flat_map);
             let _ = writeln!(dbg, "D-min mode: flat-field ({})", flat_path.display());
-        } else if let Some((r, g, b)) = options.dmin_fixed {
-            let _ = writeln!(dbg, "D-min mode: fixed ({:.6}, {:.6}, {:.6})", r, g, b);
-            dmin::neutralize_with_medians(&mut image, r, g, b)?;
-        } else if let Some(rect) = options.dmin_rect {
-            let (h, w, _) = image.dim();
-            let (x, y, rw, rh) = scale_dmin_rect(
-                rect,
-                options.dmin_rect_reference_size,
-                w as u32,
-                h as u32,
-            );
-            let _ = writeln!(
-                dbg,
-                "D-min mode: rect x={} y={} w={} h={} neutral_only={}",
-                x, y, rw, rh, options.dmin_neutral_only
-            );
-            if options.verbose_debug {
-                let x0 = (x as usize).min(w.saturating_sub(1));
-                let y0 = (y as usize).min(h.saturating_sub(1));
-                let x1 = ((x + rw) as usize).min(w).max(x0 + 1);
-                let y1 = ((y + rh) as usize).min(h).max(y0 + 1);
-                let region = image.slice(ndarray::s![y0..y1, x0..x1, ..]).to_owned();
-                let _ = write!(dbg, "{}", fmt_stats("  D-min sample region (before):", &channel_stats(&region)));
+        } else {
+            match options.dmin_mode {
+                DminMode::Fixed => {
+                    if let Some((r, g, b)) = options.dmin_fixed {
+                        let _ = writeln!(dbg, "D-min mode: fixed ({:.6}, {:.6}, {:.6})", r, g, b);
+                        dmin::neutralize_with_medians(&mut image, r, g, b)?;
+                    }
+                }
+                DminMode::SampleRegion => {
+                    if let Some(rect) = options.dmin_rect {
+                        let (h, w, _) = image.dim();
+                        let (x, y, rw, rh) = scale_dmin_rect(
+                            rect,
+                            options.dmin_rect_reference_size,
+                            w as u32,
+                            h as u32,
+                        );
+                        let _ = writeln!(
+                            dbg,
+                            "D-min mode: rect x={} y={} w={} h={} neutral_only={}",
+                            x, y, rw, rh, options.dmin_neutral_only
+                        );
+                        if options.verbose_debug {
+                            let x0 = (x as usize).min(w.saturating_sub(1));
+                            let y0 = (y as usize).min(h.saturating_sub(1));
+                            let x1 = ((x + rw) as usize).min(w).max(x0 + 1);
+                            let y1 = ((y + rh) as usize).min(h).max(y0 + 1);
+                            let region = image.slice(ndarray::s![y0..y1, x0..x1, ..]).to_owned();
+                            let _ = write!(dbg, "{}", fmt_stats("  D-min sample region (before):", &channel_stats(&region)));
+                        }
+                        dmin::neutralize(&mut image, x, y, rw, rh, options.dmin_neutral_only)?;
+                    }
+                }
+                DminMode::AutoPercentile => {
+                    let _ = writeln!(dbg, "D-min mode: auto-percentile (buffer={:.2})", options.auto_norm_buffer);
+                    dmin::auto_percentile_normalize(&mut image, options.auto_norm_buffer)?;
+                }
+                DminMode::Off => {}
             }
-            dmin::neutralize(&mut image, x, y, rw, rh, options.dmin_neutral_only)?;
         }
-        // Same as export path: keep >1.0 transmittance for highlight headroom.
         image.mapv_inplace(|v| v.max(0.0));
         if options.verbose_debug {
             let _ = write!(dbg, "{}", fmt_stats("Step 3 (after D-min, clamped [0,1]):", &channel_stats(&image)));
         }
     } else if options.debug_pipeline_step >= 3 {
-        let _ = writeln!(dbg, "Step 3: D-min SKIPPED (apply_dmin=false)");
+        let _ = writeln!(dbg, "Step 3: D-min SKIPPED (dmin_mode=Off)");
     } else {
         let _ = writeln!(dbg, "Step 3: SKIPPED (pipeline_step < 3)");
     }
@@ -2056,7 +2092,7 @@ pub fn process_one_to_preview(
 
         // 4b: Auto WB — multiplicative equalization of per-channel density medians.
         //     D *= mean_D / ch_median_D  (equivalent to per-channel gamma correction).
-        let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.apply_dmin {
+        let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.dmin_mode != DminMode::Off {
             let stats = wb_channel_stats(&image, options);
             let med_r = stats[0].2.max(1e-4);
             let med_g = stats[1].2.max(1e-4);
@@ -2084,7 +2120,7 @@ pub fn process_one_to_preview(
         let s_b = auto_s_b * man_s_b * inv_gamma;
 
         let _ = writeln!(dbg, "Auto WB (×): R={:.4} G={:.4} B={:.4} (enabled={})",
-            auto_s_r, auto_s_g, auto_s_b, options.auto_wb && options.apply_dmin);
+            auto_s_r, auto_s_g, auto_s_b, options.auto_wb && options.dmin_mode != DminMode::Off);
         let _ = writeln!(dbg, "Manual WB (×): R={:.4} G={:.4} B={:.4}", man_s_r, man_s_g, man_s_b);
         let _ = writeln!(dbg, "Film gamma: {:.3} → 1/γ = {:.4}", options.film_gamma, inv_gamma);
         let _ = writeln!(dbg, "Combined density scale: R={:.4} G={:.4} B={:.4}", s_r, s_g, s_b);

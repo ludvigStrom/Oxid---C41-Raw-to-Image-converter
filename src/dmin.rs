@@ -95,6 +95,76 @@ pub fn neutralize(
     }
 }
 
+/// Automatic percentile-based D-min normalization (negPy style).
+///
+/// Converts the image to log10 density space, finds the per-channel floor
+/// (0.5th percentile = film base density), converts back to linear, and
+/// divides the whole image by 10^floor per channel to neutralize the base.
+///
+/// `buffer_ratio` (0.0–0.3): fraction of the border to exclude from analysis
+/// to avoid film rebate/sprocket artifacts.
+pub fn auto_percentile_normalize(
+    image: &mut ndarray::Array3<f32>,
+    buffer_ratio: f32,
+) -> Result<()> {
+    let (h, w, c) = image.dim();
+    if c != 3 {
+        bail!("auto_percentile_normalize expects RGB (3 channels), got {}", c);
+    }
+
+    let safe_buffer = buffer_ratio.clamp(0.0, 0.3);
+    let cut_h = (h as f32 * safe_buffer) as usize;
+    let cut_w = (w as f32 * safe_buffer) as usize;
+    let y_start = cut_h;
+    let y_end = h.saturating_sub(cut_h).max(y_start + 1);
+    let x_start = cut_w;
+    let x_end = w.saturating_sub(cut_w).max(x_start + 1);
+
+    let analysis_region = image.slice(ndarray::s![y_start..y_end, x_start..x_end, ..]);
+
+    let epsilon: f32 = 1e-6;
+    let percentile_low = 0.5_f64;
+    let percentile_high = 99.5_f64;
+
+    let mut floors = [0.0_f32; 3];
+    let mut ceils = [0.0_f32; 3];
+
+    for ch in 0..3 {
+        let chan = analysis_region.slice(ndarray::s![.., .., ch]);
+        let mut vals: Vec<f32> = chan.iter()
+            .map(|&v| -(v.max(epsilon).log10()))
+            .collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        if vals.is_empty() {
+            floors[ch] = 0.0;
+            ceils[ch] = 1.0;
+            continue;
+        }
+
+        let idx_low = ((percentile_low / 100.0) * (vals.len() as f64 - 1.0)).round() as usize;
+        let idx_high = ((percentile_high / 100.0) * (vals.len() as f64 - 1.0)).round() as usize;
+        floors[ch] = vals[idx_low.min(vals.len() - 1)];
+        ceils[ch] = vals[idx_high.min(vals.len() - 1)];
+    }
+
+    // Convert floor from density back to linear transmittance: T = 10^(-D).
+    // The floor (lowest density) = the film base = highest transmittance.
+    let div_r = 10.0_f32.powf(-floors[0]);
+    let div_g = 10.0_f32.powf(-floors[1]);
+    let div_b = 10.0_f32.powf(-floors[2]);
+
+    let div_r = if div_r > 0.0 { div_r } else { 1.0 };
+    let div_g = if div_g > 0.0 { div_g } else { 1.0 };
+    let div_b = if div_b > 0.0 { div_b } else { 1.0 };
+
+    image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v / div_r);
+    image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v / div_g);
+    image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v / div_b);
+
+    Ok(())
+}
+
 /// Neutralize D-min using fixed medians (e.g. previously measured once).
 pub fn neutralize_with_medians(
     image: &mut ndarray::Array3<f32>,

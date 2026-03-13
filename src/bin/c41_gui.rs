@@ -26,6 +26,7 @@ use c41_raw_tool::{
     TiffFormat,
     OutputStage,
     OutputLutEncoding,
+    DminMode,
     CachedSensor,
     load_sensor_from_path,
     compute_dmin_from_sensor,
@@ -143,6 +144,13 @@ enum UIMode {
     Debug,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessTab {
+    Input,
+    Crop,
+    Film,
+}
+
 /// Calibration overlay state: 4 anchor points in normalized image space.
 ///
 /// Corner order: [top-left, top-right, bottom-left, bottom-right], each in
@@ -204,6 +212,7 @@ struct C41Gui {
     /// Deferred file dialog flag: open the output LUT browser outside the egui render loop
     /// to avoid macOS NSOpenPanel re-entrance crashes.
     pending_output_lut_browse: bool,
+    process_tab: ProcessTab,
 }
 
 impl Default for C41Gui {
@@ -234,6 +243,7 @@ impl Default for C41Gui {
             pending_preview_key: None,
             pending_preview_since: None,
             pending_output_lut_browse: false,
+            process_tab: ProcessTab::Film,
         }
     }
 }
@@ -356,7 +366,8 @@ fn sample_patch_medians(
 
 fn default_options() -> PipelineOptions {
     PipelineOptions {
-        apply_dmin: true,
+        dmin_mode: DminMode::Fixed,
+        auto_norm_buffer: 0.05,
         apply_white_balance: true,
         auto_wb: true,
         film_gamma: 0.65,
@@ -425,7 +436,8 @@ fn default_options() -> PipelineOptions {
 fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     let mut h = DefaultHasher::new();
     path.display().to_string().hash(&mut h);
-    opts.apply_dmin.hash(&mut h);
+    opts.dmin_mode.hash(&mut h);
+    opts.auto_norm_buffer.to_bits().hash(&mut h);
     opts.apply_white_balance.hash(&mut h);
     opts.auto_wb.hash(&mut h);
     opts.film_gamma.to_bits().hash(&mut h);
@@ -860,7 +872,7 @@ impl C41Gui {
         options.flat_field_path = self.flat_field_path.clone();
 
         // If D-min uses a rectangle, recompute fixed medians from full-res sensor.
-        if options.apply_dmin {
+        if options.dmin_mode == DminMode::SampleRegion {
             if let (Some(rect), Some(sensor)) = (options.dmin_rect, entry.cached_sensor.as_ref()) {
                 if let Ok((r, g, b)) = compute_dmin_from_sensor(
                     sensor.as_ref(),
@@ -1512,6 +1524,17 @@ impl eframe::App for C41Gui {
                 );
                 ui.add_space(8.0);
 
+                if self.mode == UIMode::Process {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.process_tab, ProcessTab::Input, "Input");
+                        ui.selectable_value(&mut self.process_tab, ProcessTab::Crop, "Crop");
+                        ui.selectable_value(&mut self.process_tab, ProcessTab::Film, "Film");
+                    });
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                }
+
                 if self.mode == UIMode::Debug {
                     ui.label("Pipeline step (1–6). Preview shows output up to this step.");
                     ui.add(egui::Slider::new(&mut opts.debug_pipeline_step, 1..=6).text("Step"));
@@ -1646,7 +1669,9 @@ impl eframe::App for C41Gui {
                         );
                     }
                 } else if self.mode != UIMode::LuminanceCalibrate {
+                    let in_process = self.mode == UIMode::Process;
 
+                  if !in_process || self.process_tab == ProcessTab::Film {
                     // ════════════════════════════════════════════════════════
                     // GROUP 1 — Exposure  (primary editing controls)
                     // ════════════════════════════════════════════════════════
@@ -1902,78 +1927,109 @@ impl eframe::App for C41Gui {
                             );
                         });
                     });
+                  } // end Film tab guard (groups 1-4)
 
+                  if !in_process || self.process_tab == ProcessTab::Input {
                     // ════════════════════════════════════════════════════════
-                    // GROUP 5 — Input & Film  (per-roll / scan-session)
+                    // Input — D-min, flat-field, film γ
                     // ════════════════════════════════════════════════════════
-                    ui.collapsing("Input & film", |ui| {
-                        ui.checkbox(&mut opts.apply_dmin, "D-min");
-                        if opts.apply_dmin {
-                            ui.horizontal(|ui| {
-                                if ui.button("Copy D-min").clicked() {
-                                    if let Some(text) = dmin_values_to_clipboard_text(opts) {
-                                        ui.ctx().copy_text(text.clone());
-                                        self.status = format!("D-min copied: {}", text);
-                                    } else {
-                                        self.status =
-                                            "No D-min values to copy (enable fixed or rectangle first).".to_string();
+                        ui.label(egui::RichText::new("D-min").strong());
+                        ui.add_space(2.0);
+
+                        let dmin_label = match opts.dmin_mode {
+                            DminMode::Off => "Off",
+                            DminMode::Fixed => "Fixed values",
+                            DminMode::SampleRegion => "Sample region",
+                            DminMode::AutoPercentile => "Auto (percentile)",
+                        };
+                        egui::ComboBox::from_label("Mode")
+                            .selected_text(dmin_label)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(opts.dmin_mode == DminMode::AutoPercentile, "Auto (percentile)").clicked() {
+                                    opts.dmin_mode = DminMode::AutoPercentile;
+                                }
+                                if ui.selectable_label(opts.dmin_mode == DminMode::SampleRegion, "Sample region").clicked() {
+                                    opts.dmin_mode = DminMode::SampleRegion;
+                                    if opts.dmin_rect.is_none() {
+                                        opts.dmin_rect = Some(Rect { x: 35, y: 15, width: 20, height: 20 });
                                     }
                                 }
-                                if ui.button("Paste D-min").clicked() {
-                                    match arboard::Clipboard::new()
-                                        .and_then(|mut cb| cb.get_text())
-                                    {
-                                        Ok(text) => {
-                                            if let Some((fixed, rect, neutral_only)) =
-                                                parse_dmin_clipboard_text(&text)
-                                            {
-                                                if let Some((r, g, b)) = fixed {
-                                                    opts.apply_dmin = true;
-                                                    opts.dmin_fixed = Some((r, g, b));
-                                                    opts.dmin_rect = None;
-                                                    opts.dmin_rect_reference_size = None;
-                                                    if let Some(v) = neutral_only {
-                                                        opts.dmin_neutral_only = v;
-                                                    }
-                                                    self.status = format!(
-                                                        "Applied pasted D-min fixed values: {:.6}, {:.6}, {:.6}",
-                                                        r, g, b
-                                                    );
-                                                } else if let Some(rect) = rect {
-                                                    opts.apply_dmin = true;
-                                                    opts.dmin_fixed = None;
-                                                    opts.dmin_rect = Some(rect);
-                                                    opts.dmin_rect_reference_size = None;
-                                                    if let Some(v) = neutral_only {
-                                                        opts.dmin_neutral_only = v;
-                                                    }
-                                                    self.status = format!(
-                                                        "Applied pasted D-min rectangle: {},{},{},{}",
-                                                        rect.x, rect.y, rect.width, rect.height
-                                                    );
-                                                } else {
-                                                    self.status = "Clipboard has no valid D-min payload.".to_string();
-                                                }
-                                            } else {
-                                                self.status = "Clipboard text is not a valid D-min value.".to_string();
-                                            }
-                                        }
-                                        Err(e) => {
-                                            self.status = format!("Could not read clipboard: {}", e);
-                                        }
+                                if ui.selectable_label(opts.dmin_mode == DminMode::Fixed, "Fixed values").clicked() {
+                                    opts.dmin_mode = DminMode::Fixed;
+                                    if opts.dmin_fixed.is_none() {
+                                        opts.dmin_fixed = Some((0.222537, 0.108183, 0.054116));
                                     }
+                                }
+                                if ui.selectable_label(opts.dmin_mode == DminMode::Off, "Off").clicked() {
+                                    opts.dmin_mode = DminMode::Off;
                                 }
                             });
-                            ui.label(
-                                egui::RichText::new("Format: dmin:fixed:r,g,b or dmin:rect:x,y,w,h")
-                                    .small()
-                                    .weak(),
-                            );
-                            ui.add_space(4.0);
+                        ui.add_space(4.0);
 
-                            let mut use_fixed = opts.dmin_fixed.is_some();
-                            ui.checkbox(&mut use_fixed, "Use fixed D-min (R,G,B)");
-                            if use_fixed {
+                        match opts.dmin_mode {
+                            DminMode::Off => {
+                                ui.label(
+                                    egui::RichText::new("D-min correction disabled.")
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                            DminMode::Fixed => {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Copy").clicked() {
+                                        if let Some(text) = dmin_values_to_clipboard_text(opts) {
+                                            ui.ctx().copy_text(text.clone());
+                                            self.status = format!("D-min copied: {}", text);
+                                        }
+                                    }
+                                    if ui.button("Paste").clicked() {
+                                        match arboard::Clipboard::new()
+                                            .and_then(|mut cb| cb.get_text())
+                                        {
+                                            Ok(text) => {
+                                                if let Some((fixed, rect, neutral_only)) =
+                                                    parse_dmin_clipboard_text(&text)
+                                                {
+                                                    if let Some((r, g, b)) = fixed {
+                                                        opts.dmin_mode = DminMode::Fixed;
+                                                        opts.dmin_fixed = Some((r, g, b));
+                                                        if let Some(v) = neutral_only {
+                                                            opts.dmin_neutral_only = v;
+                                                        }
+                                                        self.status = format!(
+                                                            "Applied D-min fixed: {:.6}, {:.6}, {:.6}",
+                                                            r, g, b
+                                                        );
+                                                    } else if let Some(rect) = rect {
+                                                        opts.dmin_mode = DminMode::SampleRegion;
+                                                        opts.dmin_rect = Some(rect);
+                                                        opts.dmin_rect_reference_size = None;
+                                                        if let Some(v) = neutral_only {
+                                                            opts.dmin_neutral_only = v;
+                                                        }
+                                                        self.status = format!(
+                                                            "Applied D-min rect: {},{},{},{}",
+                                                            rect.x, rect.y, rect.width, rect.height
+                                                        );
+                                                    } else {
+                                                        self.status = "Clipboard has no valid D-min payload.".to_string();
+                                                    }
+                                                } else {
+                                                    self.status = "Clipboard text is not a valid D-min value.".to_string();
+                                                }
+                                            }
+                                            Err(e) => {
+                                                self.status = format!("Could not read clipboard: {}", e);
+                                            }
+                                        }
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new("Format: dmin:fixed:r,g,b or dmin:rect:x,y,w,h")
+                                        .small()
+                                        .weak(),
+                                );
+                                ui.add_space(4.0);
                                 if opts.dmin_fixed.is_none() {
                                     opts.dmin_fixed = Some((0.222537, 0.108183, 0.054116));
                                 }
@@ -1999,9 +2055,8 @@ impl eframe::App for C41Gui {
                                     );
                                 });
                                 opts.dmin_fixed = Some((r, g, b));
-                                opts.dmin_rect = None;
-                                opts.dmin_rect_reference_size = None;
-                            } else {
+                            }
+                            DminMode::SampleRegion => {
                                 if opts.dmin_rect.is_none() {
                                     opts.dmin_rect = Some(Rect {
                                         x: 35,
@@ -2019,9 +2074,35 @@ impl eframe::App for C41Gui {
                                         ui.add(egui::DragValue::new(&mut rect.height).speed(1));
                                     });
                                 }
-                                opts.dmin_fixed = None;
+                                ui.checkbox(&mut opts.dmin_neutral_only, "Neutral only (geometric mean)");
+                                ui.label(
+                                    egui::RichText::new("Drag the blue rectangle on the preview to select the film base region.")
+                                        .small()
+                                        .weak(),
+                                );
                             }
+                            DminMode::AutoPercentile => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Border buffer");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.auto_norm_buffer, 0.0..=0.3)
+                                            .fixed_decimals(2),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Automatic per-channel percentile normalization.\n\
+                                         Finds film base density (p0.5) and normalizes.\n\
+                                         Border buffer excludes edges from analysis."
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                        }
 
+                        if opts.dmin_mode != DminMode::Off {
+                            ui.add_space(4.0);
                             ui.separator();
                             ui.label("Flat-field override (luminance calibration)");
                             ui.horizontal(|ui| {
@@ -2039,9 +2120,6 @@ impl eframe::App for C41Gui {
                                         .pick_file()
                                     {
                                         self.flat_field_path = Some(path.clone());
-                                        opts.dmin_fixed = None;
-                                        opts.dmin_rect = None;
-                                        opts.dmin_rect_reference_size = None;
                                         self.status = format!(
                                             "Using flat-field map from {} (overrides D-min).",
                                             path.display()
@@ -2052,7 +2130,6 @@ impl eframe::App for C41Gui {
                                     && ui.button("Clear flat-field override").clicked()
                                 {
                                     self.flat_field_path = None;
-                                    opts.dmin_rect_reference_size = None;
                                     self.status =
                                         "Flat-field override cleared; D-min settings are active again."
                                             .to_string();
@@ -2079,7 +2156,12 @@ impl eframe::App for C41Gui {
                             .small()
                             .weak(),
                         );
+                  } // end Input tab guard
 
+                  if !in_process || self.process_tab == ProcessTab::Crop {
+                    // ════════════════════════════════════════════════════════
+                    // Crop
+                    // ════════════════════════════════════════════════════════
                         ui.add_space(4.0);
                         ui.checkbox(&mut opts.apply_crop, "Crop");
                         if opts.apply_crop {
@@ -2108,8 +2190,9 @@ impl eframe::App for C41Gui {
                                 .weak(),
                             );
                         }
-                    });
+                  } // end Crop tab guard
 
+                  if !in_process || self.process_tab == ProcessTab::Film {
                     // ════════════════════════════════════════════════════════
                     // GROUP 6 — Curve / LUT & Output
                     // ════════════════════════════════════════════════════════
@@ -2351,6 +2434,7 @@ impl eframe::App for C41Gui {
                             }
                         });
                     });
+                  } // end Film tab guard (group 6)
                 }
 
                 if self.mode == UIMode::Calibrate {
@@ -2459,7 +2543,7 @@ impl eframe::App for C41Gui {
                     }
                 }
 
-                if self.mode == UIMode::Process {
+                if self.mode == UIMode::Process && self.process_tab == ProcessTab::Input {
                     let apply_color_prev = opts.apply_color_profile;
                     ui.checkbox(&mut opts.apply_color_profile, "Color calibration profile");
                     if apply_color_prev && !opts.apply_color_profile {
@@ -2648,7 +2732,7 @@ impl eframe::App for C41Gui {
                     });
                 }
 
-                if self.mode == UIMode::Process {
+                if self.mode == UIMode::Process && self.process_tab == ProcessTab::Film {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -3112,7 +3196,7 @@ impl eframe::App for C41Gui {
                         if self.mode == UIMode::Process {
                             if let Some(entry) = self.images.get_mut(idx) {
                                 let opts = &mut entry.options;
-                                if opts.apply_dmin && self.flat_field_path.is_none() {
+                                if opts.dmin_mode == DminMode::SampleRegion && self.flat_field_path.is_none() {
                                     if let (Some(rect), Some([input_w, input_h])) =
                                         (opts.dmin_rect, entry.preview_input_size)
                                     {
@@ -3298,8 +3382,7 @@ impl eframe::App for C41Gui {
                                             }
 
                                             // Redraw D-min overlay above the darkened crop region.
-                                            if opts.apply_dmin
-                                                && opts.dmin_fixed.is_none()
+                                            if opts.dmin_mode == DminMode::SampleRegion
                                                 && self.flat_field_path.is_none()
                                             {
                                                 if let Some(dmin_rect) = opts.dmin_rect {
