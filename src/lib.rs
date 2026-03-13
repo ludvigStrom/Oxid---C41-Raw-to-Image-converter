@@ -233,7 +233,7 @@ pub struct PipelineOptions {
 impl Default for PipelineOptions {
     fn default() -> Self {
         Self {
-            dmin_mode: DminMode::Fixed,
+            dmin_mode: DminMode::AutoPercentile,
             auto_norm_buffer: 0.05,
             apply_white_balance: true,
             auto_wb: true,

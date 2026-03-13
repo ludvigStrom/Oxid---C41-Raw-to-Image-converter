@@ -243,7 +243,7 @@ impl Default for C41Gui {
             pending_preview_key: None,
             pending_preview_since: None,
             pending_output_lut_browse: false,
-            process_tab: ProcessTab::Film,
+            process_tab: ProcessTab::Input,
         }
     }
 }
@@ -366,7 +366,7 @@ fn sample_patch_medians(
 
 fn default_options() -> PipelineOptions {
     PipelineOptions {
-        dmin_mode: DminMode::Fixed,
+        dmin_mode: DminMode::AutoPercentile,
         auto_norm_buffer: 0.05,
         apply_white_balance: true,
         auto_wb: true,
