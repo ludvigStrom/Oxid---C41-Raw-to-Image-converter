@@ -1,55 +1,51 @@
 # c41-raw-tool
 
-A high-performance, command-line and GUI RAW image processor for **C-41 color negative film** scanned with a **custom narrowband RGB light source**. The pipeline uses physically grounded log-density math with explicit, ordered operations (including camera IDT to ACEScg, D-min/flat-field normalization, density-domain calibration, and RA-4 print curve). Auto white balance is optional and explicit (toggleable), with no hidden tone/base curves.
+A command-line and GUI RAW processor for **C-41 color negative film**. The pipeline is physically grounded: film transmittance is converted to optical density, white balance and film gamma are applied in the density domain, and a Michaelis-Menten S-curve models RA-4 paper. No hidden tone curves or auto-adjustments run unless explicitly enabled.
 
-**Target cameras:** Any rawloader-supported Bayer RAW (Sony, Nikon, Canon, Fuji, Panasonic). Initially tuned for Sony a7R II (42MP uncompressed `.arw`). You can also **ingest PNG** (any size) for development or testing; it skips raw/demosaic and runs the same D-min / curve / export pipeline.
+**Supported cameras:** any `rawloader`-supported Bayer RAW (Sony `.arw`, Nikon `.nef`/`.nrw`, Canon `.cr2`/`.cr3`/`.crw`, Adobe `.dng`, Fujifilm `.raf`, Olympus `.orf`, Panasonic `.rw2`). PNG input is also accepted and runs the same D-min / curve / export pipeline (skips raw decode and demosaic).
 
 ---
 
-## Why log-density, not linear inversion?
+## Why the pipeline is in density space
 
-Film dye density is logarithmic. A simple `1.0 - input` inversion in linear space produces flat results with color cast. Instead, this tool converts transmittance to optical density (`D = -log10(T)`), inverts in the density domain, and applies an RA-4 paper S-curve (Michaelis-Menten). This models a physical darkroom enlarger and produces accurate tonality.
+Film dye accumulates logarithmically: `D = -log₁₀(T)`. The pipeline converts transmittance to density immediately after D-min, applies WB and film gamma as multiplicative density scales, and inverts in the density domain by passing D directly as log-exposure into the RA-4 curve. The Michaelis-Menten S-curve then models paper exposure:
+
+```
+density = -log10(T)
+logE    = density + offset
+E       = 10^logE
+out     = E^gamma / (E^gamma + pivot^gamma)
+```
+
+This is the exact function in [`src/curve.rs`](src/curve.rs), computed once into a 65 536-entry f32 LUT (`build_density_to_ra4_lut`). A simple `1 - T` inversion is therefore never needed when the curve is active.
 
 ---
 
 ## Prerequisites
 
-- **Rust** (2021 edition; install via [rustup](https://rustup.rs/)). Raw decoding uses **rawloader** (pure Rust); no system libraries or native build steps are required.
-
----
-
-## Building on Windows
-
-From the project root:
-
-```powershell
-cargo build --release
-```
-
-If `cargo` is not in your PATH, add it for the session: `$env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path`, then build.
-
-   To run the GUI: `.\target\release\c41-gui.exe` or `cargo run --release --bin c41-gui --features gui`.
-
+- **Rust** 2021 edition — install via [rustup](https://rustup.rs/).
+- No system libraries; `rawloader` is pure Rust.
 
 ---
 
 ## Build and run
 
 ```bash
-# From the project root (directory containing Cargo.toml)
 cargo build --release
 ```
 
-Run with required input and output directories:
+**CLI (convert subcommand):**
 
 ```bash
-cargo run --release -- --input-dir /path/to/arw/folder --output-dir /path/to/output
+cargo run --release -- convert \
+  --input-dir  /path/to/scans \
+  --output-dir /path/to/output
 ```
 
-Full example with D-min, white balance, and curve tuning:
+Full example with D-min rect, manual WB, and curve tuning:
 
 ```bash
-cargo run --release -- \
+cargo run --release -- convert \
   -i "test files/png" \
   -o "test files/png/output" \
   --dmin-rect 35,15,20,20 \
@@ -60,115 +56,189 @@ cargo run --release -- \
   --curve-white 0.745
 ```
 
-`--curve-white 0.745` (190/255) pulls the white point in so highlights don’t blow; a 256-bin histogram summary is printed after the curve for inspection.
+`--curve-white 0.745` maps normalized code 190/255 to display white, pulling in the white point so bright highlights don't clip before the shoulder.
 
-### Minimal GUI
+**Validate a single RAW file:**
 
-A desktop UI provides three tabs: **Process** (main development with per-step checkboxes for D-min, white balance, print curve, and color calibration profile), **Color calibration** (solve a 3×3 matrix from a ColorChecker and save/load profiles), and **Luminance calibration** (load/save flat-field reference frames). Pick files, set parameters, choose an output folder, and run Convert:
+```bash
+cargo run --release -- debug-raw /path/to/file.arw
+```
+
+Prints rawloader metadata and sample pixel values without running the full pipeline.
+
+**GUI:**
 
 ```bash
 cargo run --release --bin c41-gui --features gui
 ```
 
-You need to enable the `gui` feature (adds `eframe` and `rfd`). Same pipeline as the CLI; outputs go to the folder you select.
+Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Provides three tabs: **Process** (main development with per-step checkboxes), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).
 
 ---
 
-## Output format: keeping as much data as possible
+## Pipeline: exact order of operations
 
-Output is always **uncompressed** TIFF. You choose the sample format (applies when `--no-curve`):
+The steps below match the literal execution order in `process_files` and `process_one_to_preview` in `src/lib.rs`. `debug_pipeline_step` (default 6) can stop the pipeline early at any step for inspection.
 
-| Format | Flag | What it does | Use when |
-|--------|------|----------------|----------|
-| **32-bit float** | `--format 32f` (default) | Writes f32 directly. No clamping, no quantization. | Archival, further linear processing. |
-| **16-bit integer** | `--format 16` | Clamps to [0, 1], scales to 0-65535. | Viewing, printing, compatibility. |
+### Step 1 — Load and demosaic
 
-When the print curve is active (default), output is always 16-bit (the LUT produces u16).
+RAW files: `rawloader` decodes the file → single-channel Bayer or X-Trans CFA `Array3<f32>` → `demosaic_quality` → linear RGB.
+
+`demosaic_quality` (in `src/demosaic.rs`) uses:
+1. Edge-aware green interpolation (Hamilton–Adams gradient).
+2. R and B recovered via **color-difference** (R−G, B−G) interpolation. Interpolating differences rather than raw channel values eliminates false color at edges.
+
+Bayer preview downsampling preserves 2×2 super-pixels so the pattern stays intact after subsampling. X-Trans downsampling uses 6×6 super-pixels for the same reason.
+
+PNG files: loaded as linear RGB, bypassing raw decode and demosaic.
+
+Optional rotation (0°, 90°, 180°, 270°) is applied immediately after demosaic.
+
+### Step 3 — D-min / flat-field normalization
+
+Four modes (`DminMode` in `src/lib.rs`):
+
+| Mode | What it does |
+|------|--------------|
+| `AutoPercentile` (default) | Works in log-density space: finds the 0.5th-percentile density per channel in the inner 80% of the frame (border excluded), converts back to linear, divides image by that value. |
+| `SampleRegion` | Samples a user-defined `X,Y,WIDTH,HEIGHT` rect; divides image by per-channel median. |
+| `Fixed` | Divides by manually-supplied R,G,B values. |
+| `Off` | Skipped entirely. |
+
+When `neutral_only = true`, all three channels are divided by the geometric mean of the medians (`(med_r * med_g * med_b)^(1/3)`), removing density without shifting the orange mask color.
+
+Flat-field override: if `--flat-field` is provided, D-min is replaced by pixel-by-pixel division against a blurred reference frame. RAW flat-field inputs are demosaiced then blurred with a separable f32 Gaussian (σ = 60 px) to remove grain and dust, leaving only low-frequency illumination falloff. Pre-blurred 32f TIFFs are used directly.
+
+### Step 4 — T → D → WB → film gamma
+
+All in one pass per pixel after D-min:
+
+```
+4a:  D = -log10(T)       clamped T ≥ 1e-10
+4b:  auto WB:   D *= mean_D / ch_median_D   (equalize channel medians)
+4c:  manual WB: D *= slider                 (default 1.0 per channel)
+4d:  film γ:    D *= 1 / film_gamma         (default γ = 0.65 for C-41)
+```
+
+Auto WB is multiplicative in density space (not additive), so it preserves `D = 0` as the black point in all channels — no black-point shift occurs. Manual WB and film gamma are folded into the same per-channel scalar for a single pass over the data.
+
+Optional colour temperature (`--temp-k`, in Kelvin): a Kelvin-to-RGB model converts the temperature to additive density offsets that are added per channel.
+
+Optional shadow cast correction (`shadow_cast_strength`): detects per-channel colour imbalance in pixels with mean density below 0.8 and applies a correction weighted by `t^1.5` (strongest at D = 0, zero by threshold).
+
+### Step 5 — Density calibration
+
+Either a 3×3 matrix or a `.cube` 3D LUT is applied in the density domain. Both live at the same pipeline slot (after T→D, before the output stage). If the matrix is identity, the pixel loop is skipped.
+
+3×3 density matrix (per pixel):
+
+```
+D'_r = m[0][0]*D_r + m[0][1]*D_g + m[0][2]*D_b
+D'_g = m[1][0]*D_r + m[1][1]*D_g + m[1][2]*D_b
+D'_b = m[2][0]*D_r + m[2][1]*D_g + m[2][2]*D_b
+```
+
+After the matrix, `limit_highlight_density_spread` compresses speckle pixels where one channel is an extreme outlier while the other two are close (ratio-based detection, blended 85% toward the mean density).
+
+Optional density-domain saturation boost (`saturation`, default 1.0):
+
+```
+D_mean  = (D_r + D_g + D_b) / 3
+D'_ch   = D_mean + saturation * (D_ch - D_mean)
+```
+
+Optional Gaussian-masked zone adjustments: shadow (`zone_shadows`) and highlight (`zone_highlights`) density offsets. The shadow mask is a Gaussian centred at D = 0.4 (σ² = 0.25); the highlight mask at D = 2.2 (σ² = 0.50). They are additive and channel-neutral — all three channels shift by the same amount.
+
+### Step 6 — Output stage
+
+Four output stages selectable via `output_stage`:
+
+| Stage | What it does |
+|-------|--------------|
+| `Ra4` (default) | 65 536-entry `density → u16` LUT (`build_density_to_ra4_lut`), applied in parallel over rows via rayon. Includes a soft shoulder starting at 0.93: `t_shaped = 1 - (1-t)^1.5` above the knee. |
+| `FilmPrint` | Per-channel RA-4 curves with independent offset and gamma. Color bleed mixes adjacent-channel density before the curve. Post-curve luminance-aware vibrance boosts muted colors: `boost = 1 + strength * (1 - chroma)`. |
+| `Lut2383` | Density → code value with selectable encoding (Cineon log D/2.046, Rec.709, or linear D/2.5) → user-supplied `.cube` 3D LUT → display-space output. |
+| `None` | Direct density display: `D / 2.5` clamped to [0, 1]. |
+
+Post-curve operations applied after `Ra4` and `FilmPrint` (all operate on the u16 output):
+
+- **Toe/shoulder shaping** — smoothstep-masked additive offset; toe mask centered on [0.07, 0.60], shoulder mask on [0.45, 0.95].
+- **Soft clip** — exponential highlight roll-off: `v + (1 - exp(-(v-s)/(1-s))) * (1-s)` above knee `s` (default 0.93).
+- **Lab separation** — converts sRGB → XYZ → Lab, scales the a/b chroma deviation by a bell-shaped function `1 + strength * c_norm * (1 - c_norm) * 2`. Near-neutral pixels (chroma < 1e-4) are not touched.
+- **Highlight warmth** — Noritsu/Frontier-style golden tint on neutral highlights: `+0.035 R, +0.015 G, −0.055 B`, weighted by `smoothstep(0.35, 0.85, luma) * (1 − smoothstep(0.04, 0.18, chroma))`. Saturated colors receive no warmth.
+
+---
+
+## Output formats
+
+| Format | Flag | Notes |
+|--------|------|-------|
+| 16-bit TIFF (default with curve) | — | Uncompressed, u16 per channel via `write_tiff_u16`. |
+| 32-bit float TIFF | `--format 32f` | Uncompressed, f32 per channel. Only with `--no-curve`. |
+| 16-bit integer TIFF | `--format 16` | Clamped and scaled. Only with `--no-curve`. |
+| OpenEXR | `--write-exr` | f32 or normalized u16, written via the `exr` crate. |
+| JPEG | `--write-jpeg` | 8-bit: top byte of each u16 value. |
+| ACES2065-1 EXR | `--export-aces-exr` | Linear AP0-primaries EXR via `linear_acescg_to_aces2065_1`. |
+
+Output filenames are derived from the input stem: `frame_001.arw` → `frame_001.tiff`.
+
+---
+
+## Calibration
+
+### Color calibration (density matrix)
+
+Solve a 3×3 matrix from a scan of a **ColorChecker Classic** (24 patches, reference values baked into `src/calibration.rs` as manufacturer sRGB values). OLS is solved via `nalgebra`. The result is stored in a `.c41` profile (a ZIP containing `profile.json` + `lut.cube`):
+
+```json
+{
+  "name": "Kodak Gold 200",
+  "light_source": "narrowband RGB LED",
+  "matrix": [[...], [...], [...]],
+  "dmin_medians": [0.635, 0.635, 0.624]
+}
+```
+
+Profiles are loaded in Process mode; when `apply_color_profile = false` the identity matrix is used (no color correction).
+
+**3D LUT alternative:** the GUI can generate a `.cube` from the current 3×3 matrix using `Lut3d::generate_from_matrix` (default 33³ grid). The 3D LUT sits in the same pipeline slot as the matrix and is applied with tetrahedral interpolation. You can also load an external `.cube` file directly via `--lut3d-path`.
+
+### Luminance calibration (flat-field)
+
+Provide a RAW scan of an **unexposed, developed frame** from the same roll. The pipeline:
+1. Demosaics to linear RGB.
+2. Applies a separable f32 Gaussian blur at σ = 60 px to remove grain and dust.
+3. Divides every pixel of the source image by the blurred map: `T_out = T_in / T_flat`.
+
+The blurred map can be saved as a 32f TIFF and reloaded to skip re-blurring. When a flat-field is active it fully replaces D-min for that session.
 
 ---
 
 ## CLI reference
 
-| Option | Short | Description |
-|--------|-------|-------------|
-| `--input-dir` | `-i` | Directory containing RAW files (`.arw`, `.nef`, `.nrw`, `.cr2`, `.cr3`, `.crw`, `.dng`, `.raf`, `.orf`, `.rw2`) and/or `.png` files. Others are ignored. |
-| `--output-dir` | `-o` | Directory for TIFF output. Created if missing. |
-| `--dmin-rect` | -- | D-min crop as `X,Y,WIDTH,HEIGHT` (pixels). Optional. Example: `35,15,20,20`. |
-| `--dmin-fixed` | -- | Fixed D-min medians `R,G,B` in linear [0,1]. Bypasses crop measurement. Example: `0.635294,0.635294,0.623529`. |
-| `--format` | -- | `32f` (float, default) or `16` (integer). Only used with `--no-curve`. |
-| `--no-invert` | -- | Skip linear `1-x` inversion (only applies with `--no-curve`; the print curve inverts in log domain). |
-| `--no-curve` | -- | Skip physical print curve; output stays as linear transmittance. |
-| `--wb-r` | -- | Red channel gain (after D-min). Default 1.0. Compensates narrowband LED imbalance. |
-| `--wb-g` | -- | Green channel gain (after D-min). Default 1.0. |
-| `--wb-b` | -- | Blue channel gain (after D-min). Default 1.0. |
-| `--curve-offset` | -- | Print exposure bias (log-domain shift). Default 0.0. Higher = brighter print. |
-| `--curve-gamma` | -- | Paper grade / contrast. Default 2.5. Higher = harder paper. Range 0.5-5.0. |
-| `--curve-pivot` | -- | Half-saturation exposure for RA-4 S-curve. Default 3.0. |
-| `--curve-white` | -- | Normalized code that maps to display white (0–1). Default 1.0. Use e.g. 0.745 (190/255) to pull white in. |
-| `--write-exr` | -- | Also write an OpenEXR `.exr` alongside the TIFF (RGB, 32-bit float in [0,1]). |
-| `--density-matrix` | -- | 3×3 density-domain calibration matrix in row-major order: `C00,C01,C02,C10,C11,C12,C20,C21,C22`. Defaults to identity (`1,0,0,0,1,0,0,0,1`). Used for **color calibration** (dye crosstalk correction) in the density domain before the RA-4 curve. |
-| `--flat-field` | -- | Path to a RAW (or pre-blurred 32f TIFF) of an unexposed, developed frame for **luminance calibration**. When set, flat-field division replaces D-min neutralization. |
-| `--use-acescg` | -- | Run the pipeline in **ACEScg**: apply IDT (camera linear → ACEScg), then D-min, flat-field, white balance, and the print curve in ACEScg. Display output maps ACEScg to sRGB via the RA-4 curve (no ACES RRT/ODT). |
-| `--idt-matrix` | -- | 3×3 IDT matrix (row-major), 9 comma-separated values. Used when `--use-acescg`. Default: identity. |
-| `--export-aces-exr` | -- | When using `--use-acescg`, also write a linear **ACES2065-1** EXR per image (e.g. `stem_aces2065-1.exr`) for VFX/archival. |
+```
+c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
+```
 
-When the print curve is used, a **histogram summary** (min, p50, p90, p99, max in 8-bit bins of the u16 output) is printed to the console for tuning.
-
-Output filenames are derived from the input stem: e.g. `frame_001.arw` or `frame_001.png` -> `frame_001.tiff`.
-
----
-
-## Calibration: color and luminance
-
-The tool supports two kinds of calibration, each with a clear role.
-
-### Color calibration (density-domain matrix)
-
-**What it does:** A 3×3 matrix is applied in the **optical density** domain (after log, before the RA-4 curve). It maps measured densities to reference densities, correcting dye crosstalk and aligning your film/light combination to a known target (e.g. a ColorChecker Classic).
-
-**Philosophy:** C-41 dyes are not perfectly separated; red dye absorbs some green and blue, etc. Measuring 24 patches from a chart and solving OLS gives a matrix that best fits your specific film stock and light source. The correction is explicit, repeatable, and saved as a JSON profile (name, light source notes, matrix, optional D-min medians). In Process mode you can enable or disable this step and choose a profile; when disabled, the identity matrix is used so no color correction is applied.
-
-**Workflow:** Use the **Color calibration** tab: load a RAW of a ColorChecker, align the 4 corner points to the chart, then “Solve 3×3 matrix from chart”. Save the profile to `profiles/` and in Process mode select it from the Color calibration profile dropdown.
-
-### Luminance calibration (flat-field)
-
-**What it does:** You provide a reference image of an **unexposed, developed** frame from the same roll (or same stock). It is linearized and heavily blurred to remove grain and dust, leaving only the low-frequency luminance pattern of your light source and lens. Each scan is then divided by this map pixel-by-pixel.
-
-**Philosophy:** The “empty” frame is not truly empty: it records the orange mask and base density, which is uniform, plus the **illumination** (LED falloff, vignetting). Dividing by this map makes the film base resolve to ~1.0 transmittance everywhere, so exposure and color are no longer biased by where the pixel sits in the frame. This is classic flat-field correction. D-min (single scalar per channel) is a special case when the light is perfectly even; flat-field generalizes to real setups.
-
-**Workflow:** Use the **Luminance calibration** tab: “Load Reference Frame…” (RAW of empty frame). The tool blurs it and keeps it in memory. You can “Save blurred flat-field as 32f TIFF…” to reuse the same camera/lens/light setup without re-blurring. In **Process** mode, under D-min, “Load flat-field map…” lets you choose either a RAW empty frame (linearized and blurred on the fly) or a saved 32f TIFF; when a flat-field is set, it overrides D-min for that session.
-
----
-
-## Processing pipeline
- 
-Order of operations:
-
-1. **Load and linearize**  
-   RAW: `rawloader` decode -> demosaic -> linear camera RGB (`f32`).  
-   PNG: load as linearized RGB input path used for development/testing.
-
-2. **IDT (camera RGB -> ACEScg)**  
-   Apply selected camera IDT matrix (identity by default).  
-   This now runs in the main preview/export pipeline (not only ACES export).
-
-3. **D-min / flat-field normalization**  
-   Either fixed D-min RGB, sampled D-min rectangle, or flat-field map (if set).  
-   Output stays bounded to valid transmittance range.
-
-4. **Transmittance -> density + WB + film gamma**  
-   Convert to optical density: `D = -log10(T)`.  
-   Apply auto/manual WB in density domain and film-gamma decompression (`D / gamma`).
-
-5. **Density calibration**  
-   Apply density-domain 3x3 matrix or 3D LUT (if loaded).
-
-6. **Render/output stage**  
-   - With print curve: RA-4 curve from density -> positive image.  
-   - Without print curve: direct density display mapping.
-
-7. **Export transforms**  
-   Optional ACES2065-1 EXR export from ACEScg working data.
+| Option | Description |
+|--------|-------------|
+| `-i`, `--input-dir` | Directory of RAW / PNG files. |
+| `-o`, `--output-dir` | Output directory (created if missing). |
+| `--dmin-rect X,Y,W,H` | Sample D-min from this pixel rectangle. |
+| `--dmin-fixed R,G,B` | Fixed D-min medians in linear [0, 1]; bypass measurement. |
+| `--format 32f\|16` | TIFF sample format (only with `--no-curve`). |
+| `--write-exr` | Also write OpenEXR alongside TIFF. |
+| `--no-curve` | Skip RA-4 curve; output is density or linear transmittance. |
+| `--no-invert` | Skip `1-x` inversion (only relevant with `--no-curve`). |
+| `--wb-r/g/b` | Per-channel density scale factors (default 1.0). |
+| `--curve-offset` | Print exposure bias (log-domain shift). Default 0.0. |
+| `--curve-gamma` | Paper grade / contrast (0.5–5.0). Default 2.5. |
+| `--curve-pivot` | Half-saturation exposure for Michaelis-Menten. Default 3.0. |
+| `--curve-white` | Code value [0–1] that maps to display white. Default 1.0. |
+| `--density-matrix C00,...,C22` | 3×3 density calibration matrix, row-major (9 values). |
+| `--flat-field PATH` | RAW or 32f TIFF flat-field for luminance calibration. |
+| `--export-aces-exr` | Write linear ACES2065-1 EXR alongside display output. |
+| `--idt-matrix M00,...,M22` | 3×3 IDT matrix (camera linear → working space), row-major. |
 
 ---
 
@@ -176,59 +246,43 @@ Order of operations:
 
 | Path | Role |
 |------|------|
-| `src/lib.rs` | Shared pipeline: `PipelineOptions`, `process_files()`. Used by CLI and GUI. |
-| `src/main.rs` | CLI (clap), directory iteration, calls lib. |
-| `src/bin/c41_gui.rs` | GUI (egui/eframe): Process / Color calibration / Luminance calibration tabs, per-step checkboxes, profile and flat-field load/save, Convert. Requires `--features gui`. |
-| `src/raw_reader.rs` | Load RAW via **rawloader** (pure Rust): `.arw`, `.nef`, `.nrw`, `.cr2`, `.cr3`, `.crw`, `.dng`, `.raf`, `.orf`, `.rw2`, etc. -> `Array3<f32>` (H×W×1) Bayer. |
-| `src/png_reader.rs` | Load `.png` (or other image crate formats) -> RGB `Array3<f32>` (HxWx3); any size. |
-| `src/demosaic.rs` | Bayer→RGB: bilinear (fallback), edge-aware green, and **quality** (edge-aware G + R−G/B−G color-difference). Supports RGGB, Grbg, Gbrg, Bggr. |
-| `src/dmin.rs` | D-min: sample rect, median R/G/B, divide image in-place; supports fixed medians via `--dmin-fixed`. |
-| `src/inversion.rs` | Simple linear inversion (`1-x`); used only with `--no-curve`. |
-| `src/curve.rs` | Physical Cineon/RA-4 print emulation: multi-stage pipeline (T → density → 3×3 density matrix → RA-4 S-curve) using high-resolution LUTs and rayon-parallel apply. |
-| `src/aces.rs` | ACES: IDT (camera → ACEScg), ACEScg ↔ ACES2065-1 matrix, and density-matrix conversion for ACEScg. |
-| `src/calibration.rs` | Color calibration: ColorChecker reference densities, OLS solver for 3×3 matrix, JSON profile load/save. |
-| `src/tiff_export.rs` | Write uncompressed RGB TIFF: 32f/16 from f32, or u16 (after curve) via `write_tiff_u16`. |
-| `src/exr_export.rs` | Write RGB OpenEXR: f32 or normalized u16 to EXR via `--write-exr`. |
+| `src/lib.rs` | `PipelineOptions`, `process_files`, `process_one_to_preview`. Shared by CLI and GUI. Contains all pipeline logic. |
+| `src/main.rs` | CLI (`clap`): `convert` and `debug-raw` subcommands. |
+| `src/bin/c41_gui.rs` | GUI (`eframe`/`egui`): Process / Color calibration / Luminance calibration tabs. Requires `--features gui`. |
+| `src/raw_reader.rs` | `rawloader` wrapper → single-channel CFA `Array3<f32>` + `CfaPattern`. |
+| `src/png_reader.rs` | `image` crate PNG loader → linear RGB `Array3<f32>`. |
+| `src/demosaic.rs` | Bayer and X-Trans demosaic: bilinear (fallback), edge-aware green, and quality (color-difference R/B). |
+| `src/dmin.rs` | D-min: rect sampling, fixed medians, auto-percentile, flat-field division. |
+| `src/curve.rs` | RA-4 Michaelis-Menten curve: 65 536-entry LUT generation, rayon-parallel apply, Film Print variant with per-channel curves and color bleed. |
+| `src/calibration.rs` | ColorChecker reference data, OLS 3×3 solver via `nalgebra`, `.c41` profile load/save (zip). |
+| `src/lut3d.rs` | Density-domain 3D LUT: generate from 3×3 matrix, `.cube` file I/O, tetrahedral interpolation. |
+| `src/aces.rs` | ACEScg IDT and `linear_acescg_to_aces2065_1` matrix. |
+| `src/tiff_export.rs` | Uncompressed TIFF writer: `write_tiff_u16` (u16), `write_tiff` (f32 or u16). |
+| `src/exr_export.rs` | OpenEXR writer: f32, u16, and ACES2065-1 paths. |
+| `src/inversion.rs` | Simple `1-x` linear inversion used only with `--no-curve`. |
 
-Dependencies (see `Cargo.toml`): `rawloader` (RAW decoding), `ndarray`, `rayon`, `clap`, `tiff`, `anyhow`, `image` (PNG/raster ingestion), `exr` (OpenEXR export), `nalgebra` (calibration OLS), `serde`/`serde_json` (profiles).
+---
+
+## Dependencies
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `rawloader` | 0.37 | Pure-Rust RAW decode (Bayer + X-Trans) |
+| `ndarray` | 0.17 | `Array3<f32>` image volumes; `rayon` feature |
+| `rayon` | 1.10 | Row-parallel curve and demosaic passes |
+| `clap` | 4.5 | CLI argument parsing (derive) |
+| `tiff` | 0.11 | Uncompressed TIFF output |
+| `image` | 0.25 | PNG ingestion + resize |
+| `exr` | 1.74 | OpenEXR output |
+| `nalgebra` | 0.34 | OLS solver for 3×3 calibration matrix |
+| `serde` / `serde_json` | 1.0 | Calibration profile JSON |
+| `zip` | 2.2 | `.c41` profile format (zip of JSON + LUT) |
+| `eframe` | 0.29 | GUI (optional, `--features gui`) |
+| `rfd` | 0.15 | Native file dialogs (optional) |
+| `arboard` | 3 | Clipboard (optional) |
 
 ---
 
 ## License
 
 See repository for license information.
-﻿
----
-
-## Exploring 3D LUTs (vs 3×3 density matrix)
-The softtware currently use a **3×3 matrix in the density domain**: it models linear, channel-mixing color correction (dye crosstalk, white balance, primaries). 
-
-**What a 3D LUT adds**
-
-- A 3D LUT maps each (R, G, B) input to an (R′, G′, B′) output on a grid (e.g. 17³ or 33³). It can represent:
-  - **Non-linear** corrections (e.g. different hue/saturation at shadows vs highlights).
-  - **Arbitrary** per-cell behavior, not just a single linear transform.
-- C-41 dyes are often **non-linear** at shoulders and toes, so a 3×3 can leave residual errors on a ColorChecker; a 3D LUT can reduce those errors if it’s built from (or constrained by) the same data.
-
-**Can you generate a 3D LUT from the ColorChecker?**
-
-Yes, but not by “solving” the LUT directly from 24 patches—you only have 24 (measured, reference) pairs, while a 17³ LUT has 4 913 grid points. Practical approaches:
-
-1. **Matrix → LUT**  
-   Evaluate your existing 3×3 density matrix on a dense grid (e.g. 17³ or 33³) in the **same place** in the pipeline (density domain). You get a 3D LUT that behaves like the matrix but in LUT form (useful for interchange, or as a base for hand tweaks).
-
-2. **ColorChecker-driven LUT**  
-   Use the 24 pairs to **fit a model**, then **fill the LUT** by evaluating that model:
-   - **Parametric**: e.g. 3×3 matrix plus a small “residual” LUT or polynomial; fit the 24 pairs (e.g. least squares), then evaluate the full model on the grid.
-   - **Regularized LUT fit**: optimize the LUT grid so that at the 24 input positions the output is close to the 24 targets, with a **smoothness** term so the rest of the grid is interpolated in a stable way (e.g. smoothness penalty on neighboring cells). This is how many grading tools build “LUT from chart”.
-
-3. **Hybrid**  
-   Keep the 3×3 from OLS as the main correction; add a **small 3D LUT** (e.g. 5³ or 9³) that encodes only the **residual** (measured − matrix prediction) at the 24 patches, interpolated smoothly. Pipeline: density → 3×3 → residual 3D LUT → RA-4.
-
-**What’s possible in this codebase**
-
-- **Pipeline slot**: A 3D LUT would sit in the same place as the density matrix: after T→D, before D→RA-4 (so in density domain), or you could define it in linear transmittance; the former keeps “one space” for all color correction.
-- **File format**: Standard formats (e.g. `.cube`) are easy to load and apply with tetrahedral or trilateral interpolation.
-- **Generation**: A first step is **matrix → LUT** (no new calibration math). Next step is using the existing ColorChecker OLS result plus the 24 patch positions to build a residual LUT or a regularized LUT so the same scan/chart can drive either a 3×3 or a 3D LUT.
-
----

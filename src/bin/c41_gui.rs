@@ -425,6 +425,15 @@ fn default_options() -> PipelineOptions {
         shadow_cast_strength: 0.0,
         zone_shadows: 0.0,
         zone_highlights: 0.0,
+        color_shadows_r: 0.0,
+        color_shadows_g: 0.0,
+        color_shadows_b: 0.0,
+        color_mids_r: 0.0,
+        color_mids_g: 0.0,
+        color_mids_b: 0.0,
+        color_highlights_r: 0.0,
+        color_highlights_g: 0.0,
+        color_highlights_b: 0.0,
         highlight_warmth: 0.0,
         soft_clip: 0.93,
         apply_lab: false,
@@ -502,6 +511,15 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.shadow_cast_strength.to_bits().hash(&mut h);
     opts.zone_shadows.to_bits().hash(&mut h);
     opts.zone_highlights.to_bits().hash(&mut h);
+    opts.color_shadows_r.to_bits().hash(&mut h);
+    opts.color_shadows_g.to_bits().hash(&mut h);
+    opts.color_shadows_b.to_bits().hash(&mut h);
+    opts.color_mids_r.to_bits().hash(&mut h);
+    opts.color_mids_g.to_bits().hash(&mut h);
+    opts.color_mids_b.to_bits().hash(&mut h);
+    opts.color_highlights_r.to_bits().hash(&mut h);
+    opts.color_highlights_g.to_bits().hash(&mut h);
+    opts.color_highlights_b.to_bits().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
@@ -1784,6 +1802,83 @@ impl eframe::App for C41Gui {
                             .small()
                             .weak(),
                         );
+                    });
+
+                    // ════════════════════════════════════════════════════════
+                    // GROUP 2.5 — Color Zones (per-channel shadow/mid/highlight)
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("Color zones", |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Per-channel density offset per tonal zone.\n+R = more red/less cyan  +G = more green/less magenta  +B = more blue/less yellow"
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+
+                        ui.label(egui::RichText::new("Shadows").strong());
+                        egui::Grid::new("color_zones_shadows")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("R–C");
+                                ui.add(egui::Slider::new(&mut opts.color_shadows_r, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("G–M");
+                                ui.add(egui::Slider::new(&mut opts.color_shadows_g, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("B–Y");
+                                ui.add(egui::Slider::new(&mut opts.color_shadows_b, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                            });
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Midtones").strong());
+                        egui::Grid::new("color_zones_mids")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("R–C");
+                                ui.add(egui::Slider::new(&mut opts.color_mids_r, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("G–M");
+                                ui.add(egui::Slider::new(&mut opts.color_mids_g, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("B–Y");
+                                ui.add(egui::Slider::new(&mut opts.color_mids_b, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                            });
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Highlights").strong());
+                        egui::Grid::new("color_zones_highlights")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("R–C");
+                                ui.add(egui::Slider::new(&mut opts.color_highlights_r, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("G–M");
+                                ui.add(egui::Slider::new(&mut opts.color_highlights_g, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("B–Y");
+                                ui.add(egui::Slider::new(&mut opts.color_highlights_b, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                            });
+
+                        ui.add_space(6.0);
+                        if ui.small_button("Reset all").clicked() {
+                            opts.color_shadows_r = 0.0;
+                            opts.color_shadows_g = 0.0;
+                            opts.color_shadows_b = 0.0;
+                            opts.color_mids_r = 0.0;
+                            opts.color_mids_g = 0.0;
+                            opts.color_mids_b = 0.0;
+                            opts.color_highlights_r = 0.0;
+                            opts.color_highlights_g = 0.0;
+                            opts.color_highlights_b = 0.0;
+                        }
                     });
 
                     // ════════════════════════════════════════════════════════
