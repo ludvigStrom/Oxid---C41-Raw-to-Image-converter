@@ -19,9 +19,11 @@ use c41_raw_tool::{
     png_reader,
     process_files,
     process_one_to_preview,
+    process_one_to_preview_with_cache,
     raw_reader,
     tiff_export,
     PipelineOptions,
+    PreviewStepCache,
     Rect,
     TiffFormat,
     OutputStage,
@@ -128,6 +130,8 @@ struct ImageEntry {
     pipeline_debug_log: Option<String>,
     /// Cached full-resolution sensor data (Bayer or RGB) for fast previews/exports.
     cached_sensor: Option<Arc<CachedSensor>>,
+    /// Step cache for preview: reuse pipeline stages when only later options change.
+    preview_step_cache: Option<PreviewStepCache>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,7 +189,7 @@ struct C41Gui {
     selected_index: Option<usize>,
     output_dir: Option<PathBuf>,
     status: String,
-    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>, String, bool)>>>,
+    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>, String, bool, PreviewStepCache)>>>,
     preview_started_at: Option<Instant>,
     /// One-shot flag: capture detailed pipeline debug log on the next preview render.
     capture_pipeline_debug_next: bool,
@@ -924,13 +928,21 @@ impl C41Gui {
             .round()
             .max(PREVIEW_MAX_HEIGHT as f32) as u32;
 
+        let cache = entry.preview_step_cache.clone();
         let (tx, rx) = mpsc::channel();
         self.preview_receiver = Some(rx);
         self.preview_started_at = Some(Instant::now());
         thread::spawn(move || {
-            let res = process_one_to_preview(&path, &options, max_width, max_height)
-            .map(|(input_w, input_h, w, h, rgb, dbg_log)| {
-                (index, input_w, input_h, w, h, rgb, dbg_log, capture_debug)
+            let res = process_one_to_preview_with_cache(
+                &path,
+                &options,
+                max_width,
+                max_height,
+                cache.as_ref(),
+                capture_debug,
+            )
+            .map(|(input_w, input_h, w, h, rgb, dbg_log, new_cache)| {
+                (index, input_w, input_h, w, h, rgb, dbg_log, capture_debug, new_cache)
             });
             let _ = tx.send(res);
         });
@@ -1016,7 +1028,7 @@ impl eframe::App for C41Gui {
         // Poll preview worker
         if let Some(rx) = self.preview_receiver.as_ref() {
             match rx.try_recv() {
-                Ok(Ok((idx, input_w, input_h, w, h, rgb, dbg_log, captured_debug))) => {
+                Ok(Ok((idx, input_w, input_h, w, h, rgb, dbg_log, captured_debug, new_cache))) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
                     if idx < self.images.len() {
@@ -1038,6 +1050,7 @@ impl eframe::App for C41Gui {
                         self.images[idx].preview_texture = None;
                         self.images[idx].preview_hash = hash;
                         self.images[idx].preview_full_rgb = Some((w, h, rgb.clone()));
+                        self.images[idx].preview_step_cache = Some(new_cache);
                         // preview_input_size = preview working dims (crop/dmin coord reference).
                         self.images[idx].preview_input_size = Some([w, h]);
                         // raw_source_size = true sensor/file dims (info bar display only).
@@ -1267,6 +1280,7 @@ impl eframe::App for C41Gui {
                                             raw_debug_report: None,
                                             pipeline_debug_log: None,
                                             cached_sensor: None,
+                                            preview_step_cache: None,
                                         });
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);

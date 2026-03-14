@@ -22,6 +22,7 @@ pub mod flat_field;
 pub mod inversion;
 pub mod lut3d;
 pub mod options;
+pub mod pipeline_cache;
 pub mod png_reader;
 pub mod pipeline;
 pub mod post_curve;
@@ -32,6 +33,7 @@ pub mod tiff_export;
 
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{DminMode, OutputLutEncoding, OutputStage, PipelineOptions, Rect};
+pub use pipeline_cache::{PreviewStepCache, hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5};
 pub use sensor::{compute_dmin_from_sensor, load_sensor_from_path, CachedSensor};
 pub use tiff_export::TiffFormat;
 
@@ -631,4 +633,183 @@ pub fn process_one_to_preview(
     // GUI handles zoom/crop/fit-to-window from this buffer.
     let out = img.into_raw();
     Ok((true_src_w, true_src_h, orig_w, orig_h, out, dbg))
+}
+
+/// Preview with step cache: reuses cached buffers when only options for later steps changed.
+/// Returns `(input_w, input_h, preview_w, preview_h, rgb_u8, debug_log, new_cache)`.
+/// Pass `cache` from the previous run (e.g. per-image); use the returned cache for the next call.
+pub fn process_one_to_preview_with_cache(
+    path: &Path,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    cache: Option<&PreviewStepCache>,
+    capture_debug: bool,
+) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>, String, PreviewStepCache)> {
+    use pipeline_cache::{hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5};
+
+    // Simple-debayer path: no cache; delegate to full pipeline.
+    if options.debug_preview_simple_debayer {
+        let mut opts = options.clone();
+        opts.verbose_debug = capture_debug;
+        let (a, b, c, d, rgb, dbg) = process_one_to_preview(path, &opts, max_width, max_height)?;
+        return Ok((a, b, c, d, rgb, dbg, PreviewStepCache::default()));
+    }
+
+    let h1 = hash_after_load(path, options, max_width, max_height);
+    let h3 = hash_after_step3(path, options, max_width, max_height);
+    let h4 = hash_after_step4(path, options, max_width, max_height);
+    let h5 = hash_after_step5(path, options, max_width, max_height);
+
+    let mut start_step = 1u8;
+    let mut image: Option<Array3<f32>> = None;
+    let mut true_src_w: u32 = 0;
+    let mut true_src_h: u32 = 0;
+    let mut dbg = String::new();
+
+    if let Some(c) = cache {
+        if let Some((hash, ref buf, tw, th)) = c.after_load.as_ref() {
+            if *hash == h1 {
+                image = Some(buf.clone());
+                true_src_w = *tw;
+                true_src_h = *th;
+                start_step = 3;
+            }
+        }
+        if start_step <= 3 {
+            if let Some((hash, ref buf)) = c.after_step3.as_ref() {
+                if *hash == h3 {
+                    image = Some(buf.clone());
+                    start_step = 4;
+                }
+            }
+        }
+        if start_step <= 4 {
+            if let Some((hash, ref buf)) = c.after_step4.as_ref() {
+                if *hash == h4 {
+                    image = Some(buf.clone());
+                    start_step = 5;
+                }
+            }
+        }
+        if start_step <= 5 {
+            if let Some((hash, ref buf)) = c.after_step5.as_ref() {
+                if *hash == h5 {
+                    image = Some(buf.clone());
+                    start_step = 6;
+                }
+            }
+        }
+    }
+
+    let mut new_cache = PreviewStepCache::default();
+    // Preserve cache slots we didn't recompute (so e.g. step-6-only change keeps step 3–5 cache).
+    if let Some(c) = cache {
+        if start_step > 1 {
+            new_cache.after_load = c.after_load.clone();
+        }
+        if start_step > 3 {
+            new_cache.after_step3 = c.after_step3.clone();
+        }
+        if start_step > 4 {
+            new_cache.after_step4 = c.after_step4.clone();
+        }
+        if start_step > 5 {
+            new_cache.after_step5 = c.after_step5.clone();
+        }
+    }
+
+    if start_step == 1 {
+        let (mut img, tw, th) = load_and_demosaic_preview(path, options, max_width, max_height)?;
+        true_src_w = tw;
+        true_src_h = th;
+        let _ = writeln!(dbg, "=== Pipeline Debug (with cache) ===");
+        let _ = writeln!(dbg, "image: {}x{} (preview)", img.dim().1, img.dim().0);
+        let _ = writeln!(dbg, "rotation: {}°", options.rotation_degrees);
+        if options.rotation_degrees == 90 || options.rotation_degrees == 270 {
+            std::mem::swap(&mut true_src_w, &mut true_src_h);
+        }
+        if options.rotation_degrees != 0 {
+            img = apply_rotation(&img, options.rotation_degrees);
+        }
+        new_cache.after_load = Some((h1, img.clone(), true_src_w, true_src_h));
+        image = Some(img);
+    } else {
+        let _ = writeln!(dbg, "=== Pipeline Debug (cached from step {}) ===", start_step);
+    }
+
+    let mut image = image.expect("image set by load or cache");
+
+    let flat_map_preview = options
+        .flat_field_path
+        .as_ref()
+        .and_then(|p| flat_field::load_flat_field_map(p).ok());
+    let lut3d_preview = options.lut3d_path.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+    let ra4_params = curve::PrintCurveParams {
+        offset: options.curve_offset,
+        gamma: options.curve_gamma,
+        pivot: options.curve_pivot,
+    };
+    let output_lut_preview = options.output_lut_cube.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+
+    if start_step <= 3 {
+        pipeline::step_3_dmin(&mut image, options, flat_map_preview.as_ref())?;
+        new_cache.after_step3 = Some((h3, image.clone()));
+    }
+    if start_step <= 4 {
+        pipeline::step_4_t_to_d_wb(&mut image, options);
+        new_cache.after_step4 = Some((h4, image.clone()));
+    }
+    if start_step <= 5 {
+        pipeline::step_5_calibration(&mut image, options, lut3d_preview.as_ref());
+        new_cache.after_step5 = Some((h5, image.clone()));
+    }
+
+    let (orig_h, orig_w, _) = image.dim();
+    let orig_w = orig_w as u32;
+    let orig_h = orig_h as u32;
+    let display = pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
+    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+
+    let _ = writeln!(dbg, "=== end pipeline debug ===");
+    let img = RgbImage::from_raw(orig_w, orig_h, rgb_u8)
+        .ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
+    let out = img.into_raw();
+    Ok((true_src_w, true_src_h, orig_w, orig_h, out, dbg, new_cache))
+}
+
+/// Load and demosaic for preview only (no rotation). Returns (image, true_src_w, true_src_h).
+fn load_and_demosaic_preview(
+    path: &Path,
+    _options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+) -> anyhow::Result<(Array3<f32>, u32, u32)> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let (true_src_w, true_src_h);
+    let image = match ext.as_str() {
+        "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
+            let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
+            let (bh, bw, _) = bayer.dim();
+            true_src_w = bw as u32;
+            true_src_h = bh as u32;
+            let small_bayer = downsample_raw_for_preview(&bayer, pattern, max_width);
+            let mut img = demosaic::demosaic_quality(&small_bayer, pattern)?;
+            img.mapv_inplace(|v| v.max(0.0));
+            img
+        }
+        "png" => {
+            let img = png_reader::load_png_as_ndarray(path)?;
+            let (ph, pw, _) = img.dim();
+            true_src_w = pw as u32;
+            true_src_h = ph as u32;
+            downsample_rgb_for_preview(&img, max_width, max_height)
+        }
+        _ => anyhow::bail!("Unsupported extension for preview"),
+    };
+    Ok((image, true_src_w, true_src_h))
 }

@@ -1,0 +1,139 @@
+//! Step-level cache for preview: reuse results of pipeline stages so only steps
+//! after a changed option are re-run. Used by the GUI for fast preview updates.
+
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+
+use ndarray::Array3;
+
+use crate::options::{PipelineOptions, Rect};
+
+/// Cache slots for each pipeline stage. Each slot stores the hash that produced it
+/// and the image buffer after that step (so we can run from the next step).
+#[derive(Clone, Default)]
+pub struct PreviewStepCache {
+    /// After load + demosaic + rotate. Includes true source (pre-rotation) dimensions.
+    pub after_load: Option<(u64, Array3<f32>, u32, u32)>,
+    /// After step 3 (D-min / flat-field).
+    pub after_step3: Option<(u64, Array3<f32>)>,
+    /// After step 4 (T→D, WB, film γ, shadow cast).
+    pub after_step4: Option<(u64, Array3<f32>)>,
+    /// After step 5 (density matrix / LUT, saturation, zones).
+    pub after_step5: Option<(u64, Array3<f32>)>,
+}
+
+fn hash_f32(h: &mut impl Hasher, v: f32) {
+    v.to_bits().hash(h);
+}
+
+fn hash_rect(h: &mut impl Hasher, r: &Rect) {
+    r.x.hash(h);
+    r.y.hash(h);
+    r.width.hash(h);
+    r.height.hash(h);
+}
+
+/// Hash of everything that affects output after load (path, rotation, preview size, simple-debayer).
+/// Used as cache key for the "after load" slot.
+pub fn hash_after_load(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.display().to_string().hash(&mut h);
+    opts.rotation_degrees.hash(&mut h);
+    max_width.hash(&mut h);
+    max_height.hash(&mut h);
+    opts.debug_preview_simple_debayer.hash(&mut h);
+    h.finish()
+}
+
+/// Hash for "after step 3": everything that affects steps 1..3 (load + D-min/flat-field).
+pub fn hash_after_step3(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_after_load(path, opts, max_width, max_height).hash(&mut h);
+    opts.dmin_mode.hash(&mut h);
+    opts.dmin_rect_reference_size.hash(&mut h);
+    opts.dmin_neutral_only.hash(&mut h);
+    opts.auto_norm_buffer.to_bits().hash(&mut h);
+    if let Some(r) = opts.dmin_rect {
+        hash_rect(&mut h, &r);
+    }
+    if let Some((r, g, b)) = opts.dmin_fixed {
+        hash_f32(&mut h, r);
+        hash_f32(&mut h, g);
+        hash_f32(&mut h, b);
+    }
+    opts.flat_field_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .hash(&mut h);
+    h.finish()
+}
+
+/// Hash for "after step 4": everything that affects steps 1..4 (+ WB, film γ, shadow cast).
+pub fn hash_after_step4(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_after_step3(path, opts, max_width, max_height).hash(&mut h);
+    opts.auto_wb.hash(&mut h);
+    opts.apply_white_balance.hash(&mut h);
+    hash_f32(&mut h, opts.wb_r);
+    hash_f32(&mut h, opts.wb_g);
+    hash_f32(&mut h, opts.wb_b);
+    hash_f32(&mut h, opts.film_gamma);
+    opts.temp_k.map(|k| hash_f32(&mut h, k));
+    hash_f32(&mut h, opts.shadow_cast_strength);
+    h.finish()
+}
+
+/// Hash for "after step 5": everything that affects steps 1..5 (+ matrix, LUT, saturation, zones).
+pub fn hash_after_step5(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_after_step4(path, opts, max_width, max_height).hash(&mut h);
+    opts.apply_color_profile.hash(&mut h);
+    for row in &opts.density_matrix {
+        for &v in row {
+            hash_f32(&mut h, v);
+        }
+    }
+    opts.lut3d_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .hash(&mut h);
+    hash_f32(&mut h, opts.saturation);
+    hash_f32(&mut h, opts.zone_shadows);
+    hash_f32(&mut h, opts.zone_highlights);
+    hash_f32(&mut h, opts.color_shadows_r);
+    hash_f32(&mut h, opts.color_shadows_g);
+    hash_f32(&mut h, opts.color_shadows_b);
+    hash_f32(&mut h, opts.color_mids_r);
+    hash_f32(&mut h, opts.color_mids_g);
+    hash_f32(&mut h, opts.color_mids_b);
+    hash_f32(&mut h, opts.color_highlights_r);
+    hash_f32(&mut h, opts.color_highlights_g);
+    hash_f32(&mut h, opts.color_highlights_b);
+    opts.debug_pipeline_step.hash(&mut h);
+    h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::DminMode;
+    use crate::PipelineOptions;
+
+    #[test]
+    fn hash_after_load_deterministic() {
+        let opts = PipelineOptions::default();
+        let h1 = hash_after_load(Path::new("/a.raw"), &opts, 800, 600);
+        let h2 = hash_after_load(Path::new("/a.raw"), &opts, 800, 600);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_after_step3_differs_with_dmin() {
+        let mut opts = PipelineOptions::default();
+        let h_off = hash_after_step3(Path::new("/a.raw"), &opts, 800, 600);
+        opts.dmin_mode = DminMode::Fixed;
+        opts.dmin_fixed = Some((0.1, 0.2, 0.3));
+        let h_fixed = hash_after_step3(Path::new("/a.raw"), &opts, 800, 600);
+        assert_ne!(h_off, h_fixed);
+    }
+}
