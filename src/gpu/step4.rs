@@ -128,6 +128,12 @@ impl Step4Pipeline {
         let (height, width, channels) = image.dim();
         anyhow::ensure!(channels == 3, "Expected 3-channel image");
 
+        let buf_bytes = (width * height * 3 * std::mem::size_of::<f32>()) as u64;
+        let max_buf = self.ctx.device.limits().max_buffer_size;
+        if buf_bytes > max_buf {
+            anyhow::bail!("Image buffer exceeds GPU max_buffer_size; falling back to CPU");
+        }
+
         // ── CPU precomputation ──
         // Temporary density copy for stats + shadow cast analysis.
         let mut density_tmp = image.clone();

@@ -32,11 +32,20 @@ impl GpuContext {
             force_fallback_adapter: false,
         }))?;
 
+        // Request larger buffer limits for high-zoom previews. Fall back to
+        // default limits if the adapter doesn't support them.
+        let mut limits = wgpu::Limits::default();
+        let adapter_limits = adapter.limits();
+        limits.max_buffer_size = adapter_limits.max_buffer_size.max(limits.max_buffer_size);
+        limits.max_storage_buffer_binding_size = adapter_limits
+            .max_storage_buffer_binding_size
+            .max(limits.max_storage_buffer_binding_size);
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("c41_gpu"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,

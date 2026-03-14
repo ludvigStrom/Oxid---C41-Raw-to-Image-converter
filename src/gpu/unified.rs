@@ -72,6 +72,16 @@ impl GpuPipeline {
         let buf_len = pixel_count * 3;
         let buf_bytes = (buf_len * std::mem::size_of::<f32>()) as u64;
 
+        let max_buf = device.limits().max_buffer_size;
+        // Step 6 needs two buffers (input + output), so check 2x.
+        if buf_bytes * 2 > max_buf {
+            anyhow::bail!(
+                "Image buffer ({:.1} MB x2) exceeds GPU max_buffer_size ({:.1} MB); falling back to CPU",
+                buf_bytes as f64 / 1048576.0,
+                max_buf as f64 / 1048576.0,
+            );
+        }
+
         // ── Flatten image ──
         let mut flat: Vec<f32> = Vec::with_capacity(buf_len);
         for y in 0..height {
