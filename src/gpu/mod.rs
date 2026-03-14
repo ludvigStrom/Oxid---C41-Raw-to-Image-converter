@@ -5,6 +5,7 @@
 //! as the CPU reference in `pipeline.rs` and `density_ops.rs`.
 
 pub mod step5;
+pub mod step6;
 
 use std::sync::Arc;
 

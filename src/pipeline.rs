@@ -210,6 +210,26 @@ pub fn step_5_calibration(
     );
 }
 
+/// Step 6 on GPU (if available). Falls back to CPU if the GPU pass fails.
+#[cfg(feature = "gpu")]
+pub fn step_6_render_gpu(
+    image: &Array3<f32>,
+    options: &PipelineOptions,
+    ra4_params: &curve::PrintCurveParams,
+    output_lut_cube: Option<&lut3d::Lut3d>,
+    gpu_step6: Option<&crate::gpu::step6::Step6Pipeline>,
+) -> Step6Display {
+    if options.debug_pipeline_step < 6 {
+        return Step6Display::PassthroughDensity(image.clone());
+    }
+    if let Some(pipeline) = gpu_step6 {
+        if let Ok(display) = pipeline.run(image, options, ra4_params, output_lut_cube) {
+            return display;
+        }
+    }
+    step_6_render(image, options, ra4_params, output_lut_cube)
+}
+
 /// Step 6: render to display buffer (RA-4, FilmPrint, None, or Lut2383).
 /// If debug_pipeline_step < 6, returns PassthroughDensity with the current image.
 pub fn step_6_render(
