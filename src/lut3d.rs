@@ -60,6 +60,11 @@ impl Lut3d {
         self.data[r + g * self.size + b * self.size * self.size]
     }
 
+    /// Read-only access to the raw LUT data for GPU upload.
+    pub fn data_slice(&self) -> &[[f32; 3]] {
+        &self.data
+    }
+
     /// Sample the LUT at normalized coordinates (r, g, b) in [0, 1]³ using tetrahedral interpolation.
     /// Returns normalized output [0, 1]³; multiply by d_max to get density.
     #[inline]

@@ -291,6 +291,7 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
         verbose_debug: false,
+        use_gpu: false,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

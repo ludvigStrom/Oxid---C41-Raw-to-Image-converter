@@ -117,6 +117,25 @@ pub fn step_4_t_to_d_wb(image: &mut Array3<f32>, options: &PipelineOptions) {
     }
 }
 
+/// Step 5 on GPU (if available). Falls back to CPU if the GPU pass fails.
+#[cfg(feature = "gpu")]
+pub fn step_5_calibration_gpu(
+    image: &mut Array3<f32>,
+    options: &PipelineOptions,
+    lut3d: Option<&lut3d::Lut3d>,
+    gpu_step5: Option<&crate::gpu::step5::Step5Pipeline>,
+) {
+    if options.debug_pipeline_step < 5 {
+        return;
+    }
+    if let Some(pipeline) = gpu_step5 {
+        if pipeline.run(image, options, lut3d).is_ok() {
+            return;
+        }
+    }
+    step_5_calibration(image, options, lut3d);
+}
+
 /// Step 5: Density matrix / 3D LUT, limit highlight spread, saturation, zone adjustments.
 pub fn step_5_calibration(
     image: &mut Array3<f32>,

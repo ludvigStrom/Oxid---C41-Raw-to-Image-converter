@@ -26,6 +26,9 @@ pub mod pipeline_cache;
 pub mod png_reader;
 pub mod pipeline;
 pub mod post_curve;
+
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod raw_reader;
 pub mod sensor;
 pub mod stats;

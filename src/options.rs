@@ -208,6 +208,8 @@ pub struct PipelineOptions {
     /// debug log. Expensive (sorts entire image per channel per step). Only
     /// enable when the Debug tab is active.
     pub verbose_debug: bool,
+    /// When true (and the `gpu` feature is enabled), offload eligible pipeline steps to the GPU.
+    pub use_gpu: bool,
 }
 
 impl Default for PipelineOptions {
@@ -286,6 +288,7 @@ impl Default for PipelineOptions {
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
             verbose_debug: false,
+            use_gpu: false,
         }
     }
 }

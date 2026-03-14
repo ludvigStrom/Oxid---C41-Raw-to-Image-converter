@@ -74,6 +74,27 @@ cargo run --release --bin c41-gui --features gui
 
 Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Provides three tabs: **Process** (main development with per-step checkboxes), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).
 
+**GPU-accelerated build:**
+
+```bash
+cargo run --release --features gpu -- convert \
+  --input-dir /path/to/scans --output-dir /path/to/output
+```
+
+The `gpu` feature adds `wgpu`, `pollster`, and `bytemuck`. When enabled, pipeline step 5 (density matrix / 3D LUT, highlight spread, saturation, zone adjustments) can run on the GPU via a WGSL compute shader. The GPU path produces results identical to the CPU reference (tested within 1e-5 f32). If no GPU adapter is available (headless, old drivers), the pipeline falls back to CPU automatically.
+
+To build the GUI with GPU acceleration:
+
+```bash
+cargo run --release --bin c41-gui --features gui,gpu
+```
+
+To run the CPU-vs-GPU comparison tests:
+
+```bash
+cargo test --features gpu --test gpu_step5 -- --nocapture
+```
+
 ---
 
 ## Pipeline: exact order of operations
@@ -259,6 +280,11 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/aces.rs` | ACEScg IDT and `linear_acescg_to_aces2065_1` matrix. |
 | `src/tiff_export.rs` | Uncompressed TIFF writer: `write_tiff_u16` (u16), `write_tiff` (f32 or u16). |
 | `src/exr_export.rs` | OpenEXR writer: f32, u16, and ACES2065-1 paths. |
+| `src/pipeline.rs` | Shared pipeline steps 3–6 used by both `process_files` and `process_one_to_preview`. |
+| `src/pipeline_cache.rs` | Step-level cache for preview: reuse earlier stages when only later options change. |
+| `src/gpu/mod.rs` | wgpu initialization and `GpuContext` (optional, `--features gpu`). |
+| `src/gpu/step5.rs` | GPU dispatch for step 5: buffer upload, bind groups, compute dispatch, readback. |
+| `src/gpu/step5.wgsl` | WGSL compute shader: density matrix, tetrahedral 3D LUT, highlight spread, saturation, zones. |
 | `src/inversion.rs` | Simple `1-x` linear inversion used only with `--no-curve`. |
 
 ---
@@ -280,6 +306,9 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `eframe` | 0.29 | GUI (optional, `--features gui`) |
 | `rfd` | 0.15 | Native file dialogs (optional) |
 | `arboard` | 3 | Clipboard (optional) |
+| `wgpu` | 24 | GPU compute pipeline (optional, `--features gpu`) |
+| `pollster` | 0.4 | Blocking async executor for wgpu init (optional) |
+| `bytemuck` | 1 | Safe byte casting for GPU buffer upload (optional) |
 
 ---
 

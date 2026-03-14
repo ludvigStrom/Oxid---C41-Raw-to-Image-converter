@@ -446,6 +446,7 @@ fn default_options() -> PipelineOptions {
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
         verbose_debug: false,
+        use_gpu: false,
     }
 }
 
