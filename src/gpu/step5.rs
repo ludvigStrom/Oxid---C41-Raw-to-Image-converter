@@ -44,9 +44,18 @@ struct Step5Params {
 
 /// Cached GPU pipeline for step 5 (reuse across frames).
 pub struct Step5Pipeline {
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    compute_pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
     ctx: Arc<GpuContext>,
+}
+
+impl Step5Pipeline {
+    pub fn pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.compute_pipeline
+    }
+    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bgl
+    }
 }
 
 impl Step5Pipeline {
@@ -120,8 +129,8 @@ impl Step5Pipeline {
             });
 
         Self {
-            pipeline,
-            bind_group_layout,
+            compute_pipeline: pipeline,
+            bgl: bind_group_layout,
             ctx: Arc::clone(ctx),
         }
     }
@@ -221,7 +230,7 @@ impl Step5Pipeline {
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("step5_bg"),
-            layout: &self.bind_group_layout,
+            layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -246,7 +255,7 @@ impl Step5Pipeline {
                 label: Some("step5_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(&self.compute_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let workgroups = (pixel_count as u32 + 255) / 256;
             pass.dispatch_workgroups(workgroups, 1, 1);

@@ -19,7 +19,6 @@ use c41_raw_tool::{
     png_reader,
     process_files,
     process_one_to_preview,
-    process_one_to_preview_with_cache,
     raw_reader,
     tiff_export,
     PipelineOptions,
@@ -33,6 +32,8 @@ use c41_raw_tool::{
     load_sensor_from_path,
     compute_dmin_from_sensor,
 };
+#[cfg(feature = "gpu")]
+use c41_raw_tool::process_one_to_preview_with_cache_gpu;
 use eframe::egui;
 
 const PREVIEW_MAX_WIDTH: u32 = 1920;
@@ -220,6 +221,8 @@ struct C41Gui {
     /// to avoid macOS NSOpenPanel re-entrance crashes.
     pending_output_lut_browse: bool,
     process_tab: ProcessTab,
+    #[cfg(feature = "gpu")]
+    gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
 }
 
 impl Default for C41Gui {
@@ -251,6 +254,9 @@ impl Default for C41Gui {
             pending_preview_since: None,
             pending_output_lut_browse: false,
             process_tab: ProcessTab::Input,
+            #[cfg(feature = "gpu")]
+            gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
+                .map(std::sync::Arc::new),
         }
     }
 }
@@ -446,7 +452,7 @@ fn default_options() -> PipelineOptions {
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
         verbose_debug: false,
-        use_gpu: false,
+        use_gpu: cfg!(feature = "gpu"),
     }
 }
 
@@ -529,6 +535,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
     opts.verbose_debug.hash(&mut h);
+    opts.use_gpu.hash(&mut h);
     h.finish()
 }
 
@@ -930,18 +937,32 @@ impl C41Gui {
             .max(PREVIEW_MAX_HEIGHT as f32) as u32;
 
         let cache = entry.preview_step_cache.clone();
+        #[cfg(feature = "gpu")]
+        let gpu_arc = self.gpu_pipeline.clone();
         let (tx, rx) = mpsc::channel();
         self.preview_receiver = Some(rx);
         self.preview_started_at = Some(Instant::now());
         thread::spawn(move || {
-            let res = process_one_to_preview_with_cache(
+            #[cfg(feature = "gpu")]
+            let res = process_one_to_preview_with_cache_gpu(
                 &path,
                 &options,
                 max_width,
                 max_height,
                 cache.as_ref(),
                 capture_debug,
-            )
+                gpu_arc.as_deref(),
+            );
+            #[cfg(not(feature = "gpu"))]
+            let res = c41_raw_tool::process_one_to_preview_with_cache(
+                &path,
+                &options,
+                max_width,
+                max_height,
+                cache.as_ref(),
+                capture_debug,
+            );
+            let res = res
             .map(|(input_w, input_h, w, h, rgb, dbg_log, new_cache)| {
                 (index, input_w, input_h, w, h, rgb, dbg_log, capture_debug, new_cache)
             });
@@ -1550,6 +1571,21 @@ impl eframe::App for C41Gui {
                             );
                         }
                     });
+                    #[cfg(feature = "gpu")]
+                    {
+                        ui.add_space(6.0);
+                        let gpu_available = self.gpu_pipeline.is_some();
+                        ui.horizontal(|ui| {
+                            let mut use_gpu = opts.use_gpu;
+                            ui.add_enabled(gpu_available, egui::Checkbox::new(&mut use_gpu, "GPU acceleration"));
+                            opts.use_gpu = use_gpu;
+                            if gpu_available {
+                                ui.label(egui::RichText::new("(available)").small().weak());
+                            } else {
+                                ui.label(egui::RichText::new("(no GPU adapter found)").small().weak());
+                            }
+                        });
+                    }
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new("1: load+demosaic+rot · 3: +D-min · 4: +WB · 6: full (curve/invert)")

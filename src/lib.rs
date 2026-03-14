@@ -781,6 +781,159 @@ pub fn process_one_to_preview_with_cache(
     Ok((true_src_w, true_src_h, orig_w, orig_h, out, dbg, new_cache))
 }
 
+/// GPU-accelerated version of `process_one_to_preview_with_cache`.
+///
+/// When `gpu` is `Some` and `options.use_gpu` is true, runs steps 4→5→6 on
+/// the GPU in a single upload/readback via the unified pipeline. Steps 1–3
+/// (load, demosaic, D-min) still run on CPU.
+///
+/// Intermediate step 4/5 results are NOT cached when using GPU (the unified
+/// pipeline skips readback for intermediates). The step 3 cache is still
+/// populated and valid.
+#[cfg(feature = "gpu")]
+pub fn process_one_to_preview_with_cache_gpu(
+    path: &Path,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    cache: Option<&PreviewStepCache>,
+    capture_debug: bool,
+    gpu: Option<&gpu::unified::GpuPipeline>,
+) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>, String, PreviewStepCache)> {
+    let use_gpu = gpu.is_some() && options.use_gpu;
+    if !use_gpu {
+        return process_one_to_preview_with_cache(
+            path, options, max_width, max_height, cache, capture_debug,
+        );
+    }
+    let gpu = gpu.unwrap();
+
+    use pipeline_cache::{hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5};
+
+    if options.debug_preview_simple_debayer {
+        return process_one_to_preview_with_cache(
+            path, options, max_width, max_height, cache, capture_debug,
+        );
+    }
+
+    let h1 = hash_after_load(path, options, max_width, max_height);
+    let h3 = hash_after_step3(path, options, max_width, max_height);
+    let h4 = hash_after_step4(path, options, max_width, max_height);
+    let h5 = hash_after_step5(path, options, max_width, max_height);
+
+    let mut image: Option<Array3<f32>> = None;
+    let mut start_step = 1u32;
+    let mut true_src_w: u32 = 0;
+    let mut true_src_h: u32 = 0;
+    let mut dbg = String::new();
+
+    if let Some(c) = cache {
+        if let Some((hash, ref buf, tw, th)) = c.after_load.as_ref() {
+            if *hash == h1 {
+                image = Some(buf.clone());
+                true_src_w = *tw;
+                true_src_h = *th;
+                start_step = 3;
+            }
+        }
+        if start_step <= 3 {
+            if let Some((hash, ref buf)) = c.after_step3.as_ref() {
+                if *hash == h3 {
+                    image = Some(buf.clone());
+                    start_step = 4;
+                }
+            }
+        }
+        // GPU path also checks step 4/5 cache (populated by previous CPU runs)
+        if start_step <= 4 {
+            if let Some((hash, ref buf)) = c.after_step4.as_ref() {
+                if *hash == h4 {
+                    image = Some(buf.clone());
+                    start_step = 5;
+                }
+            }
+        }
+        if start_step <= 5 {
+            if let Some((hash, ref buf)) = c.after_step5.as_ref() {
+                if *hash == h5 {
+                    image = Some(buf.clone());
+                    start_step = 6;
+                }
+            }
+        }
+    }
+
+    let mut new_cache = PreviewStepCache::default();
+    if let Some(c) = cache {
+        if start_step > 1 { new_cache.after_load = c.after_load.clone(); }
+        if start_step > 3 { new_cache.after_step3 = c.after_step3.clone(); }
+        if start_step > 4 { new_cache.after_step4 = c.after_step4.clone(); }
+        if start_step > 5 { new_cache.after_step5 = c.after_step5.clone(); }
+    }
+
+    if start_step == 1 {
+        let (mut img, tw, th) = load_and_demosaic_preview(path, options, max_width, max_height)?;
+        true_src_w = tw;
+        true_src_h = th;
+        let _ = writeln!(dbg, "=== Pipeline Debug (GPU, with cache) ===");
+        let _ = writeln!(dbg, "image: {}x{} (preview)", img.dim().1, img.dim().0);
+        let _ = writeln!(dbg, "rotation: {}°", options.rotation_degrees);
+        if options.rotation_degrees == 90 || options.rotation_degrees == 270 {
+            std::mem::swap(&mut true_src_w, &mut true_src_h);
+        }
+        if options.rotation_degrees != 0 {
+            img = apply_rotation(&img, options.rotation_degrees);
+        }
+        new_cache.after_load = Some((h1, img.clone(), true_src_w, true_src_h));
+        image = Some(img);
+    } else {
+        let _ = writeln!(dbg, "=== Pipeline Debug (GPU, cached from step {}) ===", start_step);
+    }
+
+    let mut image = image.expect("image set by load or cache");
+
+    // Step 3 on CPU (D-min / flat-field)
+    if start_step <= 3 {
+        let flat_map_preview = options
+            .flat_field_path
+            .as_ref()
+            .and_then(|p| flat_field::load_flat_field_map(p).ok());
+        pipeline::step_3_dmin(&mut image, options, flat_map_preview.as_ref())?;
+        new_cache.after_step3 = Some((h3, image.clone()));
+    }
+
+    // Steps 4→5→6 on GPU (unified: single upload/readback)
+    let gpu_start = start_step.max(4);
+    let lut3d_preview = options.lut3d_path.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+    let ra4_params = curve::PrintCurveParams {
+        offset: options.curve_offset,
+        gamma: options.curve_gamma,
+        pivot: options.curve_pivot,
+    };
+    let output_lut_preview = options.output_lut_cube.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+
+    let display = gpu.run_from_step(
+        &image,
+        gpu_start,
+        options,
+        lut3d_preview.as_ref(),
+        &ra4_params,
+        output_lut_preview.as_ref(),
+    )?;
+
+    let (orig_h, orig_w, _) = image.dim();
+    let orig_w = orig_w as u32;
+    let orig_h = orig_h as u32;
+    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+
+    let _ = writeln!(dbg, "GPU steps {}-6 complete", gpu_start);
+    let _ = writeln!(dbg, "=== end pipeline debug ===");
+    let img = RgbImage::from_raw(orig_w, orig_h, rgb_u8)
+        .ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
+    let out = img.into_raw();
+    Ok((true_src_w, true_src_h, orig_w, orig_h, out, dbg, new_cache))
+}
+
 /// Load and demosaic for preview only (no rotation). Returns (image, true_src_w, true_src_h).
 fn load_and_demosaic_preview(
     path: &Path,

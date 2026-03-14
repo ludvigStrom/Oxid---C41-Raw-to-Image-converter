@@ -41,9 +41,18 @@ struct Step6Params {
 }
 
 pub struct Step6Pipeline {
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    compute_pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
     ctx: Arc<GpuContext>,
+}
+
+impl Step6Pipeline {
+    pub fn pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.compute_pipeline
+    }
+    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bgl
+    }
 }
 
 impl Step6Pipeline {
@@ -134,8 +143,8 @@ impl Step6Pipeline {
             });
 
         Self {
-            pipeline,
-            bind_group_layout,
+            compute_pipeline: pipeline,
+            bgl: bind_group_layout,
             ctx: Arc::clone(ctx),
         }
     }
@@ -273,7 +282,7 @@ impl Step6Pipeline {
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("step6_bg"),
-            layout: &self.bind_group_layout,
+            layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: input_buf.as_entire_binding() },
@@ -291,7 +300,7 @@ impl Step6Pipeline {
                 label: Some("step6_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(&self.compute_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let workgroups = (pixel_count as u32 + 255) / 256;
             pass.dispatch_workgroups(workgroups, 1, 1);

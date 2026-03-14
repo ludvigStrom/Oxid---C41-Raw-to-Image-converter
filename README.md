@@ -81,7 +81,18 @@ cargo run --release --features gpu -- convert \
   --input-dir /path/to/scans --output-dir /path/to/output
 ```
 
-The `gpu` feature adds `wgpu`, `pollster`, and `bytemuck`. When enabled, pipeline step 5 (density matrix / 3D LUT, highlight spread, saturation, zone adjustments) can run on the GPU via a WGSL compute shader. The GPU path produces results identical to the CPU reference (tested within 1e-5 f32). If no GPU adapter is available (headless, old drivers), the pipeline falls back to CPU automatically.
+The `gpu` feature adds `wgpu`, `pollster`, and `bytemuck`. When enabled, pipeline steps 4–6 (T→D / WB / shadow cast, density matrix / 3D LUT / saturation / zones, and the full output stage with post-curve ops) run on the GPU via WGSL compute shaders. A unified pipeline uploads the image once, runs all three steps as consecutive compute dispatches in a single command encoder submission, and reads back the final result once — minimizing PCIe/bus overhead.
+
+The GPU path produces results virtually identical to the CPU reference:
+
+| Step | Max diff (f32) | Max diff (u16) | Notes |
+|------|---------------|----------------|-------|
+| Step 4 (T→D, WB, shadow cast) | 2.4×10⁻⁷ | — | Hardware `log2` vs software `log10` |
+| Step 5 (matrix, LUT, saturation) | 1.2×10⁻⁶ | — | |
+| Step 6 (RA-4, FilmPrint, Lut2383) | <1×10⁻⁶ | 0–1 LSB (no Lab) | With Lab: ≤10 LSB due to `pow` precision |
+| Unified 4→5→6 end-to-end | — | ≤7 LSB | Compound precision; 0.01% |
+
+If no GPU adapter is available, the pipeline falls back to CPU automatically.
 
 To build the GUI with GPU acceleration:
 
@@ -89,11 +100,15 @@ To build the GUI with GPU acceleration:
 cargo run --release --bin c41-gui --features gui,gpu
 ```
 
+The GUI initializes the GPU at startup and adds a **GPU acceleration** checkbox in the Debug tab. Toggling it switches between GPU and CPU paths instantly. The step cache (steps 1–3) remains valid across GPU/CPU switches.
+
 To run the CPU-vs-GPU comparison tests:
 
 ```bash
-cargo test --features gpu --test gpu_step5 -- --nocapture
+cargo test --features gpu -- --nocapture
 ```
+
+This runs 25 tests across 4 test suites (`gpu_step4`, `gpu_step5`, `gpu_step6`, `gpu_unified`).
 
 ---
 
@@ -283,8 +298,13 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/pipeline.rs` | Shared pipeline steps 3–6 used by both `process_files` and `process_one_to_preview`. |
 | `src/pipeline_cache.rs` | Step-level cache for preview: reuse earlier stages when only later options change. |
 | `src/gpu/mod.rs` | wgpu initialization and `GpuContext` (optional, `--features gpu`). |
-| `src/gpu/step5.rs` | GPU dispatch for step 5: buffer upload, bind groups, compute dispatch, readback. |
-| `src/gpu/step5.wgsl` | WGSL compute shader: density matrix, tetrahedral 3D LUT, highlight spread, saturation, zones. |
+| `src/gpu/unified.rs` | Unified GPU pipeline: single upload, steps 4→5→6 as consecutive dispatches, single readback. |
+| `src/gpu/step4.rs` | GPU dispatch for step 4: T→D, WB, shadow cast. CPU precomputes auto-WB medians and shadow analysis. |
+| `src/gpu/step4.wgsl` | WGSL compute shader: T→D via hardware `log2`, per-channel scale+offset, shadow cast correction. |
+| `src/gpu/step5.rs` | GPU dispatch for step 5: density matrix, 3D LUT, saturation, zones. |
+| `src/gpu/step5.wgsl` | WGSL compute shader: matrix multiply, tetrahedral 3D LUT interpolation, highlight spread, saturation, zones. |
+| `src/gpu/step6.rs` | GPU dispatch for step 6: all output stages (RA-4, FilmPrint, Lut2383, None) with post-curve ops. |
+| `src/gpu/step6.wgsl` | WGSL compute shader: 1D/3D LUT lookup, toe/shoulder, soft knee, Lab separation, highlight warmth. |
 | `src/inversion.rs` | Simple `1-x` linear inversion used only with `--no-curve`. |
 
 ---
