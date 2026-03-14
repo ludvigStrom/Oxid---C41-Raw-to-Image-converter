@@ -4,6 +4,7 @@
 //! highlight spread, saturation, zone adjustments) on the GPU, with the same math
 //! as the CPU reference in `pipeline.rs` and `density_ops.rs`.
 
+pub mod step4;
 pub mod step5;
 pub mod step6;
 

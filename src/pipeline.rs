@@ -63,6 +63,24 @@ pub fn step_3_dmin(
     Ok(())
 }
 
+/// Step 4 on GPU (if available). Falls back to CPU if the GPU pass fails.
+#[cfg(feature = "gpu")]
+pub fn step_4_t_to_d_wb_gpu(
+    image: &mut Array3<f32>,
+    options: &PipelineOptions,
+    gpu_step4: Option<&crate::gpu::step4::Step4Pipeline>,
+) {
+    if options.debug_pipeline_step < 4 {
+        return;
+    }
+    if let Some(pipeline) = gpu_step4 {
+        if pipeline.run(image, options).is_ok() {
+            return;
+        }
+    }
+    step_4_t_to_d_wb(image, options);
+}
+
 /// Step 4: T → D → WB (multiplicative) → Film γ → shadow cast. Modifies image in place.
 pub fn step_4_t_to_d_wb(image: &mut Array3<f32>, options: &PipelineOptions) {
     if options.debug_pipeline_step < 4 {
