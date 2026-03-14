@@ -1413,6 +1413,7 @@ impl eframe::App for C41Gui {
                             }
                         });
                     });
+                    ui.add_space(10.0);
                     let had_removals = !to_remove.is_empty();
                     if had_removals {
                         self.preview_receiver = None;
@@ -1863,12 +1864,14 @@ impl eframe::App for C41Gui {
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_shadow_gain, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
-                                ui.label("Gain R/G/B");
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::Slider::new(&mut opts.color_shadow_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                    ui.add(egui::Slider::new(&mut opts.color_shadow_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                    ui.add(egui::Slider::new(&mut opts.color_shadow_gain_b, -0.3..=0.3).fixed_decimals(3));
-                                });
+                                ui.label("Gain R");
+                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_r, -0.3..=0.3).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain G");
+                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_g, -0.3..=0.3).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain B");
+                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_b, -0.3..=0.3).fixed_decimals(3));
                                 ui.end_row();
                             });
 
@@ -1890,12 +1893,14 @@ impl eframe::App for C41Gui {
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_mid_gain, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
-                                ui.label("Gain R/G/B");
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::Slider::new(&mut opts.color_mid_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                    ui.add(egui::Slider::new(&mut opts.color_mid_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                    ui.add(egui::Slider::new(&mut opts.color_mid_gain_b, -0.3..=0.3).fixed_decimals(3));
-                                });
+                                ui.label("Gain R");
+                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_r, -0.3..=0.3).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain G");
+                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_g, -0.3..=0.3).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain B");
+                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_b, -0.3..=0.3).fixed_decimals(3));
                                 ui.end_row();
                             });
 
@@ -1917,12 +1922,14 @@ impl eframe::App for C41Gui {
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_highlight_gain, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
-                                ui.label("Gain R/G/B");
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::Slider::new(&mut opts.color_highlight_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                    ui.add(egui::Slider::new(&mut opts.color_highlight_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                    ui.add(egui::Slider::new(&mut opts.color_highlight_gain_b, -0.3..=0.3).fixed_decimals(3));
-                                });
+                                ui.label("Gain R");
+                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_r, -0.3..=0.3).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain G");
+                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_g, -0.3..=0.3).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain B");
+                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_b, -0.3..=0.3).fixed_decimals(3));
                                 ui.end_row();
                             });
 
@@ -3045,7 +3052,7 @@ impl eframe::App for C41Gui {
                         const HISTOGRAM_HEIGHT: f32 = 72.0;
                         const BOTTOM_PADDING: f32 = 8.0;
                         const IMAGE_PREVIEW_BOTTOM_PADDING: f32 = 16.0;
-                        const TOP_PADDING: f32 = 12.0;
+                        const TOP_PADDING: f32 = 17.0;
                         const INFO_ROW_HEIGHT: f32 = 18.0;
 
                         let reserved_bottom = IMAGE_PREVIEW_BOTTOM_PADDING
