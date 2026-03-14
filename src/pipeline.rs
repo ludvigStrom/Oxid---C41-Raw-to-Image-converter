@@ -1,0 +1,329 @@
+//! Shared pipeline step logic used by both batch export and GUI preview.
+//!
+//! Steps 3–6 are implemented here once; `process_files` and `process_one_to_preview`
+//! call them and handle load/save or preview conversion.
+
+use anyhow::Result;
+use ndarray::Array3;
+
+use crate::curve;
+use crate::flat_field;
+use crate::lut3d;
+use crate::scale_dmin_rect;
+use crate::DminMode;
+use crate::OutputLutEncoding;
+use crate::OutputStage;
+use crate::PipelineOptions;
+
+/// Result of step 6: either intermediate density (step < 6) or final display buffer.
+pub enum Step6Display {
+    /// Pipeline stopped before step 6; image is still density.
+    PassthroughDensity(Array3<f32>),
+    U16(Array3<u16>),
+    F32(Array3<f32>),
+}
+
+/// Step 3: D-min / flat-field. Modifies image in place.
+pub fn step_3_dmin(
+    image: &mut Array3<f32>,
+    options: &PipelineOptions,
+    flat_field_map: Option<&Array3<f32>>,
+) -> Result<()> {
+    if options.debug_pipeline_step < 3 || options.dmin_mode == DminMode::Off {
+        return Ok(());
+    }
+    if let Some(flat) = flat_field_map {
+        flat_field::apply_flat_field_division(image, flat);
+    } else {
+        match options.dmin_mode {
+            DminMode::Fixed => {
+                if let Some((r, g, b)) = options.dmin_fixed {
+                    crate::dmin::neutralize_with_medians(image, r, g, b)?;
+                }
+            }
+            DminMode::SampleRegion => {
+                if let Some(rect) = options.dmin_rect {
+                    let (h, w, _) = image.dim();
+                    let (x, y, rw, rh) = scale_dmin_rect(
+                        rect,
+                        options.dmin_rect_reference_size,
+                        w as u32,
+                        h as u32,
+                    );
+                    crate::dmin::neutralize(image, x, y, rw, rh, options.dmin_neutral_only)?;
+                }
+            }
+            DminMode::AutoPercentile => {
+                crate::dmin::auto_percentile_normalize(image, options.auto_norm_buffer)?;
+            }
+            DminMode::Off => {}
+        }
+    }
+    image.mapv_inplace(|v| v.max(0.0));
+    Ok(())
+}
+
+/// Step 4: T → D → WB (multiplicative) → Film γ → shadow cast. Modifies image in place.
+pub fn step_4_t_to_d_wb(image: &mut Array3<f32>, options: &PipelineOptions) {
+    if options.debug_pipeline_step < 4 {
+        return;
+    }
+    image.mapv_inplace(|t| (-(t.max(1e-10_f32)).log10()).max(0.0));
+
+    let (auto_s_r, auto_s_g, auto_s_b) = if options.auto_wb && options.dmin_mode != DminMode::Off {
+        let stats = crate::stats::wb_channel_stats(image, options);
+        let med_r = stats[0].2.max(1e-4);
+        let med_g = stats[1].2.max(1e-4);
+        let med_b = stats[2].2.max(1e-4);
+        let mean_d = (med_r + med_g + med_b) / 3.0;
+        (mean_d / med_r, mean_d / med_g, mean_d / med_b)
+    } else {
+        (1.0, 1.0, 1.0)
+    };
+
+    let (man_s_r, man_s_g, man_s_b) = if options.apply_white_balance {
+        (options.wb_r, options.wb_g, options.wb_b)
+    } else {
+        (1.0, 1.0, 1.0)
+    };
+
+    let inv_gamma = 1.0 / options.film_gamma.max(0.1);
+    let s_r = auto_s_r * man_s_r * inv_gamma;
+    let s_g = auto_s_g * man_s_g * inv_gamma;
+    let s_b = auto_s_b * man_s_b * inv_gamma;
+
+    image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * s_r);
+    image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * s_g);
+    image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * s_b);
+
+    if let Some(k) = options.temp_k {
+        let (tr, tg, tb) = crate::color::temp_k_to_wb_gains(k);
+        let off_r = -(tr.max(1e-6) as f64).log10() as f32;
+        let off_g = -(tg.max(1e-6) as f64).log10() as f32;
+        let off_b = -(tb.max(1e-6) as f64).log10() as f32;
+        image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v + off_r);
+        image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v + off_g);
+        image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v + off_b);
+    }
+
+    if options.shadow_cast_strength > 0.0 {
+        let cast = crate::density_ops::analyze_shadow_cast(image, 0.8);
+        crate::density_ops::apply_shadow_cast_correction(
+            image,
+            cast,
+            options.shadow_cast_strength,
+            0.8,
+        );
+    }
+}
+
+/// Step 5: Density matrix / 3D LUT, limit highlight spread, saturation, zone adjustments.
+pub fn step_5_calibration(
+    image: &mut Array3<f32>,
+    options: &PipelineOptions,
+    lut3d: Option<&lut3d::Lut3d>,
+) {
+    if options.debug_pipeline_step < 5 {
+        return;
+    }
+    let m = if options.apply_color_profile {
+        options.density_matrix
+    } else {
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    };
+
+    if let Some(lut) = lut3d {
+        let (h, w, _) = image.dim();
+        for y in 0..h {
+            for x in 0..w {
+                let dr = image[[y, x, 0]];
+                let dg = image[[y, x, 1]];
+                let db = image[[y, x, 2]];
+                let [or, og, ob] = lut.sample_density(dr, dg, db);
+                image[[y, x, 0]] = or;
+                image[[y, x, 1]] = og;
+                image[[y, x, 2]] = ob;
+            }
+        }
+    } else {
+        let is_identity = (m[0][0] - 1.0).abs() < 1e-6
+            && m[0][1].abs() < 1e-6
+            && m[0][2].abs() < 1e-6
+            && m[1][0].abs() < 1e-6
+            && (m[1][1] - 1.0).abs() < 1e-6
+            && m[1][2].abs() < 1e-6
+            && m[2][0].abs() < 1e-6
+            && m[2][1].abs() < 1e-6
+            && (m[2][2] - 1.0).abs() < 1e-6;
+        if !is_identity {
+            let (h, w, _) = image.dim();
+            for y in 0..h {
+                for x in 0..w {
+                    let dr = image[[y, x, 0]];
+                    let dg = image[[y, x, 1]];
+                    let db = image[[y, x, 2]];
+                    image[[y, x, 0]] = m[0][0] * dr + m[0][1] * dg + m[0][2] * db;
+                    image[[y, x, 1]] = m[1][0] * dr + m[1][1] * dg + m[1][2] * db;
+                    image[[y, x, 2]] = m[2][0] * dr + m[2][1] * dg + m[2][2] * db;
+                }
+            }
+        }
+    }
+    image.mapv_inplace(|v| v.max(0.0));
+    crate::density_ops::limit_highlight_density_spread(image);
+
+    crate::density_ops::apply_density_saturation(image, options.saturation);
+    crate::density_ops::apply_zone_density_adjustments(
+        image,
+        options.zone_shadows,
+        options.zone_highlights,
+        [
+            options.color_shadows_r,
+            options.color_shadows_g,
+            options.color_shadows_b,
+        ],
+        [options.color_mids_r, options.color_mids_g, options.color_mids_b],
+        [
+            options.color_highlights_r,
+            options.color_highlights_g,
+            options.color_highlights_b,
+        ],
+    );
+}
+
+/// Step 6: render to display buffer (RA-4, FilmPrint, None, or Lut2383).
+/// If debug_pipeline_step < 6, returns PassthroughDensity with the current image.
+pub fn step_6_render(
+    image: &Array3<f32>,
+    options: &PipelineOptions,
+    ra4_params: &curve::PrintCurveParams,
+    output_lut_cube: Option<&lut3d::Lut3d>,
+) -> Step6Display {
+    if options.debug_pipeline_step < 6 {
+        return Step6Display::PassthroughDensity(image.clone());
+    }
+
+    match options.output_stage {
+        OutputStage::Ra4 => {
+            let mut leveled = image.clone();
+            let levels_active = options.lut_in_black != 0.0
+                || options.lut_in_white != 1.0
+                || (options.lut_in_mid - 1.0).abs() > 1e-6;
+            if levels_active {
+                crate::color::apply_density_levels(
+                    &mut leveled,
+                    4.0,
+                    options.lut_in_black,
+                    options.lut_in_white,
+                    options.lut_in_mid,
+                );
+                leveled.mapv_inplace(|v| v * 4.0);
+            }
+            let mut image_u16 =
+                curve::apply_ra4_from_density(&leveled, *ra4_params, 4.0, options.curve_white);
+            crate::post_curve::apply_toe_shoulder_u16(
+                &mut image_u16,
+                options.toe_strength,
+                options.shoulder_strength,
+            );
+            crate::post_curve::apply_soft_knee_u16(&mut image_u16, options.soft_clip);
+            if options.apply_lab {
+                crate::color::apply_lab_separation_u16(&mut image_u16, options.lab_separation);
+            }
+            crate::post_curve::apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
+            Step6Display::U16(image_u16)
+        }
+        OutputStage::FilmPrint => {
+            let fp_params = crate::post_curve::build_film_print_params(options);
+            let mut leveled = image.clone();
+            let levels_active = options.lut_in_black != 0.0
+                || options.lut_in_white != 1.0
+                || (options.lut_in_mid - 1.0).abs() > 1e-6;
+            if levels_active {
+                crate::color::apply_density_levels(
+                    &mut leveled,
+                    4.0,
+                    options.lut_in_black,
+                    options.lut_in_white,
+                    options.lut_in_mid,
+                );
+                leveled.mapv_inplace(|v| v * 4.0);
+            }
+            let mut image_u16 =
+                curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
+            crate::post_curve::apply_toe_shoulder_u16(
+                &mut image_u16,
+                options.toe_strength,
+                options.shoulder_strength,
+            );
+            crate::post_curve::apply_soft_knee_u16(&mut image_u16, options.soft_clip);
+            if options.apply_lab {
+                crate::color::apply_lab_separation_u16(&mut image_u16, options.lab_separation);
+            }
+            crate::post_curve::apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
+            Step6Display::U16(image_u16)
+        }
+        OutputStage::None => {
+            let mut display = image.clone();
+            if !options.no_invert {
+                const D_DISP_MAX: f32 = 2.5;
+                display.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+            }
+            Step6Display::F32(display)
+        }
+        OutputStage::Lut2383 => {
+            let mut display = image.clone();
+            match options.output_lut_encoding {
+                OutputLutEncoding::Rec709 => {
+                    crate::color::density_to_rec709_leveled(
+                        &mut display,
+                        options.lut_in_black,
+                        options.lut_in_white,
+                        options.lut_in_mid,
+                    );
+                }
+                enc => {
+                    let d_max = match enc {
+                        OutputLutEncoding::CineonLog => 2.046_f32,
+                        OutputLutEncoding::LinearDensity => 2.5_f32,
+                        OutputLutEncoding::Rec709 => unreachable!(),
+                    };
+                    crate::color::apply_density_levels(
+                        &mut display,
+                        d_max,
+                        options.lut_in_black,
+                        options.lut_in_white,
+                        options.lut_in_mid,
+                    );
+                }
+            }
+            if let Some(lut) = output_lut_cube {
+                crate::post_curve::apply_output_cube_rgb(&mut display, lut);
+            }
+            if options.apply_lab {
+                crate::color::apply_lab_separation_f32(&mut display, options.lab_separation);
+            }
+            crate::post_curve::apply_soft_knee_f32(&mut display, options.soft_clip);
+            crate::post_curve::apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
+            Step6Display::F32(display)
+        }
+    }
+}
+
+/// Convert Step6Display to u8 RGB for preview. PassthroughDensity maps D/2.5 to 0–255.
+pub fn step6_display_to_u8(display: &Step6Display) -> Vec<u8> {
+    match display {
+        Step6Display::PassthroughDensity(img) => img
+            .iter()
+            .map(|v| ((*v / 2.5).clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect(),
+        Step6Display::U16(img) => img
+            .iter()
+            .map(|v| ((*v as u32 >> 8).min(255)) as u8)
+            .collect(),
+        Step6Display::F32(img) => img
+            .iter()
+            .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect(),
+    }
+}
