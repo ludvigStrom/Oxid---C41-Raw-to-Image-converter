@@ -202,6 +202,11 @@ pub struct PipelineOptions {
     pub color_highlight_gain_r: f32,
     pub color_highlight_gain_g: f32,
     pub color_highlight_gain_b: f32,
+    /// Reinhard-style highlight roll-off in density space (0.0 = off, 1.0 = full).
+    /// Compresses high densities to mask noise in dense negative areas (skies).
+    pub highlight_rolloff: f32,
+    /// Knee density for highlight roll-off. Densities above this are compressed toward it. Default 1.5.
+    pub highlight_rolloff_d_mid: f32,
     /// Post-curve highlight warmth (Noritsu/Frontier style).
     /// Adds a golden/warm tint to neutral highlights while leaving saturated
     /// colors (blue sky, red etc.) untouched.
@@ -307,6 +312,8 @@ impl Default for PipelineOptions {
             color_highlight_gain_r: 0.0,
             color_highlight_gain_g: 0.0,
             color_highlight_gain_b: 0.0,
+            highlight_rolloff: 0.0,
+            highlight_rolloff_d_mid: 1.5,
             highlight_warmth: 0.0,
             soft_clip: 0.93,
             apply_lab: false,

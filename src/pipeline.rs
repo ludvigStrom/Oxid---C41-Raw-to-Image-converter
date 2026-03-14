@@ -212,6 +212,7 @@ pub fn step_5_calibration(
     crate::density_ops::apply_density_saturation(image, options.saturation);
     crate::density_ops::apply_zone_density_adjustments(
         image,
+        options.curve_offset,
         options.zone_shadows,
         options.zone_highlights,
         [
@@ -243,6 +244,11 @@ pub fn step_5_calibration(
             options.color_highlight_gain_g,
             options.color_highlight_gain_b,
         ],
+    );
+    crate::density_ops::apply_reinhard_highlight_rolloff(
+        image,
+        options.highlight_rolloff_d_mid,
+        options.highlight_rolloff,
     );
 }
 

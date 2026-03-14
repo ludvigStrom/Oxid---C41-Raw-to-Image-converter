@@ -31,10 +31,12 @@ struct Params {
     color_highlight_gain_r: f32,
     color_highlight_gain_g: f32,
     color_highlight_gain_b: f32,
-    _pad_gain0: f32,
-    _pad_gain1: f32,
-    _pad_gain2: f32,
-    // 3x3 density matrix (row-major)
+    curve_offset: f32,
+    d_zone_min: f32,   // 2nd-percentile effective density (for zone normalization)
+    d_zone_max: f32,   // 98th-percentile effective density
+    highlight_rolloff: f32,
+    highlight_rolloff_d_mid: f32,
+    // 3x3 density matrix (row-major); vec3 is 16-byte aligned, WGSL inserts implicit padding
     mat_r0: vec3<f32>,
     _pad0: f32,
     mat_r1: vec3<f32>,
@@ -213,13 +215,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if has_zones {
         let d_mean_z = (r + g + b) * (1.0 / 3.0);
+        let d_eff = d_mean_z + params.curve_offset;
+        // Normalize effective density to 0-1 using the image's own tonal range.
+        let d_range = max(params.d_zone_max - params.d_zone_min, 0.01);
+        let d_norm = (d_eff - params.d_zone_min) / d_range;
 
-        let s_diff = d_mean_z - 0.4;
-        let s_mask = exp(-s_diff * s_diff * 4.0);
-        let m_diff = d_mean_z - 1.3;
-        let m_mask = exp(-m_diff * m_diff * 5.0);
-        let h_diff = d_mean_z - 2.2;
-        let h_mask = exp(-h_diff * h_diff * 2.0);
+        // Fixed zone positions in normalized space: shadow=15%, mid=50%, highlight=85%.
+        let s_diff = d_norm - 0.15;
+        let s_mask = exp(-s_diff * s_diff * 25.0);  // sigma=0.20 in [0,1] space
+        let m_diff = d_norm - 0.50;
+        let m_mask = exp(-m_diff * m_diff * 16.0);  // sigma=0.25
+        let h_diff = d_norm - 0.85;
+        let h_mask = exp(-h_diff * h_diff * 25.0);  // sigma=0.20
 
         // Per-channel gain: (1 + global*mask) * (1 + color*mask) per zone
         let mult_r = (1.0 + g_s * s_mask) * (1.0 + g_m * m_mask) * (1.0 + g_h * h_mask)
@@ -244,6 +251,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         r = max(r + offset_r, 0.0);
         g = max(g + offset_g, 0.0);
         b = max(b + offset_b, 0.0);
+    }
+
+    // --- Reinhard highlight roll-off (matches density_ops::apply_reinhard_highlight_rolloff) ---
+    if abs(params.highlight_rolloff) > 1e-6 {
+        let d_mid = max(params.highlight_rolloff_d_mid, 1e-6);
+        let str = params.highlight_rolloff;
+        r = r + (r / (1.0 + r / d_mid) - r) * str;
+        g = g + (g / (1.0 + g / d_mid) - g) * str;
+        b = b + (b / (1.0 + b / d_mid) - b) * str;
     }
 
     image[base + 0u] = r;

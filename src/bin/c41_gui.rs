@@ -449,6 +449,8 @@ fn default_options() -> PipelineOptions {
         color_highlight_gain_r: 0.0,
         color_highlight_gain_g: 0.0,
         color_highlight_gain_b: 0.0,
+        highlight_rolloff: 0.0,
+        highlight_rolloff_d_mid: 1.5,
         highlight_warmth: 0.0,
         soft_clip: 0.93,
         apply_lab: false,
@@ -548,6 +550,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.color_highlight_gain_r.to_bits().hash(&mut h);
     opts.color_highlight_gain_g.to_bits().hash(&mut h);
     opts.color_highlight_gain_b.to_bits().hash(&mut h);
+    opts.highlight_rolloff.to_bits().hash(&mut h);
+    opts.highlight_rolloff_d_mid.to_bits().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
@@ -1933,6 +1937,16 @@ impl eframe::App for C41Gui {
                                 ui.end_row();
                             });
 
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Highlight roll-off (Reinhard)").small());
+                        ui.horizontal(|ui| {
+                            ui.label("Strength");
+                            ui.add(egui::Slider::new(&mut opts.highlight_rolloff, 0.0..=1.0).fixed_decimals(2));
+                            ui.label("Knee");
+                            ui.add(egui::Slider::new(&mut opts.highlight_rolloff_d_mid, 0.5..=3.0).fixed_decimals(2));
+                        });
+                        ui.label(egui::RichText::new("Compresses high densities to mask noise in skies. 0 = off.").small().weak());
+
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("Gain = multiplicative in that zone (0 = no change).").small().weak());
                         ui.add_space(4.0);
@@ -1958,6 +1972,8 @@ impl eframe::App for C41Gui {
                             opts.color_highlight_gain_r = 0.0;
                             opts.color_highlight_gain_g = 0.0;
                             opts.color_highlight_gain_b = 0.0;
+                            opts.highlight_rolloff = 0.0;
+                            opts.highlight_rolloff_d_mid = 1.5;
                         }
                     });
 

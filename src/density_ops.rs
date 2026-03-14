@@ -57,6 +57,31 @@ pub(crate) fn limit_highlight_density_spread(image: &mut Array3<f32>) {
     }
 }
 
+/// Reinhard-style highlight roll-off in density space. Compresses high densities
+/// to mask noise in dense negative areas (skies). Per-channel: d_out = lerp(d, d/(1 + d/d_mid), strength).
+/// When strength is 0, no change. d_mid is the knee density (e.g. 1.5).
+pub(crate) fn apply_reinhard_highlight_rolloff(
+    image: &mut Array3<f32>,
+    d_mid: f32,
+    strength: f32,
+) {
+    if strength.abs() < 1e-6 {
+        return;
+    }
+    let d_mid = d_mid.max(1e-6);
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..3 {
+                let d = image[[y, x, ch]];
+                let d_reinhard = d / (1.0 + d / d_mid);
+                image[[y, x, ch]] = d + (d_reinhard - d) * strength;
+            }
+        }
+    }
+}
+
 /// sat > 1 widens channel spread → more colorful output after the S-curve.
 /// sat = 1 is identity. Values are clamped to ≥ 0 after boosting.
 pub(crate) fn apply_density_saturation(image: &mut Array3<f32>, saturation: f32) {
@@ -152,14 +177,80 @@ pub(crate) fn apply_shadow_cast_correction(
     }
 }
 
+/// Compute the 2nd- and 98th-percentile effective density from a density image.
+/// Uses uniform sampling (~4096 pixels) so it stays fast even for large images.
+/// Returns `(d_zone_min, d_zone_max)`.
+pub(crate) fn zone_density_range(image: &Array3<f32>, curve_offset: f32) -> (f32, f32) {
+    let (h, w, _) = image.dim();
+    let n = h * w;
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let step = (n / 4096).max(1);
+    let mut d_effs: Vec<f32> = (0..n)
+        .step_by(step)
+        .map(|i| {
+            let y = i / w;
+            let x = i % w;
+            let d_mean = (image[[y, x, 0]] + image[[y, x, 1]] + image[[y, x, 2]]) / 3.0;
+            d_mean + curve_offset
+        })
+        .collect();
+    d_effs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ns = d_effs.len();
+    let lo = d_effs[(ns * 2 / 100).clamp(0, ns - 1)];
+    let hi = d_effs[(ns * 98 / 100).clamp(0, ns - 1)];
+    (lo, hi.max(lo + 0.1))
+}
+
+/// Estimate zone density range from a transmittance image (step-4 input).
+/// Approximates density as −log10(T) × inv_gamma, ignoring per-channel WB.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub(crate) fn zone_density_range_from_transmittance(
+    image: &Array3<f32>,
+    options: &crate::PipelineOptions,
+) -> (f32, f32) {
+    let (h, w, _) = image.dim();
+    let n = h * w;
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let inv_gamma = 1.0 / options.film_gamma.max(0.1);
+    let step = (n / 4096).max(1);
+    let mut d_effs: Vec<f32> = (0..n)
+        .step_by(step)
+        .map(|i| {
+            let y = i / w;
+            let x = i % w;
+            let tr = image[[y, x, 0]].max(1e-10);
+            let tg = image[[y, x, 1]].max(1e-10);
+            let tb = image[[y, x, 2]].max(1e-10);
+            let d_mean = ((-tr.log10()).max(0.0)
+                + (-tg.log10()).max(0.0)
+                + (-tb.log10()).max(0.0))
+                / 3.0
+                * inv_gamma;
+            d_mean + options.curve_offset
+        })
+        .collect();
+    d_effs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ns = d_effs.len();
+    let lo = d_effs[(ns * 2 / 100).clamp(0, ns - 1)];
+    let hi = d_effs[(ns * 98 / 100).clamp(0, ns - 1)];
+    (lo, hi.max(lo + 0.1))
+}
+
 /// Gaussian-masked zone density adjustments: per-zone gain (multiplicative) then
 /// shadow/mid/highlight offsets (additive). Operates in density space.
 ///
-/// Gain: D' = D * mult, with mult = (1 + gain_s*mask_s) * (1 + gain_m*mask_m) * (1 + gain_h*mask_h)
-/// per zone and per channel. 0 = no change. Applied first.
-/// Offset: same as before (lift-style); applied after gain.
+/// Zone masks are computed in **normalized** effective-density space: the image's own
+/// 2nd–98th percentile density range is mapped to 0–1, then shadow/mid/highlight
+/// are placed at 0.15/0.50/0.85 in that normalized space. This ensures the zones
+/// always target the actual dark/middle/bright tones of each image regardless of
+/// its overall exposure level.
 pub(crate) fn apply_zone_density_adjustments(
     image: &mut Array3<f32>,
+    curve_offset: f32,
     shadows: f32,
     highlights: f32,
     color_s: [f32; 3],
@@ -186,14 +277,20 @@ pub(crate) fn apply_zone_density_adjustments(
     }
     let (h, w, _) = image.dim();
 
-    const S_CENTER: f32 = 0.4;
-    const S_INV_2S2: f32 = 1.0 / 0.25;
-    const M_CENTER: f32 = 1.3;
-    const M_INV_2S2: f32 = 1.0 / 0.20;
-    const H_CENTER: f32 = 2.2;
-    const H_INV_2S2: f32 = 1.0 / 0.50;
-    const SCALE: f32 = 2.0;
+    // Normalize d_eff to 0-1 using the image's own tonal range.
+    let (d_zone_min, d_zone_max) = zone_density_range(image, curve_offset);
+    let d_range = (d_zone_max - d_zone_min).max(0.01);
 
+    // Fixed zone positions in normalized [0,1] space.
+    const S_NRM: f32 = 0.15;  // shadow center
+    const M_NRM: f32 = 0.50;  // midtone center
+    const H_NRM: f32 = 0.85;  // highlight center
+    // sigma = 0.20 for shadow/highlight, 0.25 for midtones → inv_2sig² = 1/(2*sigma²)
+    const S_INV_2S2: f32 = 1.0 / (2.0 * 0.20 * 0.20);  // ≈ 12.5
+    const M_INV_2S2: f32 = 1.0 / (2.0 * 0.25 * 0.25);  // ≈ 8.0
+    const H_INV_2S2: f32 = 1.0 / (2.0 * 0.20 * 0.20);  // ≈ 12.5
+
+    const SCALE: f32 = 2.0;
     let s_global = shadows * SCALE;
     let h_global = highlights * SCALE;
     let color_scale = -SCALE;
@@ -204,15 +301,16 @@ pub(crate) fn apply_zone_density_adjustments(
             let dg = image[[y, x, 1]];
             let db = image[[y, x, 2]];
             let d_mean = (dr + dg + db) * (1.0 / 3.0);
+            let d_eff = d_mean + curve_offset;
+            let d_norm = (d_eff - d_zone_min) / d_range;
 
-            let s_diff = d_mean - S_CENTER;
+            let s_diff = d_norm - S_NRM;
             let s_mask = (-s_diff * s_diff * S_INV_2S2).exp();
-            let m_diff = d_mean - M_CENTER;
+            let m_diff = d_norm - M_NRM;
             let m_mask = (-m_diff * m_diff * M_INV_2S2).exp();
-            let h_diff = d_mean - H_CENTER;
+            let h_diff = d_norm - H_NRM;
             let h_mask = (-h_diff * h_diff * H_INV_2S2).exp();
 
-            // Per-channel gain: (1 + global_gain*mask) and (1 + color_gain*mask) per zone.
             let mult_r = (1.0 + zone_shadow_gain * s_mask)
                 * (1.0 + zone_mid_gain * m_mask)
                 * (1.0 + zone_highlight_gain * h_mask)

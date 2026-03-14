@@ -295,6 +295,8 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         color_highlight_gain_r: 0.0,
         color_highlight_gain_g: 0.0,
         color_highlight_gain_b: 0.0,
+        highlight_rolloff: 0.0,
+        highlight_rolloff_d_mid: 1.5,
         highlight_warmth: 0.0,
         soft_clip: 0.0,
         apply_lab: false,
