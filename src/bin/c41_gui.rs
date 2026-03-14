@@ -1860,6 +1860,16 @@ impl eframe::App for C41Gui {
                                 ui.label("B–Y");
                                 ui.add(egui::Slider::new(&mut opts.color_shadows_b, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
+                                ui.label("Gain");
+                                ui.add(egui::Slider::new(&mut opts.zone_shadow_gain, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain R/G/B");
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Slider::new(&mut opts.color_shadow_gain_r, -0.3..=0.3).fixed_decimals(3));
+                                    ui.add(egui::Slider::new(&mut opts.color_shadow_gain_g, -0.3..=0.3).fixed_decimals(3));
+                                    ui.add(egui::Slider::new(&mut opts.color_shadow_gain_b, -0.3..=0.3).fixed_decimals(3));
+                                });
+                                ui.end_row();
                             });
 
                         ui.add_space(4.0);
@@ -1876,6 +1886,16 @@ impl eframe::App for C41Gui {
                                 ui.end_row();
                                 ui.label("B–Y");
                                 ui.add(egui::Slider::new(&mut opts.color_mids_b, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain");
+                                ui.add(egui::Slider::new(&mut opts.zone_mid_gain, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain R/G/B");
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Slider::new(&mut opts.color_mid_gain_r, -0.3..=0.3).fixed_decimals(3));
+                                    ui.add(egui::Slider::new(&mut opts.color_mid_gain_g, -0.3..=0.3).fixed_decimals(3));
+                                    ui.add(egui::Slider::new(&mut opts.color_mid_gain_b, -0.3..=0.3).fixed_decimals(3));
+                                });
                                 ui.end_row();
                             });
 
@@ -1894,46 +1914,21 @@ impl eframe::App for C41Gui {
                                 ui.label("B–Y");
                                 ui.add(egui::Slider::new(&mut opts.color_highlights_b, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
+                                ui.label("Gain");
+                                ui.add(egui::Slider::new(&mut opts.zone_highlight_gain, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Gain R/G/B");
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Slider::new(&mut opts.color_highlight_gain_r, -0.3..=0.3).fixed_decimals(3));
+                                    ui.add(egui::Slider::new(&mut opts.color_highlight_gain_g, -0.3..=0.3).fixed_decimals(3));
+                                    ui.add(egui::Slider::new(&mut opts.color_highlight_gain_b, -0.3..=0.3).fixed_decimals(3));
+                                });
+                                ui.end_row();
                             });
 
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Gain (multiplicative per zone). 0 = no change; e.g. 0.2 = 20% brighter in that zone.").small().weak());
-                        ui.add_space(2.0);
-                        egui::Grid::new("zone_gain_global")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Shadow");
-                                ui.add(egui::Slider::new(&mut opts.zone_shadow_gain, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Mid");
-                                ui.add(egui::Slider::new(&mut opts.zone_mid_gain, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Highlight");
-                                ui.add(egui::Slider::new(&mut opts.zone_highlight_gain, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                            });
-                        ui.collapsing("Per-channel gain (shadows / mid / highlight)", |ui| {
-                            ui.label(egui::RichText::new("Shadow gain R/G/B").small().weak());
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_b, -0.3..=0.3).fixed_decimals(3));
-                            });
-                            ui.label(egui::RichText::new("Mid gain R/G/B").small().weak());
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_b, -0.3..=0.3).fixed_decimals(3));
-                            });
-                            ui.label(egui::RichText::new("Highlight gain R/G/B").small().weak());
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_b, -0.3..=0.3).fixed_decimals(3));
-                            });
-                        });
-                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Gain = multiplicative in that zone (0 = no change).").small().weak());
+                        ui.add_space(4.0);
                         if ui.small_button("Reset all").clicked() {
                             opts.color_shadows_r = 0.0;
                             opts.color_shadows_g = 0.0;
