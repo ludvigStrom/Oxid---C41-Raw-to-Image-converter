@@ -187,6 +187,21 @@ pub struct PipelineOptions {
     pub color_highlights_r: f32,
     pub color_highlights_g: f32,
     pub color_highlights_b: f32,
+    /// Per-zone gain (multiplicative). 0 = no change; e.g. 0.2 = 20% brighter in that zone.
+    /// Applied before zone offsets. Shadow/mid/highlight zones use the same Gaussian masks as offsets.
+    pub zone_shadow_gain: f32,
+    pub zone_mid_gain: f32,
+    pub zone_highlight_gain: f32,
+    /// Per-channel gain in each zone. 0 = no change. Combines with global zone gain per channel.
+    pub color_shadow_gain_r: f32,
+    pub color_shadow_gain_g: f32,
+    pub color_shadow_gain_b: f32,
+    pub color_mid_gain_r: f32,
+    pub color_mid_gain_g: f32,
+    pub color_mid_gain_b: f32,
+    pub color_highlight_gain_r: f32,
+    pub color_highlight_gain_g: f32,
+    pub color_highlight_gain_b: f32,
     /// Post-curve highlight warmth (Noritsu/Frontier style).
     /// Adds a golden/warm tint to neutral highlights while leaving saturated
     /// colors (blue sky, red etc.) untouched.
@@ -280,6 +295,18 @@ impl Default for PipelineOptions {
             color_highlights_r: 0.0,
             color_highlights_g: 0.0,
             color_highlights_b: 0.0,
+            zone_shadow_gain: 0.0,
+            zone_mid_gain: 0.0,
+            zone_highlight_gain: 0.0,
+            color_shadow_gain_r: 0.0,
+            color_shadow_gain_g: 0.0,
+            color_shadow_gain_b: 0.0,
+            color_mid_gain_r: 0.0,
+            color_mid_gain_g: 0.0,
+            color_mid_gain_b: 0.0,
+            color_highlight_gain_r: 0.0,
+            color_highlight_gain_g: 0.0,
+            color_highlight_gain_b: 0.0,
             highlight_warmth: 0.0,
             soft_clip: 0.93,
             apply_lab: false,

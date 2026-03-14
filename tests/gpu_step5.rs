@@ -167,3 +167,34 @@ fn step5_identity_cpu_vs_gpu() {
     eprintln!("step5_identity_cpu_vs_gpu:");
     compare_images(&cpu_img, &gpu_img, 1e-5);
 }
+
+#[test]
+fn step5_zone_gain_cpu_vs_gpu() {
+    let ctx = match get_gpu_context() {
+        Some(c) => c,
+        None => {
+            eprintln!("No GPU adapter found; skipping test");
+            return;
+        }
+    };
+
+    let pipeline_gpu = Step5Pipeline::new(&ctx);
+
+    let mut opts = PipelineOptions::default();
+    opts.zone_shadow_gain = 0.08;
+    opts.zone_mid_gain = 0.05;
+    opts.zone_highlight_gain = -0.03;
+    opts.color_shadow_gain_r = 0.02;
+    opts.color_highlight_gain_b = -0.01;
+
+    let img = make_test_image(100, 80);
+
+    let mut cpu_img = img.clone();
+    pipeline::step_5_calibration(&mut cpu_img, &opts, None);
+
+    let mut gpu_img = img.clone();
+    pipeline_gpu.run(&mut gpu_img, &opts, None).expect("GPU step 5 zone gain failed");
+
+    eprintln!("step5_zone_gain_cpu_vs_gpu:");
+    compare_images(&cpu_img, &gpu_img, 1e-5);
+}

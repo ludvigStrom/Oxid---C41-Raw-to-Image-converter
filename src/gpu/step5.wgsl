@@ -19,6 +19,21 @@ struct Params {
     color_highlights_r: f32,
     color_highlights_g: f32,
     color_highlights_b: f32,
+    zone_shadow_gain: f32,
+    zone_mid_gain: f32,
+    zone_highlight_gain: f32,
+    color_shadow_gain_r: f32,
+    color_shadow_gain_g: f32,
+    color_shadow_gain_b: f32,
+    color_mid_gain_r: f32,
+    color_mid_gain_g: f32,
+    color_mid_gain_b: f32,
+    color_highlight_gain_r: f32,
+    color_highlight_gain_g: f32,
+    color_highlight_gain_b: f32,
+    _pad_gain0: f32,
+    _pad_gain1: f32,
+    _pad_gain2: f32,
     // 3x3 density matrix (row-major)
     mat_r0: vec3<f32>,
     _pad0: f32,
@@ -174,30 +189,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         b = max(d_mean + sat * (b - d_mean), 0.0);
     }
 
-    // --- Zone density adjustments ---
+    // --- Zone density adjustments: gain (mult) then offset ---
     let zone_s = params.zone_shadows;
     let zone_h = params.zone_highlights;
     let cs = vec3<f32>(params.color_shadows_r, params.color_shadows_g, params.color_shadows_b);
     let cm = vec3<f32>(params.color_mids_r, params.color_mids_g, params.color_mids_b);
     let ch = vec3<f32>(params.color_highlights_r, params.color_highlights_g, params.color_highlights_b);
+    let g_s = params.zone_shadow_gain;
+    let g_m = params.zone_mid_gain;
+    let g_h = params.zone_highlight_gain;
+    let cgs = vec3<f32>(params.color_shadow_gain_r, params.color_shadow_gain_g, params.color_shadow_gain_b);
+    let cgm = vec3<f32>(params.color_mid_gain_r, params.color_mid_gain_g, params.color_mid_gain_b);
+    let cgh = vec3<f32>(params.color_highlight_gain_r, params.color_highlight_gain_g, params.color_highlight_gain_b);
 
     let has_zones = abs(zone_s) > 1e-6 || abs(zone_h) > 1e-6
         || abs(cs.x) > 1e-6 || abs(cs.y) > 1e-6 || abs(cs.z) > 1e-6
         || abs(cm.x) > 1e-6 || abs(cm.y) > 1e-6 || abs(cm.z) > 1e-6
-        || abs(ch.x) > 1e-6 || abs(ch.y) > 1e-6 || abs(ch.z) > 1e-6;
+        || abs(ch.x) > 1e-6 || abs(ch.y) > 1e-6 || abs(ch.z) > 1e-6
+        || abs(g_s) > 1e-6 || abs(g_m) > 1e-6 || abs(g_h) > 1e-6
+        || abs(cgs.x) > 1e-6 || abs(cgs.y) > 1e-6 || abs(cgs.z) > 1e-6
+        || abs(cgm.x) > 1e-6 || abs(cgm.y) > 1e-6 || abs(cgm.z) > 1e-6
+        || abs(cgh.x) > 1e-6 || abs(cgh.y) > 1e-6 || abs(cgh.z) > 1e-6;
 
     if has_zones {
         let d_mean_z = (r + g + b) * (1.0 / 3.0);
 
-        // Shadow: center=0.4, inv_2sigma2=1/0.25=4.0
         let s_diff = d_mean_z - 0.4;
         let s_mask = exp(-s_diff * s_diff * 4.0);
-        // Mid: center=1.3, inv_2sigma2=1/0.20=5.0
         let m_diff = d_mean_z - 1.3;
         let m_mask = exp(-m_diff * m_diff * 5.0);
-        // Highlight: center=2.2, inv_2sigma2=1/0.50=2.0
         let h_diff = d_mean_z - 2.2;
         let h_mask = exp(-h_diff * h_diff * 2.0);
+
+        // Per-channel gain: (1 + global*mask) * (1 + color*mask) per zone
+        let mult_r = (1.0 + g_s * s_mask) * (1.0 + g_m * m_mask) * (1.0 + g_h * h_mask)
+            * (1.0 + cgs.x * s_mask) * (1.0 + cgm.x * m_mask) * (1.0 + cgh.x * h_mask);
+        let mult_g = (1.0 + g_s * s_mask) * (1.0 + g_m * m_mask) * (1.0 + g_h * h_mask)
+            * (1.0 + cgs.y * s_mask) * (1.0 + cgm.y * m_mask) * (1.0 + cgh.y * h_mask);
+        let mult_b = (1.0 + g_s * s_mask) * (1.0 + g_m * m_mask) * (1.0 + g_h * h_mask)
+            * (1.0 + cgs.z * s_mask) * (1.0 + cgm.z * m_mask) * (1.0 + cgh.z * h_mask);
+
+        r = r * mult_r;
+        g = g * mult_g;
+        b = b * mult_b;
 
         let scale = 2.0;
         let global_offset = zone_s * scale * s_mask + zone_h * scale * h_mask;

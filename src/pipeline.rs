@@ -225,6 +225,24 @@ pub fn step_5_calibration(
             options.color_highlights_g,
             options.color_highlights_b,
         ],
+        options.zone_shadow_gain,
+        options.zone_mid_gain,
+        options.zone_highlight_gain,
+        [
+            options.color_shadow_gain_r,
+            options.color_shadow_gain_g,
+            options.color_shadow_gain_b,
+        ],
+        [
+            options.color_mid_gain_r,
+            options.color_mid_gain_g,
+            options.color_mid_gain_b,
+        ],
+        [
+            options.color_highlight_gain_r,
+            options.color_highlight_gain_g,
+            options.color_highlight_gain_b,
+        ],
     );
 }
 

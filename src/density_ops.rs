@@ -152,15 +152,12 @@ pub(crate) fn apply_shadow_cast_correction(
     }
 }
 
-/// Gaussian-masked zone density adjustments: apply shadow and highlight offsets
-/// that only affect their respective tonal zone, leaving midtones untouched.
+/// Gaussian-masked zone density adjustments: per-zone gain (multiplicative) then
+/// shadow/mid/highlight offsets (additive). Operates in density space.
 ///
-/// Operates in density space (higher D = brighter output through RA-4).
-/// `shadows` > 0 adds density to the shadow zone (brightens shadows).
-/// `highlights` < 0 subtracts density from the highlight zone (darkens highlights).
-///
-/// Each pixel's mean density determines its zone membership via a Gaussian mask.
-/// The shadow mask is centered on low-density values, the highlight mask on high.
+/// Gain: D' = D * mult, with mult = (1 + gain_s*mask_s) * (1 + gain_m*mask_m) * (1 + gain_h*mask_h)
+/// per zone and per channel. 0 = no change. Applied first.
+/// Offset: same as before (lift-style); applied after gain.
 pub(crate) fn apply_zone_density_adjustments(
     image: &mut Array3<f32>,
     shadows: f32,
@@ -168,32 +165,38 @@ pub(crate) fn apply_zone_density_adjustments(
     color_s: [f32; 3],
     color_m: [f32; 3],
     color_h: [f32; 3],
+    zone_shadow_gain: f32,
+    zone_mid_gain: f32,
+    zone_highlight_gain: f32,
+    color_shadow_gain: [f32; 3],
+    color_mid_gain: [f32; 3],
+    color_highlight_gain: [f32; 3],
 ) {
-    let all_zero = shadows.abs() < 1e-6
+    let gains_zero = zone_shadow_gain.abs() < 1e-6
+        && zone_mid_gain.abs() < 1e-6
+        && zone_highlight_gain.abs() < 1e-6
+        && color_shadow_gain.iter().all(|v| v.abs() < 1e-6)
+        && color_mid_gain.iter().all(|v| v.abs() < 1e-6)
+        && color_highlight_gain.iter().all(|v| v.abs() < 1e-6);
+    let offsets_zero = shadows.abs() < 1e-6
         && highlights.abs() < 1e-6
-        && color_s
-            .iter()
-            .chain(color_m.iter())
-            .chain(color_h.iter())
-            .all(|v| v.abs() < 1e-6);
-    if all_zero {
+        && color_s.iter().chain(color_m.iter()).chain(color_h.iter()).all(|v| v.abs() < 1e-6);
+    if gains_zero && offsets_zero {
         return;
     }
     let (h, w, _) = image.dim();
 
-    // Shadow zone: Gaussian centered at D=0.4, σ²=0.25
     const S_CENTER: f32 = 0.4;
     const S_INV_2S2: f32 = 1.0 / 0.25;
-    // Midtone zone: Gaussian centered at D=1.3, σ²=0.20
     const M_CENTER: f32 = 1.3;
     const M_INV_2S2: f32 = 1.0 / 0.20;
-    // Highlight zone: Gaussian centered at D=2.2, σ²=0.50
     const H_CENTER: f32 = 2.2;
     const H_INV_2S2: f32 = 1.0 / 0.50;
     const SCALE: f32 = 2.0;
 
     let s_global = shadows * SCALE;
     let h_global = highlights * SCALE;
+    let color_scale = -SCALE;
 
     for y in 0..h {
         for x in 0..w {
@@ -204,23 +207,36 @@ pub(crate) fn apply_zone_density_adjustments(
 
             let s_diff = d_mean - S_CENTER;
             let s_mask = (-s_diff * s_diff * S_INV_2S2).exp();
-
             let m_diff = d_mean - M_CENTER;
             let m_mask = (-m_diff * m_diff * M_INV_2S2).exp();
-
             let h_diff = d_mean - H_CENTER;
             let h_mask = (-h_diff * h_diff * H_INV_2S2).exp();
 
-            // Global (luminance) offset from existing shadows/highlights sliders.
-            let global_offset = s_global * s_mask + h_global * h_mask;
+            // Per-channel gain: (1 + global_gain*mask) and (1 + color_gain*mask) per zone.
+            let mult_r = (1.0 + zone_shadow_gain * s_mask)
+                * (1.0 + zone_mid_gain * m_mask)
+                * (1.0 + zone_highlight_gain * h_mask)
+                * (1.0 + color_shadow_gain[0] * s_mask)
+                * (1.0 + color_mid_gain[0] * m_mask)
+                * (1.0 + color_highlight_gain[0] * h_mask);
+            let mult_g = (1.0 + zone_shadow_gain * s_mask)
+                * (1.0 + zone_mid_gain * m_mask)
+                * (1.0 + zone_highlight_gain * h_mask)
+                * (1.0 + color_shadow_gain[1] * s_mask)
+                * (1.0 + color_mid_gain[1] * m_mask)
+                * (1.0 + color_highlight_gain[1] * h_mask);
+            let mult_b = (1.0 + zone_shadow_gain * s_mask)
+                * (1.0 + zone_mid_gain * m_mask)
+                * (1.0 + zone_highlight_gain * h_mask)
+                * (1.0 + color_shadow_gain[2] * s_mask)
+                * (1.0 + color_mid_gain[2] * m_mask)
+                * (1.0 + color_highlight_gain[2] * h_mask);
 
-            // Per-channel color balance offsets.
-            // Negated because the pipeline is negative-film density: adding to a channel's
-            // density increases that channel's RA-4 output, but the dye layers are
-            // complementary — the perceived hue shift is opposite to the density direction.
-            // Negating makes +R visually warmer (more red in print), +B visually cooler
-            // (more blue), etc., matching the R–C / G–M / B–Y label convention.
-            let color_scale = -SCALE;
+            let dr_g = dr * mult_r;
+            let dg_g = dg * mult_g;
+            let db_g = db * mult_b;
+
+            let global_offset = s_global * s_mask + h_global * h_mask;
             let offset_r = global_offset
                 + (color_s[0] * s_mask + color_m[0] * m_mask + color_h[0] * h_mask) * color_scale;
             let offset_g = global_offset
@@ -228,9 +244,9 @@ pub(crate) fn apply_zone_density_adjustments(
             let offset_b = global_offset
                 + (color_s[2] * s_mask + color_m[2] * m_mask + color_h[2] * h_mask) * color_scale;
 
-            image[[y, x, 0]] = (dr + offset_r).max(0.0);
-            image[[y, x, 1]] = (dg + offset_g).max(0.0);
-            image[[y, x, 2]] = (db + offset_b).max(0.0);
+            image[[y, x, 0]] = (dr_g + offset_r).max(0.0);
+            image[[y, x, 1]] = (dg_g + offset_g).max(0.0);
+            image[[y, x, 2]] = (db_g + offset_b).max(0.0);
         }
     }
 }

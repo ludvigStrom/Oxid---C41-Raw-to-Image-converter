@@ -1,0 +1,15 @@
+---
+description: GPU pipeline (wgpu/WGSL) conventions and limits
+globs: src/gpu/**/*
+alwaysApply: false
+---
+
+# GPU pipeline (steps 4–6)
+
+- **Same math as CPU.** Replicate formulas from `pipeline.rs` / `curve.rs` / `density_ops.rs` exactly (constants, order of operations). No "close enough" approximations.
+- **Buffer size:** Before creating buffers, check `device.limits().max_buffer_size`. Step 6 needs input + output; use `buf_bytes * 2 <= max_buffer_size`. If over limit, return `Err(...)` so the caller falls back to CPU.
+- **Precision:** Use `f32` in shaders. Small differences (e.g. 1–10 LSB in u16 with Lab) are acceptable; document in test tolerances.
+- **Reductions on CPU:** Step 4 needs auto-WB medians and shadow-cast analysis; compute these on the CPU and pass as uniforms. Only the per-pixel transform runs on the GPU.
+- **Fallback:** All GPU entry points return `Result`. On error (e.g. buffer too large, device error), the caller uses the CPU path.
+
+When changing a shader: run `cargo test --features gpu --test gpu_stepN` (and `gpu_unified`) to confirm CPU/GPU output still matches within tolerance.

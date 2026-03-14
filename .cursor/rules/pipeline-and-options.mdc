@@ -1,0 +1,16 @@
+---
+description: Adding pipeline options and keeping CPU/GPU in sync
+globs: src/options.rs, src/pipeline.rs, src/lib.rs, src/curve.rs, src/density_ops.rs, src/post_curve.rs
+alwaysApply: false
+---
+
+# Pipeline and options
+
+When adding a new pipeline option:
+
+1. Add the field to `PipelineOptions` in `src/options.rs` and set defaults everywhere options are constructed (e.g. `default_options()` in `c41_gui.rs`, CLI in `main.rs`).
+2. Implement behaviour in the CPU pipeline (`pipeline.rs` or curve/density_ops/post_curve). Include the option in any cache/options hashing (e.g. `options_hash_for` in the GUI).
+3. If the option affects steps 4, 5, or 6: add the parameter to the right GPU shader Params struct and Rust struct in `src/gpu/stepN.wgsl` and `stepN.rs`, and to `unified.rs` (`build_stepN_*`). Use the **exact same formula** as the CPU.
+4. After changes: run `cargo test --features gpu` (or the relevant `gpu_step4` / `gpu_step5` / `gpu_step6` test) to catch CPU/GPU drift.
+
+Do not change the CPU pipeline to "match GPU". CPU stays reference.
