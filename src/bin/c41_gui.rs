@@ -1939,12 +1939,17 @@ impl eframe::App for C41Gui {
 
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("Highlight roll-off (Reinhard)").small());
-                        ui.horizontal(|ui| {
-                            ui.label("Strength");
-                            ui.add(egui::Slider::new(&mut opts.highlight_rolloff, 0.0..=1.0).fixed_decimals(2));
-                            ui.label("Knee");
-                            ui.add(egui::Slider::new(&mut opts.highlight_rolloff_d_mid, 0.5..=3.0).fixed_decimals(2));
-                        });
+                        egui::Grid::new("highlight_rolloff")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("Strength");
+                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff, 0.0..=1.0).fixed_decimals(2));
+                                ui.end_row();
+                                ui.label("Knee");
+                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff_d_mid, 0.5..=3.0).fixed_decimals(2));
+                                ui.end_row();
+                            });
                         ui.label(egui::RichText::new("Compresses high densities to mask noise in skies. 0 = off.").small().weak());
 
                         ui.add_space(6.0);
