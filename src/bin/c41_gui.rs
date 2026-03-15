@@ -871,19 +871,13 @@ fn auto_detect_crop(
     border_color: (f32, f32, f32),
     tolerance: f32,
 ) -> Option<Rect> {
-    eprintln!("[autocrop] === entry ===");
-    eprintln!("[autocrop]   image {}x{}, buffer len={}", width, height, pixels.len());
     if width < 16 || height < 16 || pixels.len() < (width * height * 3) as usize {
-        eprintln!("[autocrop] fail: image too small or invalid buffer");
         return None;
     }
 
     let (br, bg, bb) = border_color;
     let border_lum = 0.2126 * br + 0.7152 * bg + 0.0722 * bb;
     let border_cap = (border_lum + tolerance * 2.0).min(100.0);
-    eprintln!("[autocrop] --- border ---");
-    eprintln!("[autocrop]   border_color RGB=({:.2}, {:.2}, {:.2}) → lum={:.2}", br, bg, bb, border_lum);
-    eprintln!("[autocrop]   tolerance={:.2} → border_cap={:.2} (max lum for border row/col)", tolerance, border_cap);
 
     // Rec. 709 weighted luminance, 0–255 scale.
     let lum_px = |x: u32, y: u32| -> f32 {
@@ -901,33 +895,13 @@ fn auto_detect_crop(
         .map(|x| (0..height).map(|y| lum_px(x, y)).sum::<f32>() / height as f32)
         .collect();
 
-    let row_min = row_mean.iter().copied().fold(f32::INFINITY, f32::min);
-    let row_max = row_mean.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let row_avg = row_mean.iter().sum::<f32>() / height as f32;
-    let col_min = col_mean.iter().copied().fold(f32::INFINITY, f32::min);
-    let col_max = col_mean.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let col_avg = col_mean.iter().sum::<f32>() / width as f32;
-    eprintln!("[autocrop] --- row/col mean distribution ---");
-    eprintln!("[autocrop]   row_mean: min={:.2} max={:.2} avg={:.2}", row_min, row_max, row_avg);
-    eprintln!("[autocrop]   col_mean: min={:.2} max={:.2} avg={:.2}", col_min, col_max, col_avg);
-    let cy_preview = height / 2;
-    let cx_preview = width / 2;
-    eprintln!("[autocrop]   sample row_mean: y=0 {:.2}, y=cy {} {:.2}, y=h-1 {} {:.2}",
-        row_mean[0], cy_preview, row_mean[cy_preview as usize], height - 1, row_mean[(height - 1) as usize]);
-    eprintln!("[autocrop]   sample col_mean: x=0 {:.2}, x=cx {} {:.2}, x=w-1 {} {:.2}",
-        col_mean[0], cx_preview, col_mean[cx_preview as usize], width - 1, col_mean[(width - 1) as usize]);
-
     const BINS: usize = 64;
     const BIMODAL_MIN: f64 = 0.12;
 
-    eprintln!("[autocrop] --- Otsu thresholds ---");
     let row_threshold = {
         let (otsu_t, separation) = match otsu_threshold_1d(&row_mean, BINS) {
             Some(x) => x,
-            None => {
-                eprintln!("[autocrop] fail: Otsu row threshold failed (no spread?)");
-                return None;
-            }
+            None => return None,
         };
         let use_bimodal = separation >= BIMODAL_MIN;
         let t = if use_bimodal {
@@ -937,18 +911,12 @@ fn auto_detect_crop(
             let p50 = percentile_1d(&row_mean, 0.5);
             p15 + 0.2 * (p50 - p15).max(0.0)
         };
-        let t_capped = t.min(border_cap);
-        eprintln!("[autocrop]   row: otsu_t={:.2} separation={:.4} bimodal={} → t={:.2} capped={:.2}",
-            otsu_t, separation, use_bimodal, t, t_capped);
-        t_capped
+        t.min(border_cap)
     };
     let col_threshold = {
         let (otsu_t, separation) = match otsu_threshold_1d(&col_mean, BINS) {
             Some(x) => x,
-            None => {
-                eprintln!("[autocrop] fail: Otsu col threshold failed (no spread?)");
-                return None;
-            }
+            None => return None,
         };
         let use_bimodal = separation >= BIMODAL_MIN;
         let t = if use_bimodal {
@@ -958,10 +926,7 @@ fn auto_detect_crop(
             let p50 = percentile_1d(&col_mean, 0.5);
             p15 + 0.2 * (p50 - p15).max(0.0)
         };
-        let t_capped = t.min(border_cap);
-        eprintln!("[autocrop]   col: otsu_t={:.2} separation={:.4} bimodal={} → t={:.2} capped={:.2}",
-            otsu_t, separation, use_bimodal, t, t_capped);
-        t_capped
+        t.min(border_cap)
     };
 
     // Fraction of pixels in each row/col that are dark (below threshold and border_cap).
@@ -996,18 +961,6 @@ fn auto_detect_crop(
     const EDGE_BAND: f32 = 0.05;
     let row_edge_band = (height as f32 * EDGE_BAND).ceil() as u32;
     let col_edge_band = (width as f32 * EDGE_BAND).ceil() as u32;
-    let row_dark_above: usize = row_dark_frac.iter().filter(|&&f| f >= DARK_FRAC_MIN).count();
-    let col_dark_above: usize = col_dark_frac.iter().filter(|&&f| f >= DARK_FRAC_MIN).count();
-    let row_df_min = row_dark_frac.iter().copied().fold(f32::INFINITY, f32::min);
-    let row_df_max = row_dark_frac.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    eprintln!("[autocrop] --- dark fraction (thin-edge) ---");
-    eprintln!("[autocrop]   row_dark_frac: min={:.4} max={:.4}, rows with frac>={:.2}: {}",
-        row_df_min, row_df_max, DARK_FRAC_MIN, row_dark_above);
-    eprintln!("[autocrop]   col_dark_frac: cols with frac>={:.2}: {}", DARK_FRAC_MIN, col_dark_above);
-    eprintln!("[autocrop]   sample row_dark_frac: y=0 {:.4} y=cy {:.4} y=h-1 {:.4}",
-        row_dark_frac[0], row_dark_frac[cy_preview as usize], row_dark_frac[(height - 1) as usize]);
-    eprintln!("[autocrop]   sample col_dark_frac: x=0 {:.4} x=cx {:.4} x=w-1 {:.4}",
-        col_dark_frac[0], col_dark_frac[cx_preview as usize], col_dark_frac[(width - 1) as usize]);
 
     let cx = width / 2;
     let cy = height / 2;
@@ -1033,70 +986,29 @@ fn auto_detect_crop(
         let m = col_mean[x as usize];
         m < col_threshold && m <= border_cap
     };
-    eprintln!("[autocrop] --- center ---");
-    eprintln!("[autocrop]   cx={} cy={}", cx, cy);
-    eprintln!("[autocrop]   row_mean[cy]={:.2} row_dark_frac[cy]={:.4} br_row(cy)={}",
-        row_mean[cy as usize], row_dark_frac[cy as usize], br_row(cy));
-    eprintln!("[autocrop]   col_mean[cx]={:.2} col_dark_frac[cx]={:.4} bc_col(cx)={}",
-        col_mean[cx as usize], col_dark_frac[cx as usize], bc_col(cx));
 
     // Scan from centre outward. Prefer 2-run (two consecutive border rows/cols); fall back to 1-run, then image edge.
-    eprintln!("[autocrop] --- scan (top: rows above center, looking for border 2-run then 1-run) ---");
     let top_2run = (1..cy).rev().find(|&y| br_row(y) && br_row(y - 1)).map(|y| y + 1);
     let top_1run = (1..cy).rev().find(|&y| br_row(y)).map(|y| y + 1);
-    for (i, y) in (1..cy).rev().take(8).enumerate() {
-        let m = row_mean[y as usize];
-        let df = row_dark_frac[y as usize];
-        eprintln!("[autocrop]   y={} row_mean={:.2} dark_frac={:.4} br_row={}", y, m, df, br_row(y));
-        if i >= 7 { break; }
-    }
     let top = top_2run.or(top_1run).unwrap_or(0);
-    eprintln!("[autocrop]   top: 2-run→{:?} 1-run→{:?} → top={}",
-        top_2run, top_1run, top);
-    if top == 0 && top_1run.is_none() {
-        eprintln!("[autocrop]   (no border above center, using image edge 0)");
-    }
 
     let bottom_2run = (cy + 1..height - 1).find(|&y| br_row(y) && br_row(y + 1));
     let bottom_1run = (cy + 1..height).find(|&y| br_row(y));
     let bottom = bottom_2run.or(bottom_1run).unwrap_or(height);
-    eprintln!("[autocrop] --- scan bottom --- 2-run→{:?} 1-run→{:?} → bottom={}", bottom_2run, bottom_1run, bottom);
 
     let left_2run = (1..cx).rev().find(|&x| bc_col(x) && bc_col(x - 1)).map(|x| x + 1);
     let left_1run = (1..cx).rev().find(|&x| bc_col(x)).map(|x| x + 1);
     let left = left_2run.or(left_1run).unwrap_or(0);
-    eprintln!("[autocrop] --- scan left --- 2-run→{:?} 1-run→{:?} → left={}", left_2run, left_1run, left);
 
     let right_2run = (cx + 1..width - 1).find(|&x| bc_col(x) && bc_col(x + 1));
     let right_1run = (cx + 1..width).find(|&x| bc_col(x));
     let right = right_2run.or(right_1run).unwrap_or(width);
-    eprintln!("[autocrop] --- scan right --- 2-run→{:?} 1-run→{:?} → right={}", right_2run, right_1run, right);
 
-    eprintln!("[autocrop] --- edge pull (flush border at image edge?) ---");
-    let top_before = top;
-    let bottom_before = bottom;
-    let left_before = left;
-    let right_before = right;
     // Edge pull only when edge is border by mean (not just dark_frac), so we don't pull on mixed/ambiguous edges.
-    let top = if top > 0 && br_row_mean_only(0) {
-        eprintln!("[autocrop]   top: row 0 is border (mean) → pull to 0 (was {})", top);
-        0
-    } else { top };
-    let bottom = if bottom < height && br_row_mean_only(height - 1) {
-        eprintln!("[autocrop]   bottom: row h-1 is border (mean) → pull to {} (was {})", height, bottom);
-        height
-    } else { bottom };
-    let left = if left > 0 && bc_col_mean_only(0) {
-        eprintln!("[autocrop]   left: col 0 is border (mean) → pull to 0 (was {})", left);
-        0
-    } else { left };
-    let right = if right < width && bc_col_mean_only(width - 1) {
-        eprintln!("[autocrop]   right: col w-1 is border (mean) → pull to {} (was {})", width, right);
-        width
-    } else { right };
-    if top == top_before && bottom == bottom_before && left == left_before && right == right_before {
-        eprintln!("[autocrop]   (no edge pull)");
-    }
+    let top = if top > 0 && br_row_mean_only(0) { 0 } else { top };
+    let bottom = if bottom < height && br_row_mean_only(height - 1) { height } else { bottom };
+    let left = if left > 0 && bc_col_mean_only(0) { 0 } else { left };
+    let right = if right < width && bc_col_mean_only(width - 1) { width } else { right };
 
     // Inward trim to avoid including sprocket holes (detected border can sit just inside the frame).
     const SPROCKET_TRIM: u32 = 4;
@@ -1105,29 +1017,20 @@ fn auto_detect_crop(
     let top = (top + SPROCKET_TRIM).min(cy);
     let bottom = bottom.saturating_sub(SPROCKET_TRIM).max(cy + 1);
 
-    eprintln!("[autocrop] --- edges final (before margin) top={} bottom={} left={} right={}", top, bottom, left, right);
-
-    eprintln!("[autocrop] --- sanity checks ---");
     if right <= left || bottom <= top {
-        eprintln!("[autocrop] fail: invalid rect right<=left or bottom<=top (l={} r={} t={} b={})", left, right, top, bottom);
         return None;
     }
-    eprintln!("[autocrop]   rect valid (right>left, bottom>top) ok");
 
     if left >= cx || right <= cx || top >= cy || bottom <= cy {
-        eprintln!("[autocrop] fail: rect does not contain center ({}, {}): left={} right={} top={} bottom={}", cx, cy, left, right, top, bottom);
         return None;
     }
-    eprintln!("[autocrop]   rect contains center ok");
 
     let w = right - left;
     let h = bottom - top;
     let min_side = (width.min(height) / 20).max(16);
     if w < min_side || h < min_side {
-        eprintln!("[autocrop] fail: crop too small {}x{} (min_side={})", w, h, min_side);
         return None;
     }
-    eprintln!("[autocrop]   min_side {} ok (w={} h={})", min_side, w, h);
 
     let rect_cx = (left + right) / 2;
     let rect_cy = (top + bottom) / 2;
@@ -1135,15 +1038,10 @@ fn auto_detect_crop(
     let max_shift_y = (height / 5).max(1);
     let shift_x = rect_cx.abs_diff(cx);
     let shift_y = rect_cy.abs_diff(cy);
-    eprintln!("[autocrop]   rect_center=({}, {}) image_center=({}, {}) shift=({}, {}) max=({}, {})",
-        rect_cx, rect_cy, cx, cy, shift_x, shift_y, max_shift_x, max_shift_y);
     if shift_x > max_shift_x || shift_y > max_shift_y {
-        eprintln!("[autocrop] fail: rect center too far from image center");
         return None;
     }
-    eprintln!("[autocrop]   rect center near image center ok");
 
-    eprintln!("[autocrop] === ok: rect x={} y={} w={} h={} ===", left, top, w, h);
     Some(Rect {
         x: left,
         y: top,
