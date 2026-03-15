@@ -253,9 +253,6 @@ pub(crate) fn apply_zone_density_adjustments(
     curve_offset: f32,
     shadows: f32,
     highlights: f32,
-    color_s: [f32; 3],
-    color_m: [f32; 3],
-    color_h: [f32; 3],
     zone_shadow_gain: f32,
     zone_mid_gain: f32,
     zone_highlight_gain: f32,
@@ -269,9 +266,7 @@ pub(crate) fn apply_zone_density_adjustments(
         && color_shadow_gain.iter().all(|v| v.abs() < 1e-6)
         && color_mid_gain.iter().all(|v| v.abs() < 1e-6)
         && color_highlight_gain.iter().all(|v| v.abs() < 1e-6);
-    let offsets_zero = shadows.abs() < 1e-6
-        && highlights.abs() < 1e-6
-        && color_s.iter().chain(color_m.iter()).chain(color_h.iter()).all(|v| v.abs() < 1e-6);
+    let offsets_zero = shadows.abs() < 1e-6 && highlights.abs() < 1e-6;
     if gains_zero && offsets_zero {
         return;
     }
@@ -293,7 +288,6 @@ pub(crate) fn apply_zone_density_adjustments(
     const SCALE: f32 = 2.0;
     let s_global = shadows * SCALE;
     let h_global = highlights * SCALE;
-    let color_scale = -SCALE;
 
     for y in 0..h {
         for x in 0..w {
@@ -335,16 +329,10 @@ pub(crate) fn apply_zone_density_adjustments(
             let db_g = db * mult_b;
 
             let global_offset = s_global * s_mask + h_global * h_mask;
-            let offset_r = global_offset
-                + (color_s[0] * s_mask + color_m[0] * m_mask + color_h[0] * h_mask) * color_scale;
-            let offset_g = global_offset
-                + (color_s[1] * s_mask + color_m[1] * m_mask + color_h[1] * h_mask) * color_scale;
-            let offset_b = global_offset
-                + (color_s[2] * s_mask + color_m[2] * m_mask + color_h[2] * h_mask) * color_scale;
 
-            image[[y, x, 0]] = (dr_g + offset_r).max(0.0);
-            image[[y, x, 1]] = (dg_g + offset_g).max(0.0);
-            image[[y, x, 2]] = (db_g + offset_b).max(0.0);
+            image[[y, x, 0]] = (dr_g + global_offset).max(0.0);
+            image[[y, x, 1]] = (dg_g + global_offset).max(0.0);
+            image[[y, x, 2]] = (db_g + global_offset).max(0.0);
         }
     }
 }

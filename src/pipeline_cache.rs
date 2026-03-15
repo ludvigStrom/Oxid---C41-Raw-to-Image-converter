@@ -101,15 +101,6 @@ pub fn hash_after_step5(path: &Path, opts: &PipelineOptions, max_width: u32, max
     hash_f32(&mut h, opts.saturation);
     hash_f32(&mut h, opts.zone_shadows);
     hash_f32(&mut h, opts.zone_highlights);
-    hash_f32(&mut h, opts.color_shadows_r);
-    hash_f32(&mut h, opts.color_shadows_g);
-    hash_f32(&mut h, opts.color_shadows_b);
-    hash_f32(&mut h, opts.color_mids_r);
-    hash_f32(&mut h, opts.color_mids_g);
-    hash_f32(&mut h, opts.color_mids_b);
-    hash_f32(&mut h, opts.color_highlights_r);
-    hash_f32(&mut h, opts.color_highlights_g);
-    hash_f32(&mut h, opts.color_highlights_b);
     hash_f32(&mut h, opts.zone_shadow_gain);
     hash_f32(&mut h, opts.zone_mid_gain);
     hash_f32(&mut h, opts.zone_highlight_gain);

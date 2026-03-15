@@ -91,9 +91,6 @@ fn step5_matrix_cpu_vs_gpu() {
     opts.saturation = 1.3;
     opts.zone_shadows = 0.1;
     opts.zone_highlights = -0.05;
-    opts.color_shadows_r = 0.02;
-    opts.color_mids_g = -0.01;
-    opts.color_highlights_b = 0.03;
 
     let img = make_test_image(128, 96);
 

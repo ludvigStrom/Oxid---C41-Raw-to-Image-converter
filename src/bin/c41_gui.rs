@@ -442,15 +442,6 @@ fn default_options() -> PipelineOptions {
         shadow_cast_strength: 0.0,
         zone_shadows: 0.0,
         zone_highlights: 0.0,
-        color_shadows_r: 0.0,
-        color_shadows_g: 0.0,
-        color_shadows_b: 0.0,
-        color_mids_r: 0.0,
-        color_mids_g: 0.0,
-        color_mids_b: 0.0,
-        color_highlights_r: 0.0,
-        color_highlights_g: 0.0,
-        color_highlights_b: 0.0,
         zone_shadow_gain: 0.0,
         zone_mid_gain: 0.0,
         zone_highlight_gain: 0.0,
@@ -544,15 +535,6 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.shadow_cast_strength.to_bits().hash(&mut h);
     opts.zone_shadows.to_bits().hash(&mut h);
     opts.zone_highlights.to_bits().hash(&mut h);
-    opts.color_shadows_r.to_bits().hash(&mut h);
-    opts.color_shadows_g.to_bits().hash(&mut h);
-    opts.color_shadows_b.to_bits().hash(&mut h);
-    opts.color_mids_r.to_bits().hash(&mut h);
-    opts.color_mids_g.to_bits().hash(&mut h);
-    opts.color_mids_b.to_bits().hash(&mut h);
-    opts.color_highlights_r.to_bits().hash(&mut h);
-    opts.color_highlights_g.to_bits().hash(&mut h);
-    opts.color_highlights_b.to_bits().hash(&mut h);
     opts.zone_shadow_gain.to_bits().hash(&mut h);
     opts.zone_mid_gain.to_bits().hash(&mut h);
     opts.zone_highlight_gain.to_bits().hash(&mut h);
@@ -2285,13 +2267,6 @@ impl eframe::App for C41Gui {
                     // GROUP 2.5 — Color Zones (per-channel shadow/mid/highlight)
                     // ════════════════════════════════════════════════════════
                     ui.collapsing("Color zones", |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Per-channel density offset per tonal zone.\n+R = more red/less cyan  +G = more green/less magenta  +B = more blue/less yellow"
-                            )
-                            .small()
-                            .weak(),
-                        );
                         ui.add_space(4.0);
 
                         ui.label(egui::RichText::new("Shadows").strong());
@@ -2299,15 +2274,6 @@ impl eframe::App for C41Gui {
                             .num_columns(2)
                             .spacing([4.0, 2.0])
                             .show(ui, |ui| {
-                                ui.label("R–C");
-                                ui.add(egui::Slider::new(&mut opts.color_shadows_r, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("G–M");
-                                ui.add(egui::Slider::new(&mut opts.color_shadows_g, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("B–Y");
-                                ui.add(egui::Slider::new(&mut opts.color_shadows_b, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_shadow_gain, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
@@ -2328,15 +2294,6 @@ impl eframe::App for C41Gui {
                             .num_columns(2)
                             .spacing([4.0, 2.0])
                             .show(ui, |ui| {
-                                ui.label("R–C");
-                                ui.add(egui::Slider::new(&mut opts.color_mids_r, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("G–M");
-                                ui.add(egui::Slider::new(&mut opts.color_mids_g, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("B–Y");
-                                ui.add(egui::Slider::new(&mut opts.color_mids_b, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_mid_gain, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
@@ -2357,15 +2314,6 @@ impl eframe::App for C41Gui {
                             .num_columns(2)
                             .spacing([4.0, 2.0])
                             .show(ui, |ui| {
-                                ui.label("R–C");
-                                ui.add(egui::Slider::new(&mut opts.color_highlights_r, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("G–M");
-                                ui.add(egui::Slider::new(&mut opts.color_highlights_g, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("B–Y");
-                                ui.add(egui::Slider::new(&mut opts.color_highlights_b, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_highlight_gain, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
@@ -2384,15 +2332,6 @@ impl eframe::App for C41Gui {
                         ui.label(egui::RichText::new("Gain = multiplicative in that zone (0 = no change).").small().weak());
                         ui.add_space(4.0);
                         if ui.small_button("Reset all").clicked() {
-                            opts.color_shadows_r = 0.0;
-                            opts.color_shadows_g = 0.0;
-                            opts.color_shadows_b = 0.0;
-                            opts.color_mids_r = 0.0;
-                            opts.color_mids_g = 0.0;
-                            opts.color_mids_b = 0.0;
-                            opts.color_highlights_r = 0.0;
-                            opts.color_highlights_g = 0.0;
-                            opts.color_highlights_b = 0.0;
                             opts.zone_shadow_gain = 0.0;
                             opts.zone_mid_gain = 0.0;
                             opts.zone_highlight_gain = 0.0;
@@ -2561,7 +2500,7 @@ impl eframe::App for C41Gui {
                             ui.horizontal(|ui| {
                                 ui.label("Separation");
                                 ui.add(
-                                    egui::Slider::new(&mut opts.lab_separation, -0.5..=0.5)
+                                    egui::Slider::new(&mut opts.lab_separation, -1.5..=1.5)
                                         .fixed_decimals(2),
                                 );
                             });

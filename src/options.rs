@@ -184,20 +184,6 @@ pub struct PipelineOptions {
     /// Gaussian-masked highlight zone density offset. Positive = brighten highlights
     /// (adds density in high-D region), negative = darken highlights.
     pub zone_highlights: f32,
-    /// Per-channel color balance in the shadow zone (Gaussian center D≈0.4).
-    /// Each value is a density offset: positive = more of that channel = warmer/greener/bluer.
-    /// Slider convention: R–C (positive = more red), G–M (positive = more green), B–Y (positive = more blue).
-    pub color_shadows_r: f32,
-    pub color_shadows_g: f32,
-    pub color_shadows_b: f32,
-    /// Per-channel color balance in the midtone zone (Gaussian center D≈1.3).
-    pub color_mids_r: f32,
-    pub color_mids_g: f32,
-    pub color_mids_b: f32,
-    /// Per-channel color balance in the highlight zone (Gaussian center D≈2.2).
-    pub color_highlights_r: f32,
-    pub color_highlights_g: f32,
-    pub color_highlights_b: f32,
     /// Per-zone gain (multiplicative). 0 = no change; e.g. 0.2 = 20% brighter in that zone.
     /// Applied before zone offsets. Shadow/mid/highlight zones use the same Gaussian masks as offsets.
     pub zone_shadow_gain: f32,
@@ -303,15 +289,6 @@ impl Default for PipelineOptions {
             shadow_cast_strength: 0.0,
             zone_shadows: 0.0,
             zone_highlights: 0.0,
-            color_shadows_r: 0.0,
-            color_shadows_g: 0.0,
-            color_shadows_b: 0.0,
-            color_mids_r: 0.0,
-            color_mids_g: 0.0,
-            color_mids_b: 0.0,
-            color_highlights_r: 0.0,
-            color_highlights_g: 0.0,
-            color_highlights_b: 0.0,
             zone_shadow_gain: 0.0,
             zone_mid_gain: 0.0,
             zone_highlight_gain: 0.0,

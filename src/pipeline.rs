@@ -215,17 +215,6 @@ pub fn step_5_calibration(
         options.curve_offset,
         options.zone_shadows,
         options.zone_highlights,
-        [
-            options.color_shadows_r,
-            options.color_shadows_g,
-            options.color_shadows_b,
-        ],
-        [options.color_mids_r, options.color_mids_g, options.color_mids_b],
-        [
-            options.color_highlights_r,
-            options.color_highlights_g,
-            options.color_highlights_b,
-        ],
         options.zone_shadow_gain,
         options.zone_mid_gain,
         options.zone_highlight_gain,

@@ -10,15 +10,6 @@ struct Params {
     saturation: f32,
     zone_shadows: f32,
     zone_highlights: f32,
-    color_shadows_r: f32,
-    color_shadows_g: f32,
-    color_shadows_b: f32,
-    color_mids_r: f32,
-    color_mids_g: f32,
-    color_mids_b: f32,
-    color_highlights_r: f32,
-    color_highlights_g: f32,
-    color_highlights_b: f32,
     zone_shadow_gain: f32,
     zone_mid_gain: f32,
     zone_highlight_gain: f32,
@@ -196,9 +187,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- Zone density adjustments: gain (mult) then offset ---
     let zone_s = params.zone_shadows;
     let zone_h = params.zone_highlights;
-    let cs = vec3<f32>(params.color_shadows_r, params.color_shadows_g, params.color_shadows_b);
-    let cm = vec3<f32>(params.color_mids_r, params.color_mids_g, params.color_mids_b);
-    let ch = vec3<f32>(params.color_highlights_r, params.color_highlights_g, params.color_highlights_b);
     let g_s = params.zone_shadow_gain;
     let g_m = params.zone_mid_gain;
     let g_h = params.zone_highlight_gain;
@@ -207,9 +195,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cgh = vec3<f32>(params.color_highlight_gain_r, params.color_highlight_gain_g, params.color_highlight_gain_b);
 
     let has_zones = abs(zone_s) > 1e-6 || abs(zone_h) > 1e-6
-        || abs(cs.x) > 1e-6 || abs(cs.y) > 1e-6 || abs(cs.z) > 1e-6
-        || abs(cm.x) > 1e-6 || abs(cm.y) > 1e-6 || abs(cm.z) > 1e-6
-        || abs(ch.x) > 1e-6 || abs(ch.y) > 1e-6 || abs(ch.z) > 1e-6
         || abs(g_s) > 1e-6 || abs(g_m) > 1e-6 || abs(g_h) > 1e-6
         || abs(cgs.x) > 1e-6 || abs(cgs.y) > 1e-6 || abs(cgs.z) > 1e-6
         || abs(cgm.x) > 1e-6 || abs(cgm.y) > 1e-6 || abs(cgm.z) > 1e-6
@@ -244,15 +229,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let scale = 2.0;
         let global_offset = zone_s * scale * s_mask + zone_h * scale * h_mask;
-        let color_scale = -scale;
 
-        let offset_r = global_offset + (cs.x * s_mask + cm.x * m_mask + ch.x * h_mask) * color_scale;
-        let offset_g = global_offset + (cs.y * s_mask + cm.y * m_mask + ch.y * h_mask) * color_scale;
-        let offset_b = global_offset + (cs.z * s_mask + cm.z * m_mask + ch.z * h_mask) * color_scale;
-
-        r = max(r + offset_r, 0.0);
-        g = max(g + offset_g, 0.0);
-        b = max(b + offset_b, 0.0);
+        r = max(r + global_offset, 0.0);
+        g = max(g + global_offset, 0.0);
+        b = max(b + global_offset, 0.0);
     }
 
     // --- Reinhard highlight roll-off (matches density_ops::apply_reinhard_highlight_rolloff) ---
