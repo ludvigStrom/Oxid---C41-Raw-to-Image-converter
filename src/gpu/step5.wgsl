@@ -23,10 +23,13 @@ struct Params {
     color_highlight_gain_g: f32,
     color_highlight_gain_b: f32,
     curve_offset: f32,
-    d_zone_min: f32,   // 2nd-percentile effective density (for zone normalization)
+    d_zone_min: f32,   // 2nd-percentile effective density
+    d_zone_p33: f32,   // 33rd-percentile (shadow/mid crossover)
+    d_zone_p66: f32,   // 66th-percentile (mid/highlight crossover)
     d_zone_max: f32,   // 98th-percentile effective density
     highlight_rolloff: f32,
     highlight_rolloff_d_mid: f32,
+    _pad_before_mat: f32,
     // 3x3 density matrix (row-major); vec3 is 16-byte aligned, WGSL inserts implicit padding
     mat_r0: vec3<f32>,
     _pad0: f32,
@@ -184,7 +187,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         b = max(d_mean + sat * (b - d_mean), 0.0);
     }
 
-    // --- Zone density adjustments: gain (mult) then offset ---
+    // --- Zone density adjustments: smoothstep masks (sum to 1), weighted-blend gains ---
     let zone_s = params.zone_shadows;
     let zone_h = params.zone_highlights;
     let g_s = params.zone_shadow_gain;
@@ -203,36 +206,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if has_zones {
         let d_mean_z = (r + g + b) * (1.0 / 3.0);
         let d_eff = d_mean_z + params.curve_offset;
-        // Normalize effective density to 0-1 using the image's own tonal range.
-        let d_range = max(params.d_zone_max - params.d_zone_min, 0.01);
-        let d_norm = (d_eff - params.d_zone_min) / d_range;
 
-        // Fixed zone positions in normalized space: shadow=15%, mid=50%, highlight=85%.
-        let s_diff = d_norm - 0.15;
-        let s_mask = exp(-s_diff * s_diff * 25.0);  // sigma=0.20 in [0,1] space
-        let m_diff = d_norm - 0.50;
-        let m_mask = exp(-m_diff * m_diff * 16.0);  // sigma=0.25
-        let h_diff = d_norm - 0.85;
-        let h_mask = exp(-h_diff * h_diff * 25.0);  // sigma=0.20
+        // Adaptive percentile-based crossovers: 33rd/66th percentile density.
+        let gap_low = max(params.d_zone_p33 - params.d_zone_min, 0.01);
+        let gap_high = max(params.d_zone_max - params.d_zone_p66, 0.01);
+        let gap_mid = max(params.d_zone_p66 - params.d_zone_p33, 0.01);
+        let tw = max(min(min(gap_mid * 0.3, gap_low * 0.5), gap_high * 0.5), 0.005);
 
-        // Per-channel gain: (1 + global*mask) * (1 + color*mask) per zone
-        let mult_r = (1.0 + g_s * s_mask) * (1.0 + g_m * m_mask) * (1.0 + g_h * h_mask)
-            * (1.0 + cgs.x * s_mask) * (1.0 + cgm.x * m_mask) * (1.0 + cgh.x * h_mask);
-        let mult_g = (1.0 + g_s * s_mask) * (1.0 + g_m * m_mask) * (1.0 + g_h * h_mask)
-            * (1.0 + cgs.y * s_mask) * (1.0 + cgm.y * m_mask) * (1.0 + cgh.y * h_mask);
-        let mult_b = (1.0 + g_s * s_mask) * (1.0 + g_m * m_mask) * (1.0 + g_h * h_mask)
-            * (1.0 + cgs.z * s_mask) * (1.0 + cgm.z * m_mask) * (1.0 + cgh.z * h_mask);
+        let t_low = clamp((d_eff - (params.d_zone_p33 - tw)) / (2.0 * tw), 0.0, 1.0);
+        let s_fade = t_low * t_low * (3.0 - 2.0 * t_low);
+        let s_mask = 1.0 - s_fade;
 
-        r = r * mult_r;
-        g = g * mult_g;
-        b = b * mult_b;
+        let t_high = clamp((d_eff - (params.d_zone_p66 - tw)) / (2.0 * tw), 0.0, 1.0);
+        let h_mask = t_high * t_high * (3.0 - 2.0 * t_high);
+
+        let m_mask = 1.0 - s_mask - h_mask;
+
+        // Weighted blend: since masks sum to 1, identity when all gains are 0.
+        let gain_r = s_mask * (1.0 + g_s + cgs.x) + m_mask * (1.0 + g_m + cgm.x) + h_mask * (1.0 + g_h + cgh.x);
+        let gain_g = s_mask * (1.0 + g_s + cgs.y) + m_mask * (1.0 + g_m + cgm.y) + h_mask * (1.0 + g_h + cgh.y);
+        let gain_b = s_mask * (1.0 + g_s + cgs.z) + m_mask * (1.0 + g_m + cgm.z) + h_mask * (1.0 + g_h + cgh.z);
 
         let scale = 2.0;
         let global_offset = zone_s * scale * s_mask + zone_h * scale * h_mask;
 
-        r = max(r + global_offset, 0.0);
-        g = max(g + global_offset, 0.0);
-        b = max(b + global_offset, 0.0);
+        r = max(r * gain_r + global_offset, 0.0);
+        g = max(g * gain_g + global_offset, 0.0);
+        b = max(b * gain_b + global_offset, 0.0);
     }
 
     // --- Reinhard highlight roll-off (matches density_ops::apply_reinhard_highlight_rolloff) ---

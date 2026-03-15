@@ -145,13 +145,13 @@ impl GpuPipeline {
             // Compute zone density range from input image. When start_step == 4 the
             // image is still transmittance; we approximate density as -log10(T)*inv_gamma
             // (ignoring WB, which is fine for a range estimate).
-            let (d_zone_min, d_zone_max) = if start_step >= 5 {
+            let zp = if start_step >= 5 {
                 crate::density_ops::zone_density_range(image, options.curve_offset)
             } else {
                 crate::density_ops::zone_density_range_from_transmittance(image, options)
             };
             let (step5_params_buf, step5_lut_buf) =
-                self.build_step5_buffers(device, options, lut3d, width, height, d_zone_min, d_zone_max);
+                self.build_step5_buffers(device, options, lut3d, width, height, &zp);
             let step5_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("u_step5_bg"),
                 layout: self.step5.bind_group_layout(),
@@ -354,10 +354,12 @@ struct Step5Params {
     color_highlight_gain_b: f32,
     curve_offset: f32,
     d_zone_min: f32,
+    d_zone_p33: f32,
+    d_zone_p66: f32,
     d_zone_max: f32,
     highlight_rolloff: f32,
     highlight_rolloff_d_mid: f32,
-    _pad_before_mat: [f32; 3], // align mat_r0 to 16-byte boundary (match WGSL uniform size 160)
+    _pad_before_mat: [f32; 1], // align mat_r0 to 16-byte boundary
     mat_r0: [f32; 3],
     _pad0: f32,
     mat_r1: [f32; 3],
@@ -483,8 +485,7 @@ impl GpuPipeline {
         lut3d: Option<&Lut3d>,
         width: usize,
         height: usize,
-        d_zone_min: f32,
-        d_zone_max: f32,
+        zp: &crate::density_ops::ZonePercentiles,
     ) -> (wgpu::Buffer, wgpu::Buffer) {
         let m = if options.apply_color_profile {
             options.density_matrix
@@ -519,11 +520,13 @@ impl GpuPipeline {
             color_highlight_gain_g: options.color_highlight_gain_g,
             color_highlight_gain_b: options.color_highlight_gain_b,
             curve_offset: options.curve_offset,
-            d_zone_min,
-            d_zone_max,
+            d_zone_min: zp.d_min,
+            d_zone_p33: zp.d_p33,
+            d_zone_p66: zp.d_p66,
+            d_zone_max: zp.d_max,
             highlight_rolloff: options.highlight_rolloff,
             highlight_rolloff_d_mid: options.highlight_rolloff_d_mid,
-            _pad_before_mat: [0.0; 3],
+            _pad_before_mat: [0.0; 1],
             mat_r0: m[0],
             _pad0: 0.0,
             mat_r1: m[1],

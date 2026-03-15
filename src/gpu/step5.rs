@@ -35,10 +35,12 @@ struct Step5Params {
     color_highlight_gain_b: f32,
     curve_offset: f32,
     d_zone_min: f32,
+    d_zone_p33: f32,
+    d_zone_p66: f32,
     d_zone_max: f32,
     highlight_rolloff: f32,
     highlight_rolloff_d_mid: f32,
-    _pad_before_mat: [f32; 3], // align mat_r0 to 16-byte boundary (match WGSL uniform size 160)
+    _pad_before_mat: [f32; 1], // align mat_r0 to 16-byte boundary
     // mat row 0 + padding
     mat_r0: [f32; 3],
     _pad0: f32,
@@ -174,8 +176,7 @@ impl Step5Pipeline {
             None => (0u32, 1u32, 1.0f32),
         };
 
-        let (d_zone_min, d_zone_max) =
-            crate::density_ops::zone_density_range(image, options.curve_offset);
+        let zp = crate::density_ops::zone_density_range(image, options.curve_offset);
 
         let params = Step5Params {
             width: width as u32,
@@ -199,11 +200,13 @@ impl Step5Pipeline {
             color_highlight_gain_g: options.color_highlight_gain_g,
             color_highlight_gain_b: options.color_highlight_gain_b,
             curve_offset: options.curve_offset,
-            d_zone_min,
-            d_zone_max,
+            d_zone_min: zp.d_min,
+            d_zone_p33: zp.d_p33,
+            d_zone_p66: zp.d_p66,
+            d_zone_max: zp.d_max,
             highlight_rolloff: options.highlight_rolloff,
             highlight_rolloff_d_mid: options.highlight_rolloff_d_mid,
-            _pad_before_mat: [0.0; 3],
+            _pad_before_mat: [0.0; 1],
             mat_r0: m[0],
             _pad0: 0.0,
             mat_r1: m[1],
