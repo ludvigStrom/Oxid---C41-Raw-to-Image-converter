@@ -1098,6 +1098,13 @@ fn auto_detect_crop(
         eprintln!("[autocrop]   (no edge pull)");
     }
 
+    // Inward trim to avoid including sprocket holes (detected border can sit just inside the frame).
+    const SPROCKET_TRIM: u32 = 4;
+    let left = (left + SPROCKET_TRIM).min(cx);
+    let right = right.saturating_sub(SPROCKET_TRIM).max(cx + 1);
+    let top = (top + SPROCKET_TRIM).min(cy);
+    let bottom = bottom.saturating_sub(SPROCKET_TRIM).max(cy + 1);
+
     eprintln!("[autocrop] --- edges final (before margin) top={} bottom={} left={} right={}", top, bottom, left, right);
 
     eprintln!("[autocrop] --- sanity checks ---");
