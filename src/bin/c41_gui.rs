@@ -4290,12 +4290,11 @@ impl eframe::App for C41Gui {
                             let rect = hist_rect;
                             let draw_rect = rect.shrink(1.0);
 
-                            // Exclude the clipping bins (0 = pure black, 255 = pure white) from
-                            // the scale so that clipped pixels don't crush the rest of the curve.
-                            let max_r = r_hist[1..255].iter().copied().max().unwrap_or(1) as f32;
-                            let max_g = g_hist[1..255].iter().copied().max().unwrap_or(1) as f32;
-                            let max_b = b_hist[1..255].iter().copied().max().unwrap_or(1) as f32;
-                            let max_all = max_r.max(max_g).max(max_b).max(1.0);
+                            // Fixed Y-scale: full height = this fraction of total pixels; above that we clip.
+                            // 1% = full height so the curve typically uses most of the vertical space.
+                            const FULL_HEIGHT_FRACTION: f32 = 0.01;
+                            let total_pixels = r_hist.iter().sum::<u32>().max(1) as f32;
+                            let scale_at_full = (total_pixels * FULL_HEIGHT_FRACTION).max(1.0);
 
                             // Axes: X (bottom) and Y (left). Draw first so bin 0 is not hidden by Y-axis.
                             let axis_color = egui::Color32::from_gray(100);
@@ -4311,6 +4310,7 @@ impl eframe::App for C41Gui {
 
                             // Photoshop/Resolve-style histogram rendering:
                             // per-channel curve (2px) + semi-transparent fill under each curve.
+                            // Y-scale: full height = FULL_HEIGHT_FRACTION of pixels; clip above that.
                             let draw_channel =
                                 |hist: &[u32; 256],
                                  line_color: egui::Color32,
@@ -4321,8 +4321,7 @@ impl eframe::App for C41Gui {
                                     for i in 0..256 {
                                         let x = draw_rect.left()
                                             + (i as f32 / 255.0) * w;
-                                        let h_norm =
-                                            (hist[i] as f32 / max_all).clamp(0.0, 1.0);
+                                        let h_norm = (hist[i] as f32 / scale_at_full).min(1.0);
                                         let y = (draw_rect.bottom()
                                             - draw_rect.height() * h_norm)
                                             .clamp(draw_rect.top(), draw_rect.bottom());
