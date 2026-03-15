@@ -228,6 +228,8 @@ struct C41Gui {
     /// When set, the next click on the preview will sample density and set WB gains (white/gray/black point).
     wb_picker_pending: Option<WbPickerTarget>,
     process_tab: ProcessTab,
+    /// Canvas size (w, h) in points from last layout — used to request preview at screen resolution.
+    preview_canvas_size: Option<(f32, f32)>,
     #[cfg(feature = "gpu")]
     gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
 }
@@ -260,6 +262,7 @@ impl Default for C41Gui {
             pending_output_lut_browse: false,
             wb_picker_pending: None,
             process_tab: ProcessTab::Input,
+            preview_canvas_size: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
                 .map(std::sync::Arc::new),
@@ -1417,16 +1420,22 @@ impl C41Gui {
         self.capture_pipeline_debug_next = false;
         options.verbose_debug = capture_debug;
 
-        // Adaptive preview resolution based on zoom: higher zoom → higher working resolution,
-        // up to a reasonable cap to avoid processing near-full 40MP frames for every tweak.
+        // Adaptive preview resolution based on zoom: base = screen resolution (canvas × DPI),
+        // so initial load is sharp; higher zoom → higher working resolution up to 4× cap.
         let zoom = entry.preview_zoom.max(1.0);
         let scale = zoom.min(4.0); // up to 4× base preview resolution
-        let max_width = (PREVIEW_MAX_WIDTH as f32 * scale)
-            .round()
-            .max(PREVIEW_MAX_WIDTH as f32) as u32;
-        let max_height = (PREVIEW_MAX_HEIGHT as f32 * scale)
-            .round()
-            .max(PREVIEW_MAX_HEIGHT as f32) as u32;
+        let ppp = ctx.pixels_per_point();
+        let (base_w, base_h) = self
+            .preview_canvas_size
+            .map(|(w, h)| {
+                // Canvas size in physical pixels for crisp display at 1:1
+                let pw = (w * ppp).round().max(PREVIEW_MAX_WIDTH as f32);
+                let ph = (h * ppp).round().max(PREVIEW_MAX_HEIGHT as f32);
+                (pw, ph)
+            })
+            .unwrap_or((PREVIEW_MAX_WIDTH as f32, PREVIEW_MAX_HEIGHT as f32));
+        let max_width = (base_w * scale).round() as u32;
+        let max_height = (base_h * scale).round() as u32;
 
         let cache = entry.preview_step_cache.clone();
         #[cfg(feature = "gpu")]
@@ -3512,6 +3521,7 @@ impl eframe::App for C41Gui {
                             + BOTTOM_PADDING;
                         let canvas_h = (available.height() - reserved_bottom).max(60.0);
                         let canvas_w = available.width();
+                        self.preview_canvas_size = Some((canvas_w, canvas_h));
 
                         // Extract image dims with fallback so the layout is stable before
                         // the first preview arrives (no jump when data loads in).
