@@ -265,8 +265,11 @@ impl Step4Pipeline {
             });
             pass.set_pipeline(&self.compute_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            let workgroups = (pixel_count as u32 + 255) / 256;
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            const MAX_WG: u32 = 65535;
+            let total_wg = (pixel_count as u32 + 255) / 256;
+            let wg_x = total_wg.min(MAX_WG);
+            let wg_y = (total_wg + MAX_WG - 1) / MAX_WG;
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
         let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {

@@ -25,10 +25,13 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> image: array<f32>;
 
 const LOG2_10_INV: f32 = 0.30102999566;
+// Max X workgroups per dispatch is 65535; pixel_idx is computed from a 2-D dispatch
+// to handle images larger than 65535 * 256 pixels.
+const WG_X_STRIDE: u32 = 65535u * 256u;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pixel_idx = gid.x;
+    let pixel_idx = gid.y * WG_X_STRIDE + gid.x;
     let total = params.width * params.height;
     if pixel_idx >= total {
         return;

@@ -99,7 +99,11 @@ impl GpuPipeline {
                 | wgpu::BufferUsages::COPY_SRC,
         });
 
-        let workgroups = (pixel_count as u32 + 255) / 256;
+        const MAX_WG: u32 = 65535;
+        let total_wg = (pixel_count as u32 + 255) / 256;
+        let wg_x = total_wg.min(MAX_WG);
+        let wg_y = (total_wg + MAX_WG - 1) / MAX_WG;
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("unified_encoder"),
         });
@@ -133,7 +137,7 @@ impl GpuPipeline {
             });
             pass.set_pipeline(self.step4.pipeline());
             pass.set_bind_group(0, &step4_bg, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
         // ── Step 5 ──
@@ -172,7 +176,7 @@ impl GpuPipeline {
             });
             pass.set_pipeline(self.step5.pipeline());
             pass.set_bind_group(0, &step5_bg, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
         // ── Step 6 ──
@@ -218,7 +222,7 @@ impl GpuPipeline {
             });
             pass.set_pipeline(self.step6.pipeline());
             pass.set_bind_group(0, &step6_bg, &[]);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            pass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
         // ── Readback ──

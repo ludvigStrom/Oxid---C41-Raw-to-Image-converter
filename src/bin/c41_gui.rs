@@ -1937,21 +1937,6 @@ impl eframe::App for C41Gui {
                                 ui.end_row();
                             });
 
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new("Highlight roll-off (Reinhard)").small());
-                        egui::Grid::new("highlight_rolloff")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Strength");
-                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff, 0.0..=1.0).fixed_decimals(2));
-                                ui.end_row();
-                                ui.label("Knee");
-                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff_d_mid, 0.5..=3.0).fixed_decimals(2));
-                                ui.end_row();
-                            });
-                        ui.label(egui::RichText::new("Compresses high densities to mask noise in skies. 0 = off.").small().weak());
-
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("Gain = multiplicative in that zone (0 = no change).").small().weak());
                         ui.add_space(4.0);
@@ -1977,6 +1962,31 @@ impl eframe::App for C41Gui {
                             opts.color_highlight_gain_r = 0.0;
                             opts.color_highlight_gain_g = 0.0;
                             opts.color_highlight_gain_b = 0.0;
+                        }
+                    });
+
+                    // ════════════════════════════════════════════════════════
+                    // GROUP 2.6 — Highlight roll-off (Reinhard)
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("Highlight roll-off", |ui| {
+                        ui.label(
+                            egui::RichText::new("Reinhard-style compression in density space to mask noise in skies and dense negative areas.")
+                                .small()
+                                .weak(),
+                        );
+                        ui.add_space(4.0);
+                        egui::Grid::new("highlight_rolloff")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("Strength");
+                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff, 0.0..=3.0).fixed_decimals(2));
+                                ui.end_row();
+                                ui.label("Knee");
+                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff_d_mid, 0.5..=3.0).fixed_decimals(2));
+                                ui.end_row();
+                            });
+                        if ui.small_button("Reset").clicked() {
                             opts.highlight_rolloff = 0.0;
                             opts.highlight_rolloff_d_mid = 1.5;
                         }

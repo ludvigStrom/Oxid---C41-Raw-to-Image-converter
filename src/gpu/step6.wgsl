@@ -36,6 +36,8 @@ struct Params {
 // 3D output LUT for Lut2383: N^3 entries as vec4 (rgb + pad). Same format as step5.
 @group(0) @binding(4) var<storage, read> output_lut_3d: array<vec4<f32>>;
 
+const WG_X_STRIDE: u32 = 65535u * 256u;
+
 // ─── Helper functions ───
 
 fn smoothstep_fn(edge0: f32, edge1: f32, x: f32) -> f32 {
@@ -293,7 +295,7 @@ fn sample_output_lut(nr: f32, ng: f32, nb: f32) -> vec3<f32> {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pixel_idx = gid.x;
+    let pixel_idx = gid.y * WG_X_STRIDE + gid.x;
     let total = params.width * params.height;
     if pixel_idx >= total {
         return;

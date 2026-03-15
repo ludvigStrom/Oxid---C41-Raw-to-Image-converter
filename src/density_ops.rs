@@ -76,7 +76,7 @@ pub(crate) fn apply_reinhard_highlight_rolloff(
             for ch in 0..3 {
                 let d = image[[y, x, ch]];
                 let d_reinhard = d / (1.0 + d / d_mid);
-                image[[y, x, ch]] = d + (d_reinhard - d) * strength;
+                image[[y, x, ch]] = (d + (d_reinhard - d) * strength).max(0.0);
             }
         }
     }

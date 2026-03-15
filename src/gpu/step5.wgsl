@@ -126,9 +126,11 @@ fn sample_lut_tetrahedral(nr: f32, ng: f32, nb: f32) -> vec3<f32> {
     return v0 + d1 * (v1 - v0) + d2 * (v2 - v0) + d3 * (v3 - v0);
 }
 
+const WG_X_STRIDE: u32 = 65535u * 256u;
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pixel_idx = gid.x;
+    let pixel_idx = gid.y * WG_X_STRIDE + gid.x;
     let total = params.width * params.height;
     if pixel_idx >= total {
         return;
@@ -257,9 +259,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if abs(params.highlight_rolloff) > 1e-6 {
         let d_mid = max(params.highlight_rolloff_d_mid, 1e-6);
         let str = params.highlight_rolloff;
-        r = r + (r / (1.0 + r / d_mid) - r) * str;
-        g = g + (g / (1.0 + g / d_mid) - g) * str;
-        b = b + (b / (1.0 + b / d_mid) - b) * str;
+        r = max(r + (r / (1.0 + r / d_mid) - r) * str, 0.0);
+        g = max(g + (g / (1.0 + g / d_mid) - g) * str, 0.0);
+        b = max(b + (b / (1.0 + b / d_mid) - b) * str, 0.0);
     }
 
     image[base + 0u] = r;
