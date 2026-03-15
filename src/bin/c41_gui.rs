@@ -871,14 +871,16 @@ fn auto_detect_crop(
     border_color: (f32, f32, f32),
     tolerance: f32,
 ) -> Option<Rect> {
+    eprintln!("[autocrop] entry: image {}x{}", width, height);
     if width < 16 || height < 16 || pixels.len() < (width * height * 3) as usize {
+        eprintln!("[autocrop] fail: image too small or invalid buffer");
         return None;
     }
 
     let (br, bg, bb) = border_color;
     let border_lum = 0.2126 * br + 0.7152 * bg + 0.0722 * bb;
-    // Only rows/cols with mean <= this can be film border (rejects sky, etc.).
     let border_cap = (border_lum + tolerance * 2.0).min(100.0);
+    eprintln!("[autocrop] border_lum={:.2} tolerance={:.2} border_cap={:.2}", border_lum, tolerance, border_cap);
 
     // Rec. 709 weighted luminance, 0–255 scale.
     let lum_px = |x: u32, y: u32| -> f32 {
@@ -900,7 +902,13 @@ fn auto_detect_crop(
     const BIMODAL_MIN: f64 = 0.12;
 
     let row_threshold = {
-        let (otsu_t, separation) = otsu_threshold_1d(&row_mean, BINS)?;
+        let (otsu_t, separation) = match otsu_threshold_1d(&row_mean, BINS) {
+            Some(x) => x,
+            None => {
+                eprintln!("[autocrop] fail: Otsu row threshold failed (no spread?)");
+                return None;
+            }
+        };
         let t = if separation >= BIMODAL_MIN {
             otsu_t
         } else {
@@ -911,7 +919,13 @@ fn auto_detect_crop(
         t.min(border_cap)
     };
     let col_threshold = {
-        let (otsu_t, separation) = otsu_threshold_1d(&col_mean, BINS)?;
+        let (otsu_t, separation) = match otsu_threshold_1d(&col_mean, BINS) {
+            Some(x) => x,
+            None => {
+                eprintln!("[autocrop] fail: Otsu col threshold failed (no spread?)");
+                return None;
+            }
+        };
         let t = if separation >= BIMODAL_MIN {
             otsu_t
         } else {
@@ -921,9 +935,11 @@ fn auto_detect_crop(
         };
         t.min(border_cap)
     };
+    eprintln!("[autocrop] row_threshold={:.2} col_threshold={:.2}", row_threshold, col_threshold);
 
     let cx = width / 2;
     let cy = height / 2;
+    eprintln!("[autocrop] center ({}, {}), row_mean[cy]={:.2} col_mean[cx]={:.2}", cx, cy, row_mean[cy as usize], col_mean[cx as usize]);
 
     // "Black" = below data-driven threshold AND not brighter than film base
     // (so sky/landscape edges never count as border).
@@ -936,29 +952,38 @@ fn auto_detect_crop(
         m < col_threshold && m <= border_cap
     };
 
-    // Scan from centre outward.  Require 2-run.
+    // Scan from centre outward. Prefer 2-run (two consecutive border rows/cols); fall back to 1-run, then image edge.
     let top = (1..cy)
         .rev()
         .find(|&y| br_row(y) && br_row(y - 1))
-        .map(|y| y + 1)?;
-
-    let bottom = ((cy + 1)..(height - 1))
-        .find(|&y| br_row(y) && br_row(y + 1))?;
-
+        .map(|y| y + 1)
+        .or_else(|| (1..cy).rev().find(|&y| br_row(y)).map(|y| y + 1))
+        .unwrap_or(0);
+    if top == 0 && (1..cy).rev().find(|&y| br_row(y)).is_none() {
+        eprintln!("[autocrop] top: no 2-run or 1-run, using image edge 0");
+    }
+    let bottom = ((cy + 1)..(height - 1)).find(|&y| br_row(y) && br_row(y + 1))
+        .or_else(|| (cy + 1..height).find(|&y| br_row(y)))
+        .unwrap_or(height);
     let left = (1..cx)
         .rev()
         .find(|&x| bc_col(x) && bc_col(x - 1))
-        .map(|x| x + 1)?;
+        .map(|x| x + 1)
+        .or_else(|| (1..cx).rev().find(|&x| bc_col(x)).map(|x| x + 1))
+        .unwrap_or(0);
+    let right = ((cx + 1)..(width - 1)).find(|&x| bc_col(x) && bc_col(x + 1))
+        .or_else(|| (cx + 1..width).find(|&x| bc_col(x)))
+        .unwrap_or(width);
 
-    let right = ((cx + 1)..(width - 1))
-        .find(|&x| bc_col(x) && bc_col(x + 1))?;
+    eprintln!("[autocrop] edges (before margin) top={} bottom={} left={} right={}", top, bottom, left, right);
 
     if right <= left || bottom <= top {
+        eprintln!("[autocrop] fail: invalid rect right<=left or bottom<=top (l={} r={} t={} b={})", left, right, top, bottom);
         return None;
     }
 
-    // Reject if the frame doesn't contain the image centre.
     if left >= cx || right <= cx || top >= cy || bottom <= cy {
+        eprintln!("[autocrop] fail: rect does not contain center ({}, {})", cx, cy);
         return None;
     }
 
@@ -966,20 +991,20 @@ fn auto_detect_crop(
     let h = bottom - top;
     let min_side = (width.min(height) / 20).max(16);
     if w < min_side || h < min_side {
+        eprintln!("[autocrop] fail: crop too small {}x{} (min_side={})", w, h, min_side);
         return None;
     }
 
-    // Reject "upper left quadrant" (and similar) false positives: the crop
-    // rect's centre must be close to the image centre.  Otherwise we likely
-    // found borders on only one or two sides and the box is shifted into a corner.
     let rect_cx = (left + right) / 2;
     let rect_cy = (top + bottom) / 2;
-    let max_shift_x = (width / 5).max(1);   // at most 20% of width off centre
+    let max_shift_x = (width / 5).max(1);
     let max_shift_y = (height / 5).max(1);
     if rect_cx.abs_diff(cx) > max_shift_x || rect_cy.abs_diff(cy) > max_shift_y {
+        eprintln!("[autocrop] fail: rect center ({}, {}) too far from image center (max_shift {}x{})", rect_cx, rect_cy, max_shift_x, max_shift_y);
         return None;
     }
 
+    eprintln!("[autocrop] ok: rect x={} y={} w={} h={}", left, top, w, h);
     Some(Rect {
         x: left,
         y: top,
