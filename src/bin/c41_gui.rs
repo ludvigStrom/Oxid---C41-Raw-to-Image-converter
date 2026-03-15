@@ -623,6 +623,355 @@ fn scale_rect_to_size(
     }
 }
 
+/// Analyses the processed preview buffer and returns the tightest crop rect
+/// that encloses the actual film frame while excluding the uniform border
+/// (film base / rebate).  Works regardless of whether the border is bright
+/// or dark – it samples the outer perimeter to establish a border colour and
+/// then scans inward row-by-row and column-by-column until it finds content
+/// that differs meaningfully from that border colour.
+///
+/// Returns `None` if the image is too small or no clear frame boundary is
+/// found (e.g. the image is already tightly cropped).
+/// Samples the border (film-base) colour from the *processed* preview output
+/// using only reliable D-min data sources.
+///
+/// Two sources, tried in order:
+///
+/// 1. **D-min rect** (`dmin_rect` already scaled to preview pixel space) –
+///    the user explicitly placed this rectangle over the film base, so these
+///    pixels are guaranteed to be rebate/border.
+///
+/// 2. **Auto-percentile outer strip** – mirrors the `AutoPercentile` D-min
+///    logic: sample the outermost `auto_norm_buffer` fraction of each side
+///    (the same region the pipeline excludes from its percentile calculation),
+///    then take the top-10 % brightest pixels by luminance from that strip as
+///    the film-base reference.  This strip is where the pipeline itself
+///    expects to find film base; it is not guaranteed to be free of image
+///    content on multi-frame strips, but it is the best available estimate
+///    when no explicit rect exists.
+///
+/// Returns `None` when `dmin_rect` is absent *and* `auto_norm_buffer` is too
+/// small to produce a meaningful sample (≤ 0.02), so the caller can
+/// inform the user to set a D-min region.
+///
+/// Otherwise returns `Some((r, g, b, tolerance))` in 0–255 float scale where
+/// `tolerance` is 2.5 × max per-channel std-dev, clamped to [12, 55].
+fn sample_border_color(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    dmin_rect: Option<Rect>,
+    auto_norm_buffer: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let accumulate = |x: u32, y: u32,
+                      sums:   &mut [f64; 3],
+                      sq_sum: &mut [f64; 3],
+                      count:  &mut u64| {
+        if x >= width || y >= height { return; }
+        let i = ((y * width + x) * 3) as usize;
+        for c in 0..3 {
+            let v = pixels[i + c] as f64;
+            sums[c]   += v;
+            sq_sum[c] += v * v;
+        }
+        *count += 1;
+    };
+
+    let mut sums   = [0.0f64; 3];
+    let mut sq_sum = [0.0f64; 3];
+    let mut count  = 0u64;
+
+    // ── Source 1: explicit D-min rect ────────────────────────────────────────
+    if let Some(r) = dmin_rect {
+        let x1 = (r.x + r.width).min(width);
+        let y1 = (r.y + r.height).min(height);
+        for y in r.y..y1 {
+            for x in r.x..x1 {
+                accumulate(x, y, &mut sums, &mut sq_sum, &mut count);
+            }
+        }
+    }
+
+    // ── Source 2: auto-percentile outer strip ────────────────────────────────
+    if count == 0 {
+        if auto_norm_buffer <= 0.02 {
+            return None; // Buffer too small; no reliable border source.
+        }
+
+        let bw = ((width  as f32 * auto_norm_buffer) as u32).max(2).min(width  / 3);
+        let bh = ((height as f32 * auto_norm_buffer) as u32).max(2).min(height / 3);
+
+        // Collect all pixels in the outer strip.
+        let mut strip: Vec<(u8, u8, u8)> = Vec::new();
+        for y in 0..bh {                        // top
+            for x in 0..width  { let i = ((y*width+x)*3) as usize; strip.push((pixels[i],pixels[i+1],pixels[i+2])); }
+        }
+        for y in (height-bh)..height {          // bottom
+            for x in 0..width  { let i = ((y*width+x)*3) as usize; strip.push((pixels[i],pixels[i+1],pixels[i+2])); }
+        }
+        for x in 0..bw {                        // left (excluding already-counted rows)
+            for y in bh..(height-bh) { let i = ((y*width+x)*3) as usize; strip.push((pixels[i],pixels[i+1],pixels[i+2])); }
+        }
+        for x in (width-bw)..width {            // right
+            for y in bh..(height-bh) { let i = ((y*width+x)*3) as usize; strip.push((pixels[i],pixels[i+1],pixels[i+2])); }
+        }
+
+        if strip.is_empty() { return None; }
+
+        // Sort by luminance ascending; keep the darkest 10 % – after
+        // inversion the film base is the darkest region of the output.
+        strip.sort_unstable_by(|a, b| {
+            let la = a.0 as u32 + a.1 as u32 + a.2 as u32;
+            let lb = b.0 as u32 + b.1 as u32 + b.2 as u32;
+            la.cmp(&lb)
+        });
+        let keep = ((strip.len() as f32 * 0.10) as usize).max(1);
+        for &(r, g, b) in &strip[..keep] {
+            sums[0]   += r as f64; sq_sum[0] += (r as f64) * (r as f64);
+            sums[1]   += g as f64; sq_sum[1] += (g as f64) * (g as f64);
+            sums[2]   += b as f64; sq_sum[2] += (b as f64) * (b as f64);
+            count     += 1;
+        }
+    }
+
+    if count == 0 { return None; }
+
+    let n = count as f64;
+    let mut means   = [0.0f32; 3];
+    let mut max_std = 0.0f32;
+    for c in 0..3 {
+        let mean = sums[c] / n;
+        let var  = (sq_sum[c] / n - mean * mean).max(0.0);
+        means[c] = mean as f32;
+        max_std   = max_std.max(var.sqrt() as f32);
+    }
+
+    // Sanity check: after inversion the film base is always very dark (near
+    // black).  If the sampled colour is too bright the outer strip contained
+    // no real border pixels – the frame is larger than auto_norm_buffer, or
+    // the image is too tightly framed.  In that case the colour is useless
+    // and would cause bright image content to be mis-classified as border.
+    let lum = (means[0] + means[1] + means[2]) / 3.0;
+    if lum > 80.0 {
+        return None;
+    }
+
+    let tol = (max_std * 2.5).clamp(12.0, 55.0);
+    Some((means[0], means[1], means[2], tol))
+}
+
+/// Otsu threshold for a 1D distribution: quantize into bins, choose the boundary
+/// that maximizes between-class variance. Returns (threshold, separation_ratio)
+/// where separation_ratio = between_var / total_var (high = clear bimodal split).
+fn otsu_threshold_1d(values: &[f32], num_bins: usize) -> Option<(f32, f64)> {
+    if values.is_empty() || num_bins < 2 {
+        return None;
+    }
+    let min_v = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_v = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let range = max_v - min_v;
+    if range <= 0.0 {
+        return None;
+    }
+    let mut hist = vec![0u32; num_bins];
+    let bin_w = range / num_bins as f32;
+    for &v in values {
+        let b = ((v - min_v) / range * num_bins as f32)
+            .clamp(0.0, (num_bins - 1) as f32) as usize;
+        hist[b] = hist[b].saturating_add(1);
+    }
+    let n: f64 = hist.iter().map(|&c| c as f64).sum();
+    if n <= 0.0 {
+        return None;
+    }
+    let total_mean: f64 = hist
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (i as f64 + 0.5) * bin_w as f64 * c as f64)
+        .sum::<f64>()
+        / n;
+    let total_var: f64 = hist
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let center = min_v as f64 + (i as f64 + 0.5) * bin_w as f64;
+            (center - total_mean).powi(2) * c as f64
+        })
+        .sum::<f64>()
+        / n;
+    if total_var <= 0.0 {
+        return None;
+    }
+    let mut best_t = 0usize;
+    let mut best_var = 0.0f64;
+    for t in 1..num_bins {
+        let n_low: f64 = hist[..t].iter().map(|&c| c as f64).sum();
+        let n_high = n - n_low;
+        if n_low <= 0.0 || n_high <= 0.0 {
+            continue;
+        }
+        let mean_low: f64 = hist[..t]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i as f64 + 0.5) * bin_w as f64 * c as f64)
+            .sum::<f64>()
+            / n_low;
+        let mean_high: f64 = hist[t..]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (t as f64 + i as f64 + 0.5) * bin_w as f64 * c as f64)
+            .sum::<f64>()
+            / n_high;
+        let between = n_low * n_high * (mean_low - mean_high).powi(2);
+        if between > best_var {
+            best_var = between;
+            best_t = t;
+        }
+    }
+    let threshold_value = min_v + (best_t as f32 + 0.5) * bin_w;
+    let separation = best_var / total_var;
+    Some((threshold_value, separation))
+}
+
+/// Percentile of a 1D sample (0.0 = min, 1.0 = max). Uses linear interpolation.
+fn percentile_1d(values: &[f32], p: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let p = p.clamp(0.0, 1.0);
+    let mut sorted: Vec<f32> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    if n == 1 {
+        return sorted[0];
+    }
+    let idx = p * (n - 1) as f32;
+    let i = idx.floor() as usize;
+    let frac = idx - i as f32;
+    if i >= n - 1 {
+        sorted[n - 1]
+    } else {
+        sorted[i] * (1.0 - frac) + sorted[i + 1] * frac
+    }
+}
+
+/// Detects the film-frame boundary via mean row/column luminance.
+///
+/// 1. Compute mean luminance per row and per column.
+/// 2. Data-driven threshold (Otsu or percentile) plus a hard cap from the
+///    sampled film-base colour: a row/column only counts as "border" if its
+///    mean is both below the threshold and <= border_lum + tolerance.  That
+///    avoids mistaking in-image edges (sky, landscape) for film border.
+/// 3. Scan from centre outward; require minimum crop size so we never return
+///    a tiny or zero-size rect.
+fn auto_detect_crop(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    border_color: (f32, f32, f32),
+    tolerance: f32,
+) -> Option<Rect> {
+    if width < 16 || height < 16 || pixels.len() < (width * height * 3) as usize {
+        return None;
+    }
+
+    let (br, bg, bb) = border_color;
+    let border_lum = 0.2126 * br + 0.7152 * bg + 0.0722 * bb;
+    // Only rows/cols with mean <= this can be film border (rejects sky, etc.).
+    let border_cap = (border_lum + tolerance * 2.0).min(100.0);
+
+    // Rec. 709 weighted luminance, 0–255 scale.
+    let lum_px = |x: u32, y: u32| -> f32 {
+        let i = ((y * width + x) * 3) as usize;
+        0.2126 * pixels[i] as f32
+            + 0.7152 * pixels[i + 1] as f32
+            + 0.0722 * pixels[i + 2] as f32
+    };
+
+    // Mean luminance for every row and every column.
+    let row_mean: Vec<f32> = (0..height)
+        .map(|y| (0..width).map(|x| lum_px(x, y)).sum::<f32>() / width as f32)
+        .collect();
+    let col_mean: Vec<f32> = (0..width)
+        .map(|x| (0..height).map(|y| lum_px(x, y)).sum::<f32>() / height as f32)
+        .collect();
+
+    const BINS: usize = 64;
+    const BIMODAL_MIN: f64 = 0.12;
+
+    let row_threshold = {
+        let (otsu_t, separation) = otsu_threshold_1d(&row_mean, BINS)?;
+        let t = if separation >= BIMODAL_MIN {
+            otsu_t
+        } else {
+            let p15 = percentile_1d(&row_mean, 0.15);
+            let p50 = percentile_1d(&row_mean, 0.5);
+            p15 + 0.2 * (p50 - p15).max(0.0)
+        };
+        t.min(border_cap)
+    };
+    let col_threshold = {
+        let (otsu_t, separation) = otsu_threshold_1d(&col_mean, BINS)?;
+        let t = if separation >= BIMODAL_MIN {
+            otsu_t
+        } else {
+            let p15 = percentile_1d(&col_mean, 0.15);
+            let p50 = percentile_1d(&col_mean, 0.5);
+            p15 + 0.2 * (p50 - p15).max(0.0)
+        };
+        t.min(border_cap)
+    };
+
+    let cx = width / 2;
+    let cy = height / 2;
+
+    // "Black" = below data-driven threshold AND not brighter than film base
+    // (so sky/landscape edges never count as border).
+    let br_row = |y: u32| {
+        let m = row_mean[y as usize];
+        m < row_threshold && m <= border_cap
+    };
+    let bc_col = |x: u32| {
+        let m = col_mean[x as usize];
+        m < col_threshold && m <= border_cap
+    };
+
+    // Scan from centre outward.  Require 2-run.
+    let top = (1..cy)
+        .rev()
+        .find(|&y| br_row(y) && br_row(y - 1))
+        .map(|y| y + 1)?;
+
+    let bottom = ((cy + 1)..(height - 1))
+        .find(|&y| br_row(y) && br_row(y + 1))?;
+
+    let left = (1..cx)
+        .rev()
+        .find(|&x| bc_col(x) && bc_col(x - 1))
+        .map(|x| x + 1)?;
+
+    let right = ((cx + 1)..(width - 1))
+        .find(|&x| bc_col(x) && bc_col(x + 1))?;
+
+    if right <= left || bottom <= top {
+        return None;
+    }
+
+    let w = right - left;
+    let h = bottom - top;
+    let min_side = (width.min(height) / 20).max(16);
+    if w < min_side || h < min_side {
+        return None;
+    }
+
+    Some(Rect {
+        x: left,
+        y: top,
+        width: w,
+        height: h,
+    })
+}
+
 fn compute_histogram_from_rgb(
     rgb: &[u8],
     w: u32,
@@ -1442,6 +1791,7 @@ impl eframe::App for C41Gui {
             });
 
         // ---- Right panel: mode toggle + per-image settings / calibration ----
+        let mut auto_crop_requested = false;
         egui::SidePanel::right("settings_panel")
             .resizable(false)
             .exact_width(RIGHT_PANEL_WIDTH)
@@ -2327,15 +2677,28 @@ impl eframe::App for C41Gui {
                     // Crop
                     // ════════════════════════════════════════════════════════
                         ui.add_space(4.0);
-                        ui.checkbox(&mut opts.apply_crop, "Crop");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut opts.apply_crop, "Crop");
+                            if opts.apply_crop {
+                                if ui.button("Auto")
+                                    .on_hover_text("Detect film frame boundaries and maximise crop")
+                                    .clicked()
+                                {
+                                    auto_crop_requested = true;
+                                }
+                            }
+                        });
                         if opts.apply_crop {
                             if opts.crop_rect.is_none() {
+                                // Placeholder so the overlay is visible immediately;
+                                // auto-detect will replace it this same frame.
                                 opts.crop_rect = Some(Rect {
                                     x: 40,
                                     y: 40,
                                     width: 240,
                                     height: 240,
                                 });
+                                auto_crop_requested = true;
                             }
                             if let Some(rect) = opts.crop_rect.as_mut() {
                                 ui.horizontal(|ui| {
@@ -3065,6 +3428,47 @@ impl eframe::App for C41Gui {
                 });
                 });
             });
+
+        // ---- Auto-crop: run frame detection after sidebar borrow is released ----
+        if auto_crop_requested {
+            if let Some(idx) = self.selected_index {
+                if idx < self.images.len() {
+                    // Clone the pixel buffer so we can mutably write options
+                    // on the same entry without a borrow conflict.
+                    let preview_clone = self.images[idx].preview_full_rgb.clone();
+                    if let Some((w, h, pixels)) = preview_clone {
+                        // Scale the D-min rect to preview pixel space if one is set.
+                        let dmin_rect_preview = self.images[idx].options.dmin_rect.map(|r| {
+                            scale_rect_to_size(
+                                r,
+                                self.images[idx].options.dmin_rect_reference_size,
+                                w, h,
+                            )
+                        });
+                        let auto_norm_buffer = self.images[idx].options.auto_norm_buffer;
+                        match sample_border_color(w, h, &pixels, dmin_rect_preview, auto_norm_buffer) {
+                            None => {
+                                self.status = "Auto crop: set a D-min region first so the film-base colour is known.".to_string();
+                            }
+                            Some((br, bg, bb, tol)) => {
+                                match auto_detect_crop(w, h, &pixels, (br, bg, bb), tol) {
+                                    Some(rect) => {
+                                        self.images[idx].options.crop_rect = Some(rect);
+                                        self.images[idx].options.crop_rect_reference_size = Some((w, h));
+                                        self.images[idx].options.apply_crop = true;
+                                    }
+                                    None => {
+                                        self.status = "Auto crop: no clear frame boundary found.".to_string();
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        self.status = "Auto crop: waiting for preview to finish processing.".to_string();
+                    }
+                }
+            }
+        }
 
         // ---- Central panel: preview + histogram ----
         egui::CentralPanel::default().show(ctx, |ui| {
