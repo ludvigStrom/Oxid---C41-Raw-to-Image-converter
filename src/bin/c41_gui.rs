@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use c41_raw_tool::{
     blur_flat_field,
     calibration,
+    color,
     demosaic,
     dmin,
     load_flat_field_linear,
@@ -28,6 +29,7 @@ use c41_raw_tool::{
     OutputStage,
     OutputLutEncoding,
     DminMode,
+    WbMode,
     CachedSensor,
     load_sensor_from_path,
     compute_dmin_from_sensor,
@@ -151,6 +153,14 @@ enum UIMode {
     Debug,
 }
 
+/// Target for the white balance eyedropper: which neutral to set from the sampled point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WbPickerTarget {
+    WhitePoint,
+    GrayPoint,
+    BlackPoint,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessTab {
     Input,
@@ -215,6 +225,8 @@ struct C41Gui {
     /// Deferred file dialog flag: open the output LUT browser outside the egui render loop
     /// to avoid macOS NSOpenPanel re-entrance crashes.
     pending_output_lut_browse: bool,
+    /// When set, the next click on the preview will sample density and set WB gains (white/gray/black point).
+    wb_picker_pending: Option<WbPickerTarget>,
     process_tab: ProcessTab,
     #[cfg(feature = "gpu")]
     gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
@@ -246,6 +258,7 @@ impl Default for C41Gui {
             pending_preview_key: None,
             pending_preview_since: None,
             pending_output_lut_browse: false,
+            wb_picker_pending: None,
             process_tab: ProcessTab::Input,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
@@ -376,6 +389,7 @@ fn default_options() -> PipelineOptions {
         auto_norm_buffer: 0.2,
         apply_white_balance: true,
         auto_wb: true,
+        wb_mode: WbMode::Auto,
         film_gamma: 0.65,
         dmin_rect: None,
         dmin_rect_reference_size: None,
@@ -469,6 +483,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.dmin_mode.hash(&mut h);
     opts.auto_norm_buffer.to_bits().hash(&mut h);
     opts.apply_white_balance.hash(&mut h);
+    opts.wb_mode.hash(&mut h);
     opts.auto_wb.hash(&mut h);
     opts.film_gamma.to_bits().hash(&mut h);
     opts.saturation.to_bits().hash(&mut h);
@@ -2424,21 +2439,61 @@ impl eframe::App for C41Gui {
                     // GROUP 3 — White Balance & Color Neutrality
                     // ════════════════════════════════════════════════════════
                     ui.collapsing("White balance", |ui| {
-                        ui.checkbox(&mut opts.auto_wb, "Auto white balance");
-                        ui.label(
-                            egui::RichText::new(
-                                if opts.auto_wb {
-                                    "Per-channel gamma: D × (mean_D / ch_median). Preserves black point."
-                                } else {
-                                    "Auto WB disabled."
-                                },
-                            )
-                            .small()
-                            .weak(),
-                        );
+                        let mut wb_mode = opts.wb_mode;
+                        egui::ComboBox::from_id_salt(ui.id().with("wb_mode"))
+                            .selected_text(match wb_mode {
+                                WbMode::Auto => "Auto",
+                                WbMode::Picker => "Picker",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut wb_mode, WbMode::Auto, "Auto");
+                                ui.selectable_value(&mut wb_mode, WbMode::Picker, "Picker");
+                            });
+                        if wb_mode != opts.wb_mode {
+                            opts.wb_mode = wb_mode;
+                            if wb_mode == WbMode::Picker {
+                                opts.auto_wb = false;
+                                opts.apply_white_balance = true;
+                            }
+                        }
+
+                        match opts.wb_mode {
+                            WbMode::Auto => {
+                                ui.checkbox(&mut opts.auto_wb, "Auto white balance");
+                                ui.label(
+                                    egui::RichText::new(
+                                        if opts.auto_wb {
+                                            "Per-channel gamma: D × (mean_D / ch_median). Preserves black point."
+                                        } else {
+                                            "Auto WB disabled."
+                                        },
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(4.0);
+                                ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
+                            }
+                            WbMode::Picker => {
+                                ui.label(egui::RichText::new("Click a point on the preview to set it as neutral.").small().weak());
+                                ui.horizontal(|ui| {
+                                    if ui.button("Pick white point").clicked() {
+                                        self.wb_picker_pending = Some(WbPickerTarget::WhitePoint);
+                                    }
+                                    if ui.button("Pick gray point").clicked() {
+                                        self.wb_picker_pending = Some(WbPickerTarget::GrayPoint);
+                                    }
+                                    if ui.button("Pick black point").clicked() {
+                                        self.wb_picker_pending = Some(WbPickerTarget::BlackPoint);
+                                    }
+                                });
+                                if self.wb_picker_pending.is_some() {
+                                    ui.label(egui::RichText::new("Click on the preview image to sample.").small().color(egui::Color32::from_rgb(180, 220, 120)));
+                                }
+                            }
+                        }
 
                         ui.add_space(4.0);
-                        ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
                         if opts.apply_white_balance {
                             let mut use_temp = opts.temp_k.is_some();
                             ui.checkbox(&mut use_temp, "Color temperature (K)");
@@ -3752,6 +3807,46 @@ impl eframe::App for C41Gui {
                                 (entry.preview_pan.y - delta.y / img_h).clamp(0.0, 1.0);
                         }
 
+                        // White balance picker: on click, sample density from cache and set WB gains.
+                        if self.wb_picker_pending.is_some() && canvas_resp.clicked() {
+                            if let Some(pos) = canvas_resp.interact_pointer_pos() {
+                                let (px_f, py_f) = screen_to_image(pos.x, pos.y);
+                                let px = (px_f as u32).min(full_w.saturating_sub(1));
+                                let py = (py_f as u32).min(full_h.saturating_sub(1));
+                                if let Some(ref cache) = self.images[idx].preview_step_cache {
+                                    if let Some((_, ref buf)) = cache.after_step3 {
+                                        let (h, w, _) = buf.dim();
+                                        let y = (py as usize).min(h.saturating_sub(1));
+                                        let x = (px as usize).min(w.saturating_sub(1));
+                                        let tr = buf[[y, x, 0]].max(1e-10);
+                                        let tg = buf[[y, x, 1]].max(1e-10);
+                                        let tb = buf[[y, x, 2]].max(1e-10);
+                                        let dr = -(tr as f64).log10() as f32;
+                                        let dg = -(tg as f64).log10() as f32;
+                                        let db = -(tb as f64).log10() as f32;
+                                        let (wb_r, wb_g, wb_b) = color::density_to_wb_gains(dr, dg, db);
+                                        let opts = &mut self.images[idx].options;
+                                        opts.wb_r = wb_r;
+                                        opts.wb_g = wb_g;
+                                        opts.wb_b = wb_b;
+                                        opts.apply_white_balance = true;
+                                        opts.auto_wb = false;
+                                        self.status = format!("WB set from {} point (R={:.3} G={:.3} B={:.3})",
+                                            match self.wb_picker_pending.unwrap() {
+                                                WbPickerTarget::WhitePoint => "white",
+                                                WbPickerTarget::GrayPoint => "gray",
+                                                WbPickerTarget::BlackPoint => "black",
+                                            },
+                                            wb_r, wb_g, wb_b);
+                                    } else {
+                                        self.status = "WB picker: no cache (re-run preview first).".to_string();
+                                    }
+                                } else {
+                                    self.status = "WB picker: no cache (re-run preview first).".to_string();
+                                }
+                                self.wb_picker_pending = None;
+                            }
+                        }
 
                         // In Calibrate mode, draw and allow interaction with the
                         // 4-point overlay and the interpolated 24 patch boxes.

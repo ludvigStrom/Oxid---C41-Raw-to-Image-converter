@@ -13,6 +13,15 @@ pub struct Rect {
     pub height: u32,
 }
 
+/// White balance mode: Auto (per-channel median equalization) or Picker (sample a point to set neutral).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WbMode {
+    /// Use auto white balance (per-channel density median equalization when D-min is on).
+    Auto,
+    /// Use manual WB gains; can set them via eyedropper (white/gray/black point) or sliders.
+    Picker,
+}
+
 /// D-min method selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DminMode {
@@ -67,6 +76,8 @@ pub struct PipelineOptions {
     /// When true, automatically equalize per-channel density medians after D-min
     /// using multiplicative correction (per-channel gamma). Preserves D=0 black point.
     pub auto_wb: bool,
+    /// White balance mode: Auto (median equalization) or Picker (eyedropper + manual sliders).
+    pub wb_mode: WbMode,
     /// C-41 film negative gamma. Scene log-exposure = density / film_gamma.
     /// Typical values: 0.55–0.75 for C-41, ~0.65 default. Applied as D *= 1/gamma
     /// to decompress density into scene-relative log-exposure before the paper curve.
@@ -239,6 +250,7 @@ impl Default for PipelineOptions {
             auto_norm_buffer: 0.2,
             apply_white_balance: true,
             auto_wb: true,
+            wb_mode: WbMode::Auto,
             film_gamma: 0.65,
             dmin_rect: None,
             dmin_rect_reference_size: None,

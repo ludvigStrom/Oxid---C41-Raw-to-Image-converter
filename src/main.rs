@@ -218,6 +218,7 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         auto_norm_buffer: 0.2,
         apply_white_balance: true,
         auto_wb: true,
+        wb_mode: c41_raw_tool::WbMode::Auto,
         film_gamma: 0.65,
         apply_color_profile: true,
         dmin_rect: cli.dmin_rect,

@@ -3,6 +3,18 @@
 
 use ndarray::Array3;
 
+/// Compute manual WB gains so that the given density (Dr, Dg, Db) becomes neutral.
+/// Returns (wb_r, wb_g, wb_b) with geometric mean 1 so that wb_r*Dr = wb_g*Dg = wb_b*Db.
+/// Used by the white-balance picker (eyedropper).
+pub fn density_to_wb_gains(dr: f32, dg: f32, db: f32) -> (f32, f32, f32) {
+    let eps = 1e-6;
+    let r = dr.max(eps);
+    let g = dg.max(eps);
+    let b = db.max(eps);
+    let k = (r * g * b).cbrt();
+    (k / r, k / g, k / b)
+}
+
 /// Black-body temperature (K) to white-balance gains (R, G, B). 5500 K ≈ (1, 1, 1). Lower K = warm light → gains correct toward cool.
 pub(crate) fn temp_k_to_wb_gains(temp_k: f32) -> (f32, f32, f32) {
     let t = (temp_k / 100.0).clamp(1.0, 400.0);

@@ -72,6 +72,7 @@ pub fn hash_after_step3(path: &Path, opts: &PipelineOptions, max_width: u32, max
 pub fn hash_after_step4(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_after_step3(path, opts, max_width, max_height).hash(&mut h);
+    opts.wb_mode.hash(&mut h);
     opts.auto_wb.hash(&mut h);
     opts.apply_white_balance.hash(&mut h);
     hash_f32(&mut h, opts.wb_r);
