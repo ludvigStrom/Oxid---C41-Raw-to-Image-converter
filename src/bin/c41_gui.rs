@@ -957,10 +957,26 @@ fn auto_detect_crop(
         return None;
     }
 
+    // Reject if the frame doesn't contain the image centre.
+    if left >= cx || right <= cx || top >= cy || bottom <= cy {
+        return None;
+    }
+
     let w = right - left;
     let h = bottom - top;
     let min_side = (width.min(height) / 20).max(16);
     if w < min_side || h < min_side {
+        return None;
+    }
+
+    // Reject "upper left quadrant" (and similar) false positives: the crop
+    // rect's centre must be close to the image centre.  Otherwise we likely
+    // found borders on only one or two sides and the box is shifted into a corner.
+    let rect_cx = (left + right) / 2;
+    let rect_cy = (top + bottom) / 2;
+    let max_shift_x = (width / 5).max(1);   // at most 20% of width off centre
+    let max_shift_y = (height / 5).max(1);
+    if rect_cx.abs_diff(cx) > max_shift_x || rect_cy.abs_diff(cy) > max_shift_y {
         return None;
     }
 
