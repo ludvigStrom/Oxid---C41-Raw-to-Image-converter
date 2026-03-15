@@ -337,3 +337,12 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 ## License
 
 See repository for license information.
+
+
+TODO:
+DONE! White balance picker
+DONE! Remove duplicate color gain settings
+DOING Reorder color exposure highlight rolloff etc
+histogram normalization?
+Mirror left/right
+Resolution at startap is to low?

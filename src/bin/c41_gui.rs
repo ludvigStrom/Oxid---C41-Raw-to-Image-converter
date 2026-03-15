@@ -2112,57 +2112,40 @@ impl eframe::App for C41Gui {
                     // GROUP 1 — Exposure  (primary editing controls)
                     // ════════════════════════════════════════════════════════
                     ui.label(egui::RichText::new("Exposure").strong());
-                    ui.add_space(2.0);
+                    ui.add_space(4.0);
                     {
                         let mut exp = exposure_from_opts(opts);
                         let mut changed = false;
-
-                        ui.horizontal(|ui| {
-                            ui.label("Density");
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut exp.density, 0.5..=1.5)
-                                        .fixed_decimals(2),
-                                )
-                                .changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Grade");
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut exp.grade, 0.5..=2.0)
-                                        .fixed_decimals(2),
-                                )
-                                .changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Shadows");
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut exp.shadows, -0.3..=0.3)
-                                        .fixed_decimals(3),
-                                )
-                                .changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Highlights");
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut exp.highlights, -0.5..=0.5)
-                                        .fixed_decimals(3),
-                                )
-                                .changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Hardness");
-                            changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut exp.hardness, -0.5..=0.5)
-                                        .fixed_decimals(3),
-                                )
-                                .changed();
-                        });
-
+                        egui::Grid::new("exposure")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("Density");
+                                changed |= ui
+                                    .add(egui::Slider::new(&mut exp.density, 0.5..=1.5).fixed_decimals(2))
+                                    .changed();
+                                ui.end_row();
+                                ui.label("Grade");
+                                changed |= ui
+                                    .add(egui::Slider::new(&mut exp.grade, 0.5..=2.0).fixed_decimals(2))
+                                    .changed();
+                                ui.end_row();
+                                ui.label("Shadows");
+                                changed |= ui
+                                    .add(egui::Slider::new(&mut exp.shadows, -0.3..=0.3).fixed_decimals(3))
+                                    .changed();
+                                ui.end_row();
+                                ui.label("Highlights");
+                                changed |= ui
+                                    .add(egui::Slider::new(&mut exp.highlights, -0.5..=0.5).fixed_decimals(3))
+                                    .changed();
+                                ui.end_row();
+                                ui.label("Hardness");
+                                changed |= ui
+                                    .add(egui::Slider::new(&mut exp.hardness, -0.5..=0.5).fixed_decimals(3))
+                                    .changed();
+                                ui.end_row();
+                            });
                         if changed {
                             apply_exposure_to_opts(&exp, opts);
                         }
@@ -2212,51 +2195,63 @@ impl eframe::App for C41Gui {
                     ui.separator();
 
                     // ════════════════════════════════════════════════════════
-                    // GROUP 2 — Tone Shaping  (advanced shadow/highlight)
+                    // Highlight roll-off (Reinhard) — order matches workflow
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("Highlight roll-off", |ui| {
+                        ui.label(
+                            egui::RichText::new("Reinhard-style compression in density space to mask noise in skies and dense negative areas.")
+                                .small()
+                                .weak(),
+                        );
+                        ui.add_space(4.0);
+                        egui::Grid::new("highlight_rolloff")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("Strength");
+                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff, 0.0..=3.0).fixed_decimals(2));
+                                ui.end_row();
+                                ui.label("Knee");
+                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff_d_mid, 0.5..=3.0).fixed_decimals(2));
+                                ui.end_row();
+                            });
+                        if ui.small_button("Reset").clicked() {
+                            opts.highlight_rolloff = 0.0;
+                            opts.highlight_rolloff_d_mid = 1.5;
+                        }
+                    });
+
+                    // ════════════════════════════════════════════════════════
+                    // Tone shaping (advanced shadow/highlight)
                     // ════════════════════════════════════════════════════════
                     ui.collapsing("Tone shaping", |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Fine control of shadow and highlight rolloff."
-                            )
-                            .small()
-                            .weak(),
-                        );
                         ui.add_space(4.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label("Toe");
-                            ui.add(
-                                egui::Slider::new(&mut opts.toe_strength, -0.5..=0.5)
-                                    .fixed_decimals(2),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Shoulder");
-                            ui.add(
-                                egui::Slider::new(&mut opts.shoulder_strength, -0.5..=0.5)
-                                    .fixed_decimals(2),
-                            );
-                        });
+                        egui::Grid::new("tone_shaping")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("Toe");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.toe_strength, -0.5..=0.5)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+                                ui.label("Shoulder");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.shoulder_strength, -0.5..=0.5)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+                                ui.label("Shadow cast");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.shadow_cast_strength, 0.0..=1.0)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+                            });
                         ui.label(
                             egui::RichText::new(
-                                "Toe > 0 = softer shadows. Shoulder > 0 = softer highlights."
-                            )
-                            .small()
-                            .weak(),
-                        );
-
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Shadow cast");
-                            ui.add(
-                                egui::Slider::new(&mut opts.shadow_cast_strength, 0.0..=1.0)
-                                    .fixed_decimals(2),
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Auto-neutralize residual color cast in shadows."
+                                "Toe/shoulder: softer shadows and highlights. Shadow cast: auto-neutralize color cast in shadows."
                             )
                             .small()
                             .weak(),
@@ -2264,7 +2259,139 @@ impl eframe::App for C41Gui {
                     });
 
                     // ════════════════════════════════════════════════════════
-                    // GROUP 2.5 — Color Zones (per-channel shadow/mid/highlight)
+                    // White balance & color neutrality
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("White balance", |ui| {
+                        let mut wb_mode = opts.wb_mode;
+                        egui::ComboBox::from_id_salt(ui.id().with("wb_mode"))
+                            .selected_text(match wb_mode {
+                                WbMode::Auto => "Auto",
+                                WbMode::Picker => "Picker",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut wb_mode, WbMode::Auto, "Auto");
+                                ui.selectable_value(&mut wb_mode, WbMode::Picker, "Picker");
+                            });
+                        if wb_mode != opts.wb_mode {
+                            opts.wb_mode = wb_mode;
+                            if wb_mode == WbMode::Picker {
+                                opts.auto_wb = false;
+                                opts.apply_white_balance = true;
+                            }
+                        }
+
+                        match opts.wb_mode {
+                            WbMode::Auto => {
+                                ui.checkbox(&mut opts.auto_wb, "Auto white balance");
+                                ui.label(
+                                    egui::RichText::new(
+                                        if opts.auto_wb {
+                                            "Per-channel gamma: D × (mean_D / ch_median). Preserves black point."
+                                        } else {
+                                            "Auto WB disabled."
+                                        },
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(4.0);
+                                ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
+                            }
+                            WbMode::Picker => {
+                                ui.label(egui::RichText::new("Click a point on the preview to set it as neutral.").small().weak());
+                                ui.horizontal(|ui| {
+                                    if ui.button("Pick white point").clicked() {
+                                        self.wb_picker_pending = Some(WbPickerTarget::WhitePoint);
+                                    }
+                                    if ui.button("Pick gray point").clicked() {
+                                        self.wb_picker_pending = Some(WbPickerTarget::GrayPoint);
+                                    }
+                                    if ui.button("Pick black point").clicked() {
+                                        self.wb_picker_pending = Some(WbPickerTarget::BlackPoint);
+                                    }
+                                });
+                                if self.wb_picker_pending.is_some() {
+                                    ui.label(egui::RichText::new("Click on the preview image to sample.").small().color(egui::Color32::from_rgb(180, 220, 120)));
+                                }
+                            }
+                        }
+
+                        ui.add_space(4.0);
+                        if opts.apply_white_balance {
+                            let mut use_temp = opts.temp_k.is_some();
+                            ui.checkbox(&mut use_temp, "Color temperature (K)");
+                            if use_temp {
+                                let mut k = opts.temp_k.unwrap_or(5500.0);
+                                ui.add(egui::Slider::new(&mut k, 2500.0..=9000.0).suffix(" K"));
+                                opts.temp_k = Some(k);
+                            } else {
+                                opts.temp_k = None;
+                            }
+                            ui.label(egui::RichText::new("Density scale (1.0 = neutral, >1 = more color).").small().weak());
+                            egui::Grid::new("wb_rgb")
+                                .num_columns(2)
+                                .spacing([4.0, 2.0])
+                                .show(ui, |ui| {
+                                    ui.label("R");
+                                    ui.add(egui::Slider::new(&mut opts.wb_r, 0.7..=1.5));
+                                    ui.end_row();
+                                    ui.label("G");
+                                    ui.add(egui::Slider::new(&mut opts.wb_g, 0.7..=1.5));
+                                    ui.end_row();
+                                    ui.label("B");
+                                    ui.add(egui::Slider::new(&mut opts.wb_b, 0.7..=1.5));
+                                    ui.end_row();
+                                });
+                        }
+                    });
+
+                    // ════════════════════════════════════════════════════════
+                    // Color character & separation
+                    // ════════════════════════════════════════════════════════
+                    ui.collapsing("Color", |ui| {
+                        ui.add_space(4.0);
+                        egui::Grid::new("color_main")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("Saturation");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.saturation, 0.7..=1.6)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+                                ui.label("Warmth");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.highlight_warmth, 0.0..=0.6)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+                            });
+                        ui.checkbox(&mut opts.apply_lab, "Lab separation");
+                        ui.add_enabled_ui(opts.apply_lab, |ui| {
+                            egui::Grid::new("color_lab")
+                                .num_columns(2)
+                                .spacing([4.0, 2.0])
+                                .show(ui, |ui| {
+                                    ui.label("Separation");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.lab_separation, -1.5..=1.5)
+                                            .fixed_decimals(2),
+                                    );
+                                    ui.end_row();
+                                });
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Saturation: density chroma. Warmth: golden highlights. Lab: mid-chroma separation in a/b."
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    });
+
+                    // ════════════════════════════════════════════════════════
+                    // Color zones (per-channel shadow/mid/highlight)
                     // ════════════════════════════════════════════════════════
                     ui.collapsing("Color zones", |ui| {
                         ui.add_space(4.0);
@@ -2345,173 +2472,6 @@ impl eframe::App for C41Gui {
                             opts.color_highlight_gain_g = 0.0;
                             opts.color_highlight_gain_b = 0.0;
                         }
-                    });
-
-                    // ════════════════════════════════════════════════════════
-                    // GROUP 2.6 — Highlight roll-off (Reinhard)
-                    // ════════════════════════════════════════════════════════
-                    ui.collapsing("Highlight roll-off", |ui| {
-                        ui.label(
-                            egui::RichText::new("Reinhard-style compression in density space to mask noise in skies and dense negative areas.")
-                                .small()
-                                .weak(),
-                        );
-                        ui.add_space(4.0);
-                        egui::Grid::new("highlight_rolloff")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Strength");
-                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff, 0.0..=3.0).fixed_decimals(2));
-                                ui.end_row();
-                                ui.label("Knee");
-                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff_d_mid, 0.5..=3.0).fixed_decimals(2));
-                                ui.end_row();
-                            });
-                        if ui.small_button("Reset").clicked() {
-                            opts.highlight_rolloff = 0.0;
-                            opts.highlight_rolloff_d_mid = 1.5;
-                        }
-                    });
-
-                    // ════════════════════════════════════════════════════════
-                    // GROUP 3 — White Balance & Color Neutrality
-                    // ════════════════════════════════════════════════════════
-                    ui.collapsing("White balance", |ui| {
-                        let mut wb_mode = opts.wb_mode;
-                        egui::ComboBox::from_id_salt(ui.id().with("wb_mode"))
-                            .selected_text(match wb_mode {
-                                WbMode::Auto => "Auto",
-                                WbMode::Picker => "Picker",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut wb_mode, WbMode::Auto, "Auto");
-                                ui.selectable_value(&mut wb_mode, WbMode::Picker, "Picker");
-                            });
-                        if wb_mode != opts.wb_mode {
-                            opts.wb_mode = wb_mode;
-                            if wb_mode == WbMode::Picker {
-                                opts.auto_wb = false;
-                                opts.apply_white_balance = true;
-                            }
-                        }
-
-                        match opts.wb_mode {
-                            WbMode::Auto => {
-                                ui.checkbox(&mut opts.auto_wb, "Auto white balance");
-                                ui.label(
-                                    egui::RichText::new(
-                                        if opts.auto_wb {
-                                            "Per-channel gamma: D × (mean_D / ch_median). Preserves black point."
-                                        } else {
-                                            "Auto WB disabled."
-                                        },
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-                                ui.add_space(4.0);
-                                ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
-                            }
-                            WbMode::Picker => {
-                                ui.label(egui::RichText::new("Click a point on the preview to set it as neutral.").small().weak());
-                                ui.horizontal(|ui| {
-                                    if ui.button("Pick white point").clicked() {
-                                        self.wb_picker_pending = Some(WbPickerTarget::WhitePoint);
-                                    }
-                                    if ui.button("Pick gray point").clicked() {
-                                        self.wb_picker_pending = Some(WbPickerTarget::GrayPoint);
-                                    }
-                                    if ui.button("Pick black point").clicked() {
-                                        self.wb_picker_pending = Some(WbPickerTarget::BlackPoint);
-                                    }
-                                });
-                                if self.wb_picker_pending.is_some() {
-                                    ui.label(egui::RichText::new("Click on the preview image to sample.").small().color(egui::Color32::from_rgb(180, 220, 120)));
-                                }
-                            }
-                        }
-
-                        ui.add_space(4.0);
-                        if opts.apply_white_balance {
-                            let mut use_temp = opts.temp_k.is_some();
-                            ui.checkbox(&mut use_temp, "Color temperature (K)");
-                            if use_temp {
-                                let mut k = opts.temp_k.unwrap_or(5500.0);
-                                ui.add(egui::Slider::new(&mut k, 2500.0..=9000.0).suffix(" K"));
-                                opts.temp_k = Some(k);
-                            } else {
-                                opts.temp_k = None;
-                            }
-                            ui.label(egui::RichText::new("Density scale (1.0 = neutral, >1 = more color)").small().weak());
-                            ui.horizontal(|ui| {
-                                ui.label("R");
-                                ui.add(egui::Slider::new(&mut opts.wb_r, 0.7..=1.5));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("G");
-                                ui.add(egui::Slider::new(&mut opts.wb_g, 0.7..=1.5));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("B");
-                                ui.add(egui::Slider::new(&mut opts.wb_b, 0.7..=1.5));
-                            });
-                        }
-                    });
-
-                    // ════════════════════════════════════════════════════════
-                    // GROUP 4 — Color Character & Separation
-                    // ════════════════════════════════════════════════════════
-                    ui.collapsing("Color", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Saturation");
-                            ui.add(
-                                egui::Slider::new(&mut opts.saturation, 0.7..=1.6)
-                                    .fixed_decimals(2),
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Density-domain chroma boost. 1.0 = neutral."
-                            )
-                            .small()
-                            .weak(),
-                        );
-
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Warmth");
-                            ui.add(
-                                egui::Slider::new(&mut opts.highlight_warmth, 0.0..=0.6)
-                                    .fixed_decimals(2),
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Golden tint in neutral highlights (Noritsu/Frontier style)."
-                            )
-                            .small()
-                            .weak(),
-                        );
-
-                        ui.add_space(4.0);
-                        ui.checkbox(&mut opts.apply_lab, "Lab separation");
-                        ui.add_enabled_ui(opts.apply_lab, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Separation");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.lab_separation, -1.5..=1.5)
-                                        .fixed_decimals(2),
-                                );
-                            });
-                            ui.label(
-                                egui::RichText::new(
-                                    "Pushes mid-chroma colors apart in Lab a/b plane."
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        });
                     });
                   } // end Film tab guard (groups 1-4)
 
@@ -3014,24 +2974,6 @@ impl eframe::App for C41Gui {
                             ui.label(egui::RichText::new("(Applies when Output curve is off)").small());
                         }
 
-                        ui.add_space(4.0);
-                        ui.collapsing("Levels (read-only)", |ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Black:  {:.4}\nWhite:  {:.4}\nMidtone: {:.3}",
-                                    opts.lut_in_black, opts.lut_in_white, opts.lut_in_mid
-                                ))
-                                .small(),
-                            );
-                            if opts.lut_in_black >= opts.lut_in_white {
-                                ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new("Warning: Black must be less than White")
-                                        .small()
-                                        .color(egui::Color32::from_rgb(255, 160, 0)),
-                                );
-                            }
-                        });
                     });
                   } // end Film tab guard (group 6)
                 }
