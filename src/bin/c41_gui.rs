@@ -572,7 +572,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
 }
 
 /// Flip a rect horizontally (mirror left–right) within an image of `img_w` × `img_h`.
-fn flip_rect_horizontal(rect: Rect, img_w: u32, img_h: u32) -> Rect {
+fn flip_rect_horizontal(rect: Rect, img_w: u32, _img_h: u32) -> Rect {
     let new_x = img_w.saturating_sub(rect.x).saturating_sub(rect.width).max(0);
     Rect {
         x: new_x,
@@ -583,7 +583,7 @@ fn flip_rect_horizontal(rect: Rect, img_w: u32, img_h: u32) -> Rect {
 }
 
 /// Flip a rect vertically (mirror top–bottom) within an image of `img_w` × `img_h`.
-fn flip_rect_vertical(rect: Rect, img_w: u32, img_h: u32) -> Rect {
+fn flip_rect_vertical(rect: Rect, _img_w: u32, img_h: u32) -> Rect {
     let new_y = img_h.saturating_sub(rect.y).saturating_sub(rect.height).max(0);
     Rect {
         x: rect.x,
