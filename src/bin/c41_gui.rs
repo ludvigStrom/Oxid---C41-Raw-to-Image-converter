@@ -285,7 +285,7 @@ fn load_linear_transmittance_for_calibration(
             let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
             demosaic::demosaic_quality(&bayer, pattern)?
         }
-        "png" => png_reader::load_png_as_ndarray(path)?,
+        "png" | "jpeg" | "jpg" | "tiff" | "tif" => png_reader::load_png_as_ndarray(path)?,
         _ => anyhow::bail!("Unsupported extension for calibration"),
     };
 
@@ -457,6 +457,9 @@ fn default_options() -> PipelineOptions {
         color_highlight_gain_r: 0.0,
         color_highlight_gain_g: 0.0,
         color_highlight_gain_b: 0.0,
+        zone_shadow_saturation: 1.0,
+        zone_mid_saturation: 1.0,
+        zone_highlight_saturation: 1.0,
         highlight_rolloff: 0.0,
         highlight_rolloff_d_mid: 1.5,
         highlight_warmth: 0.0,
@@ -550,6 +553,9 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.color_highlight_gain_r.to_bits().hash(&mut h);
     opts.color_highlight_gain_g.to_bits().hash(&mut h);
     opts.color_highlight_gain_b.to_bits().hash(&mut h);
+    opts.zone_shadow_saturation.to_bits().hash(&mut h);
+    opts.zone_mid_saturation.to_bits().hash(&mut h);
+    opts.zone_highlight_saturation.to_bits().hash(&mut h);
     opts.highlight_rolloff.to_bits().hash(&mut h);
     opts.highlight_rolloff_d_mid.to_bits().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
@@ -1692,9 +1698,10 @@ impl eframe::App for C41Gui {
                         if ui.button("Add image…").clicked() {
                             if let Some(paths) = rfd::FileDialog::new()
                                 .add_filter(
-                                    "RAW & PNG",
+                                    "RAW & images",
                                     &[
-                                        "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf", "orf", "rw2", "png",
+                                        "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf", "orf", "rw2",
+                                        "png", "jpeg", "jpg", "tiff", "tif",
                                     ],
                                 )
                                 .pick_files()
@@ -2413,6 +2420,9 @@ impl eframe::App for C41Gui {
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_shadow_gain, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
+                                ui.label("Saturation");
+                                ui.add(egui::Slider::new(&mut opts.zone_shadow_saturation, 0.5..=1.6).fixed_decimals(2));
+                                ui.end_row();
                                 ui.label("Gain R");
                                 ui.add(egui::Slider::new(&mut opts.color_shadow_gain_r, -0.3..=0.3).fixed_decimals(3));
                                 ui.end_row();
@@ -2432,6 +2442,9 @@ impl eframe::App for C41Gui {
                             .show(ui, |ui| {
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_mid_gain, -0.5..=0.5).fixed_decimals(3));
+                                ui.end_row();
+                                ui.label("Saturation");
+                                ui.add(egui::Slider::new(&mut opts.zone_mid_saturation, 0.5..=1.6).fixed_decimals(2));
                                 ui.end_row();
                                 ui.label("Gain R");
                                 ui.add(egui::Slider::new(&mut opts.color_mid_gain_r, -0.3..=0.3).fixed_decimals(3));
@@ -2453,6 +2466,9 @@ impl eframe::App for C41Gui {
                                 ui.label("Gain");
                                 ui.add(egui::Slider::new(&mut opts.zone_highlight_gain, -0.5..=0.5).fixed_decimals(3));
                                 ui.end_row();
+                                ui.label("Saturation");
+                                ui.add(egui::Slider::new(&mut opts.zone_highlight_saturation, 0.5..=1.6).fixed_decimals(2));
+                                ui.end_row();
                                 ui.label("Gain R");
                                 ui.add(egui::Slider::new(&mut opts.color_highlight_gain_r, -0.3..=0.3).fixed_decimals(3));
                                 ui.end_row();
@@ -2465,12 +2481,15 @@ impl eframe::App for C41Gui {
                             });
 
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Gain = multiplicative in that zone (0 = no change).").small().weak());
+                        ui.label(egui::RichText::new("Gain = multiplicative. Saturation = 1.0 no change, <1 desaturate, >1 boost.").small().weak());
                         ui.add_space(4.0);
                         if ui.small_button("Reset all").clicked() {
                             opts.zone_shadow_gain = 0.0;
                             opts.zone_mid_gain = 0.0;
                             opts.zone_highlight_gain = 0.0;
+                            opts.zone_shadow_saturation = 1.0;
+                            opts.zone_mid_saturation = 1.0;
+                            opts.zone_highlight_saturation = 1.0;
                             opts.color_shadow_gain_r = 0.0;
                             opts.color_shadow_gain_g = 0.0;
                             opts.color_shadow_gain_b = 0.0;
@@ -2669,7 +2688,7 @@ impl eframe::App for C41Gui {
                                                 "tif", "tiff",
                                                 "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf",
                                                 "orf", "rw2",
-                                                "png",
+                                                "png", "jpeg", "jpg",
                                             ],
                                         )
                                         .pick_file()

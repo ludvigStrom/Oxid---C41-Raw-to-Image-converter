@@ -8,6 +8,9 @@ struct Params {
     lut_size: u32,      // grid dimension N of the LUT (e.g. 33)
     lut_d_max: f32,
     saturation: f32,
+    zone_shadow_saturation: f32,
+    zone_mid_saturation: f32,
+    zone_highlight_saturation: f32,
     zone_shadows: f32,
     zone_highlights: f32,
     zone_shadow_gain: f32,
@@ -178,13 +181,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // --- Saturation ---
+    // --- Saturation (per-zone when zone sats vary from 1.0) ---
     let sat = params.saturation;
-    if abs(sat - 1.0) > 1e-6 {
+    let zs_sat = params.zone_shadow_saturation;
+    let zm_sat = params.zone_mid_saturation;
+    let zh_sat = params.zone_highlight_saturation;
+    let zone_sat_identity = abs(zs_sat - 1.0) < 1e-6 && abs(zm_sat - 1.0) < 1e-6 && abs(zh_sat - 1.0) < 1e-6;
+    let use_per_zone_sat = !zone_sat_identity;
+
+    if use_per_zone_sat || abs(sat - 1.0) > 1e-6 {
         let d_mean = (r + g + b) * (1.0 / 3.0);
-        r = max(d_mean + sat * (r - d_mean), 0.0);
-        g = max(d_mean + sat * (g - d_mean), 0.0);
-        b = max(d_mean + sat * (b - d_mean), 0.0);
+        var effective_sat = sat;
+        if use_per_zone_sat {
+            let d_eff = d_mean + params.curve_offset;
+            let gap_low = max(params.d_zone_p33 - params.d_zone_min, 0.01);
+            let gap_high = max(params.d_zone_max - params.d_zone_p66, 0.01);
+            let gap_mid = max(params.d_zone_p66 - params.d_zone_p33, 0.01);
+            let tw = max(min(min(gap_mid * 0.3, gap_low * 0.5), gap_high * 0.5), 0.005);
+            let t_low = clamp((d_eff - (params.d_zone_p33 - tw)) / (2.0 * tw), 0.0, 1.0);
+            let s_fade = t_low * t_low * (3.0 - 2.0 * t_low);
+            let s_mask = 1.0 - s_fade;
+            let t_high = clamp((d_eff - (params.d_zone_p66 - tw)) / (2.0 * tw), 0.0, 1.0);
+            let h_mask = t_high * t_high * (3.0 - 2.0 * t_high);
+            let m_mask = 1.0 - s_mask - h_mask;
+            effective_sat = sat * (s_mask * zs_sat + m_mask * zm_sat + h_mask * zh_sat);
+        }
+        if abs(effective_sat - 1.0) > 1e-6 {
+            r = max(d_mean + effective_sat * (r - d_mean), 0.0);
+            g = max(d_mean + effective_sat * (g - d_mean), 0.0);
+            b = max(d_mean + effective_sat * (b - d_mean), 0.0);
+        }
     }
 
     // --- Zone density adjustments: smoothstep masks (sum to 1), weighted-blend gains ---

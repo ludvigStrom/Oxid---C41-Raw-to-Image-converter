@@ -209,7 +209,14 @@ pub fn step_5_calibration(
     image.mapv_inplace(|v| v.max(0.0));
     crate::density_ops::limit_highlight_density_spread(image);
 
-    crate::density_ops::apply_density_saturation(image, options.saturation);
+    crate::density_ops::apply_zone_density_saturation(
+        image,
+        options.curve_offset,
+        options.saturation,
+        options.zone_shadow_saturation,
+        options.zone_mid_saturation,
+        options.zone_highlight_saturation,
+    );
     crate::density_ops::apply_zone_density_adjustments(
         image,
         options.curve_offset,

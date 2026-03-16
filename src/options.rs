@@ -199,6 +199,10 @@ pub struct PipelineOptions {
     pub color_highlight_gain_r: f32,
     pub color_highlight_gain_g: f32,
     pub color_highlight_gain_b: f32,
+    /// Per-zone saturation (1.0 = no change). Blended by shadow/mid/highlight masks.
+    pub zone_shadow_saturation: f32,
+    pub zone_mid_saturation: f32,
+    pub zone_highlight_saturation: f32,
     /// Reinhard-style highlight roll-off in density space (0.0 = off, 1.0 = full).
     /// Compresses high densities to mask noise in dense negative areas (skies).
     pub highlight_rolloff: f32,
@@ -301,6 +305,9 @@ impl Default for PipelineOptions {
             color_highlight_gain_r: 0.0,
             color_highlight_gain_g: 0.0,
             color_highlight_gain_b: 0.0,
+            zone_shadow_saturation: 1.0,
+            zone_mid_saturation: 1.0,
+            zone_highlight_saturation: 1.0,
             highlight_rolloff: 0.0,
             highlight_rolloff_d_mid: 1.5,
             highlight_warmth: 0.0,

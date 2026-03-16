@@ -1,4 +1,4 @@
-//! Load PNG (or other raster) images into Array3<f32> for the development pipeline.
+//! Load PNG, JPEG, TIFF (and other raster) images into Array3<f32> for the development pipeline.
 //!
 //! Accepts any size; 8-bit RGB is assumed sRGB and linearized to [0, 1] linear light.
 //! No demosaic (image is already RGB).
@@ -18,9 +18,9 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
-/// Load a PNG (or image crate–supported format) into RGB Array3<f32> (linear light).
+/// Load a PNG, JPEG, or TIFF (or image crate–supported format) into RGB Array3<f32> (linear light).
 ///
-/// * Format: JPEG, PNG, etc. via the `image` crate. Converted to RGB; alpha dropped.
+/// * Format: JPEG, PNG, TIFF, etc. via the `image` crate. Converted to RGB; alpha dropped.
 /// * Assumes 8-bit values are sRGB-encoded; they are linearized so the pipeline (D-min, curve) sees linear light.
 /// * Shape: (height, width, 3), channel order R, G, B.
 pub fn load_png_as_ndarray(path: &Path) -> Result<Array3<f32>> {

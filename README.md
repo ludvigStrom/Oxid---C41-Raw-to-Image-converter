@@ -2,7 +2,7 @@
 
 A command-line and GUI RAW processor for **C-41 color negative film**. The pipeline is physically grounded: film transmittance is converted to optical density, white balance and film gamma are applied in the density domain, and a Michaelis-Menten S-curve models RA-4 paper. No hidden tone curves or auto-adjustments run unless explicitly enabled.
 
-**Supported cameras:** any `rawloader`-supported Bayer RAW (Sony `.arw`, Nikon `.nef`/`.nrw`, Canon `.cr2`/`.cr3`/`.crw`, Adobe `.dng`, Fujifilm `.raf`, Olympus `.orf`, Panasonic `.rw2`). PNG input is also accepted and runs the same D-min / curve / export pipeline (skips raw decode and demosaic).
+**Supported cameras:** any `rawloader`-supported Bayer RAW (Sony `.arw`, Nikon `.nef`/`.nrw`, Canon `.cr2`/`.cr3`/`.crw`, Adobe `.dng`, Fujifilm `.raf`, Olympus `.orf`, Panasonic `.rw2`). PNG, JPEG (`.jpg`/`.jpeg`), and TIFF (`.tiff`/`.tif`) input are also accepted and run the same D-min / curve / export pipeline (skips raw decode and demosaic).
 
 ---
 
@@ -342,7 +342,11 @@ See repository for license information.
 TODO:
 DONE! White balance picker
 DONE! Remove duplicate color gain settings
-DOING Reorder color exposure highlight rolloff etc
-histogram normalization?
+DONE! Reorder color exposure highlight rolloff etc
+DONE! histogram normalization?
+DONE! Color zones are not functioning properly
+DONE! Resolution at startap is to low?
 Mirror left/right
-Resolution at startap is to low?
+DONE! Saturation per color zone?
+Colorwheels?
+DONE! Input Develop Export

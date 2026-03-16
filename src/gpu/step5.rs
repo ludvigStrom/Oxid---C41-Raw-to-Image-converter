@@ -19,6 +19,9 @@ struct Step5Params {
     lut_size: u32,
     lut_d_max: f32,
     saturation: f32,
+    zone_shadow_saturation: f32,
+    zone_mid_saturation: f32,
+    zone_highlight_saturation: f32,
     zone_shadows: f32,
     zone_highlights: f32,
     zone_shadow_gain: f32,
@@ -40,7 +43,7 @@ struct Step5Params {
     d_zone_max: f32,
     highlight_rolloff: f32,
     highlight_rolloff_d_mid: f32,
-    _pad_before_mat: [f32; 1], // align mat_r0 to 16-byte boundary
+    _pad_before_mat: [f32; 2], // align mat_r0 to 16-byte boundary (std140: vec3 alignment)
     // mat row 0 + padding
     mat_r0: [f32; 3],
     _pad0: f32,
@@ -185,6 +188,9 @@ impl Step5Pipeline {
             lut_size,
             lut_d_max,
             saturation: options.saturation,
+            zone_shadow_saturation: options.zone_shadow_saturation,
+            zone_mid_saturation: options.zone_mid_saturation,
+            zone_highlight_saturation: options.zone_highlight_saturation,
             zone_shadows: options.zone_shadows,
             zone_highlights: options.zone_highlights,
             zone_shadow_gain: options.zone_shadow_gain,
@@ -206,7 +212,7 @@ impl Step5Pipeline {
             d_zone_max: zp.d_max,
             highlight_rolloff: options.highlight_rolloff,
             highlight_rolloff_d_mid: options.highlight_rolloff_d_mid,
-            _pad_before_mat: [0.0; 1],
+            _pad_before_mat: [0.0; 2],
             mat_r0: m[0],
             _pad0: 0.0,
             mat_r1: m[1],

@@ -103,6 +103,59 @@ pub(crate) fn apply_density_saturation(image: &mut Array3<f32>, saturation: f32)
     }
 }
 
+/// Per-zone saturation: effective_sat = saturation * (s_mask*zone_shadow_sat + m_mask*zone_mid_sat + h_mask*zone_highlight_sat).
+/// Uses the same zone masks as apply_zone_density_adjustments. When all zone sats are 1.0, falls back to global saturation.
+pub(crate) fn apply_zone_density_saturation(
+    image: &mut Array3<f32>,
+    curve_offset: f32,
+    saturation: f32,
+    zone_shadow_saturation: f32,
+    zone_mid_saturation: f32,
+    zone_highlight_saturation: f32,
+) {
+    let zone_sat_identity = (zone_shadow_saturation - 1.0).abs() < 1e-6
+        && (zone_mid_saturation - 1.0).abs() < 1e-6
+        && (zone_highlight_saturation - 1.0).abs() < 1e-6;
+    if zone_sat_identity {
+        apply_density_saturation(image, saturation);
+        return;
+    }
+
+    let (h, w, _) = image.dim();
+    let zp = zone_density_range(image, curve_offset);
+
+    let gap_low = (zp.d_p33 - zp.d_min).max(0.01);
+    let gap_high = (zp.d_max - zp.d_p66).max(0.01);
+    let gap_mid = (zp.d_p66 - zp.d_p33).max(0.01);
+    let tw = (gap_mid * 0.3).min(gap_low * 0.5).min(gap_high * 0.5).max(0.005);
+
+    for y in 0..h {
+        for x in 0..w {
+            let dr = image[[y, x, 0]];
+            let dg = image[[y, x, 1]];
+            let db = image[[y, x, 2]];
+            let d_mean = (dr + dg + db) * (1.0 / 3.0);
+            let d_eff = d_mean + curve_offset;
+
+            let s_mask = 1.0 - smoothstep(zp.d_p33 - tw, zp.d_p33 + tw, d_eff);
+            let h_mask = smoothstep(zp.d_p66 - tw, zp.d_p66 + tw, d_eff);
+            let m_mask = 1.0 - s_mask - h_mask;
+
+            let effective_sat = saturation
+                * (s_mask * zone_shadow_saturation
+                    + m_mask * zone_mid_saturation
+                    + h_mask * zone_highlight_saturation);
+
+            if (effective_sat - 1.0).abs() < 1e-6 {
+                continue;
+            }
+            image[[y, x, 0]] = (d_mean + effective_sat * (dr - d_mean)).max(0.0);
+            image[[y, x, 1]] = (d_mean + effective_sat * (dg - d_mean)).max(0.0);
+            image[[y, x, 2]] = (d_mean + effective_sat * (db - d_mean)).max(0.0);
+        }
+    }
+}
+
 /// Analyze shadow cast: measure per-channel color imbalance in the low-density
 /// (shadow) zone. Returns a correction vector (dr, dg, db) that pulls the shadow
 /// average toward neutral gray. All zeros if no shadow pixels found.

@@ -306,7 +306,7 @@ pub fn process_files(
                 img.mapv_inplace(|v| v.max(0.0));
                 img
             }
-            "png" => png_reader::load_png_as_ndarray(path)?,
+            "png" | "jpeg" | "jpg" | "tiff" | "tif" => png_reader::load_png_as_ndarray(path)?,
             _ => continue,
         };
 
@@ -455,7 +455,7 @@ pub fn process_one_to_preview(
             img.mapv_inplace(|v| v.max(0.0));
             img
         }
-        "png" => {
+        "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
             let img = png_reader::load_png_as_ndarray(path)?;
             let (ph, pw, _) = img.dim();
             true_src_w = pw as u32;
@@ -488,7 +488,9 @@ pub fn process_one_to_preview(
     }
 
     // Debug preview mode: show simple demosaic only.
-    if options.debug_preview_simple_debayer && ext != "png" {
+    if options.debug_preview_simple_debayer
+        && matches!(ext.as_str(), "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2")
+    {
         let (orig_h, orig_w, _) = image.dim();
         let orig_w = orig_w as u32;
         let orig_h = orig_h as u32;
@@ -958,7 +960,7 @@ fn load_and_demosaic_preview(
             img.mapv_inplace(|v| v.max(0.0));
             img
         }
-        "png" => {
+        "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
             let img = png_reader::load_png_as_ndarray(path)?;
             let (ph, pw, _) = img.dim();
             true_src_w = pw as u32;

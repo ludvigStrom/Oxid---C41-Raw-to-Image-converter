@@ -40,7 +40,7 @@ pub fn load_sensor_from_path(path: &Path) -> Result<CachedSensor> {
             let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
             Ok(CachedSensor::Bayer { data: bayer, pattern })
         }
-        "png" => {
+        "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
             let img = png_reader::load_png_as_ndarray(path)?;
             Ok(CachedSensor::Rgb(img))
         }
