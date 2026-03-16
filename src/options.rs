@@ -158,6 +158,10 @@ pub struct PipelineOptions {
     pub fp_vibrance: f32,
     /// Output rotation in degrees: 0, 90, 180, or 270 (applied after load/demosaic).
     pub rotation_degrees: i32,
+    /// Flip horizontal (mirror left–right). Applied after rotation.
+    pub flip_horizontal: bool,
+    /// Flip vertical (mirror top–bottom). Applied after rotation.
+    pub flip_vertical: bool,
     /// Debug: only run pipeline up to this step (1..=6). Preview and export use this. See TODO_DEBUG.md.
     pub debug_pipeline_step: u32,
     /// Density-domain saturation boost applied before the RA-4 curve.
@@ -315,6 +319,8 @@ impl Default for PipelineOptions {
             apply_lab: false,
             lab_separation: 0.0,
             rotation_degrees: 0,
+            flip_horizontal: false,
+            flip_vertical: false,
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
             verbose_debug: false,

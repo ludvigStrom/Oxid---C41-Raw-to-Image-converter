@@ -468,6 +468,8 @@ fn default_options() -> PipelineOptions {
         apply_lab: false,
         lab_separation: 0.0,
         rotation_degrees: 0,
+        flip_horizontal: false,
+        flip_vertical: false,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
         verbose_debug: false,
@@ -560,11 +562,35 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.highlight_rolloff.to_bits().hash(&mut h);
     opts.highlight_rolloff_d_mid.to_bits().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
+    opts.flip_horizontal.hash(&mut h);
+    opts.flip_vertical.hash(&mut h);
     opts.debug_pipeline_step.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
     opts.verbose_debug.hash(&mut h);
     opts.use_gpu.hash(&mut h);
     h.finish()
+}
+
+/// Flip a rect horizontally (mirror left–right) within an image of `img_w` × `img_h`.
+fn flip_rect_horizontal(rect: Rect, img_w: u32, img_h: u32) -> Rect {
+    let new_x = img_w.saturating_sub(rect.x).saturating_sub(rect.width).max(0);
+    Rect {
+        x: new_x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+/// Flip a rect vertically (mirror top–bottom) within an image of `img_w` × `img_h`.
+fn flip_rect_vertical(rect: Rect, img_w: u32, img_h: u32) -> Rect {
+    let new_y = img_h.saturating_sub(rect.y).saturating_sub(rect.height).max(0);
+    Rect {
+        x: rect.x,
+        y: new_y,
+        width: rect.width,
+        height: rect.height,
+    }
 }
 
 /// Rotate a pixel-space rect 90 degrees within an image of `img_w` × `img_h`.
@@ -1416,6 +1442,8 @@ impl C41Gui {
                     rect,
                     options.dmin_rect_reference_size,
                     options.rotation_degrees,
+                    options.flip_horizontal,
+                    options.flip_vertical,
                     options.dmin_neutral_only,
                 ) {
                     options.dmin_fixed = Some((r, g, b));
@@ -4226,10 +4254,10 @@ impl eframe::App for C41Gui {
                             );
                         }
 
-                        // Row under the image: full filename (left, truncated) + Rotate icon buttons (right)
+                        // Row under the image: full filename (left, truncated) + mirror/rotate buttons (right)
                         ui.horizontal(|ui| {
                             let full_name = self.images[idx].path.display().to_string();
-                            let max_filename_w = (ui.available_width() - 150.0).max(80.0); // leave room for rotate icons
+                            let max_filename_w = (ui.available_width() - 190.0).max(80.0); // leave room for mirror + rotate icons
                             ui.allocate_ui(egui::vec2(max_filename_w, CONTROL_ROW_HEIGHT), |ui| {
                                 ui.label(
                                     egui::RichText::new(full_name).small().color(egui::Color32::from_gray(200)),
@@ -4237,6 +4265,7 @@ impl eframe::App for C41Gui {
                                 .on_hover_text(self.images[idx].path.display().to_string());
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                // Order: rotate right, rotate left, mirror right, mirror left (right to left)
                                 let rotate_right_clicked = if let Some(icon) = &self.ui_icons.rotate_right {
                                     ui.add(egui::ImageButton::new((icon.id(), egui::vec2(20.0, 20.0))).frame(false))
                                         .on_hover_text("Rotate right")
@@ -4309,6 +4338,68 @@ impl eframe::App for C41Gui {
                                     }
                                     entry.options.rotation_degrees =
                                         (entry.options.rotation_degrees - 90).rem_euclid(360);
+                                    self.preview_receiver = None;
+                                }
+                                let mirror_right_clicked = ui
+                                    .small_button("↕")
+                                    .on_hover_text("Mirror right (flip vertical)")
+                                    .clicked();
+                                if mirror_right_clicked {
+                                    let entry = &mut self.images[idx];
+                                    let preview_size =
+                                        entry.preview_input_size.map(|[w, h]| (w, h));
+                                    if let Some(rect) = entry.options.dmin_rect {
+                                        let source_size = entry
+                                            .options
+                                            .dmin_rect_reference_size
+                                            .or(preview_size);
+                                        if let Some((w, h)) = source_size {
+                                            entry.options.dmin_rect =
+                                                Some(flip_rect_vertical(rect, w, h));
+                                        }
+                                    }
+                                    if let Some(rect) = entry.options.crop_rect {
+                                        let source_size = entry
+                                            .options
+                                            .crop_rect_reference_size
+                                            .or(preview_size);
+                                        if let Some((w, h)) = source_size {
+                                            entry.options.crop_rect =
+                                                Some(flip_rect_vertical(rect, w, h));
+                                        }
+                                    }
+                                    entry.options.flip_vertical = !entry.options.flip_vertical;
+                                    self.preview_receiver = None;
+                                }
+                                let mirror_left_clicked = ui
+                                    .small_button("↔")
+                                    .on_hover_text("Mirror left (flip horizontal)")
+                                    .clicked();
+                                if mirror_left_clicked {
+                                    let entry = &mut self.images[idx];
+                                    let preview_size =
+                                        entry.preview_input_size.map(|[w, h]| (w, h));
+                                    if let Some(rect) = entry.options.dmin_rect {
+                                        let source_size = entry
+                                            .options
+                                            .dmin_rect_reference_size
+                                            .or(preview_size);
+                                        if let Some((w, h)) = source_size {
+                                            entry.options.dmin_rect =
+                                                Some(flip_rect_horizontal(rect, w, h));
+                                        }
+                                    }
+                                    if let Some(rect) = entry.options.crop_rect {
+                                        let source_size = entry
+                                            .options
+                                            .crop_rect_reference_size
+                                            .or(preview_size);
+                                        if let Some((w, h)) = source_size {
+                                            entry.options.crop_rect =
+                                                Some(flip_rect_horizontal(rect, w, h));
+                                        }
+                                    }
+                                    entry.options.flip_horizontal = !entry.options.flip_horizontal;
                                     self.preview_receiver = None;
                                 }
                             });

@@ -9,6 +9,7 @@ use anyhow::Result;
 use ndarray::Array3;
 
 use crate::apply_rotation;
+use crate::{flip_array3_horizontal, flip_array3_vertical};
 use crate::demosaic;
 use crate::png_reader;
 use crate::raw_reader;
@@ -70,6 +71,8 @@ pub fn compute_dmin_from_sensor(
     rect: Rect,
     reference_size: Option<(u32, u32)>,
     rotation_degrees: i32,
+    flip_horizontal: bool,
+    flip_vertical: bool,
     neutral_only: bool,
 ) -> Result<(f32, f32, f32)> {
     let mut rgb: Array3<f32> = match sensor {
@@ -83,6 +86,12 @@ pub fn compute_dmin_from_sensor(
 
     if rotation_degrees != 0 {
         rgb = apply_rotation(&rgb, rotation_degrees);
+    }
+    if flip_horizontal {
+        rgb = flip_array3_horizontal(&rgb);
+    }
+    if flip_vertical {
+        rgb = flip_array3_vertical(&rgb);
     }
 
     // Scale rect to current image size.

@@ -346,7 +346,7 @@ DONE! Reorder color exposure highlight rolloff etc
 DONE! histogram normalization?
 DONE! Color zones are not functioning properly
 DONE! Resolution at startap is to low?
-Mirror left/right
 DONE! Saturation per color zone?
-Colorwheels?
 DONE! Input Develop Export
+DONE! Mirror left/right
+Colorwheels?

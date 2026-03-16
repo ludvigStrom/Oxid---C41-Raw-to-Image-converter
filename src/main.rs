@@ -297,6 +297,8 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         apply_lab: false,
         lab_separation: 0.0,
         rotation_degrees: 0,
+        flip_horizontal: false,
+        flip_vertical: false,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
         verbose_debug: false,

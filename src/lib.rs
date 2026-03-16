@@ -149,6 +149,38 @@ fn downsample_raw_for_preview(
     }
 }
 
+/// Flip image horizontally (mirror left–right). Returns a new Array3.
+pub(crate) fn flip_array3_horizontal(image: &Array3<f32>) -> Array3<f32> {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let mut out = Array3::<f32>::zeros((h, w, 3));
+    for y in 0..h {
+        for x in 0..w {
+            let new_x = w - 1 - x;
+            for ch in 0..3 {
+                out[(y, new_x, ch)] = image[(y, x, ch)];
+            }
+        }
+    }
+    out
+}
+
+/// Flip image vertically (mirror top–bottom). Returns a new Array3.
+pub(crate) fn flip_array3_vertical(image: &Array3<f32>) -> Array3<f32> {
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let mut out = Array3::<f32>::zeros((h, w, 3));
+    for y in 0..h {
+        for x in 0..w {
+            let new_y = h - 1 - y;
+            for ch in 0..3 {
+                out[(new_y, x, ch)] = image[(y, x, ch)];
+            }
+        }
+    }
+    out
+}
+
 /// Apply rotation (0, 90, 180, 270) to an image. Returns a new Array3.
 pub(crate) fn apply_rotation(image: &Array3<f32>, rotation_degrees: i32) -> Array3<f32> {
     let r = ((rotation_degrees % 360 + 360) % 360) / 90;
@@ -312,6 +344,12 @@ pub fn process_files(
 
         if options.rotation_degrees != 0 {
             image = apply_rotation(&image, options.rotation_degrees);
+        }
+        if options.flip_horizontal {
+            image = flip_array3_horizontal(&image);
+        }
+        if options.flip_vertical {
+            image = flip_array3_vertical(&image);
         }
 
         pipeline::step_3_dmin(&mut image, options, flat_field_map.as_ref())?;
@@ -479,6 +517,12 @@ pub fn process_one_to_preview(
 
     if options.rotation_degrees != 0 {
         image = apply_rotation(&image, options.rotation_degrees);
+    }
+    if options.flip_horizontal {
+        image = flip_array3_horizontal(&image);
+    }
+    if options.flip_vertical {
+        image = flip_array3_vertical(&image);
     }
 
     // Step 1: load + demosaic + rotate
@@ -737,6 +781,12 @@ pub fn process_one_to_preview_with_cache(
         if options.rotation_degrees != 0 {
             img = apply_rotation(&img, options.rotation_degrees);
         }
+        if options.flip_horizontal {
+            img = flip_array3_horizontal(&img);
+        }
+        if options.flip_vertical {
+            img = flip_array3_vertical(&img);
+        }
         new_cache.after_load = Some((h1, img.clone(), true_src_w, true_src_h));
         image = Some(img);
     } else {
@@ -885,6 +935,12 @@ pub fn process_one_to_preview_with_cache_gpu(
         }
         if options.rotation_degrees != 0 {
             img = apply_rotation(&img, options.rotation_degrees);
+        }
+        if options.flip_horizontal {
+            img = flip_array3_horizontal(&img);
+        }
+        if options.flip_vertical {
+            img = flip_array3_vertical(&img);
         }
         new_cache.after_load = Some((h1, img.clone(), true_src_w, true_src_h));
         image = Some(img);
