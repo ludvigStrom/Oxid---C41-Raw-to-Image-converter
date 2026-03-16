@@ -10,6 +10,8 @@ use ndarray::Array3;
 use wgpu::util::DeviceExt;
 
 use super::demosaic::DemosaicPipeline;
+use super::flat_field::FlatFieldPipeline;
+use super::step3_dmin::Step3DminPipeline;
 use super::step4::Step4Pipeline;
 use super::step5::Step5Pipeline;
 use super::step6::Step6Pipeline;
@@ -22,11 +24,18 @@ use crate::pipeline::Step6Display;
 use crate::stats;
 use crate::{OutputLutEncoding, OutputStage, PipelineOptions};
 
-/// Unified GPU pipeline holding compiled shaders for steps 4, 5, and 6.
+/// Step 3 GPU: flat-field divide and D-min divide. CPU does rect/percentile logic.
+pub struct Step3Gpu {
+    pub flat_field: FlatFieldPipeline,
+    pub step3_dmin: Step3DminPipeline,
+}
+
+/// Unified GPU pipeline holding compiled shaders for steps 3–6.
 /// Created once at startup, reused for every preview / export.
 pub struct GpuPipeline {
     pub ctx: Arc<GpuContext>,
     pub demosaic: DemosaicPipeline,
+    pub step3: Step3Gpu,
     step4: Step4Pipeline,
     step5: Step5Pipeline,
     step6: Step6Pipeline,
@@ -37,12 +46,17 @@ impl GpuPipeline {
     pub fn try_new() -> Option<Self> {
         let ctx = Arc::new(GpuContext::try_new()?);
         let demosaic = DemosaicPipeline::new(&ctx);
+        let step3 = Step3Gpu {
+            flat_field: FlatFieldPipeline::new(&ctx),
+            step3_dmin: Step3DminPipeline::new(&ctx),
+        };
         let step4 = Step4Pipeline::new(&ctx);
         let step5 = Step5Pipeline::new(&ctx);
         let step6 = Step6Pipeline::new(&ctx);
         Some(Self {
             ctx,
             demosaic,
+            step3,
             step4,
             step5,
             step6,

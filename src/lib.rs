@@ -952,13 +952,18 @@ pub fn process_one_to_preview_with_cache_gpu(
 
     let mut image = image.expect("image set by load or cache");
 
-    // Step 3 on CPU (D-min / flat-field)
+    // Step 3: flat-field divide and D-min divide on GPU; rect/percentile on CPU
     if start_step <= 3 {
         let flat_map_preview = options
             .flat_field_path
             .as_ref()
             .and_then(|p| flat_field::load_flat_field_map(p).ok());
-        pipeline::step_3_dmin(&mut image, options, flat_map_preview.as_ref())?;
+        pipeline::step_3_dmin_gpu(
+            &mut image,
+            options,
+            flat_map_preview.as_ref(),
+            Some(&gpu.step3),
+        )?;
         new_cache.after_step3 = Some((h3, image.clone()));
     }
 

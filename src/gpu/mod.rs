@@ -4,6 +4,8 @@
 //! (T→D, calibration, render) on the GPU, with the same math as the CPU reference.
 
 pub mod demosaic;
+pub mod flat_field;
+pub mod step3_dmin;
 pub mod step4;
 pub mod step5;
 pub mod step6;

@@ -136,7 +136,7 @@ pub(crate) fn load_flat_field_map(path: &Path) -> Result<Array3<f32>> {
 }
 
 /// Resize a blurred flat-field to match the target image dimensions (height, width, 3).
-fn resize_flat_field(flat: &Array3<f32>, height: usize, width: usize) -> Array3<f32> {
+pub(crate) fn resize_flat_field(flat: &Array3<f32>, height: usize, width: usize) -> Array3<f32> {
     let (fh, fw, fc) = flat.dim();
     assert_eq!(fc, 3, "resize_flat_field expects 3-channel input");
     if fh == height && fw == width {

@@ -302,7 +302,11 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/gpu/mod.rs` | wgpu initialization and `GpuContext` (optional, `--features gpu`). |
 | `src/gpu/demosaic.rs` | GPU demosaic for RGGB Bayer (edge-aware G + color-diff R/B); X-Trans and non-RGGB fall back to CPU. |
 | `src/gpu/demosaic.wgsl` | WGSL 2-pass compute: green interpolation, then R/B from (R-G), (B-G). |
-| `src/gpu/unified.rs` | Unified GPU pipeline: single upload, steps 4→5→6 as consecutive dispatches, single readback. |
+| `src/gpu/flat_field.rs` | GPU flat-field divide: image /= flat. CPU does resize. |
+| `src/gpu/flat_field.wgsl` | WGSL: per-pixel divide + clamp. |
+| `src/gpu/step3_dmin.rs` | GPU D-min divide: image /= (div_r, div_g, div_b). CPU does rect/percentile. |
+| `src/gpu/step3_dmin.wgsl` | WGSL: per-channel divide + clamp. |
+| `src/gpu/unified.rs` | Unified GPU pipeline: steps 3–6; Step3Gpu holds flat_field + step3_dmin. |
 | `src/gpu/step4.rs` | GPU dispatch for step 4: T→D, WB, shadow cast. CPU precomputes auto-WB medians and shadow analysis. |
 | `src/gpu/step4.wgsl` | WGSL compute shader: T→D via hardware `log2`, per-channel scale+offset, shadow cast correction. |
 | `src/gpu/step5.rs` | GPU dispatch for step 5: density matrix, 3D LUT, saturation, zones. |

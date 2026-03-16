@@ -63,6 +63,84 @@ pub fn step_3_dmin(
     Ok(())
 }
 
+/// Step 3 with GPU: flat-field divide and D-min divide on GPU; rect/percentile on CPU.
+#[cfg(feature = "gpu")]
+pub fn step_3_dmin_gpu(
+    image: &mut Array3<f32>,
+    options: &PipelineOptions,
+    flat_field_map: Option<&Array3<f32>>,
+    gpu_step3: Option<&crate::gpu::unified::Step3Gpu>,
+) -> Result<()> {
+    if options.debug_pipeline_step < 3 || options.dmin_mode == DminMode::Off {
+        return Ok(());
+    }
+
+    if let Some(flat) = flat_field_map {
+        let (h, w, _) = image.dim();
+        let flat_resampled = flat_field::resize_flat_field(flat, h, w);
+        if let Some(gpu) = gpu_step3 {
+            if gpu.flat_field.run(image, &flat_resampled).is_ok() {
+                image.mapv_inplace(|v| v.max(0.0));
+                return Ok(());
+            }
+        }
+        flat_field::apply_flat_field_division(image, &flat_resampled);
+    } else {
+        let (div_r, div_g, div_b) = match options.dmin_mode {
+            DminMode::Fixed => {
+                if let Some((r, g, b)) = options.dmin_fixed {
+                    (r, g, b)
+                } else {
+                    (1.0, 1.0, 1.0)
+                }
+            }
+            DminMode::SampleRegion => {
+                if let Some(rect) = options.dmin_rect {
+                    let (h, w, _) = image.dim();
+                    let (x, y, rw, rh) = scale_dmin_rect(
+                        rect,
+                        options.dmin_rect_reference_size,
+                        w as u32,
+                        h as u32,
+                    );
+                    crate::dmin::compute_neutralize_divisors(
+                        image,
+                        x,
+                        y,
+                        rw,
+                        rh,
+                        options.dmin_neutral_only,
+                    )?
+                } else {
+                    (1.0, 1.0, 1.0)
+                }
+            }
+            DminMode::AutoPercentile => {
+                crate::dmin::compute_auto_percentile_divisors(
+                    image,
+                    options.auto_norm_buffer,
+                )?
+            }
+            DminMode::Off => (1.0, 1.0, 1.0),
+        };
+
+        if let Some(gpu) = gpu_step3 {
+            let do_divide = (div_r - 1.0).abs() > 1e-9
+                || (div_g - 1.0).abs() > 1e-9
+                || (div_b - 1.0).abs() > 1e-9;
+            if do_divide && gpu.step3_dmin.run(image, div_r, div_g, div_b).is_ok() {
+                image.mapv_inplace(|v| v.max(0.0));
+                return Ok(());
+            }
+        }
+
+        crate::dmin::neutralize_with_medians(image, div_r, div_g, div_b)?;
+    }
+
+    image.mapv_inplace(|v| v.max(0.0));
+    Ok(())
+}
+
 /// Step 4 on GPU (if available). Falls back to CPU if the GPU pass fails.
 #[cfg(feature = "gpu")]
 pub fn step_4_t_to_d_wb_gpu(
