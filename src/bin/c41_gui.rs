@@ -133,6 +133,8 @@ struct ImageEntry {
     cached_sensor: Option<Arc<CachedSensor>>,
     /// Step cache for preview: reuse pipeline stages when only later options change.
     preview_step_cache: Option<PreviewStepCache>,
+    /// Process tab (Input/Develop/Export) — persists per image when switching.
+    process_tab: ProcessTab,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +166,8 @@ enum WbPickerTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessTab {
     Input,
-    Film,
+    Develop,
+    Export,
 }
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
@@ -227,7 +230,6 @@ struct C41Gui {
     pending_output_lut_browse: bool,
     /// When set, the next click on the preview will sample density and set WB gains (white/gray/black point).
     wb_picker_pending: Option<WbPickerTarget>,
-    process_tab: ProcessTab,
     /// Canvas size (w, h) in points from last layout — used to request preview at screen resolution.
     preview_canvas_size: Option<(f32, f32)>,
     #[cfg(feature = "gpu")]
@@ -261,7 +263,6 @@ impl Default for C41Gui {
             pending_preview_since: None,
             pending_output_lut_browse: false,
             wb_picker_pending: None,
-            process_tab: ProcessTab::Input,
             preview_canvas_size: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
@@ -1725,6 +1726,7 @@ impl eframe::App for C41Gui {
                                             pipeline_debug_log: None,
                                             cached_sensor: None,
                                             preview_step_cache: None,
+                                            process_tab: ProcessTab::Input,
                                         });
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);
@@ -1964,8 +1966,9 @@ impl eframe::App for C41Gui {
 
                 if self.mode == UIMode::Process {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.process_tab, ProcessTab::Input, "Input");
-                        ui.selectable_value(&mut self.process_tab, ProcessTab::Film, "Film");
+                        ui.selectable_value(&mut entry.process_tab, ProcessTab::Input, "Input");
+                        ui.selectable_value(&mut entry.process_tab, ProcessTab::Develop, "Develop");
+                        ui.selectable_value(&mut entry.process_tab, ProcessTab::Export, "Export");
                     });
                     ui.add_space(6.0);
                     ui.separator();
@@ -2123,7 +2126,7 @@ impl eframe::App for C41Gui {
                 } else if self.mode != UIMode::LuminanceCalibrate {
                     let in_process = self.mode == UIMode::Process;
 
-                  if !in_process || self.process_tab == ProcessTab::Film {
+                  if !in_process || entry.process_tab == ProcessTab::Develop {
                     // ════════════════════════════════════════════════════════
                     // GROUP 1 — Exposure  (primary editing controls)
                     // ════════════════════════════════════════════════════════
@@ -2501,9 +2504,9 @@ impl eframe::App for C41Gui {
                             opts.color_highlight_gain_b = 0.0;
                         }
                     });
-                  } // end Film tab guard (groups 1-4)
+                  } // end Develop tab guard (groups 1-4)
 
-                  if !in_process || self.process_tab == ProcessTab::Input {
+                  if !in_process || entry.process_tab == ProcessTab::Input {
                     // ════════════════════════════════════════════════════════
                     // Input — D-min, flat-field, film γ
                     // ════════════════════════════════════════════════════════
@@ -2732,7 +2735,7 @@ impl eframe::App for C41Gui {
                         );
                   } // end Input tab guard
 
-                  if !in_process || self.process_tab == ProcessTab::Input {
+                  if !in_process || entry.process_tab == ProcessTab::Input {
                     // ════════════════════════════════════════════════════════
                     // Crop
                     // ════════════════════════════════════════════════════════
@@ -2779,7 +2782,7 @@ impl eframe::App for C41Gui {
                         }
                   } // end Crop tab guard
 
-                  if !in_process || self.process_tab == ProcessTab::Film {
+                  if !in_process || entry.process_tab == ProcessTab::Develop {
                     // ════════════════════════════════════════════════════════
                     // GROUP 6 — Curve / LUT & Output
                     // ════════════════════════════════════════════════════════
@@ -3003,7 +3006,7 @@ impl eframe::App for C41Gui {
                         }
 
                     });
-                  } // end Film tab guard (group 6)
+                  } // end Develop tab guard (group 6)
                 }
 
                 if self.mode == UIMode::Calibrate {
@@ -3112,7 +3115,7 @@ impl eframe::App for C41Gui {
                     }
                 }
 
-                if self.mode == UIMode::Process && self.process_tab == ProcessTab::Input {
+                if self.mode == UIMode::Process && entry.process_tab == ProcessTab::Input {
                     let apply_color_prev = opts.apply_color_profile;
                     ui.checkbox(&mut opts.apply_color_profile, "Color calibration profile");
                     if apply_color_prev && !opts.apply_color_profile {
@@ -3301,7 +3304,7 @@ impl eframe::App for C41Gui {
                     });
                 }
 
-                if self.mode == UIMode::Process && self.process_tab == ProcessTab::Film {
+                if self.mode == UIMode::Process && entry.process_tab == ProcessTab::Export {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -3979,9 +3982,11 @@ impl eframe::App for C41Gui {
                                             let mut right = scr_br.x;
                                             let mut bottom = scr_br.y;
 
-                                            // Mask outside the crop. In the Film tab we use a fully
+                                            // Mask outside the crop. In Develop/Export tabs we use a fully
                                             // opaque panel-fill color so the area behaves like a hard crop.
-                                            let overlay = if self.process_tab == ProcessTab::Film {
+                                            let overlay = if entry.process_tab == ProcessTab::Develop
+                                                || entry.process_tab == ProcessTab::Export
+                                            {
                                                 ui.visuals().panel_fill
                                             } else {
                                                 egui::Color32::from_black_alpha(128)
@@ -4021,7 +4026,7 @@ impl eframe::App for C41Gui {
 
                                             // When in the Input tab, show interactive handles and D-min rect
                                             // *above* the overlay so the handles remain visible.
-                                            if self.process_tab == ProcessTab::Input {
+                                            if entry.process_tab == ProcessTab::Input {
                                                 let handle_radius = 5.0;
                                                 let mut rect_changed = false;
 
