@@ -300,6 +300,8 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/pipeline.rs` | Shared pipeline steps 3–6 used by both `process_files` and `process_one_to_preview`. |
 | `src/pipeline_cache.rs` | Step-level cache for preview: reuse earlier stages when only later options change. |
 | `src/gpu/mod.rs` | wgpu initialization and `GpuContext` (optional, `--features gpu`). |
+| `src/gpu/demosaic.rs` | GPU demosaic for RGGB Bayer (edge-aware G + color-diff R/B); X-Trans and non-RGGB fall back to CPU. |
+| `src/gpu/demosaic.wgsl` | WGSL 2-pass compute: green interpolation, then R/B from (R-G), (B-G). |
 | `src/gpu/unified.rs` | Unified GPU pipeline: single upload, steps 4→5→6 as consecutive dispatches, single readback. |
 | `src/gpu/step4.rs` | GPU dispatch for step 4: T→D, WB, shadow cast. CPU precomputes auto-WB medians and shadow analysis. |
 | `src/gpu/step4.wgsl` | WGSL compute shader: T→D via hardware `log2`, per-channel scale+offset, shadow cast correction. |

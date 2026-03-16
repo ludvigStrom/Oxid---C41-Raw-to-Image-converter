@@ -769,7 +769,8 @@ pub fn process_one_to_preview_with_cache(
     }
 
     if start_step == 1 {
-        let (mut img, tw, th) = load_and_demosaic_preview(path, options, max_width, max_height)?;
+        let (mut img, tw, th) =
+            load_and_demosaic_preview(path, options, max_width, max_height, CpuDemosaic)?;
         true_src_w = tw;
         true_src_h = th;
         let _ = writeln!(dbg, "=== Pipeline Debug (with cache) ===");
@@ -924,7 +925,8 @@ pub fn process_one_to_preview_with_cache_gpu(
     }
 
     if start_step == 1 {
-        let (mut img, tw, th) = load_and_demosaic_preview(path, options, max_width, max_height)?;
+        let (mut img, tw, th) =
+            load_and_demosaic_preview(path, options, max_width, max_height, &gpu.demosaic)?;
         true_src_w = tw;
         true_src_h = th;
         let _ = writeln!(dbg, "=== Pipeline Debug (GPU, with cache) ===");
@@ -992,12 +994,47 @@ pub fn process_one_to_preview_with_cache_gpu(
     Ok((true_src_w, true_src_h, orig_w, orig_h, out, dbg, new_cache))
 }
 
+/// Demosaic backend: CPU-only or GPU when available.
+trait DemosaicBackend {
+    fn demosaic(
+        &self,
+        bayer: &Array3<f32>,
+        pattern: CfaPattern,
+    ) -> anyhow::Result<Array3<f32>>;
+}
+
+struct CpuDemosaic;
+
+impl DemosaicBackend for CpuDemosaic {
+    fn demosaic(
+        &self,
+        bayer: &Array3<f32>,
+        pattern: CfaPattern,
+    ) -> anyhow::Result<Array3<f32>> {
+        let mut rgb = demosaic::demosaic_quality(bayer, pattern)?;
+        rgb.mapv_inplace(|v| v.max(0.0));
+        Ok(rgb)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl DemosaicBackend for &gpu::demosaic::DemosaicPipeline {
+    fn demosaic(
+        &self,
+        bayer: &Array3<f32>,
+        pattern: CfaPattern,
+    ) -> anyhow::Result<Array3<f32>> {
+        gpu::demosaic::demosaic_gpu_or_cpu(bayer, pattern, Some(self))
+    }
+}
+
 /// Load and demosaic for preview only (no rotation). Returns (image, true_src_w, true_src_h).
-fn load_and_demosaic_preview(
+fn load_and_demosaic_preview<D: DemosaicBackend>(
     path: &Path,
     _options: &PipelineOptions,
     max_width: u32,
     max_height: u32,
+    demosaic_backend: D,
 ) -> anyhow::Result<(Array3<f32>, u32, u32)> {
     let ext = path
         .extension()
@@ -1012,8 +1049,7 @@ fn load_and_demosaic_preview(
             true_src_w = bw as u32;
             true_src_h = bh as u32;
             let small_bayer = downsample_raw_for_preview(&bayer, pattern, max_width);
-            let mut img = demosaic::demosaic_quality(&small_bayer, pattern)?;
-            img.mapv_inplace(|v| v.max(0.0));
+            let img = demosaic_backend.demosaic(&small_bayer, pattern)?;
             img
         }
         "png" | "jpeg" | "jpg" | "tiff" | "tif" => {

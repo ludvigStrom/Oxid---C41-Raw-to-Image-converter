@@ -9,6 +9,7 @@ use std::sync::Arc;
 use ndarray::Array3;
 use wgpu::util::DeviceExt;
 
+use super::demosaic::DemosaicPipeline;
 use super::step4::Step4Pipeline;
 use super::step5::Step5Pipeline;
 use super::step6::Step6Pipeline;
@@ -25,6 +26,7 @@ use crate::{OutputLutEncoding, OutputStage, PipelineOptions};
 /// Created once at startup, reused for every preview / export.
 pub struct GpuPipeline {
     pub ctx: Arc<GpuContext>,
+    pub demosaic: DemosaicPipeline,
     step4: Step4Pipeline,
     step5: Step5Pipeline,
     step6: Step6Pipeline,
@@ -34,11 +36,13 @@ impl GpuPipeline {
     /// Try to initialize the full GPU pipeline. Returns `None` if no GPU adapter.
     pub fn try_new() -> Option<Self> {
         let ctx = Arc::new(GpuContext::try_new()?);
+        let demosaic = DemosaicPipeline::new(&ctx);
         let step4 = Step4Pipeline::new(&ctx);
         let step5 = Step5Pipeline::new(&ctx);
         let step6 = Step6Pipeline::new(&ctx);
         Some(Self {
             ctx,
+            demosaic,
             step4,
             step5,
             step6,
