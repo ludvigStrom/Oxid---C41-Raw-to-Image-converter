@@ -473,7 +473,8 @@ impl GpuPipeline {
             density_tmp
                 .slice_mut(ndarray::s![.., .., 2])
                 .mapv_inplace(|v| v * s_b + off_b);
-            let (cr, cg, cb) = density_ops::analyze_shadow_cast(&density_tmp, 0.8);
+            let thresh = density_ops::SHADOW_CAST_THRESHOLD;
+            let (cr, cg, cb) = density_ops::analyze_shadow_cast(&density_tmp, thresh);
             (1u32, cr, cg, cb)
         } else {
             (0u32, 0.0, 0.0, 0.0)
@@ -493,7 +494,7 @@ impl GpuPipeline {
             cg,
             cb,
             shadow_cast_strength: options.shadow_cast_strength,
-            inv_threshold: 1.0 / 0.8_f32,
+            inv_threshold: 1.0 / density_ops::SHADOW_CAST_THRESHOLD,
             _pad0: 0,
             _pad1: 0,
         }

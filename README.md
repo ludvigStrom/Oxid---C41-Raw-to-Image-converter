@@ -162,7 +162,7 @@ Auto WB is multiplicative in density space (not additive), so it preserves `D = 
 
 Optional colour temperature (`--temp-k`, in Kelvin): a Kelvin-to-RGB model converts the temperature to additive density offsets that are added per channel.
 
-Optional shadow cast correction (`shadow_cast_strength`): detects per-channel colour imbalance in pixels with mean density below 0.8 and applies a correction weighted by `t^1.5` (strongest at D = 0, zero by threshold).
+Optional shadow cast correction (`shadow_cast_strength`): detects per-channel colour imbalance in pixels with mean density below 1.2 and applies a correction weighted by `t^1.5` (strongest at D = 0, zero by threshold).
 
 ### Step 5 — Density calibration
 

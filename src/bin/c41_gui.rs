@@ -228,6 +228,10 @@ struct C41Gui {
     /// Deferred file dialog flag: open the output LUT browser outside the egui render loop
     /// to avoid macOS NSOpenPanel re-entrance crashes.
     pending_output_lut_browse: bool,
+    /// When true, preview uses full resolution (export pipeline). Deactivates on option change or image switch.
+    full_res_preview_active: bool,
+    /// One-shot: set by the full-res button so we don't deactivate on the preview request it triggers.
+    full_res_preview_button_clicked: bool,
     /// When set, the next click on the preview will sample density and set WB gains (white/gray/black point).
     wb_picker_pending: Option<WbPickerTarget>,
     /// Canvas size (w, h) in points from last layout — used to request preview at screen resolution.
@@ -262,6 +266,8 @@ impl Default for C41Gui {
             pending_preview_key: None,
             pending_preview_since: None,
             pending_output_lut_browse: false,
+            full_res_preview_active: false,
+            full_res_preview_button_clicked: false,
             wb_picker_pending: None,
             preview_canvas_size: None,
             #[cfg(feature = "gpu")]
@@ -416,7 +422,7 @@ fn default_options() -> PipelineOptions {
         curve_gamma: 2.5,
         curve_pivot: 3.0,
         curve_white: 1.0,
-        apply_color_profile: true,
+        apply_color_profile: false,
         density_matrix: [
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
@@ -1455,22 +1461,28 @@ impl C41Gui {
         self.capture_pipeline_debug_next = false;
         options.verbose_debug = capture_debug;
 
-        // Adaptive preview resolution based on zoom: base = screen resolution (canvas × DPI),
-        // so initial load is sharp; higher zoom → higher working resolution up to 4× cap.
-        let zoom = entry.preview_zoom.max(1.0);
-        let scale = zoom.min(4.0); // up to 4× base preview resolution
-        let ppp = ctx.pixels_per_point();
-        let (base_w, base_h) = self
-            .preview_canvas_size
-            .map(|(w, h)| {
-                // Canvas size in physical pixels for crisp display at 1:1
-                let pw = (w * ppp).round().max(PREVIEW_MAX_WIDTH as f32);
-                let ph = (h * ppp).round().max(PREVIEW_MAX_HEIGHT as f32);
-                (pw, ph)
-            })
-            .unwrap_or((PREVIEW_MAX_WIDTH as f32, PREVIEW_MAX_HEIGHT as f32));
-        let max_width = (base_w * scale).round() as u32;
-        let max_height = (base_h * scale).round() as u32;
+        // Full-res preview: use export pipeline at full resolution (no downsampling).
+        let (max_width, max_height) = if self.full_res_preview_active {
+            (u32::MAX, u32::MAX)
+        } else {
+            // Adaptive preview resolution based on zoom: base = screen resolution (canvas × DPI),
+            // so initial load is sharp; higher zoom → higher working resolution up to 4× cap.
+            let zoom = entry.preview_zoom.max(1.0);
+            let scale = zoom.min(4.0); // up to 4× base preview resolution
+            let ppp = ctx.pixels_per_point();
+            let (base_w, base_h) = self
+                .preview_canvas_size
+                .map(|(w, h)| {
+                    // Canvas size in physical pixels for crisp display at 1:1
+                    let pw = (w * ppp).round().max(PREVIEW_MAX_WIDTH as f32);
+                    let ph = (h * ppp).round().max(PREVIEW_MAX_HEIGHT as f32);
+                    (pw, ph)
+                })
+                .unwrap_or((PREVIEW_MAX_WIDTH as f32, PREVIEW_MAX_HEIGHT as f32));
+            let max_w = (base_w * scale).round() as u32;
+            let max_h = (base_h * scale).round() as u32;
+            (max_w, max_h)
+        };
 
         let cache = entry.preview_step_cache.clone();
         #[cfg(feature = "gpu")]
@@ -1758,6 +1770,7 @@ impl eframe::App for C41Gui {
                                         });
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);
+                                            self.full_res_preview_active = false;
                                         }
                                     }
                                 }
@@ -1879,6 +1892,7 @@ impl eframe::App for C41Gui {
                                     to_remove.push(i);
                                 } else if interact_resp.clicked() {
                                     self.selected_index = Some(i);
+                                    self.full_res_preview_active = false;
                                 }
 
                                 if i + 1 < self.images.len() {
@@ -1891,6 +1905,7 @@ impl eframe::App for C41Gui {
                     let had_removals = !to_remove.is_empty();
                     if had_removals {
                         self.preview_receiver = None;
+                        self.full_res_preview_active = false;
                         for &i in &to_remove {
                             if let Some(e) = self.images.get(i) {
                                 self.thumbnail_pending.remove(&e.path);
@@ -2004,8 +2019,8 @@ impl eframe::App for C41Gui {
                 }
 
                 if self.mode == UIMode::Debug {
-                    ui.label("Pipeline step (1–6). Preview shows output up to this step.");
-                    ui.add(egui::Slider::new(&mut opts.debug_pipeline_step, 1..=6).text("Step"));
+                    ui.add(egui::Slider::new(&mut opts.debug_pipeline_step, 1..=6).text("Step"))
+                        .on_hover_text("Pipeline step (1–6). Preview shows output up to this step.");
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
@@ -2019,11 +2034,8 @@ impl eframe::App for C41Gui {
                             opts.debug_preview_simple_debayer = !opts.debug_preview_simple_debayer;
                         }
                         if opts.debug_preview_simple_debayer {
-                            ui.label(
-                                egui::RichText::new("simple RAW bilinear debayer mode ON")
-                                    .small()
-                                    .weak(),
-                            );
+                            ui.label(egui::RichText::new("(simple debayer)").small().weak())
+                                .on_hover_text("simple RAW bilinear debayer mode ON");
                         }
                     });
                     #[cfg(feature = "gpu")]
@@ -2035,22 +2047,17 @@ impl eframe::App for C41Gui {
                             ui.add_enabled(gpu_available, egui::Checkbox::new(&mut use_gpu, "GPU acceleration"));
                             opts.use_gpu = use_gpu;
                             if gpu_available {
-                                ui.label(egui::RichText::new("(available)").small().weak());
+                                ui.label(egui::RichText::new("(available)").small().weak())
+                                    .on_hover_text("GPU acceleration is available");
                             } else {
-                                ui.label(egui::RichText::new("(no GPU adapter found)").small().weak());
+                                ui.label(egui::RichText::new("(no GPU adapter found)").small().weak())
+                                    .on_hover_text("No GPU adapter found. Pipeline runs on CPU.");
                             }
                         });
                     }
                     ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("1: load+demosaic+rot · 3: +D-min · 4: +WB · 6: full (curve/invert)")
-                            .small(),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Step 5 applies density matrix / LUT calibration.")
-                            .small(),
-                    );
+                    ui.label(egui::RichText::new("Rawloader report").strong())
+                        .on_hover_text("1: load+demosaic+rot · 3: +D-min · 4: +WB · 6: full (curve/invert). Step 5 applies density matrix / LUT calibration.");
                     ui.separator();
                     ui.label(egui::RichText::new("Rawloader report").strong());
                     let ext = entry
@@ -2085,11 +2092,8 @@ impl eframe::App for C41Gui {
                             }
                         });
                     } else {
-                        ui.label(
-                            egui::RichText::new("Selected file is not a RAW format.")
-                                .small()
-                                .weak(),
-                        );
+                        ui.label("—")
+                            .on_hover_text("Selected file is not a RAW format.");
                     }
                     ui.add_space(6.0);
                     if let Some(report) = entry.raw_debug_report.as_ref() {
@@ -2103,24 +2107,21 @@ impl eframe::App for C41Gui {
                             );
                         });
                     } else {
-                        ui.label(
-                            egui::RichText::new("No raw report yet. Click the button above.")
-                                .small()
-                                .weak(),
-                        );
+                        ui.label("—")
+                            .on_hover_text("No raw report yet. Click the button above.");
                     }
 
                     ui.add_space(8.0);
                     ui.separator();
-                    ui.label(egui::RichText::new("Pipeline debug log").strong());
-                    ui.label(
-                        egui::RichText::new("Captured on demand. Click the button to snapshot current settings.")
-                            .small()
-                            .weak(),
-                    );
+                    ui.label(egui::RichText::new("Pipeline debug log").strong())
+                        .on_hover_text("Captured on demand. Click the button to snapshot current settings.");
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Capture pipeline log for current settings").clicked() {
+                        if ui
+                            .button("Capture pipeline log for current settings")
+                            .on_hover_text("Snapshot current settings into the pipeline debug log")
+                            .clicked()
+                        {
                             self.capture_pipeline_debug_next = true;
                             entry.preview_texture = None; // force one fresh render with debug capture
                         }
@@ -2145,11 +2146,8 @@ impl eframe::App for C41Gui {
                                 );
                             });
                     } else {
-                        ui.label(
-                            egui::RichText::new("No pipeline log yet. Preview must render first.")
-                                .small()
-                                .weak(),
-                        );
+                        ui.label("—")
+                            .on_hover_text("No pipeline log yet. Preview must render first.");
                     }
                 } else if self.mode != UIMode::LuminanceCalibrate {
                     let in_process = self.mode == UIMode::Process;
@@ -2199,11 +2197,8 @@ impl eframe::App for C41Gui {
 
                         if matches!(opts.output_stage, OutputStage::FilmPrint) {
                             ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Print balance (CMY)")
-                                    .small()
-                                    .weak(),
-                            );
+                            ui.label("Print balance (CMY)")
+                                .on_hover_text("Per-channel cyan, magenta, yellow adjustments for print balance");
                             let mut pb = print_balance_from_opts(opts);
                             let mut pb_changed = false;
                             ui.horizontal(|ui| {
@@ -2244,12 +2239,7 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // Highlight roll-off (Reinhard) — order matches workflow
                     // ════════════════════════════════════════════════════════
-                    ui.collapsing("Highlight roll-off", |ui| {
-                        ui.label(
-                            egui::RichText::new("Reinhard-style compression in density space to mask noise in skies and dense negative areas.")
-                                .small()
-                                .weak(),
-                        );
+                    let cr_rolloff = ui.collapsing("Highlight roll-off", |ui| {
                         ui.add_space(4.0);
                         egui::Grid::new("highlight_rolloff")
                             .num_columns(2)
@@ -2267,11 +2257,12 @@ impl eframe::App for C41Gui {
                             opts.highlight_rolloff_d_mid = 1.5;
                         }
                     });
+                    cr_rolloff.header_response.on_hover_text("Reinhard-style compression in density space to mask noise in skies and dense negative areas.");
 
                     // ════════════════════════════════════════════════════════
                     // Tone shaping (advanced shadow/highlight)
                     // ════════════════════════════════════════════════════════
-                    ui.collapsing("Tone shaping", |ui| {
+                    let cr_tone = ui.collapsing("Tone shaping", |ui| {
                         ui.add_space(4.0);
                         egui::Grid::new("tone_shaping")
                             .num_columns(2)
@@ -2296,14 +2287,8 @@ impl eframe::App for C41Gui {
                                 );
                                 ui.end_row();
                             });
-                        ui.label(
-                            egui::RichText::new(
-                                "Toe/shoulder: softer shadows and highlights. Shadow cast: auto-neutralize color cast in shadows."
-                            )
-                            .small()
-                            .weak(),
-                        );
                     });
+                    cr_tone.header_response.on_hover_text("Toe/shoulder: softer shadows and highlights. Shadow cast: auto-neutralize color cast in shadows.");
 
                     // ════════════════════════════════════════════════════════
                     // White balance & color neutrality
@@ -2329,23 +2314,16 @@ impl eframe::App for C41Gui {
 
                         match opts.wb_mode {
                             WbMode::Auto => {
-                                ui.checkbox(&mut opts.auto_wb, "Auto white balance");
-                                ui.label(
-                                    egui::RichText::new(
-                                        if opts.auto_wb {
-                                            "Per-channel gamma: D × (mean_D / ch_median). Preserves black point."
-                                        } else {
-                                            "Auto WB disabled."
-                                        },
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
+                                ui.checkbox(&mut opts.auto_wb, "Auto white balance")
+                                    .on_hover_text(if opts.auto_wb {
+                                        "Per-channel gamma: D × (mean_D / ch_median). Preserves black point."
+                                    } else {
+                                        "Auto WB disabled."
+                                    });
                                 ui.add_space(4.0);
                                 ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
                             }
                             WbMode::Picker => {
-                                ui.label(egui::RichText::new("Click a point on the preview to set it as neutral.").small().weak());
                                 ui.horizontal(|ui| {
                                     if ui.button("Pick white point").clicked() {
                                         self.wb_picker_pending = Some(WbPickerTarget::WhitePoint);
@@ -2356,9 +2334,12 @@ impl eframe::App for C41Gui {
                                     if ui.button("Pick black point").clicked() {
                                         self.wb_picker_pending = Some(WbPickerTarget::BlackPoint);
                                     }
-                                });
+                                })
+                                .response
+                                .on_hover_text("Click a point on the preview to set it as neutral.");
                                 if self.wb_picker_pending.is_some() {
-                                    ui.label(egui::RichText::new("Click on the preview image to sample.").small().color(egui::Color32::from_rgb(180, 220, 120)));
+                                    ui.label(egui::RichText::new("Click on the preview to sample.").small().color(egui::Color32::from_rgb(180, 220, 120)))
+                                        .on_hover_text("Click on the preview image to sample.");
                                 }
                             }
                         }
@@ -2374,12 +2355,12 @@ impl eframe::App for C41Gui {
                             } else {
                                 opts.temp_k = None;
                             }
-                            ui.label(egui::RichText::new("Density scale (1.0 = neutral, >1 = more color).").small().weak());
                             egui::Grid::new("wb_rgb")
                                 .num_columns(2)
                                 .spacing([4.0, 2.0])
                                 .show(ui, |ui| {
-                                    ui.label("R");
+                                    ui.label("R")
+                                        .on_hover_text("Density scale (1.0 = neutral, >1 = more color). Applies to R, G, B.");
                                     ui.add(egui::Slider::new(&mut opts.wb_r, 0.7..=1.5));
                                     ui.end_row();
                                     ui.label("G");
@@ -2395,7 +2376,7 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // Color character & separation
                     // ════════════════════════════════════════════════════════
-                    ui.collapsing("Color", |ui| {
+                    let cr_color = ui.collapsing("Color", |ui| {
                         ui.add_space(4.0);
                         egui::Grid::new("color_main")
                             .num_columns(2)
@@ -2428,19 +2409,13 @@ impl eframe::App for C41Gui {
                                     ui.end_row();
                                 });
                         });
-                        ui.label(
-                            egui::RichText::new(
-                                "Saturation: density chroma. Warmth: golden highlights. Lab: mid-chroma separation in a/b."
-                            )
-                            .small()
-                            .weak(),
-                        );
                     });
+                    cr_color.header_response.on_hover_text("Saturation: density chroma. Warmth: golden highlights. Lab: mid-chroma separation in a/b.");
 
                     // ════════════════════════════════════════════════════════
                     // Color zones (per-channel shadow/mid/highlight)
                     // ════════════════════════════════════════════════════════
-                    ui.collapsing("Color zones", |ui| {
+                    let cr_zones = ui.collapsing("Color zones", |ui| {
                         ui.add_space(4.0);
 
                         ui.label(egui::RichText::new("Shadows").strong());
@@ -2512,8 +2487,6 @@ impl eframe::App for C41Gui {
                             });
 
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Gain = multiplicative. Saturation = 1.0 no change, <1 desaturate, >1 boost.").small().weak());
-                        ui.add_space(4.0);
                         if ui.small_button("Reset all").clicked() {
                             opts.zone_shadow_gain = 0.0;
                             opts.zone_mid_gain = 0.0;
@@ -2532,11 +2505,67 @@ impl eframe::App for C41Gui {
                             opts.color_highlight_gain_b = 0.0;
                         }
                     });
+                    cr_zones.header_response.on_hover_text("Gain = multiplicative. Saturation = 1.0 no change, <1 desaturate, >1 boost.");
                   } // end Develop tab guard (groups 1-4)
 
                   if !in_process || entry.process_tab == ProcessTab::Input {
                     // ════════════════════════════════════════════════════════
-                    // Input — D-min, flat-field, film γ
+                    // Input — Crop
+                    // ════════════════════════════════════════════════════════
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut opts.apply_crop, "Crop");
+                            if opts.apply_crop {
+                                if ui.button("Auto")
+                                    .on_hover_text("Detect film frame boundaries and maximise crop")
+                                    .clicked()
+                                {
+                                    auto_crop_requested = true;
+                                }
+                            }
+                        });
+                        if opts.apply_crop {
+                            if opts.crop_rect.is_none() {
+                                opts.crop_rect = Some(Rect {
+                                    x: 40,
+                                    y: 40,
+                                    width: 240,
+                                    height: 240,
+                                });
+                                auto_crop_requested = true;
+                            }
+                            if let Some(rect) = opts.crop_rect.as_mut() {
+                                ui.horizontal(|ui| {
+                                    ui.label("x,y,w,h")
+                                        .on_hover_text("Preview darkens outside crop. Histogram + export use inside only.");
+                                    ui.add(egui::DragValue::new(&mut rect.x).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.y).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.width).speed(1));
+                                    ui.add(egui::DragValue::new(&mut rect.height).speed(1));
+                                });
+                            }
+                        }
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                  }
+
+                  if !in_process || entry.process_tab == ProcessTab::Input {
+                    // ════════════════════════════════════════════════════════
+                    // Input — Film γ
+                    // ════════════════════════════════════════════════════════
+                        ui.horizontal(|ui| {
+                            ui.label("Film γ")
+                                .on_hover_text("C-41 γ ≈ 0.55–0.75. Converts density → scene log-exposure.");
+                            ui.add(egui::Slider::new(&mut opts.film_gamma, 0.4..=0.9));
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                  }
+
+                  if !in_process || entry.process_tab == ProcessTab::Input {
+                    // ════════════════════════════════════════════════════════
+                    // Input — D-min, flat-field
                     // ════════════════════════════════════════════════════════
                         ui.label(egui::RichText::new("D-min").strong());
                         ui.add_space(2.0);
@@ -2573,11 +2602,8 @@ impl eframe::App for C41Gui {
 
                         match opts.dmin_mode {
                             DminMode::Off => {
-                                ui.label(
-                                    egui::RichText::new("D-min correction disabled.")
-                                        .small()
-                                        .weak(),
-                                );
+                                ui.label("—")
+                                    .on_hover_text("D-min correction disabled.");
                             }
                             DminMode::Fixed => {
                                 ui.horizontal(|ui| {
@@ -2587,7 +2613,11 @@ impl eframe::App for C41Gui {
                                             self.status = format!("D-min copied: {}", text);
                                         }
                                     }
-                                    if ui.button("Paste").clicked() {
+                                    if ui
+                                        .button("Paste")
+                                        .on_hover_text("Format: dmin:fixed:r,g,b or dmin:rect:x,y,w,h")
+                                        .clicked()
+                                    {
                                         match arboard::Clipboard::new()
                                             .and_then(|mut cb| cb.get_text())
                                         {
@@ -2629,11 +2659,6 @@ impl eframe::App for C41Gui {
                                         }
                                     }
                                 });
-                                ui.label(
-                                    egui::RichText::new("Format: dmin:fixed:r,g,b or dmin:rect:x,y,w,h")
-                                        .small()
-                                        .weak(),
-                                );
                                 ui.add_space(4.0);
                                 if opts.dmin_fixed.is_none() {
                                     opts.dmin_fixed = Some((0.222537, 0.108183, 0.054116));
@@ -2672,7 +2697,8 @@ impl eframe::App for C41Gui {
                                 }
                                 if let Some(rect) = opts.dmin_rect.as_mut() {
                                     ui.horizontal(|ui| {
-                                        ui.label("x,y,w,h");
+                                        ui.label("x,y,w,h")
+                                            .on_hover_text("Drag the blue rectangle on the preview to select the film base region.");
                                         ui.add(egui::DragValue::new(&mut rect.x).speed(1));
                                         ui.add(egui::DragValue::new(&mut rect.y).speed(1));
                                         ui.add(egui::DragValue::new(&mut rect.width).speed(1));
@@ -2680,29 +2706,16 @@ impl eframe::App for C41Gui {
                                     });
                                 }
                                 ui.checkbox(&mut opts.dmin_neutral_only, "Neutral only (geometric mean)");
-                                ui.label(
-                                    egui::RichText::new("Drag the blue rectangle on the preview to select the film base region.")
-                                        .small()
-                                        .weak(),
-                                );
                             }
                             DminMode::AutoPercentile => {
                                 ui.horizontal(|ui| {
-                                    ui.label("Border buffer");
+                                    ui.label("Border buffer")
+                                        .on_hover_text("Automatic per-channel percentile normalization. Finds film base density (p0.5) and normalizes. Border buffer excludes edges from analysis.");
                                     ui.add(
                                         egui::Slider::new(&mut opts.auto_norm_buffer, 0.1..=0.3)
                                             .fixed_decimals(2),
                                     );
                                 });
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Automatic per-channel percentile normalization.\n\
-                                         Finds film base density (p0.5) and normalizes.\n\
-                                         Border buffer excludes edges from analysis."
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
                             }
                         }
 
@@ -2741,74 +2754,18 @@ impl eframe::App for C41Gui {
                                 }
                             });
                             if let Some(ref p) = self.flat_field_path {
-                                ui.label(
-                                    egui::RichText::new(format!("Flat-field: {}", p.display())).small(),
-                                );
+                                ui.label(egui::RichText::new(p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()).small())
+                                    .on_hover_text(format!("Flat-field: {}", p.display()));
                             } else {
-                                ui.label(egui::RichText::new("No flat-field override set.").small());
+                                ui.label("—")
+                                    .on_hover_text("No flat-field override set.");
                             }
                         }
 
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Film γ");
-                            ui.add(egui::Slider::new(&mut opts.film_gamma, 0.4..=0.9));
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "C-41 γ ≈ 0.55–0.75. Converts density → scene log-exposure."
-                            )
-                            .small()
-                            .weak(),
-                        );
-                  } // end Input tab guard
-
-                  if !in_process || entry.process_tab == ProcessTab::Input {
-                    // ════════════════════════════════════════════════════════
-                    // Crop
-                    // ════════════════════════════════════════════════════════
+                        ui.separator();
                         ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut opts.apply_crop, "Crop");
-                            if opts.apply_crop {
-                                if ui.button("Auto")
-                                    .on_hover_text("Detect film frame boundaries and maximise crop")
-                                    .clicked()
-                                {
-                                    auto_crop_requested = true;
-                                }
-                            }
-                        });
-                        if opts.apply_crop {
-                            if opts.crop_rect.is_none() {
-                                // Placeholder so the overlay is visible immediately;
-                                // auto-detect will replace it this same frame.
-                                opts.crop_rect = Some(Rect {
-                                    x: 40,
-                                    y: 40,
-                                    width: 240,
-                                    height: 240,
-                                });
-                                auto_crop_requested = true;
-                            }
-                            if let Some(rect) = opts.crop_rect.as_mut() {
-                                ui.horizontal(|ui| {
-                                    ui.label("x,y,w,h");
-                                    ui.add(egui::DragValue::new(&mut rect.x).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.y).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.width).speed(1));
-                                    ui.add(egui::DragValue::new(&mut rect.height).speed(1));
-                                });
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "Preview darkens outside crop. Histogram + export use inside only.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        }
-                  } // end Crop tab guard
+                  } // end D-min Input tab guard
 
                   if !in_process || entry.process_tab == ProcessTab::Develop {
                     // ════════════════════════════════════════════════════════
@@ -2892,9 +2849,9 @@ impl eframe::App for C41Gui {
 
                             if matches!(opts.output_stage, OutputStage::FilmPrint) {
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new("Per-channel offsets (exposure shift)").small());
                                 ui.horizontal(|ui| {
-                                    ui.label("R");
+                                    ui.label("R")
+                                        .on_hover_text("Per-channel offsets (exposure shift)");
                                     ui.add(
                                         egui::Slider::new(&mut opts.fp_offset_r, -0.3..=0.3)
                                             .fixed_decimals(3),
@@ -2916,9 +2873,9 @@ impl eframe::App for C41Gui {
                                 });
 
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new("Per-channel gamma (contrast)").small());
                                 ui.horizontal(|ui| {
-                                    ui.label("R");
+                                    ui.label("R")
+                                        .on_hover_text("Per-channel gamma (contrast)");
                                     ui.add(
                                         egui::Slider::new(&mut opts.fp_gamma_r, 0.7..=1.5)
                                             .fixed_decimals(2),
@@ -2958,20 +2915,12 @@ impl eframe::App for C41Gui {
 
                             if matches!(opts.output_stage, OutputStage::Lut2383) {
                                 ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Resolve-style Kodak 2383 cubes expect Cineon log input.",
-                                    )
-                                    .small()
-                                    .weak(),
-                                );
-
                                 let enc_label = match opts.output_lut_encoding {
                                     OutputLutEncoding::CineonLog => "Cineon log (D ÷ 2.046)",
                                     OutputLutEncoding::Rec709 => "Rec.709 (sRGB gamma)",
                                     OutputLutEncoding::LinearDensity => "Linear (D ÷ 2.5)",
                                 };
-                                egui::ComboBox::from_label("LUT input encoding")
+                                let lut_combo = egui::ComboBox::from_label("LUT input encoding")
                                     .selected_text(enc_label)
                                     .show_ui(ui, |ui| {
                                         if ui
@@ -3011,26 +2960,20 @@ impl eframe::App for C41Gui {
                                             opts.output_lut_encoding = OutputLutEncoding::LinearDensity;
                                         }
                                     });
+                                lut_combo.response.on_hover_text("Resolve-style Kodak 2383 cubes expect Cineon log input.");
 
                                 ui.add_space(4.0);
                                 if ui.button("Browse output LUT…").clicked() {
                                     self.pending_output_lut_browse = true;
                                 }
                                 if let Some(ref p) = opts.output_lut_cube {
-                                    ui.label(egui::RichText::new(p.display().to_string()).small());
+                                    ui.label(egui::RichText::new(p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()).small())
+                                        .on_hover_text(p.display().to_string());
                                 } else {
-                                    ui.label(egui::RichText::new("No output LUT loaded").small().weak());
+                                    ui.label("—")
+                                        .on_hover_text("No output LUT loaded");
                                 }
                             }
-                        }
-
-                        ui.add_space(4.0);
-                        ui.add_enabled(
-                            opts.no_curve,
-                            egui::Checkbox::new(&mut opts.no_invert, "Skip color inversion"),
-                        );
-                        if !opts.no_curve {
-                            ui.label(egui::RichText::new("(Applies when Output curve is off)").small());
                         }
 
                     });
@@ -3040,8 +2983,6 @@ impl eframe::App for C41Gui {
                 if self.mode == UIMode::Calibrate {
                     ui.add_space(12.0);
                     ui.separator();
-                    ui.add_space(8.0);
-                    ui.label("Set the profile name / film stock and notes, then create the color profile in one step (matrix + 3D LUT saved as .c41).");
                     ui.add_space(8.0);
 
                     if self.calibration_profile_name.is_empty() {
@@ -3053,7 +2994,8 @@ impl eframe::App for C41Gui {
                             self.calibration_profile_name = stem.to_string();
                         }
                     }
-                    ui.label("Profile name / film stock");
+                    ui.label("Profile name / film stock")
+                        .on_hover_text("Set the profile name / film stock and notes, then create the color profile in one step (matrix + 3D LUT saved as .c41).");
                     ui.text_edit_singleline(&mut self.calibration_profile_name);
                     ui.label("Notes (e.g. light source)");
                     ui.text_edit_singleline(&mut self.calibration_light_source);
@@ -3144,6 +3086,11 @@ impl eframe::App for C41Gui {
                 }
 
                 if self.mode == UIMode::Process && entry.process_tab == ProcessTab::Input {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Color Calibration").strong());
+                    ui.add_space(2.0);
                     let apply_color_prev = opts.apply_color_profile;
                     ui.checkbox(&mut opts.apply_color_profile, "Color calibration profile");
                     if apply_color_prev && !opts.apply_color_profile {
@@ -4254,16 +4201,33 @@ impl eframe::App for C41Gui {
                             );
                         }
 
-                        // Row under the image: full filename (left, truncated) + mirror/rotate buttons (right)
+                        // Row under the image: full filename (left) + full-res preview button + mirror/rotate buttons (right)
                         ui.horizontal(|ui| {
                             let full_name = self.images[idx].path.display().to_string();
-                            let max_filename_w = (ui.available_width() - 190.0).max(80.0); // leave room for mirror + rotate icons
+                            let max_filename_w = (ui.available_width() - 310.0).max(80.0); // leave room for full-res button + mirror + rotate icons
                             ui.allocate_ui(egui::vec2(max_filename_w, CONTROL_ROW_HEIGHT), |ui| {
                                 ui.label(
                                     egui::RichText::new(full_name).small().color(egui::Color32::from_gray(200)),
                                 )
                                 .on_hover_text(self.images[idx].path.display().to_string());
                             });
+                            // Full resolution/bit depth preview: generates image with export pipeline.
+                            // Deactivates on option change or image switch.
+                            let full_res_clicked = ui
+                                .selectable_label(
+                                    self.full_res_preview_active,
+                                    "Full resolution preview",
+                                )
+                                .on_hover_text("Use full resolution export pipeline for preview. Deactivates when adjusting settings or switching images.")
+                                .clicked();
+                            if full_res_clicked {
+                                self.full_res_preview_active = !self.full_res_preview_active;
+                                if self.full_res_preview_active {
+                                    self.full_res_preview_button_clicked = true;
+                                    self.images[idx].preview_texture = None; // Force re-render
+                                    self.images[idx].preview_hash = 0; // Invalidate so need_new triggers
+                                }
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // Order: rotate right, rotate left, mirror right, mirror left (right to left)
                                 let rotate_right_clicked = if let Some(icon) = &self.ui_icons.rotate_right {
@@ -4510,11 +4474,12 @@ impl eframe::App for C41Gui {
         // Runs after UI interactions so drag/release state is available for debounce.
         if let Some(idx) = self.selected_index {
             if idx < self.images.len() {
-                // Recompute hash including zoom so zoom changes trigger a new preview render.
+                // Recompute hash including zoom and full-res mode so changes trigger a new preview render.
                 let base_hash = options_hash_for(&self.images[idx].path, &self.images[idx].options);
                 let mut hh = DefaultHasher::new();
                 base_hash.hash(&mut hh);
                 self.images[idx].preview_zoom.to_bits().hash(&mut hh);
+                self.full_res_preview_active.hash(&mut hh);
                 let hash_now = hh.finish();
                 let need_new = self.images[idx].preview_texture.is_none()
                     || self.images[idx].preview_hash != hash_now;
@@ -4544,7 +4509,12 @@ impl eframe::App for C41Gui {
                         .unwrap_or(false);
 
                     if self.preview_receiver.is_none() && !waiting_for_release && settled {
+                        // Deactivate full-res when preview is triggered by option/zoom change (not by the button).
+                        if self.full_res_preview_active && !self.full_res_preview_button_clicked {
+                            self.full_res_preview_active = false;
+                        }
                         self.request_preview_for(idx, ctx);
+                        self.full_res_preview_button_clicked = false;
                         self.pending_preview_since = None;
                     } else {
                         // Keep ticking while debounce/release conditions are pending.

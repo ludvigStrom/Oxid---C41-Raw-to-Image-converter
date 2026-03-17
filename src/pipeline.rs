@@ -203,12 +203,13 @@ pub fn step_4_t_to_d_wb(image: &mut Array3<f32>, options: &PipelineOptions) {
     }
 
     if options.shadow_cast_strength > 0.0 {
-        let cast = crate::density_ops::analyze_shadow_cast(image, 0.8);
+        let thresh = crate::density_ops::SHADOW_CAST_THRESHOLD;
+        let cast = crate::density_ops::analyze_shadow_cast(image, thresh);
         crate::density_ops::apply_shadow_cast_correction(
             image,
             cast,
             options.shadow_cast_strength,
-            0.8,
+            thresh,
         );
     }
 }

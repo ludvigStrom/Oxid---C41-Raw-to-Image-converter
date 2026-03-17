@@ -267,7 +267,7 @@ impl Default for PipelineOptions {
             curve_gamma: 2.5,
             curve_pivot: 3.0,
             curve_white: 1.0,
-            apply_color_profile: true,
+            apply_color_profile: false,
             density_matrix: [
                 [1.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0],

@@ -3,6 +3,11 @@
 
 use ndarray::Array3;
 
+/// Shadow cast analysis threshold (mean density). Pixels with d_mean below this
+/// are considered shadow. 1.2 extends into lower midtones so more real-world
+/// shadow regions are captured (0.8 was too restrictive for many scans).
+pub(crate) const SHADOW_CAST_THRESHOLD: f32 = 1.2;
+
 /// Density-domain saturation boost: scale per-channel deviation from the
 /// neutral axis (equal-density gray line).
 ///
