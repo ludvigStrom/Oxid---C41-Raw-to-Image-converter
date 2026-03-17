@@ -386,6 +386,7 @@ pub fn step_6_render(
             if options.apply_lab {
                 crate::color::apply_lab_separation_u16(&mut image_u16, options.lab_separation);
             }
+            crate::color::apply_skin_magenta_shift_u16(&mut image_u16, options.skin_magenta_shift);
             crate::post_curve::apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
             Step6Display::U16(image_u16)
         }
@@ -416,6 +417,7 @@ pub fn step_6_render(
             if options.apply_lab {
                 crate::color::apply_lab_separation_u16(&mut image_u16, options.lab_separation);
             }
+            crate::color::apply_skin_magenta_shift_u16(&mut image_u16, options.skin_magenta_shift);
             crate::post_curve::apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
             Step6Display::U16(image_u16)
         }
@@ -459,6 +461,7 @@ pub fn step_6_render(
             if options.apply_lab {
                 crate::color::apply_lab_separation_f32(&mut display, options.lab_separation);
             }
+            crate::color::apply_skin_magenta_shift_f32(&mut display, options.skin_magenta_shift);
             crate::post_curve::apply_soft_knee_f32(&mut display, options.soft_clip);
             crate::post_curve::apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
             Step6Display::F32(display)

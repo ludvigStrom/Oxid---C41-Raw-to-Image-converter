@@ -173,6 +173,7 @@ fn step6_ra4_full_ops() {
     opts.highlight_warmth = 0.4;
     opts.apply_lab = true;
     opts.lab_separation = 0.5;
+    opts.skin_magenta_shift = 0.5;
 
     let ra4 = PrintCurveParams {
         offset: opts.curve_offset,
@@ -182,7 +183,7 @@ fn step6_ra4_full_ops() {
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, None);
     let gpu = gpu_pipe.run(&img, &opts, &ra4, None).expect("GPU step6 Ra4 full");
-    // Lab separation uses pow()/cbrt chains with GPU-specific precision, plus
+    // Lab separation and skin magenta shift use pow()/cbrt/trig with GPU precision, plus
     // the GPU avoids intermediate u16 quantization that CPU does between each
     // post-curve op. 10 LSB = 0.015% — imperceptible.
     compare_u16(&cpu, &gpu, 10, "Ra4 full ops");
@@ -242,6 +243,7 @@ fn step6_film_print_full_ops() {
     opts.highlight_warmth = 0.3;
     opts.apply_lab = true;
     opts.lab_separation = 0.4;
+    opts.skin_magenta_shift = 0.4;
 
     let ra4 = PrintCurveParams {
         offset: opts.curve_offset,
@@ -368,6 +370,7 @@ fn step6_lut2383_full_ops() {
     opts.highlight_warmth = 0.3;
     opts.apply_lab = true;
     opts.lab_separation = 0.5;
+    opts.skin_magenta_shift = 0.5;
 
     let ra4 = PrintCurveParams {
         offset: opts.curve_offset,

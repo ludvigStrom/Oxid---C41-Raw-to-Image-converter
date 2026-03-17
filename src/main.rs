@@ -296,6 +296,7 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         soft_clip: 0.0,
         apply_lab: false,
         lab_separation: 0.0,
+        skin_magenta_shift: 0.0,
         rotation_degrees: 0,
         flip_horizontal: false,
         flip_vertical: false,

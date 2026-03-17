@@ -226,6 +226,9 @@ pub struct PipelineOptions {
     /// Lab-space separation strength (0 = off). Boosts mid-chroma colors in
     /// the a/b plane to increase color separation without affecting neutrals.
     pub lab_separation: f32,
+    /// Skin magenta shift (0 = off). Rotates magenta/red hues in LAB toward orange
+    /// to correct scanner cast in lips and eye areas. 0.3–0.8 typical.
+    pub skin_magenta_shift: f32,
     /// Debug preview mode: for RAW files, show only a simple bilinear demosaic
     /// (plus optional rotation) and skip the rest of the pipeline.
     pub debug_preview_simple_debayer: bool,
@@ -318,6 +321,7 @@ impl Default for PipelineOptions {
             soft_clip: 0.93,
             apply_lab: false,
             lab_separation: 0.0,
+            skin_magenta_shift: 0.0,
             rotation_degrees: 0,
             flip_horizontal: false,
             flip_vertical: false,

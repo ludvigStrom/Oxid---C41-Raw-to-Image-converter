@@ -473,6 +473,7 @@ fn default_options() -> PipelineOptions {
         soft_clip: 0.93,
         apply_lab: false,
         lab_separation: 0.0,
+        skin_magenta_shift: 0.0,
         rotation_degrees: 0,
         flip_horizontal: false,
         flip_vertical: false,
@@ -496,6 +497,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.highlight_warmth.to_bits().hash(&mut h);
     opts.apply_lab.hash(&mut h);
     opts.lab_separation.to_bits().hash(&mut h);
+    opts.skin_magenta_shift.to_bits().hash(&mut h);
     opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
     opts.apply_crop.hash(&mut h);
@@ -2409,8 +2411,19 @@ impl eframe::App for C41Gui {
                                     ui.end_row();
                                 });
                         });
+                        egui::Grid::new("color_skin_magenta")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label("Skin magenta");
+                                ui.add(
+                                    egui::Slider::new(&mut opts.skin_magenta_shift, 0.0..=1.0)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+                            });
                     });
-                    cr_color.header_response.on_hover_text("Saturation: density chroma. Warmth: golden highlights. Lab: mid-chroma separation in a/b.");
+                    cr_color.header_response.on_hover_text("Saturation: density chroma. Warmth: golden highlights. Lab: mid-chroma separation in a/b. Skin magenta: rotates lips/eye magenta toward orange.");
 
                     // ════════════════════════════════════════════════════════
                     // Color zones (per-channel shadow/mid/highlight)
@@ -3403,9 +3416,22 @@ impl eframe::App for C41Gui {
                     if ui.add_enabled(ready, egui::Button::new("Convert all")).clicked() {
                         let output_dir = self.output_dir.clone().unwrap();
                         let mut err: Option<anyhow::Error> = None;
+                        // Use selected image's export format for all (dropdown only updates the selected image)
+                        let export_template = self
+                            .selected_index
+                            .filter(|&i| i < self.images.len())
+                            .map(|i| &self.images[i].options)
+                            .unwrap_or_else(|| &self.images[0].options);
                         for img in &self.images {
                             let mut opts = img.options.clone();
                             opts.flat_field_path = self.flat_field_path.clone();
+                            // Apply batch export format from the selected/first image
+                            opts.format = export_template.format;
+                            opts.write_exr = export_template.write_exr;
+                            opts.write_jpeg = export_template.write_jpeg;
+                            opts.write_jpeg_only = export_template.write_jpeg_only;
+                            opts.export_aces_exr = export_template.export_aces_exr;
+                            opts.write_aces2065_only = export_template.write_aces2065_only;
                             if let Err(e) = process_files(&[img.path.clone()], &output_dir, &opts) {
                                 err = Some(e);
                                 break;

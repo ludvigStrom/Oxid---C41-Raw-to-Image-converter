@@ -263,6 +263,106 @@ pub(crate) fn apply_lab_separation_u16(image: &mut Array3<u16>, strength: f32) {
     }
 }
 
+/// Rotate magenta/red hues in LAB toward orange to correct scanner cast in lips
+/// and eye areas. Strength 0 = off; 0.3–0.8 typical. Uses hue mask (-45° to 60°)
+/// and optional luminance gate (L 20–80) for skin-like regions.
+pub(crate) fn apply_skin_magenta_shift_f32(image: &mut Array3<f32>, strength: f32) {
+    if strength.abs() < 1e-6 {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+
+    // Max rotation at strength 1.0: ~35° toward orange (positive = counterclockwise).
+    const MAX_ROTATION_RAD: f32 = 0.611; // 35°
+    let angle = strength.clamp(0.0, 1.5) * MAX_ROTATION_RAD;
+
+    // Hue range: magenta (-60°) through red to orange (70°). atan2(b,a) in radians.
+    const HUE_LO_RAD: f32 = -1.047; // -60°
+    const HUE_HI_RAD: f32 = 1.222;  // 70°
+    // Luminance: broad range for skin/lips/eyes (L 5–95). Soft falloffs at extremes.
+    const L_LO: f32 = 5.0;
+    const L_HI: f32 = 95.0;
+
+    #[inline]
+    fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+        let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    for y in 0..h {
+        for x in 0..w {
+            let sr = image[[y, x, 0]].clamp(0.0, 1.0);
+            let sg = image[[y, x, 1]].clamp(0.0, 1.0);
+            let sb = image[[y, x, 2]].clamp(0.0, 1.0);
+
+            let r_lin = srgb_to_linear(sr);
+            let g_lin = srgb_to_linear(sg);
+            let b_lin = srgb_to_linear(sb);
+
+            let (xv, yv, zv) = rgb_linear_to_xyz(r_lin, g_lin, b_lin);
+            let (l, a, b) = xyz_to_lab(xv, yv, zv);
+
+            let c_ab = (a * a + b * b).sqrt();
+            if c_ab < 1e-4 {
+                continue;
+            }
+
+            let hue = b.atan2(a);
+            let hue_mask = smoothstep(HUE_LO_RAD, HUE_LO_RAD + 0.4, hue)
+                * (1.0 - smoothstep(HUE_HI_RAD - 0.4, HUE_HI_RAD, hue));
+            // Broad L range with soft falloffs so dark lips and fair skin are included.
+            let l_mask = smoothstep(L_LO, L_LO + 25.0, l) * (1.0 - smoothstep(L_HI - 25.0, L_HI, l));
+            let rot = angle * hue_mask * l_mask;
+
+            if rot.abs() < 1e-6 {
+                continue;
+            }
+
+            let cos_r = rot.cos();
+            let sin_r = rot.sin();
+            let a2 = a * cos_r - b * sin_r;
+            let b2 = a * sin_r + b * cos_r;
+
+            let (x2, y2, z2) = lab_to_xyz(l, a2, b2);
+            let (r_lin2, g_lin2, b_lin2) = xyz_to_rgb_linear(x2, y2, z2);
+
+            image[[y, x, 0]] = linear_to_srgb(r_lin2).clamp(0.0, 1.0);
+            image[[y, x, 1]] = linear_to_srgb(g_lin2).clamp(0.0, 1.0);
+            image[[y, x, 2]] = linear_to_srgb(b_lin2).clamp(0.0, 1.0);
+        }
+    }
+}
+
+/// Apply skin magenta shift to u16 image by converting to f32 and back.
+pub(crate) fn apply_skin_magenta_shift_u16(image: &mut Array3<u16>, strength: f32) {
+    if strength.abs() < 1e-6 {
+        return;
+    }
+    let (h, w, c) = image.dim();
+    assert_eq!(c, 3);
+    let inv = 1.0 / 65535.0_f32;
+
+    let mut fimg = Array3::<f32>::zeros((h, w, c));
+    for y in 0..h {
+        for x in 0..w {
+            fimg[[y, x, 0]] = image[[y, x, 0]] as f32 * inv;
+            fimg[[y, x, 1]] = image[[y, x, 1]] as f32 * inv;
+            fimg[[y, x, 2]] = image[[y, x, 2]] as f32 * inv;
+        }
+    }
+
+    apply_skin_magenta_shift_f32(&mut fimg, strength);
+
+    for y in 0..h {
+        for x in 0..w {
+            image[[y, x, 0]] = (fimg[[y, x, 0]].clamp(0.0, 1.0) * 65535.0).round() as u16;
+            image[[y, x, 1]] = (fimg[[y, x, 1]].clamp(0.0, 1.0) * 65535.0).round() as u16;
+            image[[y, x, 2]] = (fimg[[y, x, 2]].clamp(0.0, 1.0) * 65535.0).round() as u16;
+        }
+    }
+}
+
 /// Normalize density to [0, 1] with sRGB/Rec.709 gamma, then levels remap + midpoint.
 /// The LUT handles the neg→pos inversion (print emulation), so we keep
 /// density orientation: D / d_max → gamma-encode → levels → midpoint.

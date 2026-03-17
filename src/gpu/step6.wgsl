@@ -17,6 +17,7 @@ struct Params {
     highlight_warmth: f32,
     apply_lab: u32,
     lab_separation: f32,
+    skin_magenta_shift: f32,
     no_invert: u32,
     color_bleed: f32,
     vibrance: f32,
@@ -154,6 +155,55 @@ fn apply_lab_separation(r_in: f32, g_in: f32, b_in: f32, strength: f32) -> vec3<
     let xyz2 = lab_to_xyz(l, a2, b2);
     let rgb2 = xyz_to_rgb(xyz2.x, xyz2.y, xyz2.z);
 
+    return vec3<f32>(
+        clamp(linear_to_srgb(rgb2.x), 0.0, 1.0),
+        clamp(linear_to_srgb(rgb2.y), 0.0, 1.0),
+        clamp(linear_to_srgb(rgb2.z), 0.0, 1.0),
+    );
+}
+
+fn apply_skin_magenta_shift(r_in: f32, g_in: f32, b_in: f32, strength: f32) -> vec3<f32> {
+    if abs(strength) < 1e-6 {
+        return vec3<f32>(r_in, g_in, b_in);
+    }
+    let max_rotation_rad = 0.611;
+    let angle = clamp(strength, 0.0, 1.5) * max_rotation_rad;
+    let hue_lo_rad = -1.047;
+    let hue_hi_rad = 1.222;
+    let l_lo = 5.0;
+    let l_hi = 95.0;
+
+    let r_lin = srgb_to_linear(clamp(r_in, 0.0, 1.0));
+    let g_lin = srgb_to_linear(clamp(g_in, 0.0, 1.0));
+    let b_lin = srgb_to_linear(clamp(b_in, 0.0, 1.0));
+    let xyz = rgb_to_xyz(r_lin, g_lin, b_lin);
+    let lab = xyz_to_lab(xyz.x, xyz.y, xyz.z);
+    let l = lab.x;
+    let a = lab.y;
+    let b_l = lab.z;
+
+    let c_ab = sqrt(a * a + b_l * b_l);
+    if c_ab < 1e-4 {
+        return vec3<f32>(r_in, g_in, b_in);
+    }
+
+    let hue = atan2(b_l, a);
+    let hue_mask = smoothstep_fn(hue_lo_rad, hue_lo_rad + 0.4, hue)
+        * (1.0 - smoothstep_fn(hue_hi_rad - 0.4, hue_hi_rad, hue));
+    let l_mask = smoothstep_fn(l_lo, l_lo + 25.0, l) * (1.0 - smoothstep_fn(l_hi - 25.0, l_hi, l));
+    let rot = angle * hue_mask * l_mask;
+
+    if abs(rot) < 1e-6 {
+        return vec3<f32>(r_in, g_in, b_in);
+    }
+
+    let cos_r = cos(rot);
+    let sin_r = sin(rot);
+    let a2 = a * cos_r - b_l * sin_r;
+    let b2 = a * sin_r + b_l * cos_r;
+
+    let xyz2 = lab_to_xyz(l, a2, b2);
+    let rgb2 = xyz_to_rgb(xyz2.x, xyz2.y, xyz2.z);
     return vec3<f32>(
         clamp(linear_to_srgb(rgb2.x), 0.0, 1.0),
         clamp(linear_to_srgb(rgb2.y), 0.0, 1.0),
@@ -361,6 +411,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             r = lab_result.x; g = lab_result.y; b = lab_result.z;
         }
 
+        // Skin magenta shift
+        if abs(params.skin_magenta_shift) > 1e-6 {
+            let sms = apply_skin_magenta_shift(r, g, b, params.skin_magenta_shift);
+            r = sms.x; g = sms.y; b = sms.z;
+        }
+
         // Highlight warmth
         if abs(params.highlight_warmth) > 1e-6 {
             let hw = apply_highlight_warmth(r, g, b, params.highlight_warmth);
@@ -437,6 +493,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             r = lab_result.x; g = lab_result.y; b = lab_result.z;
         }
 
+        // Skin magenta shift
+        if abs(params.skin_magenta_shift) > 1e-6 {
+            let sms = apply_skin_magenta_shift(r, g, b, params.skin_magenta_shift);
+            r = sms.x; g = sms.y; b = sms.z;
+        }
+
         // Highlight warmth
         if abs(params.highlight_warmth) > 1e-6 {
             let hw = apply_highlight_warmth(r, g, b, params.highlight_warmth);
@@ -482,6 +544,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if params.apply_lab == 1u && abs(params.lab_separation) > 1e-6 {
             let lab_result = apply_lab_separation(r, g, b, params.lab_separation);
             r = lab_result.x; g = lab_result.y; b = lab_result.z;
+        }
+
+        // Skin magenta shift
+        if abs(params.skin_magenta_shift) > 1e-6 {
+            let sms = apply_skin_magenta_shift(clamp(r,0.0,1.0), clamp(g,0.0,1.0), clamp(b,0.0,1.0), params.skin_magenta_shift);
+            r = sms.x; g = sms.y; b = sms.z;
         }
 
         // Soft knee
