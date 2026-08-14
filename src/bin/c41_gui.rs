@@ -487,6 +487,12 @@ fn default_options() -> PipelineOptions {
         debug_preview_simple_debayer: false,
         verbose_debug: false,
         use_gpu: cfg!(feature = "gpu"),
+        bujack_enabled: false,
+        bujack_k_l: 0.25,
+        bujack_k_c: 0.30,
+        bujack_strength: 0.6,
+        bujack_radius: 16.0,
+        bujack_edge: 0.25,
     }
 }
 
@@ -588,6 +594,12 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.debug_preview_simple_debayer.hash(&mut h);
     opts.verbose_debug.hash(&mut h);
     opts.use_gpu.hash(&mut h);
+    opts.bujack_enabled.hash(&mut h);
+    opts.bujack_k_l.to_bits().hash(&mut h);
+    opts.bujack_k_c.to_bits().hash(&mut h);
+    opts.bujack_strength.to_bits().hash(&mut h);
+    opts.bujack_radius.to_bits().hash(&mut h);
+    opts.bujack_edge.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -3011,6 +3023,68 @@ impl eframe::App for C41Gui {
                         }
 
                     });
+
+                    let cr_bujack = ui.collapsing("De-Bujack", |ui| {
+                        ui.checkbox(&mut opts.bujack_enabled, "De-Bujack")
+                            .on_hover_text(
+                                "Non-local OkLab compensation for diminishing returns. \
+                                 After the output transform and looks, before encode. \
+                                 Off by default.",
+                            );
+                        ui.add_enabled_ui(opts.bujack_enabled, |ui| {
+                            ui.add_space(4.0);
+                            egui::Grid::new("bujack_knobs")
+                                .num_columns(2)
+                                .spacing([4.0, 2.0])
+                                .show(ui, |ui| {
+                                    ui.label("Knee L")
+                                        .on_hover_text("Where lightness differences start to flatten. Smaller = more aggressive.");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.bujack_k_l, 0.05..=0.60)
+                                            .fixed_decimals(3),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Knee C")
+                                        .on_hover_text("Same knee, applied to the (a,b) chroma vector.");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.bujack_k_c, 0.05..=0.60)
+                                            .fixed_decimals(3),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Strength")
+                                        .on_hover_text("Dry/wet mix. Above 1.0 over-corrects.");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.bujack_strength, 0.0..=1.5)
+                                            .fixed_decimals(2),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Radius")
+                                        .on_hover_text(
+                                            "Bilateral radius in pixels of the current buffer. \
+                                             Small = across edges, large = across the frame. \
+                                             Preview is smaller than export, so the same number \
+                                             covers more of the frame in preview.",
+                                        );
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.bujack_radius, 2.0..=48.0)
+                                            .fixed_decimals(0)
+                                            .suffix(" px"),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Edge preserve")
+                                        .on_hover_text("Bilateral range σ. Low keeps edges out of the base (less halo); 1.0 ≈ Gaussian.");
+                                    ui.add(
+                                        egui::Slider::new(&mut opts.bujack_edge, 0.03..=1.0)
+                                            .fixed_decimals(2),
+                                    );
+                                    ui.end_row();
+                                });
+                        });
+                    });
+                    cr_bujack.header_response.on_hover_text(
+                        "Stretches large OkLab differences from a local mean. \
+                         Pointwise grades cannot undo diminishing returns.",
+                    );
                   } // end Develop tab guard (group 6)
                 }
 

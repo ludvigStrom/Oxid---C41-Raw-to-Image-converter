@@ -247,6 +247,19 @@ pub struct PipelineOptions {
     pub verbose_debug: bool,
     /// When true (and the `gpu` feature is enabled), offload eligible pipeline steps to the GPU.
     pub use_gpu: bool,
+    /// De-Bujack: non-local OkLab difference stretch after the output transform.
+    /// Off by default. Runs after step 6, before encode.
+    pub bujack_enabled: bool,
+    /// Lightness knee k_L. Where L-differences start to flatten. Smaller = more aggressive.
+    pub bujack_k_l: f32,
+    /// Chroma knee k_C. Same knee, applied to the (a,b) chroma vector.
+    pub bujack_k_c: f32,
+    /// Dry/wet mix. 0 = off, 1 = full inverse-response, >1 over-corrects.
+    pub bujack_strength: f32,
+    /// Bilateral radius in pixels of the current buffer (preview or export).
+    pub bujack_radius: f32,
+    /// Bilateral range σ in OkLab. Low keeps edges out of the base (less halo).
+    pub bujack_edge: f32,
 }
 
 impl Default for PipelineOptions {
@@ -344,6 +357,12 @@ impl Default for PipelineOptions {
             debug_preview_simple_debayer: false,
             verbose_debug: false,
             use_gpu: false,
+            bujack_enabled: false,
+            bujack_k_l: 0.25,
+            bujack_k_c: 0.30,
+            bujack_strength: 0.6,
+            bujack_radius: 16.0,
+            bujack_edge: 0.25,
         }
     }
 }

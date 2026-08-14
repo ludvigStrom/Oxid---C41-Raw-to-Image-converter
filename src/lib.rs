@@ -11,6 +11,7 @@ use image::{
 use ndarray::{self, Array3};
 
 pub mod aces;
+pub mod bujack;
 pub mod calibration;
 pub mod color;
 pub mod color_space;
@@ -402,12 +403,13 @@ pub fn process_files(
 
         let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
 
-        let display = pipeline::step_6_render(
+        let mut display = pipeline::step_6_render(
             &image,
             options,
             &ra4_params,
             output_lut_cube.as_ref(),
         );
+        pipeline::apply_bujack(&mut display, options);
 
         match &display {
             pipeline::Step6Display::PassthroughDensity(img) => {
@@ -660,10 +662,22 @@ pub fn process_one_to_preview(
         pivot: options.curve_pivot,
     };
     let output_lut_preview = options.output_lut_cube.as_ref().and_then(|p| lut3d::read_cube(p).ok());
-    let display = pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
+    let mut display = pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
+    pipeline::apply_bujack(&mut display, options);
 
     if options.debug_pipeline_step >= 6 {
         let _ = writeln!(dbg, "Step 6: {:?} (shared pipeline)", options.output_stage);
+        if options.bujack_enabled {
+            let _ = writeln!(
+                dbg,
+                "De-Bujack: kL={:.3} kC={:.3} strength={:.2} radius={:.0} edge={:.2}",
+                options.bujack_k_l,
+                options.bujack_k_c,
+                options.bujack_strength,
+                options.bujack_radius,
+                options.bujack_edge
+            );
+        }
         if options.verbose_debug {
             if let pipeline::Step6Display::U16(ref u16_img) = display {
                 let mut s = [(0u16, 0u16, 0u16); 3];
@@ -840,7 +854,8 @@ pub fn process_one_to_preview_with_cache(
     let (orig_h, orig_w, _) = image.dim();
     let orig_w = orig_w as u32;
     let orig_h = orig_h as u32;
-    let display = pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
+    let mut display = pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
+    pipeline::apply_bujack(&mut display, options);
     let rgb_u8 = pipeline::step6_display_to_u8(&display);
 
     let _ = writeln!(dbg, "=== end pipeline debug ===");
@@ -994,7 +1009,7 @@ pub fn process_one_to_preview_with_cache_gpu(
     };
     let output_lut_preview = options.output_lut_cube.as_ref().and_then(|p| lut3d::read_cube(p).ok());
 
-    let display = gpu.run_from_step(
+    let mut display = gpu.run_from_step(
         &image,
         gpu_start,
         options,
@@ -1002,6 +1017,7 @@ pub fn process_one_to_preview_with_cache_gpu(
         &ra4_params,
         output_lut_preview.as_ref(),
     )?;
+    pipeline::apply_bujack(&mut display, options);
 
     let (orig_h, orig_w, _) = image.dim();
     let orig_w = orig_w as u32;

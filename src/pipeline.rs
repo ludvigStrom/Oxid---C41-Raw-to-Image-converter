@@ -488,6 +488,34 @@ pub fn step_6_render(
     }
 }
 
+/// De-Bujack after step 6: display-referred, before grain / sharpen / encode.
+///
+/// Skipped when disabled, when the pipeline stopped before step 6, or when the
+/// buffer is still density (`None` / passthrough). RA-4 / FilmPrint are linear
+/// print RGB. Lut2383 Rec.709 is sRGB-encoded and is decoded for the OkLab pass.
+pub fn apply_bujack(display: &mut Step6Display, options: &PipelineOptions) {
+    if !options.bujack_enabled || options.bujack_strength <= 0.0 {
+        return;
+    }
+    if options.debug_pipeline_step < 6 {
+        return;
+    }
+    match display {
+        Step6Display::PassthroughDensity(_) => {}
+        Step6Display::U16(img) => {
+            crate::bujack::apply_to_u16_linear(img, options);
+        }
+        Step6Display::F32(img) => {
+            if options.output_stage == OutputStage::None {
+                return;
+            }
+            let encoded_srgb = options.output_stage == OutputStage::Lut2383
+                && options.output_lut_encoding == OutputLutEncoding::Rec709;
+            crate::bujack::apply_to_f32(img, options, encoded_srgb);
+        }
+    }
+}
+
 /// Convert Step6Display to u8 RGB for preview.
 ///
 /// RA-4 / FilmPrint `U16` is linear print RGB — apply the sRGB OETF here.

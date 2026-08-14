@@ -314,6 +314,12 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         debug_preview_simple_debayer: false,
         verbose_debug: false,
         use_gpu: false,
+        bujack_enabled: false,
+        bujack_k_l: 0.25,
+        bujack_k_c: 0.30,
+        bujack_strength: 0.6,
+        bujack_radius: 16.0,
+        bujack_edge: 0.25,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;
