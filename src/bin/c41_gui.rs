@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use c41_raw_tool::{
     blur_flat_field,
@@ -50,7 +50,7 @@ const PREVIEW_MIN_SIDE: u32 = 640;
 const PREVIEW_DRAFT_MAX: u32 = 800;
 const PREVIEW_TILE_SIZE: u32 = 512;
 const PREVIEW_TILE_LRU: usize = 16;
-const PREVIEW_TILE_MAX: usize = 48;
+const PREVIEW_TILE_MAX: usize = 80;
 const PREVIEW_TILE_HALO: u32 = 32;
 const THUMB_MAX_SIZE: u32 = 64;
 const PREVIEW_DEBOUNCE_MS: u64 = 180;
@@ -59,37 +59,6 @@ const PREVIEW_LIVE_DEBOUNCE_MS: u64 = 50;
 /// Wait this long after pan/zoom before fetching 1:1 tiles.
 const PREVIEW_VIEW_SETTLE_MS: u64 = 100;
 
-// #region agent log
-fn agent_dbg(hypothesis_id: &str, location: &str, message: &str, data_json: &str) {
-    use std::io::Write;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let line = format!(
-        "{{\"sessionId\":\"ac4494\",\"hypothesisId\":\"{hypothesis_id}\",\"location\":\"{location}\",\"message\":\"{message}\",\"data\":{data_json},\"timestamp\":{ts}}}\n"
-    );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/Volumes/KINGSTON/Rust Raw/.cursor/debug-ac4494.log")
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
-}
-
-fn agent_dbg_changed(sig: &str, hypothesis_id: &str, location: &str, message: &str, data_json: &str) {
-    use std::sync::Mutex;
-    static LAST: Mutex<String> = Mutex::new(String::new());
-    if let Ok(mut last) = LAST.lock() {
-        if *last == sig {
-            return;
-        }
-        *last = sig.to_string();
-    }
-    agent_dbg(hypothesis_id, location, message, data_json);
-}
-// #endregion
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
 const ICON_CLOSE_PATH: &str = "X.png";
@@ -1967,15 +1936,14 @@ impl C41Gui {
         let tile = PREVIEW_TILE_SIZE as f32;
         let px0 = uv_l * ow as f32;
         let py0 = uv_t * oh as f32;
-        let px1 = (uv_r * ow as f32 - 1e-3).max(px0);
-        let py1 = (uv_b * oh as f32 - 1e-3).max(py0);
-        // Unpadded core: every tile that intersects the visible rect.
-        // A 1-tile pad used to inflate a 24-tile view to 48 and hit PREVIEW_TILE_MAX,
-        // which blocked fetching real edge tiles on zoom-out.
+        // uv max is exclusive (egui rect). ceil-1 includes a tile that is only
+        // a few pixels on-screen after zoom-out; floor(px-eps) used to miss it.
+        let px1 = (uv_r * ow as f32).max(px0);
+        let py1 = (uv_b * oh as f32).max(py0);
         let ix0 = (px0 / tile).floor() as i32;
         let iy0 = (py0 / tile).floor() as i32;
-        let ix1 = (px1 / tile).floor() as i32;
-        let iy1 = (py1 / tile).floor() as i32;
+        let ix1 = (px1 / tile).ceil() as i32 - 1;
+        let iy1 = (py1 / tile).ceil() as i32 - 1;
         let ix0 = ix0.clamp(0, tiles_x.saturating_sub(1));
         let iy0 = iy0.clamp(0, tiles_y.saturating_sub(1));
         let ix1 = ix1.clamp(ix0, tiles_x.saturating_sub(1));
@@ -1993,28 +1961,6 @@ impl C41Gui {
             tiles_fit: core_n <= PREVIEW_TILE_MAX,
             core_n,
         };
-        // #region agent log
-        let cache_coords: Vec<String> = entry
-            .tile_cache
-            .iter()
-            .map(|t| format!("{},{}", t.ix, t.iy))
-            .collect();
-        let sig = format!(
-            "g:{}:{}:{}:{}:{}:{}:{:.2}:{:.3}:{:.3}:{:.3}:{:.3}:{}",
-            grid.ix0, grid.iy0, grid.ix1, grid.iy1, grid.proxy_soft, grid.tiles_fit, zoom, uv_l, uv_t, uv_r, uv_b, cache_coords.len()
-        );
-        agent_dbg_changed(
-            &sig,
-            "B",
-            "c41_gui.rs:visible_tile_grid",
-            "grid+uv+cache",
-            &format!(
-                "{{\"runId\":\"post-fix\",\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{},\"proxy_soft\":{},\"tiles_fit\":{},\"core_n\":{},\"zoom\":{:.3},\"base_scale\":{:.3},\"ppx\":{:.3},\"uv\":[{:.4},{:.4},{:.4},{:.4}],\"ow\":{},\"oh\":{},\"cache_n\":{},\"cache\":\"{}\"}}",
-                grid.ix0, grid.iy0, grid.ix1, grid.iy1, grid.proxy_soft, grid.tiles_fit, grid.core_n, zoom, base_scale, base_scale * zoom,
-                uv_l, uv_t, uv_r, uv_b, ow, oh, cache_coords.len(), cache_coords.join(";")
-            ),
-        );
-        // #endregion
         Some(grid)
     }
 
@@ -2032,29 +1978,10 @@ impl C41Gui {
         let Some(grid) = self.visible_tile_grid(idx) else {
             return;
         };
-        let before = self.images[idx].tile_cache.len();
-        if !grid.tiles_fit {
-            // Cannot cover the view; drop the partial mosaic so the proxy shows.
-            self.images[idx].tile_cache.clear();
-        } else {
-            self.images[idx]
-                .tile_cache
-                .retain(|t| t.options_hash != grid.opt_hash || grid.contains(t.ix, t.iy));
-        }
-        let after = self.images[idx].tile_cache.len();
-        // #region agent log
-        if before != after {
-            agent_dbg(
-                "D",
-                "c41_gui.rs:drop_tiles_outside_view",
-                "dropped outside grid",
-                &format!(
-                    "{{\"runId\":\"post-fix\",\"before\":{},\"after\":{},\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{},\"tiles_fit\":{},\"core_n\":{}}}",
-                    before, after, grid.ix0, grid.iy0, grid.ix1, grid.iy1, grid.tiles_fit, grid.core_n
-                ),
-            );
-        }
-        // #endregion
+        // Keep on-screen tiles even when the core exceeds the cap.
+        self.images[idx]
+            .tile_cache
+            .retain(|t| t.options_hash != grid.opt_hash || grid.contains(t.ix, t.iy));
     }
 
     fn evict_tile_cache(&mut self, idx: usize) {
@@ -2085,37 +2012,12 @@ impl C41Gui {
     /// Next missing 1:1 tile, or None when the proxy is still sharp / view too large.
     fn visible_tile_to_request(&self, idx: usize) -> Option<(i32, i32)> {
         let grid = self.visible_tile_grid(idx)?;
-        if !grid.proxy_soft {
-            // #region agent log
-            agent_dbg_changed(
-                "req:not_soft",
-                "A",
-                "c41_gui.rs:visible_tile_to_request",
-                "skip not proxy_soft",
-                "{\"runId\":\"post-fix\",\"reason\":\"not_soft\"}",
-            );
-            // #endregion
-            return None;
-        }
-        if !grid.tiles_fit {
-            // #region agent log
-            agent_dbg_changed(
-                &format!("req:over:{}", grid.core_n),
-                "C",
-                "c41_gui.rs:visible_tile_to_request",
-                "skip core over cap",
-                &format!(
-                    "{{\"runId\":\"post-fix\",\"reason\":\"core_over_cap\",\"core_n\":{},\"limit\":{},\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{}}}",
-                    grid.core_n, PREVIEW_TILE_MAX, grid.ix0, grid.iy0, grid.ix1, grid.iy1
-                ),
-            );
-            // #endregion
+        if !grid.proxy_soft || !grid.tiles_fit {
             return None;
         }
         let entry = self.images.get(idx)?;
-        let limit = self.tile_cache_limit(idx);
-        // Scan missing core tiles first. Do not bail on cache_full before that —
-        // pad/off-screen tiles used to fill the cap and hide real edge misses.
+        // Scan missing core tiles first so off-screen cache entries cannot
+        // block fetching newly visible edges.
         let cx = (grid.ix0 + grid.ix1) as f32 * 0.5;
         let cy = (grid.iy0 + grid.iy1) as f32 * 0.5;
         let mut best: Option<(i32, i32, f32)> = None;
@@ -2144,32 +2046,7 @@ impl C41Gui {
                 }
             }
         }
-        let picked = best.map(|(ix, iy, _)| (ix, iy));
-        // #region agent log
-        if let Some((ix, iy)) = picked {
-            agent_dbg(
-                "E",
-                "c41_gui.rs:visible_tile_to_request",
-                "request missing",
-                &format!(
-                    "{{\"runId\":\"post-fix\",\"ix\":{},\"iy\":{},\"cache_n\":{},\"limit\":{},\"core_n\":{},\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{}}}",
-                    ix, iy, entry.tile_cache.len(), limit, grid.core_n, grid.ix0, grid.iy0, grid.ix1, grid.iy1
-                ),
-            );
-        } else {
-            agent_dbg_changed(
-                &format!("req:none:{}:{}:{}:{}:{}", grid.ix0, grid.iy0, grid.ix1, grid.iy1, entry.tile_cache.len()),
-                "C",
-                "c41_gui.rs:visible_tile_to_request",
-                "no missing in grid",
-                &format!(
-                    "{{\"runId\":\"post-fix\",\"reason\":\"all_present\",\"cache_n\":{},\"core_n\":{},\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{}}}",
-                    entry.tile_cache.len(), grid.core_n, grid.ix0, grid.iy0, grid.ix1, grid.iy1
-                ),
-            );
-        }
-        // #endregion
-        picked
+        best.map(|(ix, iy, _)| (ix, iy))
     }
 
     fn mark_preview_view_changed(&mut self) {
@@ -4456,30 +4333,23 @@ impl eframe::App for C41Gui {
                             let pointer_down = ui.input(|i| i.pointer.any_down());
                             let grid_now = self.visible_tile_grid(idx);
                             let proxy_soft = grid_now.as_ref().map(|g| g.proxy_soft).unwrap_or(false);
-                            let tiles_fit = grid_now.as_ref().map(|g| g.tiles_fit).unwrap_or(false);
+                            // Keep drawing cached tiles while the view settles so a
+                            // zoom-out does not flash back to the proxy. Fetch waits.
                             let hide_tiles = !proxy_soft
-                                || !tiles_fit
                                 || self.preview_options_dirty(idx)
                                 || pointer_down
                                 || self.preview_view_dragging
-                                || canvas_resp.dragged()
-                                || self.preview_view_settling();
+                                || canvas_resp.dragged();
                             if zoom > 1.0 && !hide_tiles {
                                 let opt_hash = self.images[idx].preview_options_hash;
                                 let grid = self.visible_tile_grid(idx);
-                                let mut drawn = 0u32;
-                                let mut skip_grid = 0u32;
-                                let mut skip_hash = 0u32;
                                 for tile in &self.images[idx].tile_cache {
                                     if tile.options_hash != opt_hash {
-                                        skip_hash += 1;
                                         continue;
                                     }
                                     if grid.as_ref().is_some_and(|g| !g.contains(tile.ix, tile.iy)) {
-                                        skip_grid += 1;
                                         continue;
                                     }
-                                    drawn += 1;
                                     let tile_rect = egui::Rect::from_min_max(
                                         egui::pos2(
                                             vir_rect.left() + tile.uv.min.x * img_w,
@@ -4518,41 +4388,6 @@ impl eframe::App for C41Gui {
                                         egui::Color32::WHITE,
                                     );
                                 }
-                                // #region agent log
-                                agent_dbg_changed(
-                                    &format!("draw:{drawn}:{skip_grid}:{skip_hash}:{}", self.images[idx].tile_cache.len()),
-                                    "D",
-                                    "c41_gui.rs:draw_tiles",
-                                    "draw vs skip",
-                                    &format!(
-                                        "{{\"drawn\":{},\"skip_grid\":{},\"skip_hash\":{},\"cache_n\":{},\"hide\":false}}",
-                                        drawn, skip_grid, skip_hash, self.images[idx].tile_cache.len()
-                                    ),
-                                );
-                                // #endregion
-                            } else if zoom > 1.0 {
-                                // #region agent log
-                                let reason = if !proxy_soft {
-                                    "not_soft"
-                                } else if !tiles_fit {
-                                    "core_over_cap"
-                                } else if self.preview_options_dirty(idx) {
-                                    "opts_dirty"
-                                } else if pointer_down || canvas_resp.dragged() || self.preview_view_dragging {
-                                    "pointer"
-                                } else if self.preview_view_settling() {
-                                    "settling"
-                                } else {
-                                    "other"
-                                };
-                                agent_dbg_changed(
-                                    &format!("hide:{reason}"),
-                                    "A",
-                                    "c41_gui.rs:draw_tiles",
-                                    "tiles hidden",
-                                    &format!("{{\"runId\":\"post-fix\",\"reason\":\"{reason}\",\"zoom\":{:.3}}}", zoom),
-                                );
-                                // #endregion
                             }
                         }
 
@@ -5580,8 +5415,7 @@ impl eframe::App for C41Gui {
                 }
                 let view_settling = self.preview_view_settling();
                 // 1:1 tiles: after pan/zoom/slider release, when the proxy is soft
-                // and the core view fits in the tile cap. Always drop first so a
-                // zoom-out that exceeds the cap clears the stale mosaic.
+                // and the core view fits in the tile cap.
                 if proxy_soft
                     && self.preview_receiver.is_none()
                     && self.tile_receiver.is_none()
@@ -5597,39 +5431,6 @@ impl eframe::App for C41Gui {
                     if let Some(missing) = self.visible_tile_to_request(idx) {
                         self.request_tile_for(idx, missing.0, missing.1, ctx);
                     }
-                } else {
-                    // #region agent log
-                    let reason = if !proxy_soft {
-                        "not_soft"
-                    } else if self.preview_receiver.is_some() {
-                        "preview_inflight"
-                    } else if self.tile_receiver.is_some() {
-                        "tile_inflight"
-                    } else if !have_current {
-                        "not_current"
-                    } else if self.full_res_preview_active {
-                        "full_res"
-                    } else if self.rect_dragging {
-                        "rect_drag"
-                    } else if self.preview_view_dragging {
-                        "view_drag"
-                    } else if view_settling {
-                        "settling"
-                    } else if need_options {
-                        "need_options"
-                    } else if pointer_down {
-                        "pointer"
-                    } else {
-                        "other"
-                    };
-                    agent_dbg_changed(
-                        &format!("gate:{reason}"),
-                        "A",
-                        "c41_gui.rs:tile_gate",
-                        "request gate blocked",
-                        &format!("{{\"reason\":\"{reason}\"}}"),
-                    );
-                    // #endregion
                 }
                 if self.tile_receiver.is_some() {
                     ctx.request_repaint();
