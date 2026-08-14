@@ -10,10 +10,16 @@ use ndarray::Array3;
 
 use crate::apply_rotation;
 use crate::{flip_array3_horizontal, flip_array3_vertical};
+use crate::color_space;
 use crate::demosaic;
+use crate::dmin;
+use crate::pipeline;
 use crate::png_reader;
 use crate::raw_reader;
 use crate::scale_dmin_rect;
+use crate::stats;
+use crate::DminMode;
+use crate::PipelineOptions;
 use crate::Rect;
 
 /// Raw sensor data cached for fast previews/exports.
@@ -150,4 +156,157 @@ pub fn compute_dmin_from_sensor(
     } else {
         Ok((med_r, med_g, med_b))
     }
+}
+
+/// Full-res D-min divisors and auto-WB scales, matching the export pipeline.
+/// Cached by the GUI so slider tweaks that do not affect these stats stay cheap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreviewSceneStats {
+    pub dmin: Option<(f32, f32, f32)>,
+    pub auto_wb: Option<(f32, f32, f32)>,
+}
+
+fn hash_f32(h: &mut impl std::hash::Hasher, v: f32) {
+    std::hash::Hash::hash(&v.to_bits(), h);
+}
+
+fn hash_rect(h: &mut impl std::hash::Hasher, r: &Rect) {
+    use std::hash::Hash;
+    r.x.hash(h);
+    r.y.hash(h);
+    r.width.hash(h);
+    r.height.hash(h);
+}
+
+/// Hash of options that change full-res D-min / auto-WB. Manual WB and curve are excluded.
+pub fn preview_scene_stats_key(opts: &PipelineOptions) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    opts.rotation_degrees.hash(&mut h);
+    opts.flip_horizontal.hash(&mut h);
+    opts.flip_vertical.hash(&mut h);
+    opts.synthetic_negative_input.hash(&mut h);
+    for row in &opts.idt_matrix {
+        for &v in row {
+            hash_f32(&mut h, v);
+        }
+    }
+    opts.dmin_mode.hash(&mut h);
+    hash_f32(&mut h, opts.auto_norm_buffer);
+    opts.dmin_neutral_only.hash(&mut h);
+    opts.dmin_rect_reference_size.hash(&mut h);
+    if let Some(r) = opts.dmin_rect {
+        hash_rect(&mut h, &r);
+    }
+    if let Some((r, g, b)) = opts.dmin_fixed {
+        hash_f32(&mut h, r);
+        hash_f32(&mut h, g);
+        hash_f32(&mut h, b);
+    }
+    opts.auto_wb.hash(&mut h);
+    opts.apply_crop.hash(&mut h);
+    opts.crop_rect_reference_size.hash(&mut h);
+    if let Some(r) = opts.crop_rect {
+        hash_rect(&mut h, &r);
+    }
+    opts.flat_field_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .hash(&mut h);
+    h.finish()
+}
+
+fn sensor_to_working_rgb(
+    sensor: &CachedSensor,
+    options: &PipelineOptions,
+) -> Result<Array3<f32>> {
+    let mut rgb: Array3<f32> = match sensor {
+        CachedSensor::Bayer { data, pattern } => {
+            let mut img = demosaic::demosaic_quality(data, *pattern)?;
+            img.mapv_inplace(|v| v.max(0.0));
+            img
+        }
+        CachedSensor::Rgb(image) => {
+            let mut img = image.clone();
+            if options.synthetic_negative_input {
+                pipeline::apply_synthetic_negative_invert(&mut img);
+            }
+            img
+        }
+    };
+
+    if options.rotation_degrees != 0 {
+        rgb = apply_rotation(&rgb, options.rotation_degrees);
+    }
+    if options.flip_horizontal {
+        rgb = flip_array3_horizontal(&rgb);
+    }
+    if options.flip_vertical {
+        rgb = flip_array3_vertical(&rgb);
+    }
+    color_space::apply_input_idt_to_working_space(&mut rgb, &options.idt_matrix);
+    Ok(rgb)
+}
+
+/// Compute export-matching D-min and auto-WB from the full-resolution cached sensor.
+///
+/// Preview runs on a downscaled buffer, so AutoPercentile / auto WB on that buffer
+/// diverge from export. Pin those global stats to the full frame instead.
+pub fn compute_preview_scene_stats(
+    sensor: &CachedSensor,
+    options: &PipelineOptions,
+) -> Result<PreviewSceneStats> {
+    if options.flat_field_path.is_some() {
+        return Ok(PreviewSceneStats {
+            dmin: None,
+            auto_wb: None,
+        });
+    }
+
+    let mut rgb = sensor_to_working_rgb(sensor, options)?;
+
+    let dmin = match options.dmin_mode {
+        DminMode::Off => None,
+        DminMode::Fixed => options.dmin_fixed,
+        DminMode::AutoPercentile => {
+            Some(dmin::compute_auto_percentile_divisors(&rgb, options.auto_norm_buffer)?)
+        }
+        DminMode::SampleRegion => {
+            if let Some(rect) = options.dmin_rect {
+                let (h, w, _) = rgb.dim();
+                let (x, y, rw, rh) =
+                    scale_dmin_rect(rect, options.dmin_rect_reference_size, w as u32, h as u32);
+                Some(dmin::compute_neutralize_divisors(
+                    &rgb,
+                    x,
+                    y,
+                    rw,
+                    rh,
+                    options.dmin_neutral_only,
+                )?)
+            } else {
+                None
+            }
+        }
+    };
+
+    let auto_wb = if options.auto_wb && options.dmin_mode != DminMode::Off {
+        if let Some((dr, dg, db)) = dmin {
+            dmin::neutralize_with_medians(&mut rgb, dr, dg, db)?;
+            rgb.mapv_inplace(|v| v.max(0.0));
+            rgb.mapv_inplace(|t| (-(t.max(1e-10_f32)).log10()).max(0.0));
+            let stats = stats::wb_channel_stats(&rgb, options);
+            let med_r = stats[0].2.max(1e-4);
+            let med_g = stats[1].2.max(1e-4);
+            let med_b = stats[2].2.max(1e-4);
+            let mean_d = (med_r + med_g + med_b) / 3.0;
+            Some((mean_d / med_r, mean_d / med_g, mean_d / med_b))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(PreviewSceneStats { dmin, auto_wb })
 }

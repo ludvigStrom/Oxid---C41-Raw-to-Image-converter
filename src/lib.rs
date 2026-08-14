@@ -39,7 +39,10 @@ pub mod tiff_export;
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{DminMode, OutputLutEncoding, OutputStage, PipelineOptions, Rect, WbMode};
 pub use pipeline_cache::{PreviewStepCache, hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5};
-pub use sensor::{compute_dmin_from_sensor, load_sensor_from_path, CachedSensor};
+pub use sensor::{
+    compute_dmin_from_sensor, compute_preview_scene_stats, load_sensor_from_path,
+    preview_scene_stats_key, CachedSensor, PreviewSceneStats,
+};
 pub use tiff_export::TiffFormat;
 
 use crate::demosaic::CfaPattern;

@@ -31,8 +31,10 @@ use c41_raw_tool::{
     DminMode,
     WbMode,
     CachedSensor,
+    PreviewSceneStats,
     load_sensor_from_path,
-    compute_dmin_from_sensor,
+    compute_preview_scene_stats,
+    preview_scene_stats_key,
 };
 #[cfg(feature = "gpu")]
 use c41_raw_tool::process_one_to_preview_with_cache_gpu;
@@ -135,6 +137,8 @@ struct ImageEntry {
     pipeline_debug_log: Option<String>,
     /// Cached full-resolution sensor data (Bayer or RGB) for fast previews/exports.
     cached_sensor: Option<Arc<CachedSensor>>,
+    /// Full-res D-min / auto-WB pinned to export, keyed by `preview_scene_stats_key`.
+    scene_stats: Option<(u64, PreviewSceneStats)>,
     /// Step cache for preview: reuse pipeline stages when only later options change.
     preview_step_cache: Option<PreviewStepCache>,
     /// Process tab (Input/Develop/Export) — persists per image when switching.
@@ -1515,19 +1519,31 @@ impl C41Gui {
         let mut options = entry.options.clone();
         options.flat_field_path = self.flat_field_path.clone();
 
-        // If D-min uses a rectangle, recompute fixed medians from full-res sensor.
-        if options.dmin_mode == DminMode::SampleRegion {
-            if let (Some(rect), Some(sensor)) = (options.dmin_rect, entry.cached_sensor.as_ref()) {
-                if let Ok((r, g, b)) = compute_dmin_from_sensor(
-                    sensor.as_ref(),
-                    rect,
-                    options.dmin_rect_reference_size,
-                    options.rotation_degrees,
-                    options.flip_horizontal,
-                    options.flip_vertical,
-                    options.dmin_neutral_only,
-                ) {
-                    options.dmin_fixed = Some((r, g, b));
+        // Pin D-min and auto WB to full-res export stats. The working preview is
+        // downscaled, so computing those on the proxy makes the image warmer.
+        // Full-res preview already matches export, so leave its options alone.
+        if !self.full_res_preview_active {
+            let key = preview_scene_stats_key(&options);
+            let stale = entry.scene_stats.as_ref().map(|(k, _)| *k) != Some(key);
+            if stale {
+                if let Some(sensor) = entry.cached_sensor.clone() {
+                    match compute_preview_scene_stats(sensor.as_ref(), &options) {
+                        Ok(stats) => entry.scene_stats = Some((key, stats)),
+                        Err(_) => entry.scene_stats = None,
+                    }
+                }
+            }
+            if let Some((_, stats)) = entry.scene_stats {
+                if let Some(dmin) = stats.dmin {
+                    options.dmin_mode = DminMode::Fixed;
+                    options.dmin_fixed = Some(dmin);
+                }
+                if let Some((ar, ag, ab)) = stats.auto_wb {
+                    options.auto_wb = false;
+                    options.apply_white_balance = true;
+                    options.wb_r *= ar;
+                    options.wb_g *= ag;
+                    options.wb_b *= ab;
                 }
             }
         }
@@ -1837,6 +1853,7 @@ impl eframe::App for C41Gui {
                                             raw_debug_report: None,
                                             pipeline_debug_log: None,
                                             cached_sensor: None,
+                                            scene_stats: None,
                                             preview_step_cache: None,
                                             process_tab: ProcessTab::Input,
                                         });
