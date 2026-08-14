@@ -611,6 +611,7 @@ fn default_options() -> PipelineOptions {
         bujack_strength: 0.6,
         bujack_radius: 16.0,
         bujack_edge: 0.25,
+        pinned_zone: None,
     }
 }
 
@@ -1635,6 +1636,7 @@ impl C41Gui {
                     options.wb_g *= ag;
                     options.wb_b *= ab;
                 }
+                options.pinned_zone = stats.zone;
             }
         }
         options
@@ -1764,6 +1766,9 @@ impl C41Gui {
         ctx: &egui::Context,
     ) {
         if !self.ensure_sensor_and_scene_stats(index) {
+            return;
+        }
+        if !self.full_res_preview_active && self.images[index].scene_stats.is_none() {
             return;
         }
         let path = self.images[index].path.clone();
@@ -5325,7 +5330,6 @@ impl eframe::App for C41Gui {
                     && (lod == PreviewLod::Draft
                         || (lod == PreviewLod::Screen
                             && (req_sw + 64 < screen_w || req_sh + 64 < screen_h)));
-                let screen_fits_draft = screen_w <= PREVIEW_DRAFT_MAX && screen_h <= PREVIEW_DRAFT_MAX;
 
                 if need_options {
                     let now = Instant::now();
@@ -5360,10 +5364,9 @@ impl eframe::App for C41Gui {
                             PreviewLod::FullRes
                         } else if slider_dragging {
                             PreviewLod::Draft
-                        } else if screen_fits_draft {
-                            PreviewLod::Screen
                         } else {
-                            PreviewLod::Draft
+                            // Fit / settled view: screen-res proxy (2× demosaic + filter).
+                            PreviewLod::Screen
                         };
                         self.request_preview_for(idx, ctx, lod);
                         self.full_res_preview_button_clicked = false;

@@ -298,6 +298,7 @@ pub fn step_5_calibration(
     image.mapv_inplace(|v| v.max(0.0));
     crate::density_ops::limit_highlight_density_spread(image);
 
+    let pinned_zone = Some(crate::density_ops::zone_range_for_options(image, options));
     crate::density_ops::apply_zone_density_saturation(
         image,
         options.curve_offset,
@@ -305,6 +306,7 @@ pub fn step_5_calibration(
         options.zone_shadow_saturation,
         options.zone_mid_saturation,
         options.zone_highlight_saturation,
+        pinned_zone,
     );
     crate::density_ops::apply_zone_density_adjustments(
         image,
@@ -329,6 +331,7 @@ pub fn step_5_calibration(
             options.color_highlight_gain_g,
             options.color_highlight_gain_b,
         ],
+        pinned_zone,
     );
     crate::density_ops::apply_reinhard_highlight_rolloff(
         image,

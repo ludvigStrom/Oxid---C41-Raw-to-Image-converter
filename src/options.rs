@@ -260,6 +260,9 @@ pub struct PipelineOptions {
     pub bujack_radius: f32,
     /// Bilateral range σ in OkLab. Low keeps edges out of the base (less halo).
     pub bujack_edge: f32,
+    /// When set, zone masks use these full-frame percentiles (d_min, p33, p66, d_max)
+    /// at curve_offset 0 instead of measuring the current buffer. Preview/tiles only.
+    pub pinned_zone: Option<(f32, f32, f32, f32)>,
 }
 
 impl Default for PipelineOptions {
@@ -363,6 +366,7 @@ impl Default for PipelineOptions {
             bujack_strength: 0.6,
             bujack_radius: 16.0,
             bujack_edge: 0.25,
+            pinned_zone: None,
         }
     }
 }

@@ -179,7 +179,7 @@ impl Step5Pipeline {
             None => (0u32, 1u32, 1.0f32),
         };
 
-        let zp = crate::density_ops::zone_density_range(image, options.curve_offset);
+        let zp = crate::density_ops::zone_range_for_options(image, options);
 
         let params = Step5Params {
             width: width as u32,

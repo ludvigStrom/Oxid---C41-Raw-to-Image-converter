@@ -163,7 +163,9 @@ impl GpuPipeline {
             // Compute zone density range from input image. When start_step == 4 the
             // image is still transmittance; we approximate density as -log10(T)*inv_gamma
             // (ignoring WB, which is fine for a range estimate).
-            let zp = if start_step >= 5 {
+            let zp = if options.pinned_zone.is_some() {
+                crate::density_ops::zone_range_for_options(image, options)
+            } else if start_step >= 5 {
                 crate::density_ops::zone_density_range(image, options.curve_offset)
             } else {
                 crate::density_ops::zone_density_range_from_transmittance(image, options)

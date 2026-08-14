@@ -164,6 +164,8 @@ pub fn compute_dmin_from_sensor(
 pub struct PreviewSceneStats {
     pub dmin: Option<(f32, f32, f32)>,
     pub auto_wb: Option<(f32, f32, f32)>,
+    /// Zone percentiles of post-step-4 density at curve_offset 0.
+    pub zone: Option<(f32, f32, f32, f32)>,
 }
 
 fn hash_f32(h: &mut impl std::hash::Hasher, v: f32) {
@@ -204,6 +206,13 @@ pub fn preview_scene_stats_key(opts: &PipelineOptions) -> u64 {
         hash_f32(&mut h, b);
     }
     opts.auto_wb.hash(&mut h);
+    hash_f32(&mut h, opts.film_gamma);
+    opts.apply_color_profile.hash(&mut h);
+    for row in &opts.density_matrix {
+        for &v in row {
+            hash_f32(&mut h, v);
+        }
+    }
     // Crop is display/histogram/export only — it must not remosaic the full sensor.
     opts.flat_field_path
         .as_ref()
@@ -256,6 +265,7 @@ pub fn compute_preview_scene_stats(
         return Ok(PreviewSceneStats {
             dmin: None,
             auto_wb: None,
+            zone: None,
         });
     }
 
@@ -304,7 +314,48 @@ pub fn compute_preview_scene_stats(
         None
     };
 
-    Ok(PreviewSceneStats { dmin, auto_wb })
+    // Match step 4 so zone masks are the same on every tile.
+    if let Some((dr, dg, db)) = dmin {
+        if auto_wb.is_none() {
+            dmin::neutralize_with_medians(&mut rgb, dr, dg, db)?;
+            rgb.mapv_inplace(|v| v.max(0.0));
+        }
+    }
+    if auto_wb.is_none() {
+        rgb.mapv_inplace(|t| (-(t.max(1e-10_f32)).log10()).max(0.0));
+    }
+    let (ar, ag, ab) = auto_wb.unwrap_or((1.0, 1.0, 1.0));
+    let inv_gamma = 1.0 / options.film_gamma.max(0.1);
+    let (mr, mg, mb) = if options.apply_white_balance {
+        (options.wb_r, options.wb_g, options.wb_b)
+    } else {
+        (1.0, 1.0, 1.0)
+    };
+    let s_r = ar * mr * inv_gamma;
+    let s_g = ag * mg * inv_gamma;
+    let s_b = ab * mb * inv_gamma;
+    rgb.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * s_r);
+    rgb.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * s_g);
+    rgb.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * s_b);
+    if options.apply_color_profile {
+        let m = options.density_matrix;
+        let (h, w, _) = rgb.dim();
+        for y in 0..h {
+            for x in 0..w {
+                let dr = rgb[[y, x, 0]];
+                let dg = rgb[[y, x, 1]];
+                let db = rgb[[y, x, 2]];
+                rgb[[y, x, 0]] = m[0][0] * dr + m[0][1] * dg + m[0][2] * db;
+                rgb[[y, x, 1]] = m[1][0] * dr + m[1][1] * dg + m[1][2] * db;
+                rgb[[y, x, 2]] = m[2][0] * dr + m[2][1] * dg + m[2][2] * db;
+            }
+        }
+        rgb.mapv_inplace(|v| v.max(0.0));
+    }
+    let zp = crate::density_ops::zone_density_range(&rgb, 0.0);
+    let zone = Some((zp.d_min, zp.d_p33, zp.d_p66, zp.d_max));
+
+    Ok(PreviewSceneStats { dmin, auto_wb, zone })
 }
 
 impl CachedSensor {

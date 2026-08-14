@@ -111,36 +111,7 @@ fn rotate_array3_90_cw(image: &Array3<f32>) -> Array3<f32> {
 /// Downsample a single-channel X-Trans array for preview, preserving the 6×6
 /// tile period so the CFA pattern survives the downscale intact.
 fn downsample_xtrans_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f32> {
-    let (h, w, c) = bayer.dim();
-    assert_eq!(c, 1, "Expected single-channel CFA for preview");
-
-    if w as u32 <= max_width {
-        return bayer.clone();
-    }
-
-    let n_super_w = w / 6;
-    let n_super_h = h / 6;
-    let max_super_w = (max_width as usize / 6).max(1);
-    let step = ((n_super_w as f32 / max_super_w as f32).ceil() as usize).max(1);
-
-    let out_super_w = n_super_w / step;
-    let out_super_h = n_super_h / step;
-    let out_w = out_super_w * 6;
-    let out_h = out_super_h * 6;
-
-    let mut out = Array3::<f32>::zeros((out_h, out_w, 1));
-    for sy in 0..out_super_h {
-        for sx in 0..out_super_w {
-            let src_sy = sy * step * 6;
-            let src_sx = sx * step * 6;
-            for dy in 0..6 {
-                for dx in 0..6 {
-                    out[(sy * 6 + dy, sx * 6 + dx, 0)] = bayer[(src_sy + dy, src_sx + dx, 0)];
-                }
-            }
-        }
-    }
-    out
+    downsample_cfa_box(bayer, max_width, 6)
 }
 
 /// Dispatch to the correct CFA-aware preview downsampler.
@@ -199,48 +170,73 @@ pub(crate) fn apply_rotation(image: &Array3<f32>, rotation_degrees: i32) -> Arra
     }
 }
 
-/// Downsample a single-channel Bayer array for preview, preserving the 2×2
-/// RGGB pattern so demosaic can produce real color.
+/// Box-filter a CFA mosaic down to `max_width`, keeping the `period`×`period`
+/// pattern intact (2 for Bayer, 6 for X-Trans).
 ///
-/// Strides through 2×2 super-pixels and copies each block intact.
-/// Old code sampled every Nth pixel with N even, which always landed on the
-/// same Bayer position (e.g. all R) → grayscale after demosaic.
-fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f32> {
+/// Same-phase photosites in each `step`×`step` block of tiles are averaged so
+/// the reduced preview is not a nearest-neighbor skip (which aliases badly
+/// next to 1:1 tiles).
+fn downsample_cfa_box(bayer: &Array3<f32>, max_width: u32, period: usize) -> Array3<f32> {
     let (h, w, c) = bayer.dim();
-    assert_eq!(c, 1, "Expected single-channel Bayer for preview");
+    assert_eq!(c, 1, "Expected single-channel CFA for preview");
+    assert!(period > 0);
 
-    let w_u32 = w as u32;
-    if w_u32 <= max_width {
+    if w as u32 <= max_width {
         return bayer.clone();
     }
 
-    let n_super_w = w / 2;
-    let n_super_h = h / 2;
-    let max_super_w = (max_width as usize / 2).max(1);
-
-    let step = (n_super_w as f32 / max_super_w as f32).ceil().max(1.0) as usize;
-
+    let n_super_w = w / period;
+    let n_super_h = h / period;
+    let max_super_w = (max_width as usize / period).max(1);
+    let step = ((n_super_w as f32 / max_super_w as f32).ceil() as usize).max(1);
     let out_super_w = n_super_w / step;
     let out_super_h = n_super_h / step;
-    let out_w = out_super_w * 2;
-    let out_h = out_super_h * 2;
-
+    let out_w = out_super_w * period;
+    let out_h = out_super_h * period;
     let mut out = Array3::<f32>::zeros((out_h, out_w, 1));
 
     for sy in 0..out_super_h {
         for sx in 0..out_super_w {
-            let src_sy = sy * step * 2;
-            let src_sx = sx * step * 2;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    out[(sy * 2 + dy, sx * 2 + dx, 0)] =
-                        bayer[(src_sy + dy, src_sx + dx, 0)];
+            for dy in 0..period {
+                for dx in 0..period {
+                    let mut acc = 0.0f32;
+                    let mut n = 0.0f32;
+                    for iy in 0..step {
+                        for ix in 0..step {
+                            let y = sy * step * period + iy * period + dy;
+                            let x = sx * step * period + ix * period + dx;
+                            if y < h && x < w {
+                                acc += bayer[(y, x, 0)];
+                                n += 1.0;
+                            }
+                        }
+                    }
+                    out[(sy * period + dy, sx * period + dx, 0)] =
+                        if n > 0.0 { acc / n } else { 0.0 };
                 }
             }
         }
     }
-
     out
+}
+
+/// Downsample a single-channel Bayer array for preview, preserving the 2×2
+/// RGGB pattern so demosaic can produce real color.
+fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f32> {
+    downsample_cfa_box(bayer, max_width, 2)
+}
+
+/// Mosaic working width. Full-res / 1:1 tiles pass `u32::MAX`.
+fn preview_mosaic_working_width(max_width: u32) -> u32 {
+    max_width
+}
+
+fn finish_preview_rgb(img: Array3<f32>, max_width: u32, max_height: u32) -> Array3<f32> {
+    if max_width == u32::MAX && max_height == u32::MAX {
+        img
+    } else {
+        downsample_rgb_for_preview(&img, max_width, max_height)
+    }
 }
 
 /// Downsample an RGB image for preview to fit within `max_width`×`max_height`,
@@ -275,7 +271,7 @@ fn downsample_rgb_for_preview(
         }
     }
 
-    let resized = imageops::resize(&img, new_w, new_h, FilterType::CatmullRom);
+    let resized = imageops::resize(&img, new_w, new_h, FilterType::Triangle);
 
     let mut out = Array3::<f32>::zeros((new_h as usize, new_w as usize, 3));
     for (x, y, pixel) in resized.enumerate_pixels() {
@@ -500,14 +496,18 @@ pub fn process_one_to_preview(
             let (bh, bw, _) = bayer.dim();
             true_src_w = bw as u32;
             true_src_h = bh as u32;
-            let small_bayer = downsample_raw_for_preview(&bayer, pattern, max_width);
+            let small_bayer = downsample_raw_for_preview(
+                &bayer,
+                pattern,
+                preview_mosaic_working_width(max_width),
+            );
             let mut img = if options.debug_preview_simple_debayer {
                 demosaic::demosaic_bilinear(&small_bayer, pattern)?
             } else {
                 demosaic::demosaic_quality(&small_bayer, pattern)?
             };
             img.mapv_inplace(|v| v.max(0.0));
-            img
+            finish_preview_rgb(img, max_width, max_height)
         }
         "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
             let mut img = png_reader::load_png_as_ndarray(path)?;
@@ -1083,9 +1083,13 @@ fn load_preview_from_sensor<D: DemosaicBackend>(
     match sensor {
         CachedSensor::Bayer { data, pattern } => {
             let (bh, bw, _) = data.dim();
-            let small_bayer = downsample_raw_for_preview(data, *pattern, max_width);
+            let small_bayer = downsample_raw_for_preview(
+                data,
+                *pattern,
+                preview_mosaic_working_width(max_width),
+            );
             let img = demosaic_backend.demosaic(&small_bayer, *pattern)?;
-            Ok((img, bw as u32, bh as u32))
+            Ok((finish_preview_rgb(img, max_width, max_height), bw as u32, bh as u32))
         }
         CachedSensor::Rgb(img) => {
             let mut img = img.clone();
@@ -1124,9 +1128,13 @@ fn load_and_demosaic_preview<D: DemosaicBackend>(
             let (bh, bw, _) = bayer.dim();
             true_src_w = bw as u32;
             true_src_h = bh as u32;
-            let small_bayer = downsample_raw_for_preview(&bayer, pattern, max_width);
+            let small_bayer = downsample_raw_for_preview(
+                &bayer,
+                pattern,
+                preview_mosaic_working_width(max_width),
+            );
             let img = demosaic_backend.demosaic(&small_bayer, pattern)?;
-            img
+            finish_preview_rgb(img, max_width, max_height)
         }
         "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
             let mut img = png_reader::load_png_as_ndarray(path)?;

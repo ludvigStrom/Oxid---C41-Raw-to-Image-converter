@@ -117,6 +117,7 @@ pub(crate) fn apply_zone_density_saturation(
     zone_shadow_saturation: f32,
     zone_mid_saturation: f32,
     zone_highlight_saturation: f32,
+    pinned_zone: Option<ZonePercentiles>,
 ) {
     let zone_sat_identity = (zone_shadow_saturation - 1.0).abs() < 1e-6
         && (zone_mid_saturation - 1.0).abs() < 1e-6
@@ -127,7 +128,7 @@ pub(crate) fn apply_zone_density_saturation(
     }
 
     let (h, w, _) = image.dim();
-    let zp = zone_density_range(image, curve_offset);
+    let zp = pinned_zone.unwrap_or_else(|| zone_density_range(image, curve_offset));
 
     let gap_low = (zp.d_p33 - zp.d_min).max(0.01);
     let gap_high = (zp.d_max - zp.d_p66).max(0.01);
@@ -283,6 +284,24 @@ pub(crate) fn zone_density_range(image: &Array3<f32>, curve_offset: f32) -> Zone
     }
 }
 
+/// Zone range for the current buffer, or full-frame pins from preview options.
+pub(crate) fn zone_range_for_options(
+    image: &Array3<f32>,
+    options: &crate::PipelineOptions,
+) -> ZonePercentiles {
+    if let Some((d_min, d_p33, d_p66, d_max)) = options.pinned_zone {
+        let o = options.curve_offset;
+        ZonePercentiles {
+            d_min: d_min + o,
+            d_p33: d_p33 + o,
+            d_p66: d_p66 + o,
+            d_max: d_max + o,
+        }
+    } else {
+        zone_density_range(image, options.curve_offset)
+    }
+}
+
 /// Estimate zone percentiles from a transmittance image (step-4 input).
 /// Approximates density as −log10(T) × inv_gamma, ignoring per-channel WB.
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
@@ -354,6 +373,7 @@ pub(crate) fn apply_zone_density_adjustments(
     color_shadow_gain: [f32; 3],
     color_mid_gain: [f32; 3],
     color_highlight_gain: [f32; 3],
+    pinned_zone: Option<ZonePercentiles>,
 ) {
     let gains_zero = zone_shadow_gain.abs() < 1e-6
         && zone_mid_gain.abs() < 1e-6
@@ -367,7 +387,7 @@ pub(crate) fn apply_zone_density_adjustments(
     }
     let (h, w, _) = image.dim();
 
-    let zp = zone_density_range(image, curve_offset);
+    let zp = pinned_zone.unwrap_or_else(|| zone_density_range(image, curve_offset));
 
     // Transition half-width: 30% of the gap between crossover percentiles,
     // so the two smoothstep transitions never overlap.
