@@ -296,6 +296,27 @@ fn sample_density_to_u16(d: f32, pipeline: &CurvePipeline) -> u16 {
     pipeline.d_to_u16_lut[idx]
 }
 
+/// Density → linear print reflectance (unquantized RA-4). Used for ACES/EXR export
+/// so archival linear files are print-referred, not raw density treated as ACEScg.
+pub fn apply_ra4_from_density_f32(
+    density_image: &Array3<f32>,
+    params: PrintCurveParams,
+    d_max: f32,
+) -> Array3<f32> {
+    let (h, w, c) = density_image.dim();
+    assert_eq!(c, 3, "Expected 3-channel RGB image");
+    let mut out = Array3::<f32>::zeros((h, w, c));
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..3 {
+                let d = density_image[[y, x, ch]].clamp(0.0, d_max);
+                out[[y, x, ch]] = density_to_ra4(d, &params);
+            }
+        }
+    }
+    out
+}
+
 /// Apply RA-4 curve from density input (T→D and matrix/WB already applied upstream).
 ///
 /// `density_image` is in density domain (H, W, 3): D=0 is film base, higher D = more dye.

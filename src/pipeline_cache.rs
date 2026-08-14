@@ -41,9 +41,15 @@ pub fn hash_after_load(path: &Path, opts: &PipelineOptions, max_width: u32, max_
     opts.rotation_degrees.hash(&mut h);
     opts.flip_horizontal.hash(&mut h);
     opts.flip_vertical.hash(&mut h);
+    opts.synthetic_negative_input.hash(&mut h);
     max_width.hash(&mut h);
     max_height.hash(&mut h);
     opts.debug_preview_simple_debayer.hash(&mut h);
+    for row in &opts.idt_matrix {
+        for &v in row {
+            hash_f32(&mut h, v);
+        }
+    }
     h.finish()
 }
 

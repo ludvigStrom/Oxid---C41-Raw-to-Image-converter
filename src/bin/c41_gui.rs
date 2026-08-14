@@ -428,6 +428,11 @@ fn default_options() -> PipelineOptions {
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 1.0],
         ],
+        idt_matrix: [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
         flat_field_path: None,
         export_aces_exr: false,
         write_aces2065_only: false,
@@ -477,6 +482,7 @@ fn default_options() -> PipelineOptions {
         rotation_degrees: 0,
         flip_horizontal: false,
         flip_vertical: false,
+        synthetic_negative_input: false,
         debug_pipeline_step: 6,
         debug_preview_simple_debayer: false,
         verbose_debug: false,
@@ -512,6 +518,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.temp_k.map(|k| k.to_bits()).hash(&mut h);
     opts.no_curve.hash(&mut h);
     opts.no_invert.hash(&mut h);
+    opts.synthetic_negative_input.hash(&mut h);
     opts.curve_offset.to_bits().hash(&mut h);
     opts.curve_gamma.to_bits().hash(&mut h);
     opts.curve_pivot.to_bits().hash(&mut h);
@@ -521,6 +528,11 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.write_jpeg.hash(&mut h);
     opts.write_jpeg_only.hash(&mut h);
     for row in &opts.density_matrix {
+        for v in row {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    for row in &opts.idt_matrix {
         for v in row {
             v.to_bits().hash(&mut h);
         }
@@ -2522,6 +2534,15 @@ impl eframe::App for C41Gui {
                   } // end Develop tab guard (groups 1-4)
 
                   if !in_process || entry.process_tab == ProcessTab::Input {
+                    // ════════════════════════════════════════════════════════
+                    // Input — Synthetic negative (PNG/TIFF only)
+                    // ════════════════════════════════════════════════════════
+                        ui.checkbox(
+                            &mut opts.synthetic_negative_input,
+                            "Synthetic negative (invert before T→D)",
+                        )
+                        .on_hover_text("For PNG/TIFF: invert (T=1−V) before T→D. Use when input is a synthetic negative (positive+orange) rather than camera scan.");
+                        ui.add_space(4.0);
                     // ════════════════════════════════════════════════════════
                     // Input — Crop
                     // ════════════════════════════════════════════════════════

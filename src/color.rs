@@ -184,7 +184,11 @@ fn lab_to_xyz(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
 /// Apply Lab-space separation on an f32 RGB image in [0, 1]. Strength is
 /// typically 0.0–1.0. Neutrals (low chroma) are largely preserved; mid-chroma
 /// colors are pushed outward in the a/b plane to increase separation.
-pub(crate) fn apply_lab_separation_f32(image: &mut Array3<f32>, strength: f32) {
+///
+/// `encoded_srgb`: RA-4 / FilmPrint output is **linear** (`false`). Lut2383 Rec.709
+/// code values are already OETF-encoded (`true`). Decoding linear as sRGB was
+/// shifting hues toward magenta.
+pub(crate) fn apply_lab_separation_f32(image: &mut Array3<f32>, strength: f32, encoded_srgb: bool) {
     if strength.abs() < 1e-6 {
         return;
     }
@@ -198,9 +202,9 @@ pub(crate) fn apply_lab_separation_f32(image: &mut Array3<f32>, strength: f32) {
             let sg = image[[y, x, 1]].clamp(0.0, 1.0);
             let sb = image[[y, x, 2]].clamp(0.0, 1.0);
 
-            let r_lin = srgb_to_linear(sr);
-            let g_lin = srgb_to_linear(sg);
-            let b_lin = srgb_to_linear(sb);
+            let r_lin = if encoded_srgb { srgb_to_linear(sr) } else { sr };
+            let g_lin = if encoded_srgb { srgb_to_linear(sg) } else { sg };
+            let b_lin = if encoded_srgb { srgb_to_linear(sb) } else { sb };
 
             let (xv, yv, zv) = rgb_linear_to_xyz(r_lin, g_lin, b_lin);
             let (l, a, b) = xyz_to_lab(xv, yv, zv);
@@ -224,15 +228,29 @@ pub(crate) fn apply_lab_separation_f32(image: &mut Array3<f32>, strength: f32) {
             let (x2, y2, z2) = lab_to_xyz(l, a2, b2);
             let (r_lin2, g_lin2, b_lin2) = xyz_to_rgb_linear(x2, y2, z2);
 
-            image[[y, x, 0]] = linear_to_srgb(r_lin2).clamp(0.0, 1.0);
-            image[[y, x, 1]] = linear_to_srgb(g_lin2).clamp(0.0, 1.0);
-            image[[y, x, 2]] = linear_to_srgb(b_lin2).clamp(0.0, 1.0);
+            let (r_out, g_out, b_out) = if encoded_srgb {
+                (
+                    linear_to_srgb(r_lin2).clamp(0.0, 1.0),
+                    linear_to_srgb(g_lin2).clamp(0.0, 1.0),
+                    linear_to_srgb(b_lin2).clamp(0.0, 1.0),
+                )
+            } else {
+                (
+                    r_lin2.clamp(0.0, 1.0),
+                    g_lin2.clamp(0.0, 1.0),
+                    b_lin2.clamp(0.0, 1.0),
+                )
+            };
+            image[[y, x, 0]] = r_out;
+            image[[y, x, 1]] = g_out;
+            image[[y, x, 2]] = b_out;
         }
     }
 }
 
 /// Apply Lab separation to a u16 RGB image (0–65535) in-place by converting
 /// to f32, running `apply_lab_separation_f32`, then quantizing back.
+/// RA-4 / FilmPrint u16 is linear print RGB.
 pub(crate) fn apply_lab_separation_u16(image: &mut Array3<u16>, strength: f32) {
     if strength.abs() < 1e-6 {
         return;
@@ -251,7 +269,7 @@ pub(crate) fn apply_lab_separation_u16(image: &mut Array3<u16>, strength: f32) {
         }
     }
 
-    apply_lab_separation_f32(&mut fimg, strength);
+    apply_lab_separation_f32(&mut fimg, strength, false);
 
     // Quantize back.
     for y in 0..h {
@@ -266,7 +284,7 @@ pub(crate) fn apply_lab_separation_u16(image: &mut Array3<u16>, strength: f32) {
 /// Rotate magenta/red hues in LAB toward orange to correct scanner cast in lips
 /// and eye areas. Strength 0 = off; 0.3–0.8 typical. Uses hue mask (-45° to 60°)
 /// and optional luminance gate (L 20–80) for skin-like regions.
-pub(crate) fn apply_skin_magenta_shift_f32(image: &mut Array3<f32>, strength: f32) {
+pub(crate) fn apply_skin_magenta_shift_f32(image: &mut Array3<f32>, strength: f32, encoded_srgb: bool) {
     if strength.abs() < 1e-6 {
         return;
     }
@@ -296,9 +314,9 @@ pub(crate) fn apply_skin_magenta_shift_f32(image: &mut Array3<f32>, strength: f3
             let sg = image[[y, x, 1]].clamp(0.0, 1.0);
             let sb = image[[y, x, 2]].clamp(0.0, 1.0);
 
-            let r_lin = srgb_to_linear(sr);
-            let g_lin = srgb_to_linear(sg);
-            let b_lin = srgb_to_linear(sb);
+            let r_lin = if encoded_srgb { srgb_to_linear(sr) } else { sr };
+            let g_lin = if encoded_srgb { srgb_to_linear(sg) } else { sg };
+            let b_lin = if encoded_srgb { srgb_to_linear(sb) } else { sb };
 
             let (xv, yv, zv) = rgb_linear_to_xyz(r_lin, g_lin, b_lin);
             let (l, a, b) = xyz_to_lab(xv, yv, zv);
@@ -327,9 +345,22 @@ pub(crate) fn apply_skin_magenta_shift_f32(image: &mut Array3<f32>, strength: f3
             let (x2, y2, z2) = lab_to_xyz(l, a2, b2);
             let (r_lin2, g_lin2, b_lin2) = xyz_to_rgb_linear(x2, y2, z2);
 
-            image[[y, x, 0]] = linear_to_srgb(r_lin2).clamp(0.0, 1.0);
-            image[[y, x, 1]] = linear_to_srgb(g_lin2).clamp(0.0, 1.0);
-            image[[y, x, 2]] = linear_to_srgb(b_lin2).clamp(0.0, 1.0);
+            let (r_out, g_out, b_out) = if encoded_srgb {
+                (
+                    linear_to_srgb(r_lin2).clamp(0.0, 1.0),
+                    linear_to_srgb(g_lin2).clamp(0.0, 1.0),
+                    linear_to_srgb(b_lin2).clamp(0.0, 1.0),
+                )
+            } else {
+                (
+                    r_lin2.clamp(0.0, 1.0),
+                    g_lin2.clamp(0.0, 1.0),
+                    b_lin2.clamp(0.0, 1.0),
+                )
+            };
+            image[[y, x, 0]] = r_out;
+            image[[y, x, 1]] = g_out;
+            image[[y, x, 2]] = b_out;
         }
     }
 }
@@ -352,7 +383,7 @@ pub(crate) fn apply_skin_magenta_shift_u16(image: &mut Array3<u16>, strength: f3
         }
     }
 
-    apply_skin_magenta_shift_f32(&mut fimg, strength);
+    apply_skin_magenta_shift_f32(&mut fimg, strength, false);
 
     for y in 0..h {
         for x in 0..w {

@@ -13,6 +13,7 @@ use ndarray::{self, Array3};
 pub mod aces;
 pub mod calibration;
 pub mod color;
+pub mod color_space;
 pub mod curve;
 pub mod demosaic;
 pub mod density_ops;
@@ -338,7 +339,13 @@ pub fn process_files(
                 img.mapv_inplace(|v| v.max(0.0));
                 img
             }
-            "png" | "jpeg" | "jpg" | "tiff" | "tif" => png_reader::load_png_as_ndarray(path)?,
+            "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
+                let mut img = png_reader::load_png_as_ndarray(path)?;
+                if options.synthetic_negative_input {
+                    pipeline::apply_synthetic_negative_invert(&mut img);
+                }
+                img
+            }
             _ => continue,
         };
 
@@ -351,6 +358,8 @@ pub fn process_files(
         if options.flip_vertical {
             image = flip_array3_vertical(&image);
         }
+
+        color_space::apply_input_idt_to_working_space(&mut image, &options.idt_matrix);
 
         pipeline::step_3_dmin(&mut image, options, flat_field_map.as_ref())?;
         pipeline::step_4_t_to_d_wb(&mut image, options);
@@ -379,18 +388,16 @@ pub fn process_files(
         let exr_path = output_dir.join(format!("{}.exr", stem));
         let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
 
-        // ACES2065-1 only: image is already in ACEScg (after Step 2).
-        if options.write_aces2065_only {
-            let mut aces2065 = image.clone();
-            aces::linear_acescg_to_aces2065_1(&mut aces2065);
+        // ACES export: density → linear print, then Rec.709→AP0 only if an IDT ran.
+        // Never treat density (or camera RGB) as ACEScg — that was a magenta shift.
+        if options.write_aces2065_only || options.export_aces_exr {
+            let mut aces2065 = curve::apply_ra4_from_density_f32(&image, ra4_params, 4.0);
+            let rec709 = !aces::is_identity(&options.idt_matrix);
+            aces::linear_print_to_aces2065_1(&mut aces2065, rec709);
             exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
-            continue;
-        }
-
-        if options.export_aces_exr {
-            let mut aces2065 = image.clone();
-            aces::linear_acescg_to_aces2065_1(&mut aces2065);
-            exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
+            if options.write_aces2065_only {
+                continue;
+            }
         }
 
         let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
@@ -420,7 +427,10 @@ pub fn process_files(
                 }
                 if write_jpeg_this {
                     let (height, width, _) = img.dim();
-                    let buf: Vec<u8> = img.iter().map(|v| (*v >> 8) as u8).collect();
+                    let buf: Vec<u8> = img
+                        .iter()
+                        .map(|v| color_space::linear_to_srgb_u8(*v as f32 / 65535.0))
+                        .collect();
                     let rgb = RgbImage::from_raw(width as u32, height as u32, buf)
                         .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
                     rgb.save(&jpg_path)?;
@@ -494,7 +504,10 @@ pub fn process_one_to_preview(
             img
         }
         "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
-            let img = png_reader::load_png_as_ndarray(path)?;
+            let mut img = png_reader::load_png_as_ndarray(path)?;
+            if options.synthetic_negative_input {
+                pipeline::apply_synthetic_negative_invert(&mut img);
+            }
             let (ph, pw, _) = img.dim();
             true_src_w = pw as u32;
             true_src_h = ph as u32;
@@ -524,6 +537,8 @@ pub fn process_one_to_preview(
     if options.flip_vertical {
         image = flip_array3_vertical(&image);
     }
+
+    color_space::apply_input_idt_to_working_space(&mut image, &options.idt_matrix);
 
     // Step 1: load + demosaic + rotate
     if options.verbose_debug {
@@ -788,6 +803,7 @@ pub fn process_one_to_preview_with_cache(
         if options.flip_vertical {
             img = flip_array3_vertical(&img);
         }
+        color_space::apply_input_idt_to_working_space(&mut img, &options.idt_matrix);
         new_cache.after_load = Some((h1, img.clone(), true_src_w, true_src_h));
         image = Some(img);
     } else {
@@ -944,6 +960,7 @@ pub fn process_one_to_preview_with_cache_gpu(
         if options.flip_vertical {
             img = flip_array3_vertical(&img);
         }
+        color_space::apply_input_idt_to_working_space(&mut img, &options.idt_matrix);
         new_cache.after_load = Some((h1, img.clone(), true_src_w, true_src_h));
         image = Some(img);
     } else {
@@ -1036,7 +1053,7 @@ impl DemosaicBackend for &gpu::demosaic::DemosaicPipeline {
 /// Load and demosaic for preview only (no rotation). Returns (image, true_src_w, true_src_h).
 fn load_and_demosaic_preview<D: DemosaicBackend>(
     path: &Path,
-    _options: &PipelineOptions,
+    options: &PipelineOptions,
     max_width: u32,
     max_height: u32,
     demosaic_backend: D,
@@ -1058,7 +1075,10 @@ fn load_and_demosaic_preview<D: DemosaicBackend>(
             img
         }
         "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
-            let img = png_reader::load_png_as_ndarray(path)?;
+            let mut img = png_reader::load_png_as_ndarray(path)?;
+            if options.synthetic_negative_input {
+                pipeline::apply_synthetic_negative_invert(&mut img);
+            }
             let (ph, pw, _) = img.dim();
             true_src_w = pw as u32;
             true_src_h = ph as u32;

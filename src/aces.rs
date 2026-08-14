@@ -169,6 +169,38 @@ pub fn convert_density_matrix_to_acescg(
     ]
 }
 
+/// Convert linear Rec.709 / sRGB to linear ACEScg in place.
+pub fn linear_srgb_to_acescg(image: &mut Array3<f32>) {
+    let s = Matrix3::from_row_slice(&[
+        ACESCG_TO_LINEAR_SRGB[0][0], ACESCG_TO_LINEAR_SRGB[0][1], ACESCG_TO_LINEAR_SRGB[0][2],
+        ACESCG_TO_LINEAR_SRGB[1][0], ACESCG_TO_LINEAR_SRGB[1][1], ACESCG_TO_LINEAR_SRGB[1][2],
+        ACESCG_TO_LINEAR_SRGB[2][0], ACESCG_TO_LINEAR_SRGB[2][1], ACESCG_TO_LINEAR_SRGB[2][2],
+    ]);
+    let Some(inv) = s.try_inverse() else {
+        return;
+    };
+    let m = [
+        [inv[(0, 0)], inv[(0, 1)], inv[(0, 2)]],
+        [inv[(1, 0)], inv[(1, 1)], inv[(1, 2)]],
+        [inv[(2, 0)], inv[(2, 1)], inv[(2, 2)]],
+    ];
+    apply_idt(image, &m);
+}
+
+/// Convert linear print RGB toward ACES2065-1.
+///
+/// * When `working_space_is_rec709` (a real IDT was applied), Rec.709 → ACEScg → AP0.
+/// * When the buffer is still camera RGB, the ACEScg→AP0 matrix is **not** applied
+///   (that would treat camera primaries as AP1 and shift color, often toward magenta).
+///   The image is left as linear camera/print RGB.
+pub fn linear_print_to_aces2065_1(image: &mut Array3<f32>, working_space_is_rec709: bool) {
+    if !working_space_is_rec709 {
+        return;
+    }
+    linear_srgb_to_acescg(image);
+    linear_acescg_to_aces2065_1(image);
+}
+
 /// Convert a density-domain calibration matrix from camera space to linear sRGB.
 /// Combined transform: camera → ACEScg (IDT) → linear sRGB, conjugated around the density matrix.
 /// `M_srgb = (S·T) · M_cam · (S·T)^(-1)` where S = ACEScg→sRGB and T = IDT.

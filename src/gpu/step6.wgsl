@@ -123,14 +123,12 @@ fn lab_to_xyz(l: f32, a: f32, b: f32) -> vec3<f32> {
 
 // ─── Post-curve operations ───
 
+// Lab on linear RGB. RA-4 / FilmPrint are linear print; Lut2383 Rec.709
+// callers decode first. Treating linear as sRGB-encoded shifted hues magenta.
 fn apply_lab_separation(r_in: f32, g_in: f32, b_in: f32, strength: f32) -> vec3<f32> {
-    let sr = clamp(r_in, 0.0, 1.0);
-    let sg = clamp(g_in, 0.0, 1.0);
-    let sb = clamp(b_in, 0.0, 1.0);
-
-    let r_lin = srgb_to_linear(sr);
-    let g_lin = srgb_to_linear(sg);
-    let b_lin = srgb_to_linear(sb);
+    let r_lin = clamp(r_in, 0.0, 1.0);
+    let g_lin = clamp(g_in, 0.0, 1.0);
+    let b_lin = clamp(b_in, 0.0, 1.0);
 
     let xyz = rgb_to_xyz(r_lin, g_lin, b_lin);
     let lab = xyz_to_lab(xyz.x, xyz.y, xyz.z);
@@ -140,7 +138,7 @@ fn apply_lab_separation(r_in: f32, g_in: f32, b_in: f32, strength: f32) -> vec3<
 
     let c_ab = sqrt(a * a + b_l * b_l);
     if c_ab < 1e-4 {
-        return vec3<f32>(sr, sg, sb);
+        return vec3<f32>(r_lin, g_lin, b_lin);
     }
 
     let s = clamp(strength, -2.0, 2.0);
@@ -156,9 +154,9 @@ fn apply_lab_separation(r_in: f32, g_in: f32, b_in: f32, strength: f32) -> vec3<
     let rgb2 = xyz_to_rgb(xyz2.x, xyz2.y, xyz2.z);
 
     return vec3<f32>(
-        clamp(linear_to_srgb(rgb2.x), 0.0, 1.0),
-        clamp(linear_to_srgb(rgb2.y), 0.0, 1.0),
-        clamp(linear_to_srgb(rgb2.z), 0.0, 1.0),
+        clamp(rgb2.x, 0.0, 1.0),
+        clamp(rgb2.y, 0.0, 1.0),
+        clamp(rgb2.z, 0.0, 1.0),
     );
 }
 
@@ -173,9 +171,9 @@ fn apply_skin_magenta_shift(r_in: f32, g_in: f32, b_in: f32, strength: f32) -> v
     let l_lo = 5.0;
     let l_hi = 95.0;
 
-    let r_lin = srgb_to_linear(clamp(r_in, 0.0, 1.0));
-    let g_lin = srgb_to_linear(clamp(g_in, 0.0, 1.0));
-    let b_lin = srgb_to_linear(clamp(b_in, 0.0, 1.0));
+    let r_lin = clamp(r_in, 0.0, 1.0);
+    let g_lin = clamp(g_in, 0.0, 1.0);
+    let b_lin = clamp(b_in, 0.0, 1.0);
     let xyz = rgb_to_xyz(r_lin, g_lin, b_lin);
     let lab = xyz_to_lab(xyz.x, xyz.y, xyz.z);
     let l = lab.x;
@@ -205,9 +203,9 @@ fn apply_skin_magenta_shift(r_in: f32, g_in: f32, b_in: f32, strength: f32) -> v
     let xyz2 = lab_to_xyz(l, a2, b2);
     let rgb2 = xyz_to_rgb(xyz2.x, xyz2.y, xyz2.z);
     return vec3<f32>(
-        clamp(linear_to_srgb(rgb2.x), 0.0, 1.0),
-        clamp(linear_to_srgb(rgb2.y), 0.0, 1.0),
-        clamp(linear_to_srgb(rgb2.z), 0.0, 1.0),
+        clamp(rgb2.x, 0.0, 1.0),
+        clamp(rgb2.y, 0.0, 1.0),
+        clamp(rgb2.z, 0.0, 1.0),
     );
 }
 
@@ -540,16 +538,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             r = lut_out.x; g = lut_out.y; b = lut_out.z;
         }
 
-        // Lab separation
+        // Lab / skin: Rec.709 encoding is OETF'd — decode, process in linear, encode.
+        let lab_encoded = params.output_lut_encoding == 1u;
         if params.apply_lab == 1u && abs(params.lab_separation) > 1e-6 {
-            let lab_result = apply_lab_separation(r, g, b, params.lab_separation);
-            r = lab_result.x; g = lab_result.y; b = lab_result.z;
+            var lr = r; var lg = g; var lb = b;
+            if lab_encoded {
+                lr = srgb_to_linear(clamp(r, 0.0, 1.0));
+                lg = srgb_to_linear(clamp(g, 0.0, 1.0));
+                lb = srgb_to_linear(clamp(b, 0.0, 1.0));
+            }
+            let lab_result = apply_lab_separation(lr, lg, lb, params.lab_separation);
+            if lab_encoded {
+                r = linear_to_srgb(lab_result.x);
+                g = linear_to_srgb(lab_result.y);
+                b = linear_to_srgb(lab_result.z);
+            } else {
+                r = lab_result.x; g = lab_result.y; b = lab_result.z;
+            }
         }
 
-        // Skin magenta shift
         if abs(params.skin_magenta_shift) > 1e-6 {
-            let sms = apply_skin_magenta_shift(clamp(r,0.0,1.0), clamp(g,0.0,1.0), clamp(b,0.0,1.0), params.skin_magenta_shift);
-            r = sms.x; g = sms.y; b = sms.z;
+            var lr = clamp(r, 0.0, 1.0);
+            var lg = clamp(g, 0.0, 1.0);
+            var lb = clamp(b, 0.0, 1.0);
+            if lab_encoded {
+                lr = srgb_to_linear(lr);
+                lg = srgb_to_linear(lg);
+                lb = srgb_to_linear(lb);
+            }
+            let sms = apply_skin_magenta_shift(lr, lg, lb, params.skin_magenta_shift);
+            if lab_encoded {
+                r = linear_to_srgb(sms.x);
+                g = linear_to_srgb(sms.y);
+                b = linear_to_srgb(sms.z);
+            } else {
+                r = sms.x; g = sms.y; b = sms.z;
+            }
         }
 
         // Soft knee

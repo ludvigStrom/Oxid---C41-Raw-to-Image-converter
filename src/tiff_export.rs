@@ -76,7 +76,10 @@ pub fn write_tiff(image: &Array3<f32>, path: &Path, format: TiffFormat) -> Resul
     Ok(())
 }
 
-/// Write an already-quantized 16-bit RGB image (e.g. after tone curve LUT) as uncompressed TIFF.
+/// Write linear print-RGB u16 as an sRGB-encoded 16-bit TIFF.
+///
+/// RA-4 / FilmPrint output is linear. Viewers (Preview, Photoshop without a
+/// linear profile) assume sRGB, so we apply the OETF here.
 pub fn write_tiff_u16(image: &Array3<u16>, path: &Path) -> Result<()> {
     let (height, width, c) = image.dim();
     if c != 3 {
@@ -87,11 +90,12 @@ pub fn write_tiff_u16(image: &Array3<u16>, path: &Path) -> Result<()> {
     let height_u = u32::try_from(height).context("Image height too large for TIFF")?;
 
     let mut buf: Vec<u16> = Vec::with_capacity(height * width * 3);
+    let scale = 1.0 / 65535.0_f32;
     for row in image.axis_iter(ndarray::Axis(0)) {
         for pixel in row.axis_iter(ndarray::Axis(0)) {
-            buf.push(pixel[0]);
-            buf.push(pixel[1]);
-            buf.push(pixel[2]);
+            buf.push(crate::color_space::linear_to_srgb_u16(pixel[0] as f32 * scale));
+            buf.push(crate::color_space::linear_to_srgb_u16(pixel[1] as f32 * scale));
+            buf.push(crate::color_space::linear_to_srgb_u16(pixel[2] as f32 * scale));
         }
     }
 

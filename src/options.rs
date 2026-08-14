@@ -56,8 +56,9 @@ pub enum OutputLutEncoding {
     /// Cineon log: printing density ÷ 2.046 (10-bit Cineon full-scale).
     /// Use with Resolve-style "Kodak 2383" cubes whose input is Cineon Film Log.
     CineonLog,
-    /// Rec.709 / sRGB: density → linear scene → ACEScg-to-Rec.709 primaries → sRGB OETF.
-    /// Use with cubes that expect gamma-encoded Rec.709 input (e.g. "Rec709 Kodak 2383 D55").
+    /// Density-as-code-value + sRGB OETF: `OETF(D / 2.5)` then levels.
+    /// This is **not** a scene-linear Rec.709 conversion (no primaries hop).
+    /// Use with cubes that expect gamma-encoded Rec.709-looking input.
     Rec709,
     /// Linear normalized density: D ÷ D_max (2.5).
     /// Use with generic cubes that expect linear 0–1 RGB.
@@ -115,6 +116,10 @@ pub struct PipelineOptions {
     pub density_matrix: [[f32; 3]; 3],
     /// Path to a RAW flat-field (unexposed) frame for luminance calibration. Optional.
     pub flat_field_path: Option<PathBuf>,
+    /// Camera IDT (linear camera RGB → ACEScg). Identity = stay in camera RGB;
+    /// the ACEScg→Rec.709 matrix is not applied. Non-identity: IDT then
+    /// ACEScg→linear Rec.709 so D-min / density / RA-4 run in Rec.709.
+    pub idt_matrix: [[f32; 3]; 3],
     /// When true, also write a linear ACES2065-1 EXR alongside display output.
     pub export_aces_exr: bool,
     /// When true, output is only ACES2065-1 EXR (32-bit float); no TIFF/JPEG.
@@ -229,6 +234,10 @@ pub struct PipelineOptions {
     /// Skin magenta shift (0 = off). Rotates magenta/red hues in LAB toward orange
     /// to correct scanner cast in lips and eye areas. 0.3–0.8 typical.
     pub skin_magenta_shift: f32,
+    /// When true and input is PNG/TIFF (not RAW), invert values before T→D: T = 1 − V (per channel).
+    /// Use for synthetic negatives that store "display negative" (positive with orange) instead of
+    /// transmittance-like camera scan values. Pipeline then treats inverted values as transmittance.
+    pub synthetic_negative_input: bool,
     /// Debug preview mode: for RAW files, show only a simple bilinear demosaic
     /// (plus optional rotation) and skip the rest of the pipeline.
     pub debug_preview_simple_debayer: bool,
@@ -272,6 +281,11 @@ impl Default for PipelineOptions {
             curve_white: 1.0,
             apply_color_profile: false,
             density_matrix: [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            idt_matrix: [
                 [1.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0],
                 [0.0, 0.0, 1.0],
@@ -325,6 +339,7 @@ impl Default for PipelineOptions {
             rotation_degrees: 0,
             flip_horizontal: false,
             flip_vertical: false,
+            synthetic_negative_input: false,
             debug_pipeline_step: 6,
             debug_preview_simple_debayer: false,
             verbose_debug: false,

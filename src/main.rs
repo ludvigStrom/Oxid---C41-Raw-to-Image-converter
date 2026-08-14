@@ -60,6 +60,10 @@ struct ConvertArgs {
     #[arg(long = "no-curve", action = clap::ArgAction::SetTrue)]
     no_curve: bool,
 
+    /// Synthetic negative input: invert (T=1−V) before T→D for PNG/TIFF. Use for synthetic negatives.
+    #[arg(long = "synthetic-negative", action = clap::ArgAction::SetTrue)]
+    synthetic_negative: bool,
+
     #[arg(long = "wb-r", default_value = "1.0")]
     wb_r: f32,
     #[arg(long = "wb-g", default_value = "1.0")]
@@ -234,6 +238,7 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         write_jpeg_only: false,
         no_invert: cli.no_invert,
         no_curve: cli.no_curve,
+        synthetic_negative_input: cli.synthetic_negative,
         wb_r: cli.wb_r,
         wb_g: cli.wb_g,
         wb_b: cli.wb_b,
@@ -246,6 +251,11 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
             [cli.density_matrix[0], cli.density_matrix[1], cli.density_matrix[2]],
             [cli.density_matrix[3], cli.density_matrix[4], cli.density_matrix[5]],
             [cli.density_matrix[6], cli.density_matrix[7], cli.density_matrix[8]],
+        ],
+        idt_matrix: [
+            [cli.idt_matrix[0], cli.idt_matrix[1], cli.idt_matrix[2]],
+            [cli.idt_matrix[3], cli.idt_matrix[4], cli.idt_matrix[5]],
+            [cli.idt_matrix[6], cli.idt_matrix[7], cli.idt_matrix[8]],
         ],
         flat_field_path: cli.flat_field,
         export_aces_exr: cli.export_aces_exr,

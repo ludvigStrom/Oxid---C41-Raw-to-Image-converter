@@ -7,6 +7,16 @@ use anyhow::Result;
 use ndarray::Array3;
 
 use crate::curve;
+
+/// Minimum transmittance to avoid log(0). Same as curve::transmittance_to_density threshold.
+const T_MIN: f32 = 1e-10;
+
+/// Apply synthetic negative inversion: T = 1 − V (per channel), clamped to [T_MIN, 1].
+/// Use when input is a synthetic negative that stores "display negative" (positive * orange in sRGB)
+/// instead of transmittance. After inversion, pipeline treats values as transmittance for T→D.
+pub fn apply_synthetic_negative_invert(image: &mut Array3<f32>) {
+    image.mapv_inplace(|v| (1.0 - v).clamp(T_MIN, 1.0));
+}
 use crate::flat_field;
 use crate::lut3d;
 use crate::scale_dmin_rect;
@@ -458,10 +468,19 @@ pub fn step_6_render(
             if let Some(lut) = output_lut_cube {
                 crate::post_curve::apply_output_cube_rgb(&mut display, lut);
             }
+            let encoded_srgb = options.output_lut_encoding == OutputLutEncoding::Rec709;
             if options.apply_lab {
-                crate::color::apply_lab_separation_f32(&mut display, options.lab_separation);
+                crate::color::apply_lab_separation_f32(
+                    &mut display,
+                    options.lab_separation,
+                    encoded_srgb,
+                );
             }
-            crate::color::apply_skin_magenta_shift_f32(&mut display, options.skin_magenta_shift);
+            crate::color::apply_skin_magenta_shift_f32(
+                &mut display,
+                options.skin_magenta_shift,
+                encoded_srgb,
+            );
             crate::post_curve::apply_soft_knee_f32(&mut display, options.soft_clip);
             crate::post_curve::apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
             Step6Display::F32(display)
@@ -469,7 +488,12 @@ pub fn step_6_render(
     }
 }
 
-/// Convert Step6Display to u8 RGB for preview. PassthroughDensity maps D/2.5 to 0–255.
+/// Convert Step6Display to u8 RGB for preview.
+///
+/// RA-4 / FilmPrint `U16` is linear print RGB — apply the sRGB OETF here.
+/// Showing linear as sRGB-encoded (the old `v >> 8` path) is the main purple
+/// cast: monitor EOTF exaggerates any green deficit into magenta.
+/// Lut2383 / None `F32` is already display-referred code values.
 pub fn step6_display_to_u8(display: &Step6Display) -> Vec<u8> {
     match display {
         Step6Display::PassthroughDensity(img) => img
@@ -478,7 +502,7 @@ pub fn step6_display_to_u8(display: &Step6Display) -> Vec<u8> {
             .collect(),
         Step6Display::U16(img) => img
             .iter()
-            .map(|v| ((*v as u32 >> 8).min(255)) as u8)
+            .map(|v| crate::color_space::linear_to_srgb_u8(*v as f32 / 65535.0))
             .collect(),
         Step6Display::F32(img) => img
             .iter()
