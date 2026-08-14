@@ -209,6 +209,40 @@ impl VisibleTileGrid {
     fn contains(&self, ix: i32, iy: i32) -> bool {
         ix >= self.ix0 && ix <= self.ix1 && iy >= self.iy0 && iy <= self.iy1
     }
+
+    /// Tiles we fetch and keep when the core exceeds `PREVIEW_TILE_MAX`:
+    /// the cap closest to the view center (the full core when it fits).
+    fn is_priority(&self, ix: i32, iy: i32) -> bool {
+        if !self.contains(ix, iy) {
+            return false;
+        }
+        if self.tiles_fit {
+            return true;
+        }
+        let cx = (self.ix0 + self.ix1) as f32 * 0.5;
+        let cy = (self.iy0 + self.iy1) as f32 * 0.5;
+        let d = (ix as f32 - cx).hypot(iy as f32 - cy);
+        let mut closer = 0usize;
+        for y in self.iy0..=self.iy1 {
+            for x in self.ix0..=self.ix1 {
+                let dd = (x as f32 - cx).hypot(y as f32 - cy);
+                let before = if dd < d - 1e-6 {
+                    true
+                } else if (dd - d).abs() <= 1e-6 {
+                    y < iy || (y == iy && x < ix)
+                } else {
+                    false
+                };
+                if before {
+                    closer += 1;
+                    if closer >= PREVIEW_TILE_MAX {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
 }
 
 struct PreviewJobResult {
@@ -1968,9 +2002,7 @@ impl C41Gui {
         let Some(g) = self.visible_tile_grid(idx) else {
             return PREVIEW_TILE_LRU;
         };
-        if !g.tiles_fit {
-            return PREVIEW_TILE_LRU;
-        }
+        // Over-cap views still hold a center-first window of PREVIEW_TILE_MAX.
         g.core_n.max(PREVIEW_TILE_LRU).min(PREVIEW_TILE_MAX)
     }
 
@@ -1978,10 +2010,11 @@ impl C41Gui {
         let Some(grid) = self.visible_tile_grid(idx) else {
             return;
         };
-        // Keep on-screen tiles even when the core exceeds the cap.
+        // Drop off-screen tiles, and when over cap drop the farthest so
+        // newly visible center-adjacent edges can be fetched.
         self.images[idx]
             .tile_cache
-            .retain(|t| t.options_hash != grid.opt_hash || grid.contains(t.ix, t.iy));
+            .retain(|t| t.options_hash != grid.opt_hash || grid.is_priority(t.ix, t.iy));
     }
 
     fn evict_tile_cache(&mut self, idx: usize) {
@@ -2002,27 +2035,31 @@ impl C41Gui {
         while cache.len() > limit && i > 0 {
             i -= 1;
             let t = &cache[i];
-            let visible = t.options_hash == grid.opt_hash && grid.contains(t.ix, t.iy);
+            let visible = t.options_hash == grid.opt_hash && grid.is_priority(t.ix, t.iy);
             if !visible {
                 cache.remove(i);
             }
         }
     }
 
-    /// Next missing 1:1 tile, or None when the proxy is still sharp / view too large.
+    /// Next missing 1:1 tile, or None when the proxy is still sharp.
+    /// Over-cap views still fetch the center-first priority window.
     fn visible_tile_to_request(&self, idx: usize) -> Option<(i32, i32)> {
         let grid = self.visible_tile_grid(idx)?;
-        if !grid.proxy_soft || !grid.tiles_fit {
+        if !grid.proxy_soft {
             return None;
         }
         let entry = self.images.get(idx)?;
-        // Scan missing core tiles first so off-screen cache entries cannot
-        // block fetching newly visible edges.
+        // Scan missing priority tiles so zoom-out edges inside the cap window
+        // are fetched even when the full core exceeds PREVIEW_TILE_MAX.
         let cx = (grid.ix0 + grid.ix1) as f32 * 0.5;
         let cy = (grid.iy0 + grid.iy1) as f32 * 0.5;
         let mut best: Option<(i32, i32, f32)> = None;
         for iy in grid.iy0..=grid.iy1 {
             for ix in grid.ix0..=grid.ix1 {
+                if !grid.is_priority(ix, iy) {
+                    continue;
+                }
                 if self.tile_inflight == Some((idx, ix, iy)) {
                     continue;
                 }
@@ -2046,7 +2083,32 @@ impl C41Gui {
                 }
             }
         }
-        best.map(|(ix, iy, _)| (ix, iy))
+        let picked = best.map(|(ix, iy, _)| (ix, iy));
+        // #region agent log
+        if let Some((ix, iy)) = picked {
+            agent_dbg(
+                "C",
+                "c41_gui.rs:visible_tile_to_request",
+                "request missing",
+                &format!(
+                    "{{\"ix\":{},\"iy\":{},\"cache_n\":{},\"core_n\":{},\"tiles_fit\":{},\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{}}}",
+                    ix, iy, entry.tile_cache.len(), grid.core_n, grid.tiles_fit, grid.ix0, grid.iy0, grid.ix1, grid.iy1
+                ),
+            );
+        } else {
+            agent_dbg_changed(
+                &format!("all:{}:{}:{}:{}:{}", grid.ix0, grid.iy0, grid.ix1, grid.iy1, entry.tile_cache.len()),
+                "D",
+                "c41_gui.rs:visible_tile_to_request",
+                "all present",
+                &format!(
+                    "{{\"cache_n\":{},\"core_n\":{},\"tiles_fit\":{},\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{}}}",
+                    entry.tile_cache.len(), grid.core_n, grid.tiles_fit, grid.ix0, grid.iy0, grid.ix1, grid.iy1
+                ),
+            );
+        }
+        // #endregion
+        picked
     }
 
     fn mark_preview_view_changed(&mut self) {
@@ -4247,6 +4309,15 @@ impl eframe::App for C41Gui {
                         });
                         self.preview_canvas_size = Some((canvas_w, canvas_h));
                         if canvas_changed == Some(true) {
+                            // #region agent log
+                            agent_dbg_changed(
+                                "canvas",
+                                "A",
+                                "c41_gui.rs:canvas_changed",
+                                "canvas resize marked view changed",
+                                &format!("{{\"cw\":{:.1},\"ch\":{:.1}}}", canvas_w, canvas_h),
+                            );
+                            // #endregion
                             self.mark_preview_view_changed();
                         }
 
@@ -5431,6 +5502,39 @@ impl eframe::App for C41Gui {
                     if let Some(missing) = self.visible_tile_to_request(idx) {
                         self.request_tile_for(idx, missing.0, missing.1, ctx);
                     }
+                } else {
+                    // #region agent log
+                    let reason = if !proxy_soft {
+                        "not_soft"
+                    } else if self.preview_receiver.is_some() {
+                        "preview_inflight"
+                    } else if self.tile_receiver.is_some() {
+                        "tile_inflight"
+                    } else if !have_current {
+                        "not_current"
+                    } else if self.full_res_preview_active {
+                        "full_res"
+                    } else if self.rect_dragging {
+                        "rect_drag"
+                    } else if self.preview_view_dragging {
+                        "view_drag"
+                    } else if view_settling {
+                        "settling"
+                    } else if need_options {
+                        "need_options"
+                    } else if pointer_down {
+                        "pointer"
+                    } else {
+                        "other"
+                    };
+                    agent_dbg_changed(
+                        &format!("gate:{reason}"),
+                        "A",
+                        "c41_gui.rs:tile_gate",
+                        "request gate blocked",
+                        &format!("{{\"reason\":\"{reason}\"}}"),
+                    );
+                    // #endregion
                 }
                 if self.tile_receiver.is_some() {
                     ctx.request_repaint();
