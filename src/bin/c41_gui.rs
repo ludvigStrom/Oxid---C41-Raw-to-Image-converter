@@ -47,7 +47,7 @@ const PREVIEW_MAX_HEIGHT: u32 = 1200;
 /// Floor so a tiny window still produces a usable working image.
 const PREVIEW_MIN_SIDE: u32 = 640;
 /// Lightroom-style draft proxy: process this first, then refine to screen-res.
-const PREVIEW_DRAFT_MAX: u32 = 800;
+const PREVIEW_DRAFT_MAX: u32 = 1920;
 const PREVIEW_TILE_SIZE: u32 = 512;
 const PREVIEW_TILE_LRU: usize = 16;
 const PREVIEW_TILE_MAX: usize = 80;
