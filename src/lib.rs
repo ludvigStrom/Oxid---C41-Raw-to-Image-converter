@@ -723,6 +723,7 @@ pub fn process_one_to_preview_with_cache(
     max_height: u32,
     cache: Option<&PreviewStepCache>,
     capture_debug: bool,
+    sensor: Option<&CachedSensor>,
 ) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>, String, PreviewStepCache)> {
     use pipeline_cache::{hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5};
 
@@ -799,7 +800,7 @@ pub fn process_one_to_preview_with_cache(
 
     if start_step == 1 {
         let (mut img, tw, th) =
-            load_and_demosaic_preview(path, options, max_width, max_height, CpuDemosaic)?;
+            load_and_demosaic_preview(path, options, max_width, max_height, CpuDemosaic, sensor)?;
         true_src_w = tw;
         true_src_h = th;
         let _ = writeln!(dbg, "=== Pipeline Debug (with cache) ===");
@@ -883,11 +884,12 @@ pub fn process_one_to_preview_with_cache_gpu(
     cache: Option<&PreviewStepCache>,
     capture_debug: bool,
     gpu: Option<&gpu::unified::GpuPipeline>,
+    sensor: Option<&CachedSensor>,
 ) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>, String, PreviewStepCache)> {
     let use_gpu = gpu.is_some() && options.use_gpu;
     if !use_gpu {
         return process_one_to_preview_with_cache(
-            path, options, max_width, max_height, cache, capture_debug,
+            path, options, max_width, max_height, cache, capture_debug, sensor,
         );
     }
     let gpu = gpu.unwrap();
@@ -896,7 +898,7 @@ pub fn process_one_to_preview_with_cache_gpu(
 
     if options.debug_preview_simple_debayer {
         return process_one_to_preview_with_cache(
-            path, options, max_width, max_height, cache, capture_debug,
+            path, options, max_width, max_height, cache, capture_debug, sensor,
         );
     }
 
@@ -957,7 +959,7 @@ pub fn process_one_to_preview_with_cache_gpu(
 
     if start_step == 1 {
         let (mut img, tw, th) =
-            load_and_demosaic_preview(path, options, max_width, max_height, &gpu.demosaic)?;
+            load_and_demosaic_preview(path, options, max_width, max_height, &gpu.demosaic, sensor)?;
         true_src_w = tw;
         true_src_h = th;
         let _ = writeln!(dbg, "=== Pipeline Debug (GPU, with cache) ===");
@@ -1066,14 +1068,46 @@ impl DemosaicBackend for &gpu::demosaic::DemosaicPipeline {
     }
 }
 
+/// Load and demosaic from an already-decoded sensor cache (no disk I/O).
+fn load_preview_from_sensor<D: DemosaicBackend>(
+    sensor: &CachedSensor,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    demosaic_backend: D,
+) -> anyhow::Result<(Array3<f32>, u32, u32)> {
+    match sensor {
+        CachedSensor::Bayer { data, pattern } => {
+            let (bh, bw, _) = data.dim();
+            let small_bayer = downsample_raw_for_preview(data, *pattern, max_width);
+            let img = demosaic_backend.demosaic(&small_bayer, *pattern)?;
+            Ok((img, bw as u32, bh as u32))
+        }
+        CachedSensor::Rgb(img) => {
+            let mut img = img.clone();
+            if options.synthetic_negative_input {
+                pipeline::apply_synthetic_negative_invert(&mut img);
+            }
+            let (ph, pw, _) = img.dim();
+            let out = downsample_rgb_for_preview(&img, max_width, max_height);
+            Ok((out, pw as u32, ph as u32))
+        }
+    }
+}
+
 /// Load and demosaic for preview only (no rotation). Returns (image, true_src_w, true_src_h).
+/// When `sensor` is `Some`, skips disk decode and downsamples the cached buffer.
 fn load_and_demosaic_preview<D: DemosaicBackend>(
     path: &Path,
     options: &PipelineOptions,
     max_width: u32,
     max_height: u32,
     demosaic_backend: D,
+    sensor: Option<&CachedSensor>,
 ) -> anyhow::Result<(Array3<f32>, u32, u32)> {
+    if let Some(sensor) = sensor {
+        return load_preview_from_sensor(sensor, options, max_width, max_height, demosaic_backend);
+    }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

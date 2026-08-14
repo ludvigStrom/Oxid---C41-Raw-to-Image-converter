@@ -40,6 +40,8 @@ use eframe::egui;
 
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
+/// Floor so a tiny window still produces a usable working image.
+const PREVIEW_MIN_SIDE: u32 = 640;
 const THUMB_MAX_SIZE: u32 = 64;
 const PREVIEW_DEBOUNCE_MS: u64 = 180;
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
@@ -103,9 +105,11 @@ fn main() -> eframe::Result<()> {
 struct ImageEntry {
     path: PathBuf,
     options: PipelineOptions,
-    /// Current preview texture for the visible ROI (re-built when zoom/pan/size changes).
+    /// Preview texture uploaded when RGB arrives; filter updated only when zoom crosses 1×.
     preview_texture: Option<egui::TextureHandle>,
-    /// Hash of `PipelineOptions` at the time of last full preview processing.
+    /// Whether `preview_texture` was uploaded with NEAREST (zoomed) vs LINEAR (fit).
+    preview_texture_nearest: bool,
+    /// Hash of options + working size + full-res flag at last completed preview.
     preview_hash: u64,
     /// Full processed preview buffer (post-curve) at `preview_full_size`.
     /// Used for zoom/pan ROI rendering without re-running the pipeline.
@@ -236,6 +240,8 @@ struct C41Gui {
     wb_picker_pending: Option<WbPickerTarget>,
     /// Canvas size (w, h) in points from last layout — used to request preview at screen resolution.
     preview_canvas_size: Option<(f32, f32)>,
+    /// Invalidation hash of the in-flight preview job (options + working size, not zoom).
+    preview_job_hash: Option<u64>,
     #[cfg(feature = "gpu")]
     gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
 }
@@ -270,6 +276,7 @@ impl Default for C41Gui {
             full_res_preview_button_clicked: false,
             wb_picker_pending: None,
             preview_canvas_size: None,
+            preview_job_hash: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
                 .map(std::sync::Arc::new),
@@ -1442,6 +1449,48 @@ fn make_thumbnail_from_rgb(rgb: &[u8], src_w: u32, src_h: u32, max_side: u32) ->
     })
 }
 
+fn rgb_u8_to_color_image(w: u32, h: u32, rgb: &[u8]) -> egui::ColorImage {
+    let size = [w as usize, h as usize];
+    let pixels: Vec<egui::Color32> = rgb
+        .chunks_exact(3)
+        .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+        .collect();
+    egui::ColorImage { size, pixels }
+}
+
+/// Working preview size: canvas × DPI, floored at 640 and capped at 1920×1200.
+/// Zoom does not change this; full-res mode requests the export pipeline size.
+fn preview_working_limits(canvas: Option<(f32, f32)>, ppp: f32, full_res: bool) -> (u32, u32) {
+    if full_res {
+        return (u32::MAX, u32::MAX);
+    }
+    let min_side = PREVIEW_MIN_SIDE as f32;
+    let (base_w, base_h) = canvas
+        .map(|(w, h)| {
+            let pw = (w * ppp).round().clamp(min_side, PREVIEW_MAX_WIDTH as f32);
+            let ph = (h * ppp).round().clamp(min_side, PREVIEW_MAX_HEIGHT as f32);
+            (pw, ph)
+        })
+        .unwrap_or((PREVIEW_MAX_WIDTH as f32, PREVIEW_MAX_HEIGHT as f32));
+    (base_w as u32, base_h as u32)
+}
+
+fn preview_invalidation_hash(
+    path: &PathBuf,
+    options: &PipelineOptions,
+    full_res: bool,
+    max_w: u32,
+    max_h: u32,
+) -> u64 {
+    let base_hash = options_hash_for(path, options);
+    let mut hh = DefaultHasher::new();
+    base_hash.hash(&mut hh);
+    full_res.hash(&mut hh);
+    max_w.hash(&mut hh);
+    max_h.hash(&mut hh);
+    hh.finish()
+}
+
 impl C41Gui {
     fn request_preview_for(&mut self, index: usize, ctx: &egui::Context) {
         if index >= self.images.len() {
@@ -1487,30 +1536,23 @@ impl C41Gui {
         self.capture_pipeline_debug_next = false;
         options.verbose_debug = capture_debug;
 
-        // Full-res preview: use export pipeline at full resolution (no downsampling).
-        let (max_width, max_height) = if self.full_res_preview_active {
-            (u32::MAX, u32::MAX)
-        } else {
-            // Adaptive preview resolution based on zoom: base = screen resolution (canvas × DPI),
-            // so initial load is sharp; higher zoom → higher working resolution up to 4× cap.
-            let zoom = entry.preview_zoom.max(1.0);
-            let scale = zoom.min(4.0); // up to 4× base preview resolution
-            let ppp = ctx.pixels_per_point();
-            let (base_w, base_h) = self
-                .preview_canvas_size
-                .map(|(w, h)| {
-                    // Canvas size in physical pixels for crisp display at 1:1
-                    let pw = (w * ppp).round().max(PREVIEW_MAX_WIDTH as f32);
-                    let ph = (h * ppp).round().max(PREVIEW_MAX_HEIGHT as f32);
-                    (pw, ph)
-                })
-                .unwrap_or((PREVIEW_MAX_WIDTH as f32, PREVIEW_MAX_HEIGHT as f32));
-            let max_w = (base_w * scale).round() as u32;
-            let max_h = (base_h * scale).round() as u32;
-            (max_w, max_h)
-        };
+        // Full-res preview: export pipeline at sensor resolution. Otherwise canvas × DPI,
+        // capped at 1920×1200. Zoom is display-only and does not change working size.
+        let (max_width, max_height) = preview_working_limits(
+            self.preview_canvas_size,
+            ctx.pixels_per_point(),
+            self.full_res_preview_active,
+        );
+        self.preview_job_hash = Some(preview_invalidation_hash(
+            &path,
+            &entry.options,
+            self.full_res_preview_active,
+            max_width,
+            max_height,
+        ));
 
         let cache = entry.preview_step_cache.clone();
+        let sensor = entry.cached_sensor.clone();
         #[cfg(feature = "gpu")]
         let gpu_arc = self.gpu_pipeline.clone();
         let (tx, rx) = mpsc::channel();
@@ -1526,6 +1568,7 @@ impl C41Gui {
                 cache.as_ref(),
                 capture_debug,
                 gpu_arc.as_deref(),
+                sensor.as_deref(),
             );
             #[cfg(not(feature = "gpu"))]
             let res = c41_raw_tool::process_one_to_preview_with_cache(
@@ -1535,6 +1578,7 @@ impl C41Gui {
                 max_height,
                 cache.as_ref(),
                 capture_debug,
+                sensor.as_deref(),
             );
             let res = res
             .map(|(input_w, input_h, w, h, rgb, dbg_log, new_cache)| {
@@ -1628,23 +1672,22 @@ impl eframe::App for C41Gui {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
                     if idx < self.images.len() {
-                        let size = [w as usize, h as usize];
-                        let mut pixels: Vec<egui::Color32> = Vec::with_capacity(size[0] * size[1]);
-                        for c in rgb.chunks_exact(3) {
-                            pixels.push(egui::Color32::from_rgb(c[0], c[1], c[2]));
-                        }
-                        let _image = egui::ColorImage { size, pixels };
-                        // Histogram is computed in the background worker using a fixed-resolution
-                        // preview and the current crop; here we only update the preview buffers.
-                        // Preview hash also incorporates zoom so changing zoom triggers re-render.
-                        let base_hash =
-                            options_hash_for(&self.images[idx].path, &self.images[idx].options);
-                        let mut hh = DefaultHasher::new();
-                        base_hash.hash(&mut hh);
-                        self.images[idx].preview_zoom.to_bits().hash(&mut hh);
-                        let hash = hh.finish();
-                        self.images[idx].preview_texture = None;
-                        self.images[idx].preview_hash = hash;
+                        let nearest = self.images[idx].preview_zoom > 1.0;
+                        let image = rgb_u8_to_color_image(w, h, &rgb);
+                        let tex_opts = if nearest {
+                            egui::TextureOptions::NEAREST
+                        } else {
+                            egui::TextureOptions::LINEAR
+                        };
+                        let tex = ctx.load_texture(
+                            format!("preview_full_{}", idx),
+                            image,
+                            tex_opts,
+                        );
+                        self.images[idx].preview_texture = Some(tex);
+                        self.images[idx].preview_texture_nearest = nearest;
+                        self.images[idx].preview_hash =
+                            self.preview_job_hash.take().unwrap_or(0);
                         self.images[idx].preview_full_rgb = Some((w, h, rgb.clone()));
                         self.images[idx].preview_step_cache = Some(new_cache);
                         // preview_input_size = preview working dims (crop/dmin coord reference).
@@ -1686,12 +1729,14 @@ impl eframe::App for C41Gui {
                 Ok(Err(e)) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
+                    self.preview_job_hash = None;
                     self.status = format!("Preview error: {}", e);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
+                    self.preview_job_hash = None;
                 }
             }
         }
@@ -1779,6 +1824,7 @@ impl eframe::App for C41Gui {
                                             path: p.clone(),
                                             options: default_options(),
                                             preview_texture: None,
+                                            preview_texture_nearest: false,
                                             preview_hash: 0,
                                             preview_full_rgb: None,
                                             preview_input_size: None,
@@ -3643,8 +3689,7 @@ impl eframe::App for C41Gui {
 
                         // Extract image dims with fallback so the layout is stable before
                         // the first preview arrives (no jump when data loads in).
-                        let full_rgb_opt = self.images[idx].preview_full_rgb.clone();
-                        let (full_w, full_h) = if let Some((w, h, _)) = &full_rgb_opt {
+                        let (full_w, full_h) = if let Some((w, h, _)) = &self.images[idx].preview_full_rgb {
                             (*w, *h)
                         } else {
                             self.images[idx].preview_input_size
@@ -3654,32 +3699,28 @@ impl eframe::App for C41Gui {
                         let full_w_f = (full_w as f32).max(1.0);
                         let full_h_f = (full_h as f32).max(1.0);
 
-                        // Upload texture only when RGB data is available.
-                        let tex_opt: Option<egui::TextureHandle> =
-                            if let Some((fw, fh, full_rgb)) = &full_rgb_opt {
-                                let entry = &self.images[idx];
-                                let size = [*fw as usize, *fh as usize];
-                                let pixels: Vec<egui::Color32> = full_rgb
-                                    .chunks_exact(3)
-                                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
-                                    .collect();
-                                let image = egui::ColorImage { size, pixels };
-                                let tex_opts = if entry.preview_zoom > 1.0 {
+                        // Recreate texture only when LINEAR/NEAREST must flip (zoom crosses 1×).
+                        let want_nearest = self.images[idx].preview_zoom > 1.0;
+                        if self.images[idx].preview_texture.is_some()
+                            && self.images[idx].preview_texture_nearest != want_nearest
+                        {
+                            if let Some((fw, fh, rgb)) = self.images[idx].preview_full_rgb.as_ref() {
+                                let image = rgb_u8_to_color_image(*fw, *fh, rgb);
+                                let tex_opts = if want_nearest {
                                     egui::TextureOptions::NEAREST
                                 } else {
                                     egui::TextureOptions::LINEAR
                                 };
-                                Some(ui.ctx().load_texture(
+                                let tex = ui.ctx().load_texture(
                                     format!("preview_full_{}", idx),
                                     image,
                                     tex_opts,
-                                ))
-                            } else {
-                                None
-                            };
-                        if let Some(tex) = &tex_opt {
-                            self.images[idx].preview_texture = Some(tex.clone());
+                                );
+                                self.images[idx].preview_texture = Some(tex);
+                                self.images[idx].preview_texture_nearest = want_nearest;
+                            }
                         }
+                        let tex_opt = self.images[idx].preview_texture.clone();
 
                         // Allocate the full canvas area — always, so the layout never jumps.
                         ui.add_space(TOP_PADDING);
@@ -3751,7 +3792,7 @@ impl eframe::App for C41Gui {
                         // Loading spinner overlay — drawn entirely via canvas_painter so it
                         // never touches the UI layout cursor (which would shift the histogram).
                         // Also show when no preview data is available yet (first load).
-                        if show_loader || full_rgb_opt.is_none() {
+                        if show_loader || self.images[idx].preview_texture.is_none() {
                             canvas_painter.rect_filled(
                                 canvas_rect,
                                 0.0,
@@ -4595,13 +4636,19 @@ impl eframe::App for C41Gui {
         // Runs after UI interactions so drag/release state is available for debounce.
         if let Some(idx) = self.selected_index {
             if idx < self.images.len() {
-                // Recompute hash including zoom and full-res mode so changes trigger a new preview render.
-                let base_hash = options_hash_for(&self.images[idx].path, &self.images[idx].options);
-                let mut hh = DefaultHasher::new();
-                base_hash.hash(&mut hh);
-                self.images[idx].preview_zoom.to_bits().hash(&mut hh);
-                self.full_res_preview_active.hash(&mut hh);
-                let hash_now = hh.finish();
+                // Hash options + working size + full-res flag. Zoom is display-only.
+                let (max_w, max_h) = preview_working_limits(
+                    self.preview_canvas_size,
+                    ctx.pixels_per_point(),
+                    self.full_res_preview_active,
+                );
+                let hash_now = preview_invalidation_hash(
+                    &self.images[idx].path,
+                    &self.images[idx].options,
+                    self.full_res_preview_active,
+                    max_w,
+                    max_h,
+                );
                 let need_new = self.images[idx].preview_texture.is_none()
                     || self.images[idx].preview_hash != hash_now;
                 if need_new {
@@ -4630,7 +4677,7 @@ impl eframe::App for C41Gui {
                         .unwrap_or(false);
 
                     if self.preview_receiver.is_none() && !waiting_for_release && settled {
-                        // Deactivate full-res when preview is triggered by option/zoom change (not by the button).
+                        // Deactivate full-res when preview is triggered by option/size change (not by the button).
                         if self.full_res_preview_active && !self.full_res_preview_button_clicked {
                             self.full_res_preview_active = false;
                         }
