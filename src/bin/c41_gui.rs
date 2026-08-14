@@ -34,6 +34,8 @@ use c41_raw_tool::{
     PreviewSceneStats,
     load_sensor_from_path,
     compute_preview_scene_stats,
+    crop_sensor_for_oriented_rect,
+    oriented_sensor_size,
     preview_scene_stats_key,
 };
 #[cfg(feature = "gpu")]
@@ -44,6 +46,11 @@ const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
 /// Floor so a tiny window still produces a usable working image.
 const PREVIEW_MIN_SIDE: u32 = 640;
+/// Lightroom-style draft proxy: process this first, then refine to screen-res.
+const PREVIEW_DRAFT_MAX: u32 = 800;
+const PREVIEW_TILE_SIZE: u32 = 512;
+const PREVIEW_TILE_LRU: usize = 16;
+const PREVIEW_TILE_HALO: u32 = 32;
 const THUMB_MAX_SIZE: u32 = 64;
 const PREVIEW_DEBOUNCE_MS: u64 = 180;
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
@@ -130,6 +137,8 @@ struct ImageEntry {
     thumbnail_texture: Option<egui::TextureHandle>,
     // Per-channel histograms (R, G, B) over 0–255
     histogram: Option<([u32; 256], [u32; 256], [u32; 256])>,
+    /// Crop used for the last histogram so we can refresh without re-running the pipeline.
+    histogram_crop_hash: u64,
     export_format: ExportFormat,
     /// Rawloader debug report for this file (Debug tab).
     raw_debug_report: Option<String>,
@@ -139,10 +148,80 @@ struct ImageEntry {
     cached_sensor: Option<Arc<CachedSensor>>,
     /// Full-res D-min / auto-WB pinned to export, keyed by `preview_scene_stats_key`.
     scene_stats: Option<(u64, PreviewSceneStats)>,
-    /// Step cache for preview: reuse pipeline stages when only later options change.
+    /// Step cache of the currently displayed LOD (WB picker / overlays).
     preview_step_cache: Option<PreviewStepCache>,
+    draft_step_cache: Option<PreviewStepCache>,
+    screen_step_cache: Option<PreviewStepCache>,
+    /// Which proxy is on screen (draft is soft; screen/full-res is sharp).
+    preview_lod: PreviewLod,
+    /// Options + full-res flag that produced the current texture (not working size).
+    preview_options_hash: u64,
+    /// Screen-res working size last applied.
+    preview_screen_wh: (u32, u32),
+    /// Last *requested* screen limits (avoids a refine loop when CFA downsample comes in smaller).
+    preview_screen_requested_wh: (u32, u32),
+    /// 1:1 tiles composited over the proxy when zoomed in. Front = most recently used.
+    tile_cache: Vec<PreviewTile>,
     /// Process tab (Input/Develop/Export) — persists per image when switching.
     process_tab: ProcessTab,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewLod {
+    Draft,
+    Screen,
+    FullRes,
+}
+
+struct PreviewTile {
+    ix: i32,
+    iy: i32,
+    options_hash: u64,
+    texture: egui::TextureHandle,
+    uv: egui::Rect,
+}
+
+/// Visible 1:1 tile grid for the current canvas / pan / zoom.
+struct VisibleTileGrid {
+    ix0: i32,
+    iy0: i32,
+    ix1: i32,
+    iy1: i32,
+    opt_hash: u64,
+    /// True when the screen proxy is magnified past 1:1 (tiles actually help).
+    proxy_soft: bool,
+}
+
+impl VisibleTileGrid {
+    fn contains(&self, ix: i32, iy: i32) -> bool {
+        ix >= self.ix0 && ix <= self.ix1 && iy >= self.iy0 && iy <= self.iy1
+    }
+}
+
+struct PreviewJobResult {
+    gen: u64,
+    lod: PreviewLod,
+    index: usize,
+    input_w: u32,
+    input_h: u32,
+    w: u32,
+    h: u32,
+    rgb: Vec<u8>,
+    dbg_log: String,
+    captured_debug: bool,
+    new_cache: PreviewStepCache,
+}
+
+struct TileJobResult {
+    gen: u64,
+    index: usize,
+    ix: i32,
+    iy: i32,
+    options_hash: u64,
+    w: u32,
+    h: u32,
+    rgb: Vec<u8>,
+    uv: egui::Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,8 +288,16 @@ struct C41Gui {
     selected_index: Option<usize>,
     output_dir: Option<PathBuf>,
     status: String,
-    preview_receiver: Option<mpsc::Receiver<anyhow::Result<(usize, u32, u32, u32, u32, Vec<u8>, String, bool, PreviewStepCache)>>>,
+    preview_receiver: Option<mpsc::Receiver<anyhow::Result<PreviewJobResult>>>,
     preview_started_at: Option<Instant>,
+    /// Bumped when the desired options hash changes; in-flight jobs with an older gen are ignored.
+    preview_gen: u64,
+    tile_receiver: Option<mpsc::Receiver<anyhow::Result<TileJobResult>>>,
+    tile_gen: u64,
+    /// In-flight tile so we do not request the same one twice.
+    tile_inflight: Option<(usize, i32, i32)>,
+    /// Tiles that failed this generation — do not retry until options change.
+    tile_failed: Vec<(u64, i32, i32)>,
     /// One-shot flag: capture detailed pipeline debug log on the next preview render.
     capture_pipeline_debug_next: bool,
     /// Thumbnails for the image strip: (path, Ok((w, h, rgb)) or Err).
@@ -259,6 +346,11 @@ impl Default for C41Gui {
             status: String::new(),
             preview_receiver: None,
             preview_started_at: None,
+            preview_gen: 0,
+            tile_receiver: None,
+            tile_gen: 0,
+            tile_inflight: None,
+            tile_failed: Vec::new(),
             capture_pipeline_debug_next: false,
             thumbnail_receiver: None,
             thumbnail_pending: HashSet::new(),
@@ -523,8 +615,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.skin_magenta_shift.to_bits().hash(&mut h);
     opts.apply_color_profile.hash(&mut h);
     opts.dmin_rect.hash(&mut h);
-    opts.apply_crop.hash(&mut h);
-    opts.crop_rect.hash(&mut h);
+    // Crop is an overlay + histogram window. Preview pixels do not change.
     opts.dmin_neutral_only.hash(&mut h);
     if let Some((r, g, b)) = opts.dmin_fixed {
         r.to_bits().hash(&mut h);
@@ -1495,44 +1586,28 @@ fn preview_invalidation_hash(
     hh.finish()
 }
 
+/// Options + full-res flag only. Working size is not included so draft and screen share a key.
+fn preview_options_hash(path: &PathBuf, options: &PipelineOptions, full_res: bool) -> u64 {
+    preview_invalidation_hash(path, options, full_res, 0, 0)
+}
+
+fn preview_draft_limits() -> (u32, u32) {
+    (PREVIEW_DRAFT_MAX, PREVIEW_DRAFT_MAX)
+}
+
+fn crop_histogram_hash(opts: &PipelineOptions) -> u64 {
+    let mut h = DefaultHasher::new();
+    opts.apply_crop.hash(&mut h);
+    opts.crop_rect.hash(&mut h);
+    opts.crop_rect_reference_size.hash(&mut h);
+    h.finish()
+}
+
 impl C41Gui {
-    fn request_preview_for(&mut self, index: usize, ctx: &egui::Context) {
-        if index >= self.images.len() {
-            return;
-        }
-        let path = self.images[index].path.clone();
-        let entry = &mut self.images[index];
-
-        // Ensure we have cached sensor data for this image.
-        if entry.cached_sensor.is_none() {
-            match load_sensor_from_path(&path) {
-                Ok(sensor) => {
-                    entry.cached_sensor = Some(Arc::new(sensor));
-                }
-                Err(e) => {
-                    self.status = format!("Failed to load sensor data: {}", e);
-                    return;
-                }
-            }
-        }
-
+    fn bake_preview_options(&self, entry: &ImageEntry) -> PipelineOptions {
         let mut options = entry.options.clone();
         options.flat_field_path = self.flat_field_path.clone();
-
-        // Pin D-min and auto WB to full-res export stats. The working preview is
-        // downscaled, so computing those on the proxy makes the image warmer.
-        // Full-res preview already matches export, so leave its options alone.
         if !self.full_res_preview_active {
-            let key = preview_scene_stats_key(&options);
-            let stale = entry.scene_stats.as_ref().map(|(k, _)| *k) != Some(key);
-            if stale {
-                if let Some(sensor) = entry.cached_sensor.clone() {
-                    match compute_preview_scene_stats(sensor.as_ref(), &options) {
-                        Ok(stats) => entry.scene_stats = Some((key, stats)),
-                        Err(_) => entry.scene_stats = None,
-                    }
-                }
-            }
             if let Some((_, stats)) = entry.scene_stats {
                 if let Some(dmin) = stats.dmin {
                     options.dmin_mode = DminMode::Fixed;
@@ -1547,28 +1622,78 @@ impl C41Gui {
                 }
             }
         }
+        options
+    }
 
+    fn ensure_sensor_and_scene_stats(&mut self, index: usize) -> bool {
+        if index >= self.images.len() {
+            return false;
+        }
+        let path = self.images[index].path.clone();
+        let entry = &mut self.images[index];
+        if entry.cached_sensor.is_none() {
+            match load_sensor_from_path(&path) {
+                Ok(sensor) => {
+                    entry.cached_sensor = Some(Arc::new(sensor));
+                }
+                Err(e) => {
+                    self.status = format!("Failed to load sensor data: {}", e);
+                    return false;
+                }
+            }
+        }
+        if self.full_res_preview_active {
+            return true;
+        }
+        let mut options = entry.options.clone();
+        options.flat_field_path = self.flat_field_path.clone();
+        let key = preview_scene_stats_key(&options);
+        let stale = entry.scene_stats.as_ref().map(|(k, _)| *k) != Some(key);
+        if stale {
+            if let Some(sensor) = entry.cached_sensor.clone() {
+                match compute_preview_scene_stats(sensor.as_ref(), &options) {
+                    Ok(stats) => entry.scene_stats = Some((key, stats)),
+                    Err(_) => entry.scene_stats = None,
+                }
+            }
+        }
+        true
+    }
+
+    fn request_preview_for(&mut self, index: usize, ctx: &egui::Context, lod: PreviewLod) {
+        if !self.ensure_sensor_and_scene_stats(index) {
+            return;
+        }
+        let path = self.images[index].path.clone();
+        let mut options = self.bake_preview_options(&self.images[index]);
         let capture_debug = self.capture_pipeline_debug_next;
         self.capture_pipeline_debug_next = false;
         options.verbose_debug = capture_debug;
 
-        // Full-res preview: export pipeline at sensor resolution. Otherwise canvas × DPI,
-        // capped at 1920×1200. Zoom is display-only and does not change working size.
-        let (max_width, max_height) = preview_working_limits(
-            self.preview_canvas_size,
-            ctx.pixels_per_point(),
-            self.full_res_preview_active,
-        );
-        self.preview_job_hash = Some(preview_invalidation_hash(
+        let (max_width, max_height) = match lod {
+            PreviewLod::Draft => preview_draft_limits(),
+            PreviewLod::Screen => preview_working_limits(
+                self.preview_canvas_size,
+                ctx.pixels_per_point(),
+                false,
+            ),
+            PreviewLod::FullRes => (u32::MAX, u32::MAX),
+        };
+        if lod == PreviewLod::Screen {
+            self.images[index].preview_screen_requested_wh = (max_width, max_height);
+        }
+        self.preview_job_hash = Some(preview_options_hash(
             &path,
-            &entry.options,
+            &self.images[index].options,
             self.full_res_preview_active,
-            max_width,
-            max_height,
         ));
 
-        let cache = entry.preview_step_cache.clone();
-        let sensor = entry.cached_sensor.clone();
+        let cache = match lod {
+            PreviewLod::Draft => self.images[index].draft_step_cache.clone(),
+            PreviewLod::Screen | PreviewLod::FullRes => self.images[index].screen_step_cache.clone(),
+        };
+        let sensor = self.images[index].cached_sensor.clone();
+        let gen = self.preview_gen;
         #[cfg(feature = "gpu")]
         let gpu_arc = self.gpu_pipeline.clone();
         let (tx, rx) = mpsc::channel();
@@ -1596,13 +1721,259 @@ impl C41Gui {
                 capture_debug,
                 sensor.as_deref(),
             );
-            let res = res
-            .map(|(input_w, input_h, w, h, rgb, dbg_log, new_cache)| {
-                (index, input_w, input_h, w, h, rgb, dbg_log, capture_debug, new_cache)
+            let res = res.map(|(input_w, input_h, w, h, rgb, dbg_log, new_cache)| {
+                PreviewJobResult {
+                    gen,
+                    lod,
+                    index,
+                    input_w,
+                    input_h,
+                    w,
+                    h,
+                    rgb,
+                    dbg_log,
+                    captured_debug: capture_debug,
+                    new_cache,
+                }
             });
             let _ = tx.send(res);
         });
         ctx.request_repaint();
+    }
+
+    fn request_tile_for(
+        &mut self,
+        index: usize,
+        ix: i32,
+        iy: i32,
+        ctx: &egui::Context,
+    ) {
+        if !self.ensure_sensor_and_scene_stats(index) {
+            return;
+        }
+        let path = self.images[index].path.clone();
+        let entry = &self.images[index];
+        let Some(sensor) = entry.cached_sensor.clone() else {
+            return;
+        };
+        let (sw, sh) = sensor.dimensions();
+        let (ow, oh) = oriented_sensor_size(sw, sh, entry.options.rotation_degrees);
+        if ow == 0 || oh == 0 {
+            return;
+        }
+        let x = (ix as u32).saturating_mul(PREVIEW_TILE_SIZE);
+        let y = (iy as u32).saturating_mul(PREVIEW_TILE_SIZE);
+        if x >= ow || y >= oh {
+            return;
+        }
+        let tw = PREVIEW_TILE_SIZE.min(ow - x);
+        let th = PREVIEW_TILE_SIZE.min(oh - y);
+        let halo = if entry.options.bujack_enabled {
+            PREVIEW_TILE_HALO.max(entry.options.bujack_radius.ceil() as u32 + 8)
+        } else {
+            PREVIEW_TILE_HALO
+        };
+        let crop = match crop_sensor_for_oriented_rect(
+            sensor.as_ref(),
+            x,
+            y,
+            tw,
+            th,
+            entry.options.rotation_degrees,
+            entry.options.flip_horizontal,
+            entry.options.flip_vertical,
+            halo,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("Tile crop failed: {}", e);
+                self.tile_failed.push((self.tile_gen, ix, iy));
+                return;
+            }
+        };
+        let uv = egui::Rect::from_min_max(
+            egui::pos2(crop.uv_left, crop.uv_top),
+            egui::pos2(crop.uv_right, crop.uv_bottom),
+        );
+        let mut options = self.bake_preview_options(entry);
+        options.verbose_debug = false;
+        // Same hash the cache lookup uses, so a finished tile is never "missing".
+        let options_hash = entry.preview_options_hash;
+        let gen = self.tile_gen;
+        let tile_sensor = crop.sensor;
+        #[cfg(feature = "gpu")]
+        let gpu_arc = self.gpu_pipeline.clone();
+        let (tx, rx) = mpsc::channel();
+        self.tile_receiver = Some(rx);
+        self.tile_inflight = Some((index, ix, iy));
+        thread::spawn(move || {
+            #[cfg(feature = "gpu")]
+            let res = process_one_to_preview_with_cache_gpu(
+                &path,
+                &options,
+                u32::MAX,
+                u32::MAX,
+                None,
+                false,
+                gpu_arc.as_deref(),
+                Some(&tile_sensor),
+            );
+            #[cfg(not(feature = "gpu"))]
+            let res = c41_raw_tool::process_one_to_preview_with_cache(
+                &path,
+                &options,
+                u32::MAX,
+                u32::MAX,
+                None,
+                false,
+                Some(&tile_sensor),
+            );
+            let res = res.map(|(_iw, _ih, w, h, rgb, _dbg, _cache)| TileJobResult {
+                gen,
+                index,
+                ix,
+                iy,
+                options_hash,
+                w,
+                h,
+                rgb,
+                uv,
+            });
+            let _ = tx.send(res);
+        });
+        ctx.request_repaint();
+    }
+
+    fn visible_tile_grid(&self, idx: usize) -> Option<VisibleTileGrid> {
+        let entry = self.images.get(idx)?;
+        let (tex_w, tex_h, _) = entry.preview_full_rgb.as_ref()?;
+        let (canvas_w, canvas_h) = self.preview_canvas_size?;
+        let (ow, oh) = if let Some([w, h]) = entry.raw_source_size {
+            (w, h)
+        } else if let Some(s) = entry.cached_sensor.as_ref() {
+            oriented_sensor_size(
+                s.dimensions().0,
+                s.dimensions().1,
+                entry.options.rotation_degrees,
+            )
+        } else {
+            return None;
+        };
+        if ow == 0 || oh == 0 {
+            return None;
+        }
+        let full_w_f = (*tex_w as f32).max(1.0);
+        let full_h_f = (*tex_h as f32).max(1.0);
+        let zoom = entry.preview_zoom.max(1.0);
+        let base_scale = (canvas_w / full_w_f).min(canvas_h / full_h_f);
+        let img_w = (full_w_f * base_scale * zoom).max(1.0);
+        let img_h = (full_h_f * base_scale * zoom).max(1.0);
+        // Same canvas ∩ virtual-image UV as the draw path.
+        let pan_x = entry.preview_pan.x.clamp(0.0, 1.0);
+        let pan_y = entry.preview_pan.y.clamp(0.0, 1.0);
+        let vir_left = canvas_w * 0.5 - pan_x * img_w;
+        let vir_top = canvas_h * 0.5 - pan_y * img_h;
+        let vis_left = vir_left.max(0.0);
+        let vis_top = vir_top.max(0.0);
+        let vis_right = (vir_left + img_w).min(canvas_w);
+        let vis_bottom = (vir_top + img_h).min(canvas_h);
+        if vis_right <= vis_left || vis_bottom <= vis_top {
+            return None;
+        }
+        let uv_l = ((vis_left - vir_left) / img_w).clamp(0.0, 1.0);
+        let uv_t = ((vis_top - vir_top) / img_h).clamp(0.0, 1.0);
+        let uv_r = ((vis_right - vir_left) / img_w).clamp(0.0, 1.0);
+        let uv_b = ((vis_bottom - vir_top) / img_h).clamp(0.0, 1.0);
+        let tiles_x = ((ow + PREVIEW_TILE_SIZE - 1) / PREVIEW_TILE_SIZE) as i32;
+        let tiles_y = ((oh + PREVIEW_TILE_SIZE - 1) / PREVIEW_TILE_SIZE) as i32;
+        let ix0 = ((uv_l * ow as f32) / PREVIEW_TILE_SIZE as f32)
+            .floor()
+            .max(0.0) as i32;
+        let iy0 = ((uv_t * oh as f32) / PREVIEW_TILE_SIZE as f32)
+            .floor()
+            .max(0.0) as i32;
+        let ix1 = ((uv_r * ow as f32) / PREVIEW_TILE_SIZE as f32)
+            .floor()
+            .min((tiles_x.saturating_sub(1)) as f32) as i32;
+        let iy1 = ((uv_b * oh as f32) / PREVIEW_TILE_SIZE as f32)
+            .floor()
+            .min((tiles_y.saturating_sub(1)) as f32) as i32;
+        Some(VisibleTileGrid {
+            ix0,
+            iy0,
+            ix1: ix1.max(ix0),
+            iy1: iy1.max(iy0),
+            opt_hash: entry.preview_options_hash,
+            proxy_soft: zoom > 1.0 && base_scale * zoom > 1.02,
+        })
+    }
+
+    fn evict_tile_cache(&mut self, idx: usize) {
+        if idx >= self.images.len() {
+            return;
+        }
+        let grid = self.visible_tile_grid(idx);
+        let cache = &mut self.images[idx].tile_cache;
+        if cache.len() <= PREVIEW_TILE_LRU {
+            return;
+        }
+        let Some(grid) = grid else {
+            cache.truncate(PREVIEW_TILE_LRU);
+            return;
+        };
+        let mut i = cache.len();
+        while cache.len() > PREVIEW_TILE_LRU && i > 0 {
+            i -= 1;
+            let t = &cache[i];
+            let visible = t.options_hash == grid.opt_hash && grid.contains(t.ix, t.iy);
+            if !visible {
+                cache.remove(i);
+            }
+        }
+    }
+
+    /// Next missing 1:1 tile, or None when the proxy is still sharp / cache is full of visible tiles.
+    fn visible_tile_to_request(&self, idx: usize) -> Option<(i32, i32)> {
+        let grid = self.visible_tile_grid(idx)?;
+        if !grid.proxy_soft {
+            return None;
+        }
+        let entry = self.images.get(idx)?;
+        let can_evict_offscreen = entry.tile_cache.iter().any(|t| {
+            t.options_hash != grid.opt_hash || !grid.contains(t.ix, t.iy)
+        });
+        if entry.tile_cache.len() >= PREVIEW_TILE_LRU && !can_evict_offscreen {
+            return None;
+        }
+        let cx = (grid.ix0 + grid.ix1) as f32 * 0.5;
+        let cy = (grid.iy0 + grid.iy1) as f32 * 0.5;
+        let mut best: Option<(i32, i32, f32)> = None;
+        for iy in grid.iy0..=grid.iy1 {
+            for ix in grid.ix0..=grid.ix1 {
+                if self.tile_inflight == Some((idx, ix, iy)) {
+                    continue;
+                }
+                if self
+                    .tile_failed
+                    .iter()
+                    .any(|&(g, fx, fy)| g == self.tile_gen && fx == ix && fy == iy)
+                {
+                    continue;
+                }
+                let have = entry
+                    .tile_cache
+                    .iter()
+                    .any(|t| t.ix == ix && t.iy == iy && t.options_hash == grid.opt_hash);
+                if have {
+                    continue;
+                }
+                let d = (ix as f32 - cx).hypot(iy as f32 - cy);
+                if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+                    best = Some((ix, iy, d));
+                }
+            }
+        }
+        best.map(|(ix, iy, _)| (ix, iy))
     }
 }
 
@@ -1684,12 +2055,13 @@ impl eframe::App for C41Gui {
         // Poll preview worker
         if let Some(rx) = self.preview_receiver.as_ref() {
             match rx.try_recv() {
-                Ok(Ok((idx, input_w, input_h, w, h, rgb, dbg_log, captured_debug, new_cache))) => {
+                Ok(Ok(job)) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
-                    if idx < self.images.len() {
+                    if job.gen == self.preview_gen && job.index < self.images.len() {
+                        let idx = job.index;
                         let nearest = self.images[idx].preview_zoom > 1.0;
-                        let image = rgb_u8_to_color_image(w, h, &rgb);
+                        let image = rgb_u8_to_color_image(job.w, job.h, &job.rgb);
                         let tex_opts = if nearest {
                             egui::TextureOptions::NEAREST
                         } else {
@@ -1703,56 +2075,109 @@ impl eframe::App for C41Gui {
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_texture_nearest = nearest;
                         self.images[idx].preview_hash =
-                            self.preview_job_hash.take().unwrap_or(0);
-                        self.images[idx].preview_full_rgb = Some((w, h, rgb.clone()));
-                        self.images[idx].preview_step_cache = Some(new_cache);
-                        // preview_input_size = preview working dims (crop/dmin coord reference).
-                        self.images[idx].preview_input_size = Some([w, h]);
-                        // raw_source_size = true sensor/file dims (info bar display only).
-                        self.images[idx].raw_source_size = Some([input_w, input_h]);
-                        if let Some(thumb_image) = make_thumbnail_from_rgb(&rgb, w, h, THUMB_MAX_SIZE) {
-                            let thumb_tex = ctx.load_texture(
-                                format!(
-                                    "thumb_{}",
-                                    self.images[idx]
-                                        .path
-                                        .display()
-                                        .to_string()
-                                        .replace('\\', "_")
-                                        .replace('/', "_")
-                                ),
-                                thumb_image,
-                                egui::TextureOptions::default(),
-                            );
-                            self.images[idx].thumbnail_texture = Some(thumb_tex);
+                            self.preview_job_hash.unwrap_or(0);
+                        self.images[idx].preview_options_hash =
+                            self.preview_job_hash.unwrap_or(0);
+                        self.images[idx].preview_lod = job.lod;
+                        if job.lod == PreviewLod::Screen || job.lod == PreviewLod::FullRes {
+                            self.images[idx].preview_screen_wh = (job.w, job.h);
+                            self.images[idx].screen_step_cache = Some(job.new_cache.clone());
+                        } else {
+                            self.images[idx].draft_step_cache = Some(job.new_cache.clone());
                         }
-                        // Do not overwrite dmin/crop reference sizes here; they stay in the
-                        // coordinate space where the user last edited them.
-
-                        // Compute histogram inline from preview RGB (< 1ms).
+                        self.images[idx].preview_full_rgb = Some((job.w, job.h, job.rgb.clone()));
+                        self.images[idx].preview_step_cache = Some(job.new_cache);
+                        self.images[idx].preview_input_size = Some([job.w, job.h]);
+                        self.images[idx].raw_source_size = Some([job.input_w, job.input_h]);
+                        if self.images[idx].thumbnail_texture.is_none() {
+                            if let Some(thumb_image) =
+                                make_thumbnail_from_rgb(&job.rgb, job.w, job.h, THUMB_MAX_SIZE)
+                            {
+                                let thumb_tex = ctx.load_texture(
+                                    format!(
+                                        "thumb_{}",
+                                        self.images[idx]
+                                            .path
+                                            .display()
+                                            .to_string()
+                                            .replace('\\', "_")
+                                            .replace('/', "_")
+                                    ),
+                                    thumb_image,
+                                    egui::TextureOptions::default(),
+                                );
+                                self.images[idx].thumbnail_texture = Some(thumb_tex);
+                            }
+                        }
                         {
-                            let opts = &self.images[idx].options;
                             let hist = compute_histogram_from_rgb(
-                                &rgb, w, h, opts, input_w, input_h,
+                                &job.rgb,
+                                job.w,
+                                job.h,
+                                &self.images[idx].options,
+                                job.input_w,
+                                job.input_h,
                             );
+                            let crop_h = crop_histogram_hash(&self.images[idx].options);
                             self.images[idx].histogram = Some(hist);
+                            self.images[idx].histogram_crop_hash = crop_h;
                         }
-                        if captured_debug {
-                            self.images[idx].pipeline_debug_log = Some(dbg_log);
+                        if job.captured_debug {
+                            self.images[idx].pipeline_debug_log = Some(job.dbg_log);
                         }
                     }
                 }
                 Ok(Err(e)) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
-                    self.preview_job_hash = None;
                     self.status = format!("Preview error: {}", e);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
-                    self.preview_job_hash = None;
+                }
+            }
+        }
+
+        if let Some(rx) = self.tile_receiver.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(job)) => {
+                    self.tile_receiver = None;
+                    self.tile_inflight = None;
+                    if job.gen == self.tile_gen && job.index < self.images.len() {
+                        let idx = job.index;
+                        let image = rgb_u8_to_color_image(job.w, job.h, &job.rgb);
+                        let tex = ctx.load_texture(
+                            format!("preview_tile_{}_{}_{}", idx, job.ix, job.iy),
+                            image,
+                            egui::TextureOptions::NEAREST,
+                        );
+                        let tile = PreviewTile {
+                            ix: job.ix,
+                            iy: job.iy,
+                            options_hash: job.options_hash,
+                            texture: tex,
+                            uv: job.uv,
+                        };
+                        let cache = &mut self.images[idx].tile_cache;
+                        cache.retain(|t| !(t.ix == tile.ix && t.iy == tile.iy));
+                        cache.insert(0, tile);
+                        self.evict_tile_cache(idx);
+                        ctx.request_repaint();
+                    }
+                }
+                Ok(Err(e)) => {
+                    if let Some((_, ix, iy)) = self.tile_inflight.take() {
+                        self.tile_failed.push((self.tile_gen, ix, iy));
+                    }
+                    self.tile_receiver = None;
+                    self.status = format!("Tile error: {}", e);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.tile_receiver = None;
+                    self.tile_inflight = None;
                 }
             }
         }
@@ -1842,6 +2267,13 @@ impl eframe::App for C41Gui {
                                             preview_texture: None,
                                             preview_texture_nearest: false,
                                             preview_hash: 0,
+                                            preview_options_hash: 0,
+                                            preview_lod: PreviewLod::Draft,
+                                            preview_screen_wh: (0, 0),
+                                            preview_screen_requested_wh: (0, 0),
+                                            tile_cache: Vec::new(),
+                                            draft_step_cache: None,
+                                            screen_step_cache: None,
                                             preview_full_rgb: None,
                                             preview_input_size: None,
                                             raw_source_size: None,
@@ -1849,6 +2281,7 @@ impl eframe::App for C41Gui {
                                             preview_pan: egui::vec2(0.5, 0.5),
                                             thumbnail_texture: None,
                                             histogram: None,
+                                            histogram_crop_hash: 0,
                                             export_format: ExportFormat::Tiff16,
                                             raw_debug_report: None,
                                             pipeline_debug_log: None,
@@ -1994,6 +2427,8 @@ impl eframe::App for C41Gui {
                     let had_removals = !to_remove.is_empty();
                     if had_removals {
                         self.preview_receiver = None;
+                        self.tile_receiver = None;
+                        self.tile_inflight = None;
                         self.full_res_preview_active = false;
                         for &i in &to_remove {
                             if let Some(e) = self.images.get(i) {
@@ -2212,7 +2647,8 @@ impl eframe::App for C41Gui {
                             .clicked()
                         {
                             self.capture_pipeline_debug_next = true;
-                            entry.preview_texture = None; // force one fresh render with debug capture
+                            entry.preview_hash = 0;
+                            entry.preview_options_hash = 0;
                         }
                         if let Some(ref log) = entry.pipeline_debug_log {
                             if ui.button("Copy pipeline log").clicked() {
@@ -3782,6 +4218,48 @@ impl eframe::App for C41Gui {
                                 );
                                 canvas_painter.image(tex.id(), vis_rect, uv, egui::Color32::WHITE);
                             }
+
+                            // 1:1 tiles over the proxy whenever the user has zoomed in.
+                            if zoom > 1.0 {
+                                let opt_hash = self.images[idx].preview_options_hash;
+                                for tile in &self.images[idx].tile_cache {
+                                    if tile.options_hash != opt_hash {
+                                        continue;
+                                    }
+                                    let tile_rect = egui::Rect::from_min_max(
+                                        egui::pos2(
+                                            vir_rect.left() + tile.uv.min.x * img_w,
+                                            vir_rect.top() + tile.uv.min.y * img_h,
+                                        ),
+                                        egui::pos2(
+                                            vir_rect.left() + tile.uv.max.x * img_w,
+                                            vir_rect.top() + tile.uv.max.y * img_h,
+                                        ),
+                                    );
+                                    let tvis = tile_rect.intersect(canvas_rect);
+                                    if tvis.width() <= 0.0 || tvis.height() <= 0.0 {
+                                        continue;
+                                    }
+                                    let tw = tile_rect.width().max(1.0);
+                                    let th = tile_rect.height().max(1.0);
+                                    let tuv = egui::Rect::from_min_max(
+                                        egui::pos2(
+                                            (tvis.left() - tile_rect.left()) / tw,
+                                            (tvis.top() - tile_rect.top()) / th,
+                                        ),
+                                        egui::pos2(
+                                            (tvis.right() - tile_rect.left()) / tw,
+                                            (tvis.bottom() - tile_rect.top()) / th,
+                                        ),
+                                    );
+                                    canvas_painter.image(
+                                        tile.texture.id(),
+                                        tvis,
+                                        tuv,
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            }
                         }
 
                         // image_rect = canvas_rect so overlays can paint across the full canvas.
@@ -3809,7 +4287,9 @@ impl eframe::App for C41Gui {
                         // Loading spinner overlay — drawn entirely via canvas_painter so it
                         // never touches the UI layout cursor (which would shift the histogram).
                         // Also show when no preview data is available yet (first load).
-                        if show_loader || self.images[idx].preview_texture.is_none() {
+                        if self.images[idx].preview_texture.is_none()
+                            && (show_loader || has_inflight)
+                        {
                             canvas_painter.rect_filled(
                                 canvas_rect,
                                 0.0,
@@ -4354,7 +4834,7 @@ impl eframe::App for C41Gui {
                             // Photoshop-style zoom: 100 % = 1 image pixel : 1 screen pixel.
                             let zoom_pct = base_scale * entry.preview_zoom * 100.0;
 
-                            let info_text = if let Some((cw, ch)) = crop_dims {
+                            let mut info_text = if let Some((cw, ch)) = crop_dims {
                                 format!(
                                     "{} × {}  →  {} × {}  ·  {:.0}%",
                                     src_w, src_h, cw, ch, zoom_pct
@@ -4362,6 +4842,29 @@ impl eframe::App for C41Gui {
                             } else {
                                 format!("{} × {}  ·  {:.0}%", src_w, src_h, zoom_pct)
                             };
+                            let (scr_w, scr_h) = preview_working_limits(
+                                self.preview_canvas_size,
+                                ctx.pixels_per_point(),
+                                false,
+                            );
+                            if self.images[idx].preview_lod == PreviewLod::Draft
+                                && !self.full_res_preview_active
+                                && zoom <= 1.0
+                                && (has_inflight || scr_w > PREVIEW_DRAFT_MAX || scr_h > PREVIEW_DRAFT_MAX)
+                            {
+                                info_text.push_str("  ·  Refining…");
+                            }
+                            if zoom > 1.0
+                                && (self.tile_receiver.is_some()
+                                    || !self.images[idx].tile_cache.is_empty())
+                            {
+                                let n = self.images[idx].tile_cache.len();
+                                if self.tile_receiver.is_some() {
+                                    info_text.push_str(&format!("  ·  1:1 tiles ({n})…"));
+                                } else {
+                                    info_text.push_str(&format!("  ·  1:1 tiles ({n})"));
+                                }
+                            }
 
                             ui.allocate_ui(
                                 egui::vec2(ui.available_width(), INFO_ROW_HEIGHT),
@@ -4403,8 +4906,13 @@ impl eframe::App for C41Gui {
                                 self.full_res_preview_active = !self.full_res_preview_active;
                                 if self.full_res_preview_active {
                                     self.full_res_preview_button_clicked = true;
-                                    self.images[idx].preview_texture = None; // Force re-render
-                                    self.images[idx].preview_hash = 0; // Invalidate so need_new triggers
+                                    self.images[idx].preview_hash = 0;
+                                    self.images[idx].preview_options_hash = 0;
+                                    self.preview_gen = self.preview_gen.wrapping_add(1);
+                                    self.tile_gen = self.tile_gen.wrapping_add(1);
+                                    self.tile_inflight = None;
+                                    self.tile_failed.clear();
+                                    self.images[idx].tile_cache.clear();
                                 }
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4649,31 +5157,75 @@ impl eframe::App for C41Gui {
             }
         });
 
-        // If selected image has no preview or options changed, request a new one.
-        // Runs after UI interactions so drag/release state is available for debounce.
+        // Crop is overlay-only: refresh the histogram from the current preview, no pipeline.
         if let Some(idx) = self.selected_index {
             if idx < self.images.len() {
-                // Hash options + working size + full-res flag. Zoom is display-only.
-                let (max_w, max_h) = preview_working_limits(
+                let crop_h = crop_histogram_hash(&self.images[idx].options);
+                if self.images[idx].histogram_crop_hash != crop_h {
+                    if let Some((w, h, rgb)) = self.images[idx].preview_full_rgb.clone() {
+                        let input = self.images[idx].raw_source_size.unwrap_or([w, h]);
+                        let hist = compute_histogram_from_rgb(
+                            &rgb,
+                            w,
+                            h,
+                            &self.images[idx].options,
+                            input[0],
+                            input[1],
+                        );
+                        self.images[idx].histogram = Some(hist);
+                        self.images[idx].histogram_crop_hash = crop_h;
+                    }
+                }
+            }
+        }
+
+        // Draft → screen refine. Runs after UI so drag/release is available for debounce.
+        if let Some(idx) = self.selected_index {
+            if idx < self.images.len() {
+                let (screen_w, screen_h) = preview_working_limits(
                     self.preview_canvas_size,
                     ctx.pixels_per_point(),
                     self.full_res_preview_active,
                 );
-                let hash_now = preview_invalidation_hash(
+                let hash_now = preview_options_hash(
                     &self.images[idx].path,
                     &self.images[idx].options,
                     self.full_res_preview_active,
-                    max_w,
-                    max_h,
                 );
-                let need_new = self.images[idx].preview_texture.is_none()
-                    || self.images[idx].preview_hash != hash_now;
-                if need_new {
+                if self.capture_pipeline_debug_next {
+                    self.images[idx].preview_options_hash = 0;
+                }
+                let have_rgb = self.images[idx].preview_full_rgb.is_some();
+                let have_current = have_rgb && self.images[idx].preview_options_hash == hash_now;
+                let need_options = !have_current;
+                let lod = self.images[idx].preview_lod;
+                let proxy_soft = self
+                    .visible_tile_grid(idx)
+                    .map(|g| g.proxy_soft)
+                    .unwrap_or(false);
+                let (req_sw, req_sh) = self.images[idx].preview_screen_requested_wh;
+                // Do not compare CFA output size to the request cap — downsample often
+                // comes in smaller and that used to restart screen refine forever,
+                // which blocked 1:1 tiles. Skip refine only when tiles will actually run.
+                let need_screen = have_current
+                    && !self.full_res_preview_active
+                    && !proxy_soft
+                    && (lod == PreviewLod::Draft
+                        || (lod == PreviewLod::Screen
+                            && (req_sw + 64 < screen_w || req_sh + 64 < screen_h)));
+                let screen_fits_draft = screen_w <= PREVIEW_DRAFT_MAX && screen_h <= PREVIEW_DRAFT_MAX;
+
+                if need_options {
                     let now = Instant::now();
                     let key = (idx, hash_now);
                     if self.pending_preview_key != Some(key) {
                         self.pending_preview_key = Some(key);
                         self.pending_preview_since = Some(now);
+                        self.preview_gen = self.preview_gen.wrapping_add(1);
+                        self.tile_gen = self.tile_gen.wrapping_add(1);
+                        self.tile_inflight = None;
+                        self.tile_failed.clear();
+                        self.images[idx].tile_cache.clear();
                     }
 
                     let gpu_active = {
@@ -4694,20 +5246,45 @@ impl eframe::App for C41Gui {
                         .unwrap_or(false);
 
                     if self.preview_receiver.is_none() && !waiting_for_release && settled {
-                        // Deactivate full-res when preview is triggered by option/size change (not by the button).
                         if self.full_res_preview_active && !self.full_res_preview_button_clicked {
                             self.full_res_preview_active = false;
                         }
-                        self.request_preview_for(idx, ctx);
+                        let lod = if self.full_res_preview_active {
+                            PreviewLod::FullRes
+                        } else if screen_fits_draft {
+                            PreviewLod::Screen
+                        } else {
+                            PreviewLod::Draft
+                        };
+                        self.request_preview_for(idx, ctx, lod);
                         self.full_res_preview_button_clicked = false;
                         self.pending_preview_since = None;
                     } else {
-                        // Keep ticking while debounce/release conditions are pending.
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }
+                } else if need_screen && self.preview_receiver.is_none() {
+                    self.pending_preview_key = None;
+                    self.pending_preview_since = None;
+                    self.request_preview_for(idx, ctx, PreviewLod::Screen);
                 } else if self.pending_preview_key.map(|(i, _)| i) == Some(idx) {
                     self.pending_preview_key = None;
                     self.pending_preview_since = None;
+                }
+
+                // 1:1 tiles: only when the screen proxy is soft and no full-frame job is running.
+                if proxy_soft
+                    && self.preview_receiver.is_none()
+                    && self.tile_receiver.is_none()
+                    && have_current
+                    && !self.full_res_preview_active
+                    && !self.rect_dragging
+                {
+                    if let Some(missing) = self.visible_tile_to_request(idx) {
+                        self.request_tile_for(idx, missing.0, missing.1, ctx);
+                    }
+                }
+                if self.tile_receiver.is_some() {
+                    ctx.request_repaint();
                 }
             }
         } else {

@@ -204,11 +204,7 @@ pub fn preview_scene_stats_key(opts: &PipelineOptions) -> u64 {
         hash_f32(&mut h, b);
     }
     opts.auto_wb.hash(&mut h);
-    opts.apply_crop.hash(&mut h);
-    opts.crop_rect_reference_size.hash(&mut h);
-    if let Some(r) = opts.crop_rect {
-        hash_rect(&mut h, &r);
-    }
+    // Crop is display/histogram/export only — it must not remosaic the full sensor.
     opts.flat_field_path
         .as_ref()
         .map(|p| p.display().to_string())
@@ -309,4 +305,274 @@ pub fn compute_preview_scene_stats(
     };
 
     Ok(PreviewSceneStats { dmin, auto_wb })
+}
+
+impl CachedSensor {
+    /// Unrotated sensor / file dimensions (width, height).
+    pub fn dimensions(&self) -> (u32, u32) {
+        match self {
+            CachedSensor::Bayer { data, .. } => {
+                let (h, w, _) = data.dim();
+                (w as u32, h as u32)
+            }
+            CachedSensor::Rgb(img) => {
+                let (h, w, _) = img.dim();
+                (w as u32, h as u32)
+            }
+        }
+    }
+}
+
+/// Oriented (after rotation) full-frame size from unrotated sensor dims.
+pub fn oriented_sensor_size(sensor_w: u32, sensor_h: u32, rotation_degrees: i32) -> (u32, u32) {
+    let r = ((rotation_degrees % 360 + 360) % 360) / 90;
+    if r == 1 || r == 3 {
+        (sensor_h, sensor_w)
+    } else {
+        (sensor_w, sensor_h)
+    }
+}
+
+fn cfa_align(sensor: &CachedSensor) -> u32 {
+    match sensor {
+        CachedSensor::Bayer {
+            pattern: crate::demosaic::CfaPattern::XTrans(_),
+            ..
+        } => 6,
+        CachedSensor::Bayer { .. } => 2,
+        CachedSensor::Rgb(_) => 1,
+    }
+}
+
+fn align_down(v: i32, a: i32) -> i32 {
+    if a <= 1 {
+        return v.max(0);
+    }
+    let v = v.max(0);
+    v / a * a
+}
+
+fn align_up(v: i32, a: i32) -> i32 {
+    if a <= 1 {
+        return v.max(0);
+    }
+    let v = v.max(0);
+    ((v + a - 1) / a) * a
+}
+
+/// Map an oriented pixel to unrotated sensor coordinates.
+pub(crate) fn oriented_to_sensor(
+    ox: i32,
+    oy: i32,
+    sensor_w: i32,
+    sensor_h: i32,
+    rotation_degrees: i32,
+    flip_h: bool,
+    flip_v: bool,
+) -> (i32, i32) {
+    let (ow, oh) = oriented_sensor_size(sensor_w as u32, sensor_h as u32, rotation_degrees);
+    let mut x = ox;
+    let mut y = oy;
+    if flip_h {
+        x = ow as i32 - 1 - x;
+    }
+    if flip_v {
+        y = oh as i32 - 1 - y;
+    }
+    let r = ((rotation_degrees % 360 + 360) % 360) / 90;
+    match r {
+        1 => (y, sensor_h - 1 - x), // inverse of 90 CW
+        2 => (sensor_w - 1 - x, sensor_h - 1 - y),
+        3 => (sensor_w - 1 - y, x), // inverse of 270 CW
+        _ => (x, y),
+    }
+}
+
+/// Map an unrotated sensor pixel to oriented coordinates.
+pub(crate) fn sensor_to_oriented(
+    sx: i32,
+    sy: i32,
+    sensor_w: i32,
+    sensor_h: i32,
+    rotation_degrees: i32,
+    flip_h: bool,
+    flip_v: bool,
+) -> (i32, i32) {
+    let r = ((rotation_degrees % 360 + 360) % 360) / 90;
+    let (mut ox, mut oy) = match r {
+        1 => (sensor_h - 1 - sy, sx), // 90 CW
+        2 => (sensor_w - 1 - sx, sensor_h - 1 - sy),
+        3 => (sy, sensor_w - 1 - sx), // 270 CW
+        _ => (sx, sy),
+    };
+    let (ow, oh) = oriented_sensor_size(sensor_w as u32, sensor_h as u32, rotation_degrees);
+    if flip_h {
+        ox = ow as i32 - 1 - ox;
+    }
+    if flip_v {
+        oy = oh as i32 - 1 - oy;
+    }
+    (ox, oy)
+}
+
+/// Crop of `CachedSensor` covering an oriented rectangle, plus the UV of the
+/// processed tile in the oriented full frame (0–1).
+pub struct SensorTileCrop {
+    pub sensor: CachedSensor,
+    pub uv_left: f32,
+    pub uv_top: f32,
+    pub uv_right: f32,
+    pub uv_bottom: f32,
+}
+
+/// Extract a CFA-aligned sensor crop that covers `oriented` pixels plus `halo`.
+///
+/// `oriented_*` is in the rotated/flipped full-frame space (same as the GUI image).
+pub fn crop_sensor_for_oriented_rect(
+    sensor: &CachedSensor,
+    oriented_x: u32,
+    oriented_y: u32,
+    oriented_w: u32,
+    oriented_h: u32,
+    rotation_degrees: i32,
+    flip_h: bool,
+    flip_v: bool,
+    halo: u32,
+) -> Result<SensorTileCrop> {
+    let (sw, sh) = sensor.dimensions();
+    let (ow, oh) = oriented_sensor_size(sw, sh, rotation_degrees);
+    if ow == 0 || oh == 0 {
+        anyhow::bail!("empty sensor");
+    }
+
+    let x0 = oriented_x as i32 - halo as i32;
+    let y0 = oriented_y as i32 - halo as i32;
+    let x1 = (oriented_x + oriented_w) as i32 + halo as i32;
+    let y1 = (oriented_y + oriented_h) as i32 + halo as i32;
+
+    let corners = [
+        (x0, y0),
+        (x1 - 1, y0),
+        (x0, y1 - 1),
+        (x1 - 1, y1 - 1),
+    ];
+    let mut min_sx = sw as i32;
+    let mut min_sy = sh as i32;
+    let mut max_sx = 0;
+    let mut max_sy = 0;
+    for (ox, oy) in corners {
+        let (sx, sy) = oriented_to_sensor(
+            ox,
+            oy,
+            sw as i32,
+            sh as i32,
+            rotation_degrees,
+            flip_h,
+            flip_v,
+        );
+        min_sx = min_sx.min(sx);
+        min_sy = min_sy.min(sy);
+        max_sx = max_sx.max(sx);
+        max_sy = max_sy.max(sy);
+    }
+
+    let align = cfa_align(sensor) as i32;
+    min_sx = align_down(min_sx, align).clamp(0, sw as i32 - 1);
+    min_sy = align_down(min_sy, align).clamp(0, sh as i32 - 1);
+    max_sx = align_up(max_sx + 1, align).clamp(min_sx + align, sw as i32);
+    max_sy = align_up(max_sy + 1, align).clamp(min_sy + align, sh as i32);
+
+    let cw = (max_sx - min_sx) as usize;
+    let ch = (max_sy - min_sy) as usize;
+    if cw == 0 || ch == 0 {
+        anyhow::bail!("empty sensor tile crop");
+    }
+
+    let cropped = match sensor {
+        CachedSensor::Bayer { data, pattern } => {
+            let slice = data.slice(ndarray::s![
+                min_sy as usize..max_sy as usize,
+                min_sx as usize..max_sx as usize,
+                ..
+            ]);
+            CachedSensor::Bayer {
+                data: slice.to_owned(),
+                pattern: *pattern,
+            }
+        }
+        CachedSensor::Rgb(img) => {
+            let slice = img.slice(ndarray::s![
+                min_sy as usize..max_sy as usize,
+                min_sx as usize..max_sx as usize,
+                ..
+            ]);
+            CachedSensor::Rgb(slice.to_owned())
+        }
+    };
+
+    // Forward-map the actual crop corners to oriented UV.
+    let fwd = [
+        (min_sx, min_sy),
+        (max_sx - 1, min_sy),
+        (min_sx, max_sy - 1),
+        (max_sx - 1, max_sy - 1),
+    ];
+    let mut min_ox = ow as i32;
+    let mut min_oy = oh as i32;
+    let mut max_ox = 0;
+    let mut max_oy = 0;
+    for (sx, sy) in fwd {
+        let (ox, oy) = sensor_to_oriented(
+            sx,
+            sy,
+            sw as i32,
+            sh as i32,
+            rotation_degrees,
+            flip_h,
+            flip_v,
+        );
+        min_ox = min_ox.min(ox);
+        min_oy = min_oy.min(oy);
+        max_ox = max_ox.max(ox);
+        max_oy = max_oy.max(oy);
+    }
+    let owf = ow as f32;
+    let ohf = oh as f32;
+    Ok(SensorTileCrop {
+        sensor: cropped,
+        uv_left: (min_ox as f32 / owf).clamp(0.0, 1.0),
+        uv_top: (min_oy as f32 / ohf).clamp(0.0, 1.0),
+        uv_right: ((max_ox + 1) as f32 / owf).clamp(0.0, 1.0),
+        uv_bottom: ((max_oy + 1) as f32 / ohf).clamp(0.0, 1.0),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensor_oriented_roundtrip() {
+        let sw = 20;
+        let sh = 12;
+        for rot in [0, 90, 180, 270] {
+            for flip_h in [false, true] {
+                for flip_v in [false, true] {
+                    for sy in 0..sh {
+                        for sx in 0..sw {
+                            let (ox, oy) =
+                                sensor_to_oriented(sx, sy, sw, sh, rot, flip_h, flip_v);
+                            let (rx, ry) =
+                                oriented_to_sensor(ox, oy, sw, sh, rot, flip_h, flip_v);
+                            assert_eq!(
+                                (rx, ry),
+                                (sx, sy),
+                                "rot={rot} flip={flip_h},{flip_v} ({sx},{sy})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
