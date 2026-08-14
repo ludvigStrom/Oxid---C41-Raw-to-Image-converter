@@ -178,7 +178,10 @@ struct PreviewTile {
     iy: i32,
     options_hash: u64,
     texture: egui::TextureHandle,
+    /// Placement in the oriented full frame (0–1), halo excluded.
     uv: egui::Rect,
+    /// Corresponding region of `texture` (0–1), halo excluded.
+    tex_uv: egui::Rect,
 }
 
 /// Visible 1:1 tile grid for the current canvas / pan / zoom.
@@ -222,6 +225,7 @@ struct TileJobResult {
     h: u32,
     rgb: Vec<u8>,
     uv: egui::Rect,
+    tex_uv: egui::Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1791,9 +1795,30 @@ impl C41Gui {
                 return;
             }
         };
+        // Place the requested 512² (plus 1 px overlap), not the halo crop.
+        // Drawing the halo showed C-41 edge fringes as red seams.
+        let owf = ow as f32;
+        let ohf = oh as f32;
+        let overlap = 1.0;
+        let inner_l = (x as f32 - overlap).max(0.0) / owf;
+        let inner_t = (y as f32 - overlap).max(0.0) / ohf;
+        let inner_r = ((x + tw) as f32 + overlap).min(owf) / owf;
+        let inner_b = ((y + th) as f32 + overlap).min(ohf) / ohf;
         let uv = egui::Rect::from_min_max(
-            egui::pos2(crop.uv_left, crop.uv_top),
-            egui::pos2(crop.uv_right, crop.uv_bottom),
+            egui::pos2(inner_l, inner_t),
+            egui::pos2(inner_r, inner_b),
+        );
+        let crop_uw = (crop.uv_right - crop.uv_left).max(1e-6);
+        let crop_uh = (crop.uv_bottom - crop.uv_top).max(1e-6);
+        let tex_uv = egui::Rect::from_min_max(
+            egui::pos2(
+                ((inner_l - crop.uv_left) / crop_uw).clamp(0.0, 1.0),
+                ((inner_t - crop.uv_top) / crop_uh).clamp(0.0, 1.0),
+            ),
+            egui::pos2(
+                ((inner_r - crop.uv_left) / crop_uw).clamp(0.0, 1.0),
+                ((inner_b - crop.uv_top) / crop_uh).clamp(0.0, 1.0),
+            ),
         );
         let mut options = self.bake_preview_options(entry);
         options.verbose_debug = false;
@@ -1838,6 +1863,7 @@ impl C41Gui {
                 h,
                 rgb,
                 uv,
+                tex_uv,
             });
             let _ = tx.send(res);
         });
@@ -2125,6 +2151,12 @@ impl eframe::App for C41Gui {
                         if job.captured_debug {
                             self.images[idx].pipeline_debug_log = Some(job.dbg_log);
                         }
+                        // Old 1:1 tiles belong to the previous options; drop them
+                        // with the new proxy so we don't flash stale seams.
+                        self.images[idx].tile_cache.clear();
+                        self.tile_gen = self.tile_gen.wrapping_add(1);
+                        self.tile_inflight = None;
+                        self.tile_failed.clear();
                     }
                 }
                 Ok(Err(e)) => {
@@ -2159,6 +2191,7 @@ impl eframe::App for C41Gui {
                             options_hash: job.options_hash,
                             texture: tex,
                             uv: job.uv,
+                            tex_uv: job.tex_uv,
                         };
                         let cache = &mut self.images[idx].tile_cache;
                         cache.retain(|t| !(t.ix == tile.ix && t.iy == tile.iy));
@@ -4242,14 +4275,19 @@ impl eframe::App for C41Gui {
                                     }
                                     let tw = tile_rect.width().max(1.0);
                                     let th = tile_rect.height().max(1.0);
+                                    let fx0 = (tvis.left() - tile_rect.left()) / tw;
+                                    let fy0 = (tvis.top() - tile_rect.top()) / th;
+                                    let fx1 = (tvis.right() - tile_rect.left()) / tw;
+                                    let fy1 = (tvis.bottom() - tile_rect.top()) / th;
+                                    let tu = tile.tex_uv;
                                     let tuv = egui::Rect::from_min_max(
                                         egui::pos2(
-                                            (tvis.left() - tile_rect.left()) / tw,
-                                            (tvis.top() - tile_rect.top()) / th,
+                                            tu.min.x + fx0 * (tu.max.x - tu.min.x),
+                                            tu.min.y + fy0 * (tu.max.y - tu.min.y),
                                         ),
                                         egui::pos2(
-                                            (tvis.right() - tile_rect.left()) / tw,
-                                            (tvis.bottom() - tile_rect.top()) / th,
+                                            tu.min.x + fx1 * (tu.max.x - tu.min.x),
+                                            tu.min.y + fy1 * (tu.max.y - tu.min.y),
                                         ),
                                     );
                                     canvas_painter.image(
@@ -5221,28 +5259,22 @@ impl eframe::App for C41Gui {
                     if self.pending_preview_key != Some(key) {
                         self.pending_preview_key = Some(key);
                         self.pending_preview_since = Some(now);
+                        // Cancel in-flight work, but keep the last proxy + tiles
+                        // on screen until the pointer is released.
                         self.preview_gen = self.preview_gen.wrapping_add(1);
                         self.tile_gen = self.tile_gen.wrapping_add(1);
                         self.tile_inflight = None;
                         self.tile_failed.clear();
-                        self.images[idx].tile_cache.clear();
                     }
 
-                    let gpu_active = {
-                        #[cfg(feature = "gpu")]
-                        { self.gpu_pipeline.is_some() && self.images[idx].options.use_gpu }
-                        #[cfg(not(feature = "gpu"))]
-                        { false }
-                    };
-                    let waiting_for_release = if gpu_active {
-                        self.rect_dragging
-                    } else {
-                        self.rect_dragging || ctx.input(|i| i.pointer.any_down())
-                    };
-                    let debounce_ms = if gpu_active { 0 } else { PREVIEW_DEBOUNCE_MS };
+                    let waiting_for_release =
+                        self.rect_dragging || ctx.input(|i| i.pointer.any_down());
                     let settled = self
                         .pending_preview_since
-                        .map(|t| now.saturating_duration_since(t) >= Duration::from_millis(debounce_ms))
+                        .map(|t| {
+                            now.saturating_duration_since(t)
+                                >= Duration::from_millis(PREVIEW_DEBOUNCE_MS)
+                        })
                         .unwrap_or(false);
 
                     if self.preview_receiver.is_none() && !waiting_for_release && settled {
