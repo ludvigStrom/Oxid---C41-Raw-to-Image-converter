@@ -2083,32 +2083,7 @@ impl C41Gui {
                 }
             }
         }
-        let picked = best.map(|(ix, iy, _)| (ix, iy));
-        // #region agent log
-        if let Some((ix, iy)) = picked {
-            agent_dbg(
-                "C",
-                "c41_gui.rs:visible_tile_to_request",
-                "request missing",
-                &format!(
-                    "{{\"ix\":{},\"iy\":{},\"cache_n\":{},\"core_n\":{},\"tiles_fit\":{},\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{}}}",
-                    ix, iy, entry.tile_cache.len(), grid.core_n, grid.tiles_fit, grid.ix0, grid.iy0, grid.ix1, grid.iy1
-                ),
-            );
-        } else {
-            agent_dbg_changed(
-                &format!("all:{}:{}:{}:{}:{}", grid.ix0, grid.iy0, grid.ix1, grid.iy1, entry.tile_cache.len()),
-                "D",
-                "c41_gui.rs:visible_tile_to_request",
-                "all present",
-                &format!(
-                    "{{\"cache_n\":{},\"core_n\":{},\"tiles_fit\":{},\"ix0\":{},\"iy0\":{},\"ix1\":{},\"iy1\":{}}}",
-                    entry.tile_cache.len(), grid.core_n, grid.tiles_fit, grid.ix0, grid.iy0, grid.ix1, grid.iy1
-                ),
-            );
-        }
-        // #endregion
-        picked
+        best.map(|(ix, iy, _)| (ix, iy))
     }
 
     fn mark_preview_view_changed(&mut self) {
@@ -4309,15 +4284,6 @@ impl eframe::App for C41Gui {
                         });
                         self.preview_canvas_size = Some((canvas_w, canvas_h));
                         if canvas_changed == Some(true) {
-                            // #region agent log
-                            agent_dbg_changed(
-                                "canvas",
-                                "A",
-                                "c41_gui.rs:canvas_changed",
-                                "canvas resize marked view changed",
-                                &format!("{{\"cw\":{:.1},\"ch\":{:.1}}}", canvas_w, canvas_h),
-                            );
-                            // #endregion
                             self.mark_preview_view_changed();
                         }
 
@@ -5485,8 +5451,8 @@ impl eframe::App for C41Gui {
                     self.preview_view_dragging = false;
                 }
                 let view_settling = self.preview_view_settling();
-                // 1:1 tiles: after pan/zoom/slider release, when the proxy is soft
-                // and the core view fits in the tile cap.
+                // 1:1 tiles: after pan/zoom/slider release, when the proxy is soft.
+                // Over-cap views still fetch a center-first window of PREVIEW_TILE_MAX.
                 if proxy_soft
                     && self.preview_receiver.is_none()
                     && self.tile_receiver.is_none()
@@ -5502,39 +5468,6 @@ impl eframe::App for C41Gui {
                     if let Some(missing) = self.visible_tile_to_request(idx) {
                         self.request_tile_for(idx, missing.0, missing.1, ctx);
                     }
-                } else {
-                    // #region agent log
-                    let reason = if !proxy_soft {
-                        "not_soft"
-                    } else if self.preview_receiver.is_some() {
-                        "preview_inflight"
-                    } else if self.tile_receiver.is_some() {
-                        "tile_inflight"
-                    } else if !have_current {
-                        "not_current"
-                    } else if self.full_res_preview_active {
-                        "full_res"
-                    } else if self.rect_dragging {
-                        "rect_drag"
-                    } else if self.preview_view_dragging {
-                        "view_drag"
-                    } else if view_settling {
-                        "settling"
-                    } else if need_options {
-                        "need_options"
-                    } else if pointer_down {
-                        "pointer"
-                    } else {
-                        "other"
-                    };
-                    agent_dbg_changed(
-                        &format!("gate:{reason}"),
-                        "A",
-                        "c41_gui.rs:tile_gate",
-                        "request gate blocked",
-                        &format!("{{\"reason\":\"{reason}\"}}"),
-                    );
-                    // #endregion
                 }
                 if self.tile_receiver.is_some() {
                     ctx.request_repaint();
