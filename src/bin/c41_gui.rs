@@ -50,9 +50,14 @@ const PREVIEW_MIN_SIDE: u32 = 640;
 const PREVIEW_DRAFT_MAX: u32 = 800;
 const PREVIEW_TILE_SIZE: u32 = 512;
 const PREVIEW_TILE_LRU: usize = 16;
+const PREVIEW_TILE_MAX: usize = 48;
 const PREVIEW_TILE_HALO: u32 = 32;
 const THUMB_MAX_SIZE: u32 = 64;
 const PREVIEW_DEBOUNCE_MS: u64 = 180;
+/// Coalesce slider ticks so the draft proxy can update while dragging.
+const PREVIEW_LIVE_DEBOUNCE_MS: u64 = 50;
+/// Wait this long after pan/zoom before fetching 1:1 tiles.
+const PREVIEW_VIEW_SETTLE_MS: u64 = 100;
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
 const ICON_CLOSE_PATH: &str = "X.png";
@@ -321,6 +326,10 @@ struct C41Gui {
     ui_icons: UiIcons,
     /// Suppresses preview reprocessing while the user is dragging a rect handle (crop / d-min).
     rect_dragging: bool,
+    /// True while the preview is being panned (left/middle drag).
+    preview_view_dragging: bool,
+    /// Last pan/zoom; tiles wait until this has settled.
+    preview_view_changed_at: Option<Instant>,
     /// Debounce state for preview refreshes: (image index, options hash) currently waiting to settle.
     pending_preview_key: Option<(usize, u64)>,
     pending_preview_since: Option<Instant>,
@@ -369,6 +378,8 @@ impl Default for C41Gui {
             flat_field_image: None,
             ui_icons: UiIcons::default(),
             rect_dragging: false,
+            preview_view_dragging: false,
+            preview_view_changed_at: None,
             pending_preview_key: None,
             pending_preview_since: None,
             pending_output_lut_browse: false,
@@ -1934,21 +1945,33 @@ impl C41Gui {
         })
     }
 
+    fn tile_cache_limit(&self, idx: usize) -> usize {
+        let Some(g) = self.visible_tile_grid(idx) else {
+            return PREVIEW_TILE_LRU;
+        };
+        let nx = (g.ix1 - g.ix0 + 1) as usize;
+        let ny = (g.iy1 - g.iy0 + 1) as usize;
+        nx.saturating_mul(ny)
+            .max(PREVIEW_TILE_LRU)
+            .min(PREVIEW_TILE_MAX)
+    }
+
     fn evict_tile_cache(&mut self, idx: usize) {
         if idx >= self.images.len() {
             return;
         }
+        let limit = self.tile_cache_limit(idx);
         let grid = self.visible_tile_grid(idx);
         let cache = &mut self.images[idx].tile_cache;
-        if cache.len() <= PREVIEW_TILE_LRU {
+        if cache.len() <= limit {
             return;
         }
         let Some(grid) = grid else {
-            cache.truncate(PREVIEW_TILE_LRU);
+            cache.truncate(limit);
             return;
         };
         let mut i = cache.len();
-        while cache.len() > PREVIEW_TILE_LRU && i > 0 {
+        while cache.len() > limit && i > 0 {
             i -= 1;
             let t = &cache[i];
             let visible = t.options_hash == grid.opt_hash && grid.contains(t.ix, t.iy);
@@ -1958,17 +1981,18 @@ impl C41Gui {
         }
     }
 
-    /// Next missing 1:1 tile, or None when the proxy is still sharp / cache is full of visible tiles.
+    /// Next missing 1:1 tile, or None when the proxy is still sharp / cache is full.
     fn visible_tile_to_request(&self, idx: usize) -> Option<(i32, i32)> {
         let grid = self.visible_tile_grid(idx)?;
         if !grid.proxy_soft {
             return None;
         }
         let entry = self.images.get(idx)?;
+        let limit = self.tile_cache_limit(idx);
         let can_evict_offscreen = entry.tile_cache.iter().any(|t| {
             t.options_hash != grid.opt_hash || !grid.contains(t.ix, t.iy)
         });
-        if entry.tile_cache.len() >= PREVIEW_TILE_LRU && !can_evict_offscreen {
+        if entry.tile_cache.len() >= limit && !can_evict_offscreen {
             return None;
         }
         let cx = (grid.ix0 + grid.ix1) as f32 * 0.5;
@@ -2000,6 +2024,30 @@ impl C41Gui {
             }
         }
         best.map(|(ix, iy, _)| (ix, iy))
+    }
+
+    fn mark_preview_view_changed(&mut self) {
+        if !self.preview_view_dragging {
+            self.tile_gen = self.tile_gen.wrapping_add(1);
+            self.tile_inflight = None;
+        }
+        self.preview_view_dragging = true;
+        self.preview_view_changed_at = Some(Instant::now());
+    }
+
+    fn preview_view_settling(&self) -> bool {
+        self.preview_view_changed_at
+            .map(|t| t.elapsed() < Duration::from_millis(PREVIEW_VIEW_SETTLE_MS))
+            .unwrap_or(false)
+    }
+
+    fn preview_options_dirty(&self, idx: usize) -> bool {
+        let Some(entry) = self.images.get(idx) else {
+            return false;
+        };
+        let hash_now =
+            preview_options_hash(&entry.path, &entry.options, self.full_res_preview_active);
+        entry.preview_options_hash != hash_now
     }
 }
 
@@ -4220,14 +4268,13 @@ impl eframe::App for C41Gui {
                         // Base scale: image size at zoom=1.0 to fit within canvas.
                         let base_scale = (canvas_w / full_w_f).min(canvas_h / full_h_f);
 
-                        let entry = &mut self.images[idx];
-                        let zoom = entry.preview_zoom.max(1.0);
+                        let zoom = self.images[idx].preview_zoom.max(1.0);
                         let img_w = full_w_f * base_scale * zoom;
                         let img_h = full_h_f * base_scale * zoom;
 
                         // Pan: which image-normalized point sits at canvas center.
-                        let pan_x = entry.preview_pan.x.clamp(0.0, 1.0);
-                        let pan_y = entry.preview_pan.y.clamp(0.0, 1.0);
+                        let pan_x = self.images[idx].preview_pan.x.clamp(0.0, 1.0);
+                        let pan_y = self.images[idx].preview_pan.y.clamp(0.0, 1.0);
 
                         // Virtual image rect: where the full image lives in screen coords.
                         let vir_left = canvas_rect.center().x - pan_x * img_w;
@@ -4252,8 +4299,20 @@ impl eframe::App for C41Gui {
                                 canvas_painter.image(tex.id(), vis_rect, uv, egui::Color32::WHITE);
                             }
 
-                            // 1:1 tiles over the proxy whenever the user has zoomed in.
-                            if zoom > 1.0 {
+                            // 1:1 tiles over the proxy when the view is settled.
+                            // Slider drag and pan/zoom show the proxy only.
+                            let pointer_down = ui.input(|i| i.pointer.any_down());
+                            let proxy_soft = self
+                                .visible_tile_grid(idx)
+                                .map(|g| g.proxy_soft)
+                                .unwrap_or(false);
+                            let hide_tiles = !proxy_soft
+                                || self.preview_options_dirty(idx)
+                                || pointer_down
+                                || self.preview_view_dragging
+                                || canvas_resp.dragged()
+                                || self.preview_view_settling();
+                            if zoom > 1.0 && !hide_tiles {
                                 let opt_hash = self.images[idx].preview_options_hash;
                                 for tile in &self.images[idx].tile_cache {
                                     if tile.options_hash != opt_hash {
@@ -4379,17 +4438,25 @@ impl eframe::App for C41Gui {
 
                             entry.preview_zoom = new_zoom;
                         }
+                        if canvas_resp.hovered()
+                            && ui.input(|i| i.raw_scroll_delta.y != 0.0 && !i.modifiers.shift)
+                        {
+                            self.mark_preview_view_changed();
+                        }
 
                         // Pan with left drag (when no rect handle hit) or middle drag.
                         let middle_drag = ui.input(|i| i.pointer.middle_down()) && canvas_resp.dragged();
                         let left_drag = canvas_resp.dragged() && !self.rect_dragging;
                         if middle_drag || left_drag {
                             let delta = canvas_resp.drag_delta();
-                            let entry = &mut self.images[idx];
-                            entry.preview_pan.x =
-                                (entry.preview_pan.x - delta.x / img_w).clamp(0.0, 1.0);
-                            entry.preview_pan.y =
-                                (entry.preview_pan.y - delta.y / img_h).clamp(0.0, 1.0);
+                            {
+                                let entry = &mut self.images[idx];
+                                entry.preview_pan.x =
+                                    (entry.preview_pan.x - delta.x / img_w).clamp(0.0, 1.0);
+                                entry.preview_pan.y =
+                                    (entry.preview_pan.y - delta.y / img_h).clamp(0.0, 1.0);
+                            }
+                            self.mark_preview_view_changed();
                         }
 
                         // White balance picker: on click, sample density from cache and set WB gains.
@@ -4893,6 +4960,9 @@ impl eframe::App for C41Gui {
                                 info_text.push_str("  ·  Refining…");
                             }
                             if zoom > 1.0
+                                && !self.preview_options_dirty(idx)
+                                && !self.preview_view_dragging
+                                && !self.preview_view_settling()
                                 && (self.tile_receiver.is_some()
                                     || !self.images[idx].tile_cache.is_empty())
                             {
@@ -5245,9 +5315,13 @@ impl eframe::App for C41Gui {
                 // Do not compare CFA output size to the request cap — downsample often
                 // comes in smaller and that used to restart screen refine forever,
                 // which blocked 1:1 tiles. Skip refine only when tiles will actually run.
+                let pointer_down = ctx.input(|i| i.pointer.any_down());
+                let slider_dragging =
+                    pointer_down && !self.rect_dragging && !self.preview_view_dragging;
                 let need_screen = have_current
                     && !self.full_res_preview_active
                     && !proxy_soft
+                    && !pointer_down
                     && (lod == PreviewLod::Draft
                         || (lod == PreviewLod::Screen
                             && (req_sw + 64 < screen_w || req_sh + 64 < screen_h)));
@@ -5259,30 +5333,33 @@ impl eframe::App for C41Gui {
                     if self.pending_preview_key != Some(key) {
                         self.pending_preview_key = Some(key);
                         self.pending_preview_since = Some(now);
-                        // Cancel in-flight work, but keep the last proxy + tiles
-                        // on screen until the pointer is released.
-                        self.preview_gen = self.preview_gen.wrapping_add(1);
+                        // Keep an in-flight draft so the proxy can update while dragging.
+                        // Tiles wait until the pointer is released.
                         self.tile_gen = self.tile_gen.wrapping_add(1);
                         self.tile_inflight = None;
                         self.tile_failed.clear();
                     }
 
-                    let waiting_for_release =
-                        self.rect_dragging || ctx.input(|i| i.pointer.any_down());
+                    let debounce_ms = if slider_dragging {
+                        PREVIEW_LIVE_DEBOUNCE_MS
+                    } else {
+                        PREVIEW_DEBOUNCE_MS
+                    };
                     let settled = self
                         .pending_preview_since
                         .map(|t| {
-                            now.saturating_duration_since(t)
-                                >= Duration::from_millis(PREVIEW_DEBOUNCE_MS)
+                            now.saturating_duration_since(t) >= Duration::from_millis(debounce_ms)
                         })
                         .unwrap_or(false);
 
-                    if self.preview_receiver.is_none() && !waiting_for_release && settled {
+                    if self.preview_receiver.is_none() && !self.rect_dragging && settled {
                         if self.full_res_preview_active && !self.full_res_preview_button_clicked {
                             self.full_res_preview_active = false;
                         }
-                        let lod = if self.full_res_preview_active {
+                        let lod = if self.full_res_preview_active && !slider_dragging {
                             PreviewLod::FullRes
+                        } else if slider_dragging {
+                            PreviewLod::Draft
                         } else if screen_fits_draft {
                             PreviewLod::Screen
                         } else {
@@ -5303,13 +5380,21 @@ impl eframe::App for C41Gui {
                     self.pending_preview_since = None;
                 }
 
-                // 1:1 tiles: only when the screen proxy is soft and no full-frame job is running.
+                if !pointer_down {
+                    self.preview_view_dragging = false;
+                }
+                let view_settling = self.preview_view_settling();
+                // 1:1 tiles: after pan/zoom/slider release, when the proxy is soft.
                 if proxy_soft
                     && self.preview_receiver.is_none()
                     && self.tile_receiver.is_none()
                     && have_current
                     && !self.full_res_preview_active
                     && !self.rect_dragging
+                    && !self.preview_view_dragging
+                    && !view_settling
+                    && !need_options
+                    && !pointer_down
                 {
                     if let Some(missing) = self.visible_tile_to_request(idx) {
                         self.request_tile_for(idx, missing.0, missing.1, ctx);
@@ -5317,6 +5402,13 @@ impl eframe::App for C41Gui {
                 }
                 if self.tile_receiver.is_some() {
                     ctx.request_repaint();
+                } else if view_settling {
+                    if let Some(t) = self.preview_view_changed_at {
+                        let left = PREVIEW_VIEW_SETTLE_MS
+                            .saturating_sub(t.elapsed().as_millis() as u64)
+                            .max(16);
+                        ctx.request_repaint_after(Duration::from_millis(left));
+                    }
                 }
             }
         } else {
