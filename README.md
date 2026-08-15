@@ -198,12 +198,32 @@ Four output stages selectable via `output_stage`:
 | `Lut2383` | Density → code value with selectable encoding (Cineon log D/2.046, Rec.709, or linear D/2.5) → user-supplied `.cube` 3D LUT → display-space output. |
 | `None` | Direct density display: `D / 2.5` clamped to [0, 1]. |
 
-Post-curve operations applied after `Ra4` and `FilmPrint` (all operate on the u16 output):
+Post-curve operations applied after `Ra4` and `FilmPrint` (all operate on the u16 output): 
 
 - **Toe/shoulder shaping** — smoothstep-masked additive offset; toe mask centered on [0.07, 0.60], shoulder mask on [0.45, 0.95].
 - **Soft clip** — exponential highlight roll-off: `v + (1 - exp(-(v-s)/(1-s))) * (1-s)` above knee `s` (default 0.93).
 - **Lab separation** — converts sRGB → XYZ → Lab, scales the a/b chroma deviation by a bell-shaped function `1 + strength * c_norm * (1 - c_norm) * 2`. Near-neutral pixels (chroma < 1e-4) are not touched.
 - **Highlight warmth** — Noritsu/Frontier-style golden tint on neutral highlights: `+0.035 R, +0.015 G, −0.055 B`, weighted by `smoothstep(0.35, 0.85, luma) * (1 − smoothstep(0.04, 0.18, chroma))`. Saturated colors receive no warmth.
+
+### De-Bujack (after step 6)
+
+Optional, **off by default**. Runs after the output transform and display-space looks, before grain / sharpen / encode. Skipped when the pipeline stopped before step 6, or when the buffer is still density (`output_stage = None`).
+
+Bujack et al. showed that perceived color difference is not a Riemannian metric: large differences compress (diminishing returns). A pointwise grade cannot undo that — any pointwise map of a Riemannian metric is still Riemannian — so this pass is spatial.
+
+It works in **OkLab** on linear Rec.709-like RGB (RA-4 / FilmPrint u16 print RGB; Lut2383 Rec.709 is decoded to linear for the pass). Each pixel’s difference from an edge-aware local mean (bilateral) is pushed through the inverse of a saturating response `f(d) = k·d/(k+d)`, stretching large differences while leaving small ones alone. Out-of-gamut results are pulled toward their own luminance.
+
+The paper proves the effect exists, not its numbers, so the knobs are taste. In the GUI they live under **Develop → De-Bujack**:
+
+| Knob | Default | What it does |
+|------|---------|--------------|
+| Knee L (`bujack_k_l`) | 0.25 | Where lightness differences start to flatten. Smaller = more aggressive. |
+| Knee C (`bujack_k_c`) | 0.30 | Same knee on the (a, b) chroma vector. |
+| Strength | 0.2 | Dry/wet mix. 1.0 = full inverse-response; above 1.0 over-corrects. |
+| Radius | 16 px | Bilateral radius in pixels of the **current** buffer. Preview is smaller than export, so the same number covers more of the frame in preview. |
+| Edge preserve | 0.25 | Bilateral range σ. Low keeps edges out of the base (less halo); 1.0 ≈ Gaussian. |
+
+Implementation: [`src/bujack.rs`](src/bujack.rs), called from `pipeline::apply_bujack`.
 
 ---
 
@@ -298,6 +318,7 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/tiff_export.rs` | Uncompressed TIFF writer: `write_tiff_u16` (u16), `write_tiff` (f32 or u16). |
 | `src/exr_export.rs` | OpenEXR writer: f32, u16, and ACES2065-1 paths. |
 | `src/pipeline.rs` | Shared pipeline steps 3–6 used by both `process_files` and `process_one_to_preview`. |
+| `src/bujack.rs` | De-Bujack: non-local OkLab difference stretch after step 6 (optional, off by default). |
 | `src/pipeline_cache.rs` | Step-level cache for preview: reuse earlier stages when only later options change. |
 | `src/gpu/mod.rs` | wgpu initialization and `GpuContext` (optional, `--features gpu`). |
 | `src/gpu/demosaic.rs` | GPU demosaic for RGGB Bayer (edge-aware G + color-diff R/B); X-Trans and non-RGGB fall back to CPU. |
