@@ -1422,6 +1422,22 @@ pub fn run_auto_crop_for_path(
     .ok_or_else(|| anyhow::anyhow!("Auto crop: no clear frame boundary found."))
 }
 
+/// Load one file to after-step-3 and return crop-detector probe text.
+pub fn probe_auto_crop_for_path(path: &Path, options: &PipelineOptions) -> anyhow::Result<String> {
+    let sensor = load_sensor_from_path(path)?;
+    let stats = compute_preview_scene_stats(&sensor, options)?;
+    let mut baked = options.clone();
+    bake_scene_stats_into_options(&mut baked, &stats);
+    let side = CROP_PROXY_MAX_SIDE as u32;
+    let (_, _, _, _, _, _, cache) =
+        process_one_to_preview_with_cache(path, &baked, side, side, None, false, Some(&sensor))?;
+    let after_step3 = cache
+        .after_step3
+        .map(|(_, img)| img)
+        .ok_or_else(|| anyhow::anyhow!("Auto crop probe: no D-min buffer."))?;
+    Ok(auto_crop::crop_probe(&after_step3))
+}
+
 /// GPU-accelerated version of `process_one_to_preview_with_cache`.
 ///
 /// When `gpu` is `Some` and `options.use_gpu` is true, runs steps 4→5→6 on

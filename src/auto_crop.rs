@@ -47,6 +47,63 @@ pub struct AutoCropResult {
     pub format_hint: Option<FilmFormat>,
 }
 
+/// Probe stats for crop-benchmark debugging.
+pub(crate) fn crop_probe(image: &Array3<f32>) -> String {
+    let proxy = downsample_to_max_side(image, CROP_PROXY_MAX_SIDE);
+    let (h, w, _) = proxy.dim();
+    let t = pixel_transmittance(&proxy);
+    let t_max = pixel_max(&proxy);
+    let tex = pixel_texture(&t, w, h);
+    let light_level = find_bright_mode(&t_max, w, h);
+    let base = estimate_base(&t, &t_max, w, h, None, light_level);
+    let tex_thresh = adaptive_tex_thresh(&tex, w, h);
+    let (outer, inner) = outer_inner_means(&t, w, h);
+    let polarity = detect_polarity(&t, w, h);
+    let seed = bounds_from_bright_seed(&t, &tex, w, h);
+    let image_px = {
+        let holder_cap = (0.07 * base).clamp(0.05, 0.10);
+        let light_floor = (1.18 * base).max(1.12);
+        let rebate_floor = 0.86 * base;
+        let dye_cap = 0.62 * base;
+        let mut image_px = vec![false; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                image_px[i] = classify_image_pixel(
+                    t[i],
+                    t_max[i],
+                    tex[i],
+                    holder_cap,
+                    light_floor,
+                    rebate_floor,
+                    dye_cap,
+                    tex_thresh,
+                    light_level,
+                    outer,
+                );
+            }
+        }
+        mark_sprocket_rows_as_border(&t, &mut image_px, w, h, base);
+        bounds_from_image_frac(&image_px, w, h, 0.18)
+    };
+    let fmt = |b: Option<(usize, usize, usize, usize)>| match b {
+        Some((l, r, t0, b0)) => format!(
+            "[{:.3},{:.3},{:.3},{:.3}] a={:.2}",
+            l as f32 / w as f32,
+            t0 as f32 / h as f32,
+            r as f32 / w as f32,
+            b0 as f32 / h as f32,
+            (r.saturating_sub(l) * b0.saturating_sub(t0)) as f32 / (w * h) as f32
+        ),
+        None => "none".to_string(),
+    };
+    format!(
+        "{w}x{h} pol={polarity:?} outer={outer:.3} inner={inner:.3} base={base:.3} texT={tex_thresh:.4} light={light_level:?} seed={} px={}",
+        fmt(seed),
+        fmt(image_px)
+    )
+}
+
 /// Detect a tight image-area crop on a linear-transmittance RGB buffer.
 ///
 /// `dmin_rect` is an optional film-base sample (any reference size). It is a
@@ -114,6 +171,7 @@ fn detect_on_proxy(image: &Array3<f32>, dmin_rect: Option<Rect>) -> Option<AutoC
     let light_floor = (1.18 * base).max(1.12);
     let rebate_floor = 0.86 * base;
     let dye_cap = 0.62 * base;
+    let (outer_t, _) = outer_inner_means(&t, w, h);
 
     let mut image_px = vec![false; w * h];
     for y in 0..h {
@@ -129,6 +187,7 @@ fn detect_on_proxy(image: &Array3<f32>, dmin_rect: Option<Rect>) -> Option<AutoC
                 dye_cap,
                 tex_thresh,
                 light_level,
+                outer_t,
             );
         }
     }
@@ -143,46 +202,14 @@ fn detect_on_proxy(image: &Array3<f32>, dmin_rect: Option<Rect>) -> Option<AutoC
     };
 
     const FRAC_MIN: f32 = 0.18;
-    let (top, bottom, left, right) = if polarity == Polarity::FilmBrighter {
-        let row_p = axis_percentile(&t, w, h, true, 0.60);
-        let col_p = axis_percentile(&t, w, h, false, 0.60);
-        let (outer_t, inner_t) = outer_inner_means(&t, w, h);
-        let thresh = outer_t * 0.35 + inner_t * 0.65;
-        let row_ok: Vec<f32> = row_p
-            .iter()
-            .map(|&v| if v > thresh { 1.0 } else { 0.0 })
-            .collect();
-        let col_ok: Vec<f32> = col_p
-            .iter()
-            .map(|&v| if v > thresh { 1.0 } else { 0.0 })
-            .collect();
-        let (top, bottom) = longest_run(&row_ok, 0.5, h / 2)?;
-        let (left, right) = longest_run(&col_ok, 0.5, w / 2)?;
-        let row_tex = tex_row_mean(&tex, w, h);
-        let col_tex = tex_col_mean(&tex, w, h);
-        let (top, bottom) = trim_edge_rebate(&row_p, &row_tex, top, bottom);
-        let (left, right) = trim_edge_rebate(&col_p, &col_tex, left, right);
-        // Only grow top/bottom: sky and stage lights sit on those edges.
-        // Left/right already come from the bright-column run; expanding
-        // sideways follows the film's horizontal edge across the lightbox.
-        let (top, bottom) = expand_axis(&t, w, h, true, top, bottom, left, right, tex_thresh);
-        (top, bottom, left, right)
+    let image_px_bounds = bounds_from_image_frac(&image_px, w, h, FRAC_MIN);
+    let gate_bounds = bounds_from_gate_edges(&t, w, h, polarity);
+    let (left, right, top, bottom) = if polarity == Polarity::FilmBrighter {
+        let seed = bounds_from_bright_seed(&t, &tex, w, h)?;
+        let grown = grow_bright_seed(&t, w, h, seed, tex_thresh, light_floor);
+        pick_bounds(&t, w, h, grown, image_px_bounds, gate_bounds)
     } else {
-        let row_frac: Vec<f32> = (0..h)
-            .map(|y| {
-                let count = (0..w).filter(|&x| image_px[y * w + x]).count();
-                count as f32 / w as f32
-            })
-            .collect();
-        let col_frac: Vec<f32> = (0..w)
-            .map(|x| {
-                let count = (0..h).filter(|&y| image_px[y * w + x]).count();
-                count as f32 / h as f32
-            })
-            .collect();
-        let (top, bottom) = longest_run(&row_frac, FRAC_MIN, h / 2)?;
-        let (left, right) = longest_run(&col_frac, FRAC_MIN, w / 2)?;
-        (top, bottom, left, right)
+        pick_bounds(&t, w, h, image_px_bounds?, None, gate_bounds)
     };
 
     if right <= left || bottom <= top {
@@ -246,6 +273,7 @@ fn classify_image_pixel(
     dye_cap: f32,
     tex_thresh: f32,
     light_level: Option<f32>,
+    outer_t: f32,
 ) -> bool {
     if t < holder_cap {
         return false;
@@ -253,6 +281,10 @@ fn classify_image_pixel(
     // Lightbox (including chromatic narrowband) is never image, even if textured.
     let in_bright = light_level.map(|l| t_max >= l * 0.88).unwrap_or(false);
     if t_max > light_floor || in_bright {
+        return false;
+    }
+    // Mid-T surround matches the outer band; do not promote it via dye_cap.
+    if (t - outer_t).abs() < 0.08 && tex < tex_thresh {
         return false;
     }
     if tex >= tex_thresh {
@@ -525,6 +557,431 @@ fn has_gate(t: &[f32], w: usize, h: usize, rows: bool, index: usize, a: usize, b
         };
         (inside - outside).abs() > 0.06
     }
+}
+
+fn bounds_from_image_frac(
+    image_px: &[bool],
+    w: usize,
+    h: usize,
+    frac_min: f32,
+) -> Option<(usize, usize, usize, usize)> {
+    let row_frac: Vec<f32> = (0..h)
+        .map(|y| {
+            let count = (0..w).filter(|&x| image_px[y * w + x]).count();
+            count as f32 / w as f32
+        })
+        .collect();
+    let col_frac: Vec<f32> = (0..w)
+        .map(|x| {
+            let count = (0..h).filter(|&y| image_px[y * w + x]).count();
+            count as f32 / h as f32
+        })
+        .collect();
+    let (top, bottom) = longest_run(&row_frac, frac_min, h / 2)?;
+    let (left, right) = longest_run(&col_frac, frac_min, w / 2)?;
+    if right <= left || bottom <= top {
+        None
+    } else {
+        Some((left, right, top, bottom))
+    }
+}
+
+/// High-T seed inside the film. Dark scene content is recovered by
+/// [`grow_bright_seed`], not by this threshold.
+fn bounds_from_bright_seed(
+    t: &[f32],
+    tex: &[f32],
+    w: usize,
+    h: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let row_p = axis_percentile(t, w, h, true, 0.60);
+    let col_p = axis_percentile(t, w, h, false, 0.60);
+    let (outer_t, inner_t) = outer_inner_means(t, w, h);
+    let thresh = outer_t * 0.35 + inner_t * 0.65;
+    let row_ok: Vec<f32> = row_p
+        .iter()
+        .map(|&v| if v > thresh { 1.0 } else { 0.0 })
+        .collect();
+    let col_ok: Vec<f32> = col_p
+        .iter()
+        .map(|&v| if v > thresh { 1.0 } else { 0.0 })
+        .collect();
+    let (top, bottom) = longest_run(&row_ok, 0.5, h / 2)?;
+    let (left, right) = longest_run(&col_ok, 0.5, w / 2)?;
+    let row_tex = tex_row_mean(tex, w, h);
+    let col_tex = tex_col_mean(tex, w, h);
+    let (top, bottom) = trim_edge_rebate(&row_p, &row_tex, top, bottom);
+    let (left, right) = trim_edge_rebate(&col_p, &col_tex, left, right);
+    if right <= left || bottom <= top {
+        None
+    } else {
+        Some((left, right, top, bottom))
+    }
+}
+
+fn seed_looks_complete(
+    w: usize,
+    h: usize,
+    (left, right, top, bottom): (usize, usize, usize, usize),
+) -> bool {
+    if right <= left || bottom <= top {
+        return false;
+    }
+    let rw = (right - left) as f32;
+    let rh = (bottom - top) as f32;
+    let area = (rw * rh) / (w.max(1) * h.max(1)) as f32;
+    let ratio = rw / rh.max(1.0);
+    let aspect_err = [1.333, 1.5, 0.75, 0.667]
+        .into_iter()
+        .map(|target| (ratio - target).abs() / target)
+        .fold(1.0f32, f32::min);
+    area >= 0.40 && rw / w as f32 >= 0.52 && rh / h as f32 >= 0.45 && aspect_err < 0.10
+}
+
+fn grow_bright_seed(
+    t: &[f32],
+    w: usize,
+    h: usize,
+    seed: (usize, usize, usize, usize),
+    tex_thresh: f32,
+    light_floor: f32,
+) -> (usize, usize, usize, usize) {
+    let (mut left, mut right, mut top, mut bottom) = seed;
+    let side_wide =
+        left as f32 / w as f32 > 0.175 || (w.saturating_sub(right)) as f32 / w as f32 > 0.175;
+    if side_wide || !seed_looks_complete(w, h, seed) {
+        // Recover width first. Vertical expand uses left/right as the gate
+        // span; a half-frame seed cannot grow into a dark sky above it.
+        let (l, r) = expand_into_dark_film(
+            t,
+            w,
+            h,
+            false,
+            left,
+            right,
+            top,
+            bottom,
+            tex_thresh,
+            light_floor,
+        );
+        left = l;
+        right = r;
+    }
+    let (t0, b0) = expand_axis(t, w, h, true, top, bottom, left, right, tex_thresh);
+    top = t0;
+    bottom = b0;
+    let tall_margin =
+        top as f32 / h as f32 > 0.14 || (h.saturating_sub(bottom)) as f32 / h as f32 > 0.14;
+    if tall_margin {
+        let (t0, b0) = expand_into_dark_film(
+            t,
+            w,
+            h,
+            true,
+            top,
+            bottom,
+            left,
+            right,
+            tex_thresh,
+            light_floor,
+        );
+        top = t0;
+        bottom = b0;
+    }
+    (left, right, top, bottom)
+}
+
+fn bounds_from_gate_edges(
+    t: &[f32],
+    w: usize,
+    h: usize,
+    polarity: Polarity,
+) -> Option<(usize, usize, usize, usize)> {
+    let col_p = axis_percentile(t, w, h, false, 0.50);
+    let row_p = axis_percentile(t, w, h, true, 0.50);
+    let film_brighter = !matches!(polarity, Polarity::SurroundBrighter);
+    let (left, right) = best_gate_pair(&col_p, 0.52, 0.86, film_brighter)?;
+    let (top, bottom) = best_gate_pair(&row_p, 0.45, 0.92, film_brighter)?;
+    if right <= left || bottom <= top {
+        None
+    } else {
+        Some((left, right, top, bottom))
+    }
+}
+
+fn smooth_profile(values: &[f32], radius: usize) -> Vec<f32> {
+    let n = values.len();
+    let r = radius.max(1);
+    (0..n)
+        .map(|i| {
+            let a = i.saturating_sub(r);
+            let b = (i + r + 1).min(n);
+            let s: f32 = values[a..b].iter().sum();
+            s / (b - a) as f32
+        })
+        .collect()
+}
+
+/// Strongest opposite-edge pair whose span looks like a still frame.
+fn best_gate_pair(
+    profile: &[f32],
+    min_span: f32,
+    max_span: f32,
+    rise_then_fall: bool,
+) -> Option<(usize, usize)> {
+    let n = profile.len();
+    if n < 24 {
+        return None;
+    }
+    let sm = smooth_profile(profile, 2);
+    let step = 4usize;
+    let mut deriv = vec![0.0f32; n];
+    for i in 0..n.saturating_sub(step) {
+        deriv[i] = sm[i + step] - sm[i];
+    }
+    let lo = ((n as f32 * min_span).round() as usize).max(8);
+    let hi = ((n as f32 * max_span).round() as usize).min(n - 1);
+    let mut best = None;
+    let mut best_s = 0.12f32;
+    for l in 0..(n / 2) {
+        let r0 = (l + lo).min(n);
+        let r1 = (l + hi).min(n);
+        for r in r0..r1 {
+            let left_d = deriv[l];
+            let right_d = deriv[r.saturating_sub(step)];
+            let s = if rise_then_fall {
+                left_d.max(0.0) + (-right_d).max(0.0)
+            } else {
+                (-left_d).max(0.0) + right_d.max(0.0)
+            };
+            if s > best_s {
+                best_s = s;
+                best = Some((l, r));
+            }
+        }
+    }
+    best
+}
+
+fn pick_bounds(
+    t: &[f32],
+    w: usize,
+    h: usize,
+    grown: (usize, usize, usize, usize),
+    image_px: Option<(usize, usize, usize, usize)>,
+    gate: Option<(usize, usize, usize, usize)>,
+) -> (usize, usize, usize, usize) {
+    let area =
+        |c: (usize, usize, usize, usize)| (c.1.saturating_sub(c.0)) * (c.3.saturating_sub(c.2));
+    let frame = (w * h).max(1) as f32;
+    if seed_looks_complete(w, h, grown) {
+        if let Some(px) = image_px {
+            let pa = area(px) as f32 / frame;
+            if pa > 0.88 {
+                return grown;
+            }
+        }
+        return grown;
+    }
+
+    let score = |c: (usize, usize, usize, usize)| {
+        let area_frac = area(c) as f32 / frame;
+        if area_frac < 0.22 || area_frac > 0.92 {
+            return -1.0;
+        }
+        let rw = c.1.saturating_sub(c.0).max(1) as f32;
+        let rh = c.3.saturating_sub(c.2).max(1) as f32;
+        let ratio = rw / rh;
+        let aspect = [1.333, 1.5, 0.75, 0.667]
+            .into_iter()
+            .map(|target| (ratio - target).abs() / target)
+            .fold(1.0f32, f32::min);
+        let gates = count_side_gates(t, w, h, c) as f32;
+        0.35 * gates + (1.0 - aspect).max(0.0) + area_frac.min(0.72)
+    };
+
+    let mut best = grown;
+    let mut best_s = score(grown);
+    if let Some(px) = image_px {
+        let s = score(px);
+        if s > best_s + 0.20 {
+            best_s = s;
+            best = px;
+        }
+    }
+    // Gate edges are a last resort for highlight islands. They can lock
+    // onto rebate / sprocket steps, so ignore them when a decent seed exists.
+    let grown_area = area(grown) as f32 / frame;
+    if grown_area < 0.30 {
+        if let Some(g) = gate {
+            let s = score(g);
+            if seed_looks_complete(w, h, g) && s > best_s + 0.20 {
+                best = g;
+            }
+        }
+    }
+    best
+}
+
+fn count_side_gates(
+    t: &[f32],
+    w: usize,
+    h: usize,
+    (left, right, top, bottom): (usize, usize, usize, usize),
+) -> u32 {
+    let band = 6usize;
+    let mut n = 0u32;
+    let strong = |inside: f32, outside: f32| (inside - outside).abs() > 0.06;
+    if left >= band {
+        let inside = strip_mean(t, w, h, left, (left + band).min(right), top, bottom);
+        let outside = strip_mean(t, w, h, left - band, left, top, bottom);
+        if strong(inside, outside) {
+            n += 1;
+        }
+    }
+    if right + band <= w {
+        let inside = strip_mean(
+            t,
+            w,
+            h,
+            right.saturating_sub(band).max(left),
+            right,
+            top,
+            bottom,
+        );
+        let outside = strip_mean(t, w, h, right, right + band, top, bottom);
+        if strong(inside, outside) {
+            n += 1;
+        }
+    }
+    if top >= band {
+        let inside = strip_mean(t, w, h, left, right, top, (top + band).min(bottom));
+        let outside = strip_mean(t, w, h, left, right, top - band, top);
+        if strong(inside, outside) {
+            n += 1;
+        }
+    }
+    if bottom + band <= h {
+        let inside = strip_mean(
+            t,
+            w,
+            h,
+            left,
+            right,
+            bottom.saturating_sub(band).max(top),
+            bottom,
+        );
+        let outside = strip_mean(t, w, h, left, right, bottom, bottom + band);
+        if strong(inside, outside) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Grow a bright-film seed into darker image content. Stops at holder,
+/// lightbox, and flat mid-T surround (inverted-looking white border).
+fn expand_into_dark_film(
+    t: &[f32],
+    w: usize,
+    h: usize,
+    rows: bool,
+    start: usize,
+    end: usize,
+    other0: usize,
+    other1: usize,
+    tex_thresh: f32,
+    light_floor: f32,
+) -> (usize, usize) {
+    let n = if rows { h } else { w };
+    let holder_cap = 0.08;
+    let rebate_floor = 0.86;
+    let max_walk = (n / 3).max(12);
+    let line_mean = |i: usize| {
+        if rows {
+            strip_mean(t, w, h, other0, other1, i, i + 1)
+        } else {
+            strip_mean(t, w, h, i, i + 1, other0, other1)
+        }
+    };
+    let line_tex = |i: usize| {
+        let m = line_mean(i);
+        if rows {
+            let mut s = 0.0;
+            let mut c = 0.0;
+            for x in other0..other1.min(w) {
+                s += (t[i * w + x] - m).abs();
+                c += 1.0;
+            }
+            if c > 0.0 {
+                s / c
+            } else {
+                0.0
+            }
+        } else {
+            let mut s = 0.0;
+            let mut c = 0.0;
+            for y in other0..other1.min(h) {
+                s += (t[y * w + i] - m).abs();
+                c += 1.0;
+            }
+            if c > 0.0 {
+                s / c
+            } else {
+                0.0
+            }
+        }
+    };
+    let mut body_vals = Vec::new();
+    for i in start..end.min(n) {
+        body_vals.push(line_mean(i));
+    }
+    let body = if body_vals.is_empty() {
+        0.5
+    } else {
+        percentile(&body_vals, 0.50)
+    };
+    let (outer, _) = outer_inner_means(t, w, h);
+    let include = |i: usize| {
+        if i >= n {
+            return false;
+        }
+        let m = line_mean(i);
+        if m < holder_cap {
+            return false;
+        }
+        if m > light_floor {
+            return false;
+        }
+        if (m - outer).abs() < 0.08 {
+            return false;
+        }
+        let tx = line_tex(i);
+        if m > body * 1.06 {
+            return false;
+        }
+        if tx < tex_thresh * 0.7 && m > rebate_floor {
+            return false;
+        }
+        // Mid-T uniform surround: darker than the bright seed, little grain.
+        if m < body * 0.55 && tx < tex_thresh * 0.85 {
+            return false;
+        }
+        true
+    };
+    let mut new_start = start;
+    let mut walked = 0usize;
+    while new_start > 0 && walked < max_walk && include(new_start - 1) {
+        new_start -= 1;
+        walked += 1;
+    }
+    let mut new_end = end;
+    walked = 0;
+    while new_end < n && walked < max_walk && include(new_end) {
+        new_end += 1;
+        walked += 1;
+    }
+    (new_start, new_end)
 }
 
 /// Grow a bright-film run into low-T content (sky, stage lights) that still
@@ -1007,6 +1464,9 @@ fn inset_bounds(
     w: usize,
     h: usize,
 ) {
+    if *right <= *left || *bottom <= *top || *right > w || *bottom > h {
+        return;
+    }
     let min_side = (*right - *left).min(*bottom - *top);
     let margin = (*left).min(w - *right).min(*top).min(h - *bottom);
     let inset = ((min_side as f32 * 0.006).round() as usize)
@@ -1412,5 +1872,22 @@ mod tests {
             r.rect
         );
         assert_eq!(r.surround, SurroundClass::DarkHolder);
+    }
+
+    #[test]
+    fn dark_and_bright_halves_inside_holder() {
+        // Concert-style: one side of the film is dense (low T), the other is thin.
+        // The bright-seed path must grow back into the dark half.
+        let (w, h) = (320, 240);
+        let mut img = canvas(w, h, 0.03);
+        fill_image_pattern(&mut img, 36, 28, 156, 212, 0.22, 0.40);
+        fill_image_pattern(&mut img, 156, 28, 278, 212, 0.78, 0.94);
+        let r = detect(&img);
+        assert_rect_close(r.rect, (36, 28, 242, 184), 18);
+        assert!(
+            r.rect.x <= 48 && r.rect.x + r.rect.width >= 260,
+            "missed the dark half: {:?}",
+            r.rect
+        );
     }
 }
