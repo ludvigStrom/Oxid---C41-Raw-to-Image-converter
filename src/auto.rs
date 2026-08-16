@@ -1,4 +1,4 @@
-//! One-shot Auto grade: search Film γ / toe / hardness / highlight roll-off
+//! One-shot Auto grade: search Film γ, density, grade, toe, and hardness
 //! from a display histogram, then solve saturation from midtone density chroma.
 
 use ndarray::Array3;
@@ -13,14 +13,16 @@ const PROXY_MAX_SIDE: usize = 384;
 const TARGET_CENTROID: f32 = 118.0;
 const TARGET_P1: f32 = 8.0;
 const TARGET_MID_CHROMA: f32 = 0.10;
-const GAMMA_LO: f32 = 0.50;
-const GAMMA_HI: f32 = 0.85;
+const GAMMA_LO: f32 = 0.55;
+const GAMMA_HI: f32 = 0.75;
+const OFFSET_LO: f32 = -0.12;
+const OFFSET_HI: f32 = 0.12;
+const GRADE_LO: f32 = 0.80;
+const GRADE_HI: f32 = 1.25;
 const TOE_LO: f32 = -0.50;
 const TOE_HI: f32 = 0.50;
 const MID_LO: f32 = 1.00;
 const MID_HI: f32 = 1.35;
-const ROLLOFF_HI: f32 = 2.00;
-const CLIP_HI_TRIGGER: f32 = 0.001;
 const SAT_LO: f32 = 0.90;
 const SAT_HI: f32 = 1.35;
 const HOUSE_LAB: f32 = 1.5;
@@ -30,6 +32,8 @@ const HOUSE_WARMTH: f32 = 0.6;
 #[derive(Debug, Clone, Copy)]
 pub struct AutoTuneResult {
     pub film_gamma: f32,
+    pub curve_offset: f32,
+    pub curve_gamma: f32,
     pub toe_strength: f32,
     pub lut_in_mid: f32,
     pub highlight_rolloff: f32,
@@ -43,6 +47,8 @@ pub struct AutoTuneResult {
 impl AutoTuneResult {
     pub fn apply_to(&self, opts: &mut PipelineOptions) {
         opts.film_gamma = self.film_gamma;
+        opts.curve_offset = self.curve_offset;
+        opts.curve_gamma = self.curve_gamma;
         opts.toe_strength = self.toe_strength;
         opts.lut_in_mid = self.lut_in_mid;
         opts.highlight_rolloff = self.highlight_rolloff;
@@ -83,66 +89,70 @@ pub fn auto_tune(
 
     on_progress(
         "Finding optimal Film γ…",
-        0.10,
+        0.08,
         Some("Finding optimal Film γ…"),
     );
     opts.film_gamma = search_1d(GAMMA_LO, GAMMA_HI, 7, 5, |g, i, n| {
         opts.film_gamma = g;
-        let frac = 0.10 + 0.20 * (i as f32 / n.max(1) as f32);
+        let frac = 0.08 + 0.14 * (i as f32 / n.max(1) as f32);
         on_progress("Finding optimal Film γ…", frac, None);
         gamma_score(&eval.metrics(&opts))
     });
     opts.film_gamma = opts.film_gamma.clamp(GAMMA_LO, GAMMA_HI);
 
-    on_progress("Adjusting exposure…", 0.30, Some("Adjusting exposure…"));
+    on_progress("Adjusting density…", 0.22, Some("Adjusting density…"));
+    opts.curve_offset = search_1d(OFFSET_LO, OFFSET_HI, 7, 5, |o, i, n| {
+        opts.curve_offset = o;
+        let frac = 0.22 + 0.12 * (i as f32 / n.max(1) as f32);
+        on_progress("Adjusting density…", frac, None);
+        gamma_score(&eval.metrics(&opts))
+    });
+    opts.curve_offset = opts.curve_offset.clamp(OFFSET_LO, OFFSET_HI);
+
+    on_progress("Setting paper grade…", 0.34, Some("Setting paper grade…"));
+    let grade = search_1d(GRADE_LO, GRADE_HI, 7, 5, |g, i, n| {
+        opts.curve_gamma = 2.5 * g;
+        let frac = 0.34 + 0.12 * (i as f32 / n.max(1) as f32);
+        on_progress("Setting paper grade…", frac, None);
+        grade_score(&eval.metrics(&opts))
+    });
+    opts.curve_gamma = (2.5 * grade.clamp(GRADE_LO, GRADE_HI)).clamp(2.0, 3.125);
+
+    on_progress("Adjusting exposure…", 0.46, Some("Adjusting exposure…"));
     opts.toe_strength = search_1d(TOE_LO, TOE_HI, 7, 5, |t, i, n| {
         opts.toe_strength = t;
-        let frac = 0.30 + 0.15 * (i as f32 / n.max(1) as f32);
+        let frac = 0.46 + 0.10 * (i as f32 / n.max(1) as f32);
         on_progress("Adjusting exposure…", frac, None);
         toe_score(&eval.metrics(&opts))
     });
     opts.toe_strength = opts.toe_strength.clamp(TOE_LO, TOE_HI);
 
-    on_progress("Stretching midtones…", 0.45, Some("Stretching midtones…"));
+    on_progress("Stretching midtones…", 0.56, Some("Stretching midtones…"));
     opts.lut_in_mid = search_1d(MID_LO, MID_HI, 7, 5, |m, i, n| {
         opts.lut_in_mid = m;
-        let frac = 0.45 + 0.15 * (i as f32 / n.max(1) as f32);
+        let frac = 0.56 + 0.10 * (i as f32 / n.max(1) as f32);
         on_progress("Stretching midtones…", frac, None);
         hardness_score(&eval.metrics(&opts))
     });
     opts.lut_in_mid = opts.lut_in_mid.clamp(MID_LO, MID_HI);
 
-    on_progress("Refining shadows…", 0.60, Some("Refining shadows…"));
+    on_progress("Refining shadows…", 0.66, Some("Refining shadows…"));
     opts.toe_strength = search_1d(TOE_LO, TOE_HI, 7, 5, |t, i, n| {
         opts.toe_strength = t;
-        let frac = 0.60 + 0.15 * (i as f32 / n.max(1) as f32);
+        let frac = 0.66 + 0.10 * (i as f32 / n.max(1) as f32);
         on_progress("Refining shadows…", frac, None);
         toe_score(&eval.metrics(&opts))
     });
     opts.toe_strength = opts.toe_strength.clamp(TOE_LO, TOE_HI);
 
-    on_progress(
-        "Analysing highlight roll-off…",
-        0.75,
-        Some("Analysing highlight roll-off…"),
-    );
-    let clip0 = eval.metrics(&opts).clip_hi;
-    if clip0 > CLIP_HI_TRIGGER {
-        opts.highlight_rolloff = search_1d(0.0, ROLLOFF_HI, 7, 5, |r, i, n| {
-            opts.highlight_rolloff = r;
-            let frac = 0.75 + 0.10 * (i as f32 / n.max(1) as f32);
-            on_progress("Analysing highlight roll-off…", frac, None);
-            rolloff_score(&eval.metrics(&opts))
-        });
-        opts.highlight_rolloff = opts.highlight_rolloff.clamp(0.0, ROLLOFF_HI);
-    } else {
-        opts.highlight_rolloff = 0.0;
-        on_progress(
-            "Analysing highlight roll-off…",
-            0.85,
-            Some("No highlight clip — roll-off left at 0."),
-        );
-    }
+    on_progress("Refining density…", 0.76, Some("Refining density…"));
+    opts.curve_offset = search_1d(OFFSET_LO, OFFSET_HI, 7, 5, |o, i, n| {
+        opts.curve_offset = o;
+        let frac = 0.76 + 0.10 * (i as f32 / n.max(1) as f32);
+        on_progress("Refining density…", frac, None);
+        gamma_score(&eval.metrics(&opts))
+    });
+    opts.curve_offset = opts.curve_offset.clamp(OFFSET_LO, OFFSET_HI);
 
     on_progress(
         "Adjusting saturation…",
@@ -166,13 +176,15 @@ pub fn auto_tune(
 
     Ok(AutoTuneResult {
         film_gamma: opts.film_gamma,
+        curve_offset: opts.curve_offset,
+        curve_gamma: opts.curve_gamma,
         toe_strength: opts.toe_strength,
         lut_in_mid: opts.lut_in_mid,
-        highlight_rolloff: opts.highlight_rolloff,
+        highlight_rolloff: 0.0,
         saturation: opts.saturation,
         apply_lab: true,
         lab_separation: HOUSE_LAB,
-        bujack_enabled: true,
+        bujack_enabled: false,
         highlight_warmth: HOUSE_WARMTH,
     })
 }
@@ -180,6 +192,8 @@ pub fn auto_tune(
 fn prepare_search_options(src: &PipelineOptions) -> PipelineOptions {
     let mut opts = src.clone();
     opts.film_gamma = 0.65;
+    opts.curve_offset = 0.0;
+    opts.curve_gamma = 2.5;
     opts.toe_strength = 0.0;
     opts.lut_in_mid = 1.0;
     opts.highlight_rolloff = 0.0;
@@ -274,7 +288,6 @@ struct HistMetrics {
     clip_lo: f32,
     p1: f32,
     p50: f32,
-    #[allow(dead_code)]
     p99: f32,
 }
 
@@ -351,8 +364,9 @@ fn hardness_score(m: &HistMetrics) -> f32 {
     (m.p50 - TARGET_CENTROID).abs() / 128.0 + 4.0 * m.clip_hi
 }
 
-fn rolloff_score(m: &HistMetrics) -> f32 {
-    m.clip_hi + 0.15 * (m.centroid - TARGET_CENTROID).abs() / 128.0
+fn grade_score(m: &HistMetrics) -> f32 {
+    let spread = ((m.p99 - m.p1) / 255.0).clamp(0.0, 1.0);
+    (m.centroid - TARGET_CENTROID).abs() / 128.0 + 6.0 * m.clip_hi + 0.35 * (1.0 - spread)
 }
 
 fn solve_saturation(measured: f32, target: f32) -> f32 {
@@ -577,5 +591,49 @@ mod tests {
     fn search_1d_finds_parabola_minimum() {
         let x = search_1d(0.0, 1.0, 9, 7, |v, _, _| (v - 0.37) * (v - 0.37));
         assert!((x - 0.37).abs() < 0.03);
+    }
+
+    #[test]
+    fn grade_score_prefers_wider_unclipped_hist() {
+        let narrow = HistMetrics {
+            centroid: 118.0,
+            clip_hi: 0.0,
+            clip_lo: 0.0,
+            p1: 80.0,
+            p50: 118.0,
+            p99: 160.0,
+        };
+        let wide = HistMetrics {
+            centroid: 118.0,
+            clip_hi: 0.0,
+            clip_lo: 0.0,
+            p1: 12.0,
+            p50: 118.0,
+            p99: 240.0,
+        };
+        let clipped_wide = HistMetrics {
+            centroid: 118.0,
+            clip_hi: 0.04,
+            clip_lo: 0.0,
+            p1: 8.0,
+            p50: 118.0,
+            p99: 254.0,
+        };
+        assert!(grade_score(&wide) < grade_score(&narrow));
+        assert!(grade_score(&narrow) < grade_score(&clipped_wide));
+    }
+
+    #[test]
+    fn prepare_search_resets_owned_knobs() {
+        let mut src = PipelineOptions::default();
+        src.highlight_rolloff = 1.2;
+        src.curve_offset = 0.3;
+        src.curve_gamma = 4.0;
+        src.bujack_enabled = true;
+        let opts = prepare_search_options(&src);
+        assert_eq!(opts.highlight_rolloff, 0.0);
+        assert_eq!(opts.curve_offset, 0.0);
+        assert_eq!(opts.curve_gamma, 2.5);
+        assert!(!opts.bujack_enabled);
     }
 }

@@ -3029,9 +3029,15 @@ impl C41Gui {
                     self.images[index].preview_hash = 0;
                     self.images[index].preview_options_hash = 0;
                     let hardness = result.lut_in_mid - 1.0;
+                    let density = 1.0 + result.curve_offset;
+                    let grade = if result.curve_gamma > 0.0 {
+                        result.curve_gamma / 2.5
+                    } else {
+                        1.0
+                    };
                     self.status = format!(
-                        "Auto: γ {:.2}, toe {:+.2}, hardness {:+.2}",
-                        result.film_gamma, result.toe_strength, hardness
+                        "Auto: γ {:.2}, density {:.2}, grade {:.2}, toe {:+.2}, hardness {:+.2}",
+                        result.film_gamma, density, grade, result.toe_strength, hardness
                     );
                     self.preview_gen = self.preview_gen.wrapping_add(1);
                     ctx.request_repaint();
@@ -3837,7 +3843,7 @@ impl eframe::App for C41Gui {
                         if ui
                             .add_enabled(!auto_busy, egui::Button::new("Auto"))
                             .on_hover_text(
-                                "Set Film γ, toe, hardness, highlight roll-off, and saturation from the histogram. Applies Lab 1.5, De-Bujack, and max warmth.",
+                                "Set Film γ, density, grade, toe, hardness, and saturation from the histogram. Applies Lab 1.5 and max warmth.",
                             )
                             .clicked()
                         {
