@@ -113,8 +113,7 @@ impl GpuPipeline {
         let image_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("unified_image"),
             contents: bytemuck::cast_slice(&flat),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
         const MAX_WG: u32 = 65535;
@@ -129,12 +128,11 @@ impl GpuPipeline {
         // ── Step 4 ──
         if start_step <= 4 && options.debug_pipeline_step >= 4 {
             let step4_params = self.build_step4_params(image, options, width, height);
-            let step4_params_buf =
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("u_step4_params"),
-                    contents: bytemuck::bytes_of(&step4_params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+            let step4_params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("u_step4_params"),
+                contents: bytemuck::bytes_of(&step4_params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
             let step4_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("u_step4_bg"),
                 layout: self.step4.bind_group_layout(),
@@ -208,8 +206,8 @@ impl GpuPipeline {
         });
 
         if options.debug_pipeline_step >= 6 {
-            let (step6_params_buf, step6_curve_lut_buf, step6_output_lut_buf) =
-                self.build_step6_buffers(device, options, ra4_params, output_lut_cube, width, height);
+            let (step6_params_buf, step6_curve_lut_buf, step6_output_lut_buf) = self
+                .build_step6_buffers(device, options, ra4_params, output_lut_cube, width, height);
             let step6_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("u_step6_bg"),
                 layout: self.step6.bind_group_layout(),
@@ -293,8 +291,7 @@ impl GpuPipeline {
                     for y in 0..height {
                         for x in 0..width {
                             let i = (y * width + x) * 3;
-                            out[[y, x, 0]] =
-                                (result[i].clamp(0.0, 1.0) * 65535.0).round() as u16;
+                            out[[y, x, 0]] = (result[i].clamp(0.0, 1.0) * 65535.0).round() as u16;
                             out[[y, x, 1]] =
                                 (result[i + 1].clamp(0.0, 1.0) * 65535.0).round() as u16;
                             out[[y, x, 2]] =
@@ -634,7 +631,11 @@ impl GpuPipeline {
                 OutputLutEncoding::LinearDensity => 2,
             },
             output_lut_size: output_lut_cube.map(|l| l.size as u32).unwrap_or(1),
-            use_output_lut: if output_lut_cube.is_some() && mode == 3 { 1 } else { 0 },
+            use_output_lut: if output_lut_cube.is_some() && mode == 3 {
+                1
+            } else {
+                0
+            },
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
@@ -687,10 +688,7 @@ impl GpuPipeline {
     }
 }
 
-fn build_film_print_luts(
-    params: &crate::curve::FilmPrintParams,
-    d_max: f32,
-) -> [Vec<u16>; 3] {
+fn build_film_print_luts(params: &crate::curve::FilmPrintParams, d_max: f32) -> [Vec<u16>; 3] {
     let mut luts: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for ch in 0..3 {
         let offset = params.base.offset + params.offset_rgb[ch];

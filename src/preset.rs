@@ -324,8 +324,8 @@ mod tests {
 
     #[test]
     fn missing_fields_use_defaults() {
-        let loaded: DevelopPreset = serde_json::from_str(r#"{"name":"partial","saturation":1.4}"#)
-            .unwrap();
+        let loaded: DevelopPreset =
+            serde_json::from_str(r#"{"name":"partial","saturation":1.4}"#).unwrap();
         assert_eq!(loaded.name, "partial");
         assert_eq!(loaded.saturation, 1.4);
         assert_eq!(loaded.curve_gamma, PipelineOptions::default().curve_gamma);

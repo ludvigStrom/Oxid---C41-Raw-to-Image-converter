@@ -117,11 +117,9 @@ fn demosaic_edge_aware_bayer(bayer: &Array3<f32>, pattern: BayerPattern) -> Resu
     (0..height).into_par_iter().for_each(|y| {
         let ptr = ptr_base as *mut f32;
         for x in 0..width {
-            let r =
-                sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::R);
+            let r = sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::R);
             let g = sample_channel_edge_aware_rggb_g(&bayer_2d, y, x, height, width);
-            let b =
-                sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::B);
+            let b = sample_channel_bilinear(&bayer_2d, y, x, height, width, pattern, Channel::B);
             let base = y * width * 3 + x * 3;
             unsafe {
                 *ptr.add(base) = r;
@@ -259,9 +257,21 @@ fn demosaic_xtrans(bayer: &Array3<f32>, xtrans: [[u8; 6]; 6]) -> Result<Array3<f
 
             let base = y * width * 3 + x * 3;
             unsafe {
-                *ptr.add(base) = if wt[0] > 0.0 { sum[0] / wt[0] } else { bayer_2d[[y, x]] };
-                *ptr.add(base + 1) = if wt[1] > 0.0 { sum[1] / wt[1] } else { bayer_2d[[y, x]] };
-                *ptr.add(base + 2) = if wt[2] > 0.0 { sum[2] / wt[2] } else { bayer_2d[[y, x]] };
+                *ptr.add(base) = if wt[0] > 0.0 {
+                    sum[0] / wt[0]
+                } else {
+                    bayer_2d[[y, x]]
+                };
+                *ptr.add(base + 1) = if wt[1] > 0.0 {
+                    sum[1] / wt[1]
+                } else {
+                    bayer_2d[[y, x]]
+                };
+                *ptr.add(base + 2) = if wt[2] > 0.0 {
+                    sum[2] / wt[2]
+                } else {
+                    bayer_2d[[y, x]]
+                };
             }
         }
     });
@@ -285,12 +295,7 @@ fn interpolate_r_minus_g_rggb(
     let mut n = 0u32;
     for dy in [0, 2] {
         for dx in [0, 2] {
-            let (yy, xx) = clamp(
-                yt as i32 + dy,
-                xt as i32 + dx,
-                h,
-                w,
-            );
+            let (yy, xx) = clamp(yt as i32 + dy, xt as i32 + dx, h, w);
             sum += bayer[[yy, xx]] - g_plane[[yy, xx]];
             n += 1;
         }
@@ -314,12 +319,7 @@ fn interpolate_b_minus_g_rggb(
     let mut n = 0u32;
     for dy in [1, 3] {
         for dx in [1, 3] {
-            let (yy, xx) = clamp(
-                base_y as i32 + dy,
-                base_x as i32 + dx,
-                h,
-                w,
-            );
+            let (yy, xx) = clamp(base_y as i32 + dy, base_x as i32 + dx, h, w);
             sum += bayer[[yy, xx]] - g_plane[[yy, xx]];
             n += 1;
         }
@@ -399,11 +399,7 @@ fn sample_channel_edge_aware_rggb_g(
         0.5 * (s(y_i - 1, x_i) + s(y_i + 1, x_i))
     } else {
         // Isotropic case: average of both directions.
-        0.25
-            * (s(y_i, x_i - 1)
-                + s(y_i, x_i + 1)
-                + s(y_i - 1, x_i)
-                + s(y_i + 1, x_i))
+        0.25 * (s(y_i, x_i - 1) + s(y_i, x_i + 1) + s(y_i - 1, x_i) + s(y_i + 1, x_i))
     }
 }
 

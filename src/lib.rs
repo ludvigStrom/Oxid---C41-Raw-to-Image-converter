@@ -1,9 +1,11 @@
 //! C-41 RAW pipeline library. Used by both CLI and GUI.
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::Context;
 use image::{
@@ -27,12 +29,12 @@ pub mod flat_field;
 pub mod inversion;
 pub mod lut3d;
 pub mod options;
-pub mod preset;
-pub mod project;
+pub mod pipeline;
 pub mod pipeline_cache;
 pub mod png_reader;
-pub mod pipeline;
 pub mod post_curve;
+pub mod preset;
+pub mod project;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -47,14 +49,14 @@ pub use options::{
     reset_wb_for_picker, sync_wb_flags_from_mode, DminMode, OutputLutEncoding, OutputStage,
     PipelineOptions, Rect, WbMode,
 };
-pub use preset::{
-    load_develop_preset, save_develop_preset, DevelopPreset, PRESET_VERSION,
+pub use pipeline_cache::{
+    hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5, PreviewStepCache,
 };
+pub use preset::{load_develop_preset, save_develop_preset, DevelopPreset, PRESET_VERSION};
 pub use project::{
     load_project, save_project, LoadedProject, ProjectExportFormat, ProjectFile, ProjectImage,
     PROJECT_VERSION,
 };
-pub use pipeline_cache::{PreviewStepCache, hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5};
 pub use sensor::{
     compute_dmin_from_sensor, compute_preview_scene_stats, crop_sensor_for_oriented_rect,
     load_sensor_from_path, oriented_sensor_size, preview_scene_stats_key, CachedSensor,
@@ -90,7 +92,13 @@ pub(crate) fn scale_dmin_rect(
 }
 
 /// Crop an image to `(x, y, w, h)` (clamped), returning a new `(H, W, 3)` array.
-pub(crate) fn crop_array3(image: &Array3<f32>, x: u32, y: u32, width: u32, height: u32) -> Array3<f32> {
+pub(crate) fn crop_array3(
+    image: &Array3<f32>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Array3<f32> {
     let (h, w, c) = image.dim();
     assert_eq!(c, 3);
     let x = x as usize;
@@ -258,11 +266,7 @@ fn finish_preview_rgb(img: Array3<f32>, max_width: u32, max_height: u32) -> Arra
 /// Downsample an RGB image for preview to fit within `max_width`×`max_height`,
 /// preserving aspect ratio. Used for non-RAW (PNG) previews so the full C-41
 /// pipeline only runs on a smaller working resolution.
-fn downsample_rgb_for_preview(
-    image: &Array3<f32>,
-    max_width: u32,
-    max_height: u32,
-) -> Array3<f32> {
+fn downsample_rgb_for_preview(image: &Array3<f32>, max_width: u32, max_height: u32) -> Array3<f32> {
     let (h, w, c) = image.dim();
     assert_eq!(c, 3);
     let w_u32 = w as u32;
@@ -305,8 +309,10 @@ fn downsample_rgb_for_preview(
 /// Snapshot of an in-flight export for the GUI progress dialog.
 #[derive(Clone, Debug)]
 pub struct ExportProgress {
-    /// 0-based index of the file currently being processed.
+    /// 0-based index of the file most recently started.
     pub current: usize,
+    /// Files that have finished (success).
+    pub completed: usize,
     pub total: usize,
     pub file_name: String,
     pub stage: String,
@@ -317,6 +323,7 @@ pub struct ExportProgress {
 /// Cooperative cancel + progress for [`process_files_with_control`].
 pub struct ExportControl {
     cancel: AtomicBool,
+    completed: AtomicUsize,
     progress: Mutex<ExportProgress>,
 }
 
@@ -324,8 +331,10 @@ impl ExportControl {
     pub fn new(total: usize) -> Self {
         Self {
             cancel: AtomicBool::new(false),
+            completed: AtomicUsize::new(0),
             progress: Mutex::new(ExportProgress {
                 current: 0,
+                completed: 0,
                 total,
                 file_name: String::new(),
                 stage: "Starting".to_string(),
@@ -342,6 +351,10 @@ impl ExportControl {
         self.cancel.load(Ordering::Relaxed)
     }
 
+    pub fn completed(&self) -> usize {
+        self.completed.load(Ordering::Relaxed)
+    }
+
     pub fn snapshot(&self) -> ExportProgress {
         self.progress
             .lock()
@@ -352,20 +365,33 @@ impl ExportControl {
     /// Mark which file in a batch is being processed. Call before each
     /// [`process_files_with_control`] when options differ per image.
     pub fn begin_file(&self, index: usize, total: usize, file_name: impl Into<String>) {
+        let done = self.completed.load(Ordering::Relaxed);
         if let Ok(mut p) = self.progress.lock() {
             p.current = index;
+            p.completed = done;
             p.total = total;
             p.file_name = file_name.into();
             p.stage = "Starting".to_string();
-            p.fraction = index as f32 / total.max(1) as f32;
+            p.fraction = done as f32 / total.max(1) as f32;
+        }
+    }
+
+    pub fn mark_completed(&self) {
+        let done = self.completed.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut p) = self.progress.lock() {
+            p.completed = done;
+            let n = p.total.max(1) as f32;
+            p.fraction = done as f32 / n;
         }
     }
 
     fn set_stage(&self, stage: &str, within_file: f32) {
         if let Ok(mut p) = self.progress.lock() {
             p.stage = stage.to_string();
+            let done = self.completed.load(Ordering::Relaxed);
+            p.completed = done;
             let n = p.total.max(1) as f32;
-            p.fraction = (p.current as f32 + within_file.clamp(0.0, 1.0)) / n;
+            p.fraction = (done as f32 + within_file.clamp(0.0, 1.0)) / n;
         }
     }
 }
@@ -382,7 +408,11 @@ impl std::fmt::Display for ExportCancelled {
 
 impl std::error::Error for ExportCancelled {}
 
-fn export_tick(control: Option<&ExportControl>, stage: &str, within_file: f32) -> anyhow::Result<()> {
+fn export_tick(
+    control: Option<&ExportControl>,
+    stage: &str,
+    within_file: f32,
+) -> anyhow::Result<()> {
     if let Some(c) = control {
         if c.is_cancelled() {
             return Err(anyhow::Error::new(ExportCancelled));
@@ -390,6 +420,164 @@ fn export_tick(control: Option<&ExportControl>, stage: &str, within_file: f32) -
         c.set_stage(stage, within_file);
     }
     Ok(())
+}
+
+/// One file in a batch export. Options may differ per image (GUI); the CLI
+/// uses the same options for every path.
+#[derive(Clone)]
+pub struct ExportJobSpec {
+    pub path: PathBuf,
+    pub options: PipelineOptions,
+    /// Native width × height when known (GUI preview). Used for the RAM cap.
+    pub source_size: Option<(u32, u32)>,
+}
+
+/// Shared LUTs / flat-field, loaded once per unique path for a batch.
+struct ExportAssets {
+    lut3d: HashMap<PathBuf, Arc<lut3d::Lut3d>>,
+    output_lut: HashMap<PathBuf, Arc<lut3d::Lut3d>>,
+    flat_field: HashMap<PathBuf, Arc<Array3<f32>>>,
+}
+
+impl ExportAssets {
+    fn preload(jobs: &[ExportJobSpec]) -> anyhow::Result<Self> {
+        let mut lut3d_maps = HashMap::new();
+        let mut output_lut_maps = HashMap::new();
+        let mut flat_field_maps = HashMap::new();
+        for job in jobs {
+            if let Some(p) = &job.options.lut3d_path {
+                if !lut3d_maps.contains_key(p) {
+                    if let Ok(lut) = lut3d::read_cube(p) {
+                        lut3d_maps.insert(p.clone(), Arc::new(lut));
+                    }
+                }
+            }
+            if let Some(p) = &job.options.output_lut_cube {
+                if !output_lut_maps.contains_key(p) {
+                    if let Ok(lut) = lut3d::read_cube(p) {
+                        output_lut_maps.insert(p.clone(), Arc::new(lut));
+                    }
+                }
+            }
+            if let Some(p) = &job.options.flat_field_path {
+                if !flat_field_maps.contains_key(p) {
+                    let ff = crate::flat_field::load_flat_field_map(p)?;
+                    flat_field_maps.insert(p.clone(), Arc::new(ff));
+                }
+            }
+        }
+        Ok(Self {
+            lut3d: lut3d_maps,
+            output_lut: output_lut_maps,
+            flat_field: flat_field_maps,
+        })
+    }
+
+    fn lut3d_for(&self, options: &PipelineOptions) -> Option<&lut3d::Lut3d> {
+        options
+            .lut3d_path
+            .as_ref()
+            .and_then(|p| self.lut3d.get(p))
+            .map(|a| a.as_ref())
+    }
+
+    fn output_lut_for(&self, options: &PipelineOptions) -> Option<&lut3d::Lut3d> {
+        options
+            .output_lut_cube
+            .as_ref()
+            .and_then(|p| self.output_lut.get(p))
+            .map(|a| a.as_ref())
+    }
+
+    fn flat_field_for(&self, options: &PipelineOptions) -> Option<&Array3<f32>> {
+        options
+            .flat_field_path
+            .as_ref()
+            .and_then(|p| self.flat_field.get(p))
+            .map(|a| a.as_ref())
+    }
+}
+
+/// Fallback when image size is unknown (Sony a7R II class).
+const DEFAULT_EXPORT_PIXELS: u64 = 42_000_000;
+const FALLBACK_EXPORT_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+fn system_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut size: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let name = b"hw.memsize\0";
+        let ret = unsafe {
+            sysctlbyname(
+                name.as_ptr().cast(),
+                (&mut size as *mut u64).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        return (ret == 0).then_some(size);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb.saturating_mul(1024));
+            }
+        }
+        return None;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn sysctlbyname(
+        name: *const i8,
+        oldp: *mut std::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut std::ffi::c_void,
+        newlen: usize,
+    ) -> i32;
+}
+
+fn export_working_set_budget_bytes() -> u64 {
+    system_memory_bytes()
+        .map(|total| total / 2)
+        .unwrap_or(FALLBACK_EXPORT_BUDGET_BYTES)
+}
+
+fn job_pixel_count(job: &ExportJobSpec) -> u64 {
+    job.source_size
+        .map(|(w, h)| u64::from(w).saturating_mul(u64::from(h)))
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_EXPORT_PIXELS)
+}
+
+fn estimate_export_peak_bytes(pixels: u64, options: &PipelineOptions) -> u64 {
+    // Working RGB f32 (12) + step-6 u16 (6) + TIFF flatten (6). Levels run in place.
+    let mut bpp: u64 = 24;
+    if options.export_aces_exr || options.write_aces2065_only {
+        bpp += 12;
+    }
+    if options.bujack_enabled && options.bujack_strength > 0.0 {
+        bpp += 12;
+    }
+    pixels.saturating_mul(bpp)
+}
+
+fn export_concurrency(budget_bytes: u64, peak_bytes: u64) -> usize {
+    if peak_bytes == 0 {
+        return 1;
+    }
+    let fit = (budget_bytes / peak_bytes).max(1).min(2);
+    fit as usize
 }
 
 /// **Pipeline order (do not reorder without updating this comment).**
@@ -414,186 +602,278 @@ pub fn process_files_with_control(
     options: &PipelineOptions,
     control: Option<&ExportControl>,
 ) -> anyhow::Result<()> {
+    let jobs: Vec<ExportJobSpec> = paths
+        .iter()
+        .map(|path| ExportJobSpec {
+            path: path.clone(),
+            options: options.clone(),
+            source_size: None,
+        })
+        .collect();
+    process_export_jobs(&jobs, output_dir, control)
+}
+
+/// Batch export with a hard cap of two images in flight (one if the RAM
+/// budget cannot fit two peaks). Intra-image rayon stays on the global pool.
+pub fn process_export_jobs(
+    jobs: &[ExportJobSpec],
+    output_dir: &Path,
+    control: Option<&ExportControl>,
+) -> anyhow::Result<()> {
     export_tick(control, "Preparing", 0.0)?;
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory {}", output_dir.display()))?;
+    if jobs.is_empty() {
+        return Ok(());
+    }
 
-    let lut3d = options
-        .lut3d_path
-        .as_ref()
-        .and_then(|p| lut3d::read_cube(p).ok());
+    let assets = Arc::new(ExportAssets::preload(jobs)?);
+    let budget = export_working_set_budget_bytes();
+    let max_peak = jobs
+        .iter()
+        .map(|j| estimate_export_peak_bytes(job_pixel_count(j), &j.options))
+        .max()
+        .unwrap_or(1);
+    let workers = export_concurrency(budget, max_peak);
+    let total = jobs.len();
+    let output_dir = output_dir.to_path_buf();
 
-    let output_lut_cube = options
-        .output_lut_cube
-        .as_ref()
-        .and_then(|p| lut3d::read_cube(p).ok());
+    if workers <= 1 {
+        for (i, job) in jobs.iter().enumerate() {
+            export_tick(control, "Starting", 0.0)?;
+            if let Some(c) = control {
+                let name = job
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image");
+                c.begin_file(i, total, name);
+            }
+            process_one_export(&job.path, &output_dir, &job.options, &assets, control)?;
+            if let Some(c) = control {
+                c.mark_completed();
+            }
+        }
+        return Ok(());
+    }
 
-    // RA-4 curve parameters (used at step 6 if !no_curve).
+    let queue = Mutex::new((0..total).collect::<VecDeque<usize>>());
+    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if control.map(|c| c.is_cancelled()).unwrap_or(false) {
+                    return;
+                }
+                if first_err.lock().map(|g| g.is_some()).unwrap_or(false) {
+                    return;
+                }
+                let Some(i) = queue.lock().ok().and_then(|mut q| q.pop_front()) else {
+                    return;
+                };
+                let job = &jobs[i];
+                if let Some(c) = control {
+                    let name = job
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image");
+                    c.begin_file(i, total, name);
+                }
+                match process_one_export(&job.path, &output_dir, &job.options, &assets, control) {
+                    Ok(()) => {
+                        if let Some(c) = control {
+                            c.mark_completed();
+                        }
+                    }
+                    Err(e) if e.downcast_ref::<ExportCancelled>().is_some() => return,
+                    Err(e) => {
+                        if let Ok(mut slot) = first_err.lock() {
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    if control.map(|c| c.is_cancelled()).unwrap_or(false) {
+        return Err(anyhow::Error::new(ExportCancelled));
+    }
+    if let Some(e) = first_err.lock().ok().and_then(|mut g| g.take()) {
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn process_one_export(
+    path: &Path,
+    output_dir: &Path,
+    options: &PipelineOptions,
+    assets: &ExportAssets,
+    control: Option<&ExportControl>,
+) -> anyhow::Result<()> {
+    export_tick(control, "Loading", 0.05)?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+
+    let mut image = match ext.as_str() {
+        "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
+            let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
+            export_tick(control, "Demosaic", 0.15)?;
+            let mut img = demosaic::demosaic_quality(&bayer, pattern)?;
+            img.mapv_inplace(|v| v.max(0.0));
+            img
+        }
+        "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
+            let mut img = png_reader::load_png_as_ndarray(path)?;
+            if options.synthetic_negative_input {
+                pipeline::apply_synthetic_negative_invert(&mut img);
+            }
+            img
+        }
+        _ => return Ok(()),
+    };
+
+    export_tick(control, "Geometry", 0.30)?;
+    if options.rotation_degrees != 0 {
+        image = apply_rotation(&image, options.rotation_degrees);
+    }
+    if options.flip_horizontal {
+        image = flip_array3_horizontal(&image);
+    }
+    if options.flip_vertical {
+        image = flip_array3_vertical(&image);
+    }
+
+    color_space::apply_input_idt_to_working_space(&mut image, &options.idt_matrix);
+
+    export_tick(control, "D-min", 0.40)?;
+    pipeline::step_3_dmin(&mut image, options, assets.flat_field_for(options))?;
+    export_tick(control, "White balance", 0.52)?;
+    pipeline::step_4_t_to_d_wb(&mut image, options);
+    export_tick(control, "Color", 0.65)?;
+    pipeline::step_5_calibration(&mut image, options, assets.lut3d_for(options));
+
+    if options.apply_crop {
+        if let Some(rect) = options.crop_rect {
+            let (h, w, _) = image.dim();
+            let (x, y, rw, rh) =
+                scale_dmin_rect(rect, options.crop_rect_reference_size, w as u32, h as u32);
+            image = crop_array3(&image, x, y, rw, rh);
+        }
+    }
+
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+    let out_path = output_dir.join(format!("{}.tiff", stem));
+    let jpg_path = output_dir.join(format!("{}.jpg", stem));
+    let exr_path = output_dir.join(format!("{}.exr", stem));
+    let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
+
     let ra4_params = curve::PrintCurveParams {
         offset: options.curve_offset,
         gamma: options.curve_gamma,
         pivot: options.curve_pivot,
     };
 
-    let flat_field_map: Option<Array3<f32>> =
-        if let Some(ref flat_path) = options.flat_field_path {
-            let ff = flat_field::load_flat_field_map(flat_path)?;
-            Some(ff)
-        } else {
-            None
-        };
+    if options.write_aces2065_only || options.export_aces_exr {
+        export_tick(control, "ACES", 0.78)?;
+        let mut aces2065 = curve::apply_ra4_from_density_f32(&image, ra4_params, 4.0);
+        let rec709 = !aces::is_identity(&options.idt_matrix);
+        aces::linear_print_to_aces2065_1(&mut aces2065, rec709);
+        exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
+        drop(aces2065);
+        if options.write_aces2065_only {
+            return Ok(());
+        }
+    }
 
-    for path in paths {
-        export_tick(control, "Loading", 0.05)?;
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
+    let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
 
-        let mut image = match ext.as_str() {
-            "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
-                let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
-                export_tick(control, "Demosaic", 0.15)?;
-                let mut img = demosaic::demosaic_quality(&bayer, pattern)?;
-                img.mapv_inplace(|v| v.max(0.0));
-                img
+    export_tick(control, "Rendering", 0.82)?;
+    let mut display =
+        pipeline::step_6_render_owned(image, options, &ra4_params, assets.output_lut_for(options));
+    pipeline::apply_bujack(&mut display, options);
+
+    export_tick(control, "Writing", 0.92)?;
+    match &display {
+        pipeline::Step6Display::PassthroughDensity(img) => {
+            if !options.write_jpeg_only {
+                tiff_export::write_tiff(img, &out_path, options.format)?;
             }
-            "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
-                let mut img = png_reader::load_png_as_ndarray(path)?;
-                if options.synthetic_negative_input {
-                    pipeline::apply_synthetic_negative_invert(&mut img);
-                }
-                img
-            }
-            _ => continue,
-        };
-
-        export_tick(control, "Geometry", 0.30)?;
-        if options.rotation_degrees != 0 {
-            image = apply_rotation(&image, options.rotation_degrees);
-        }
-        if options.flip_horizontal {
-            image = flip_array3_horizontal(&image);
-        }
-        if options.flip_vertical {
-            image = flip_array3_vertical(&image);
-        }
-
-        color_space::apply_input_idt_to_working_space(&mut image, &options.idt_matrix);
-
-        export_tick(control, "D-min", 0.40)?;
-        pipeline::step_3_dmin(&mut image, options, flat_field_map.as_ref())?;
-        export_tick(control, "White balance", 0.52)?;
-        pipeline::step_4_t_to_d_wb(&mut image, options);
-        export_tick(control, "Color", 0.65)?;
-        pipeline::step_5_calibration(&mut image, options, lut3d.as_ref());
-
-        // Optional crop (export path only): keep only selected region.
-        if options.apply_crop {
-            if let Some(rect) = options.crop_rect {
-                let (h, w, _) = image.dim();
-                let (x, y, rw, rh) = scale_dmin_rect(
-                    rect,
-                    options.crop_rect_reference_size,
-                    w as u32,
-                    h as u32,
-                );
-                image = crop_array3(&image, x, y, rw, rh);
+            if options.write_exr {
+                exr_export::write_exr_f32(img, &exr_path)?;
             }
         }
-
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("image");
-        let out_path = output_dir.join(format!("{}.tiff", stem));
-        let jpg_path = output_dir.join(format!("{}.jpg", stem));
-        let exr_path = output_dir.join(format!("{}.exr", stem));
-        let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
-
-        // ACES export: density → linear print, then Rec.709→AP0 only if an IDT ran.
-        // Never treat density (or camera RGB) as ACEScg — that was a magenta shift.
-        if options.write_aces2065_only || options.export_aces_exr {
-            export_tick(control, "ACES", 0.78)?;
-            let mut aces2065 = curve::apply_ra4_from_density_f32(&image, ra4_params, 4.0);
-            let rec709 = !aces::is_identity(&options.idt_matrix);
-            aces::linear_print_to_aces2065_1(&mut aces2065, rec709);
-            exr_export::write_exr_aces2065_1(&aces2065, &aces_exr_path)?;
-            if options.write_aces2065_only {
-                continue;
+        pipeline::Step6Display::U16(img) => {
+            if !options.write_jpeg_only {
+                tiff_export::write_tiff_u16(img, &out_path)?;
+            }
+            if options.write_exr {
+                exr_export::write_exr_u16(img, &exr_path)?;
+            }
+            if write_jpeg_this {
+                let (height, width, _) = img.dim();
+                let buf: Vec<u8> = img
+                    .iter()
+                    .map(|v| color_space::linear_to_srgb_u8(*v as f32 / 65535.0))
+                    .collect();
+                let rgb = RgbImage::from_raw(width as u32, height as u32, buf)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                rgb.save(&jpg_path)?;
             }
         }
-
-        let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
-
-        export_tick(control, "Rendering", 0.82)?;
-        let mut display = pipeline::step_6_render(
-            &image,
-            options,
-            &ra4_params,
-            output_lut_cube.as_ref(),
-        );
-        pipeline::apply_bujack(&mut display, options);
-
-        export_tick(control, "Writing", 0.92)?;
-        match &display {
-            pipeline::Step6Display::PassthroughDensity(img) => {
-                if !options.write_jpeg_only {
-                    tiff_export::write_tiff(img, &out_path, options.format)?;
-                }
-                if options.write_exr {
-                    exr_export::write_exr_f32(img, &exr_path)?;
-                }
+        pipeline::Step6Display::F32(img) => {
+            if !options.write_jpeg_only {
+                tiff_export::write_tiff(
+                    img,
+                    &out_path,
+                    if options.output_stage == OutputStage::None {
+                        options.format
+                    } else {
+                        TiffFormat::U16
+                    },
+                )?;
             }
-            pipeline::Step6Display::U16(img) => {
-                if !options.write_jpeg_only {
-                    tiff_export::write_tiff_u16(img, &out_path)?;
-                }
-                if options.write_exr {
-                    exr_export::write_exr_u16(img, &exr_path)?;
-                }
-                if write_jpeg_this {
-                    let (height, width, _) = img.dim();
-                    let buf: Vec<u8> = img
-                        .iter()
-                        .map(|v| color_space::linear_to_srgb_u8(*v as f32 / 65535.0))
-                        .collect();
-                    let rgb = RgbImage::from_raw(width as u32, height as u32, buf)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                    rgb.save(&jpg_path)?;
-                }
+            if options.write_exr {
+                exr_export::write_exr_f32(img, &exr_path)?;
             }
-            pipeline::Step6Display::F32(img) => {
-                if !options.write_jpeg_only {
-                    tiff_export::write_tiff(
-                        img,
-                        &out_path,
-                        if options.output_stage == OutputStage::None {
-                            options.format
-                        } else {
-                            TiffFormat::U16
-                        },
-                    )?;
-                }
-                if options.write_exr {
-                    exr_export::write_exr_f32(img, &exr_path)?;
-                }
-                if write_jpeg_this {
-                    let (height, width, _) = img.dim();
-                    let buf: Vec<u8> = img
-                        .iter()
-                        .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
-                        .collect();
-                    let rgb = RgbImage::from_raw(width as u32, height as u32, buf)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                    rgb.save(&jpg_path)?;
-                }
+            if write_jpeg_this {
+                let (height, width, _) = img.dim();
+                let buf: Vec<u8> = img
+                    .iter()
+                    .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+                    .collect();
+                let rgb = RgbImage::from_raw(width as u32, height as u32, buf)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
+                rgb.save(&jpg_path)?;
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod export_mem_tests {
+    use super::*;
+
+    #[test]
+    fn concurrency_caps_at_two_and_falls_back_to_one() {
+        let opts = PipelineOptions::default();
+        let peak = estimate_export_peak_bytes(24_000_000, &opts);
+        assert!(peak > 500_000_000);
+        assert_eq!(export_concurrency(4 * 1024 * 1024 * 1024, peak), 2);
+        assert_eq!(export_concurrency(peak, peak.saturating_mul(3)), 1);
+        assert_eq!(export_concurrency(100, peak), 1);
+    }
 }
 
 /// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
@@ -674,22 +954,25 @@ pub fn process_one_to_preview(
 
     // Step 1: load + demosaic + rotate
     if options.verbose_debug {
-        let _ = write!(dbg, "{}", stats::fmt_stats("Step 1 (load+demosaic+rot):", &stats::channel_stats(&image)));
+        let _ = write!(
+            dbg,
+            "{}",
+            stats::fmt_stats("Step 1 (load+demosaic+rot):", &stats::channel_stats(&image))
+        );
         let _ = writeln!(dbg);
     }
 
     // Debug preview mode: show simple demosaic only.
     if options.debug_preview_simple_debayer
-        && matches!(ext.as_str(), "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2")
+        && matches!(
+            ext.as_str(),
+            "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2"
+        )
     {
         let (orig_h, orig_w, _) = image.dim();
         let orig_w = orig_w as u32;
         let orig_h = orig_h as u32;
-        let max_v = image
-            .iter()
-            .copied()
-            .fold(0.0_f32, f32::max)
-            .max(1.0e-6);
+        let max_v = image.iter().copied().fold(0.0_f32, f32::max).max(1.0e-6);
         let inv_max = 1.0 / max_v;
         let rgb_u8: Vec<u8> = image
             .iter()
@@ -714,7 +997,11 @@ pub fn process_one_to_preview(
         .and_then(|p| flat_field::load_flat_field_map(p).ok());
     if options.debug_pipeline_step >= 3 && options.dmin_mode != DminMode::Off {
         if flat_map_preview.is_some() {
-            let _ = writeln!(dbg, "D-min mode: flat-field ({})", options.flat_field_path.as_ref().unwrap().display());
+            let _ = writeln!(
+                dbg,
+                "D-min mode: flat-field ({})",
+                options.flat_field_path.as_ref().unwrap().display()
+            );
         } else {
             match options.dmin_mode {
                 DminMode::Fixed => {
@@ -739,15 +1026,29 @@ pub fn process_one_to_preview(
                     }
                 }
                 DminMode::AutoPercentile => {
-                    let _ = writeln!(dbg, "D-min mode: auto-percentile (buffer={:.2})", options.auto_norm_buffer);
+                    let _ = writeln!(
+                        dbg,
+                        "D-min mode: auto-percentile (buffer={:.2})",
+                        options.auto_norm_buffer
+                    );
                 }
                 DminMode::Off => {}
             }
         }
     }
     pipeline::step_3_dmin(&mut image, options, flat_map_preview.as_ref())?;
-    if options.debug_pipeline_step >= 3 && options.dmin_mode != DminMode::Off && options.verbose_debug {
-        let _ = write!(dbg, "{}", stats::fmt_stats("Step 3 (after D-min, clamped [0,1]):", &stats::channel_stats(&image)));
+    if options.debug_pipeline_step >= 3
+        && options.dmin_mode != DminMode::Off
+        && options.verbose_debug
+    {
+        let _ = write!(
+            dbg,
+            "{}",
+            stats::fmt_stats(
+                "Step 3 (after D-min, clamped [0,1]):",
+                &stats::channel_stats(&image)
+            )
+        );
     } else if options.debug_pipeline_step >= 3 && options.dmin_mode == DminMode::Off {
         let _ = writeln!(dbg, "Step 3: D-min SKIPPED (dmin_mode=Off)");
     } else if options.debug_pipeline_step < 3 {
@@ -761,22 +1062,51 @@ pub fn process_one_to_preview(
     }
     pipeline::step_4_t_to_d_wb(&mut image, options);
     if options.debug_pipeline_step >= 4 && options.verbose_debug {
-        let _ = write!(dbg, "{}", stats::fmt_stats("Step 4 (after WB + film γ + shadow cast):", &stats::channel_stats(&image)));
+        let _ = write!(
+            dbg,
+            "{}",
+            stats::fmt_stats(
+                "Step 4 (after WB + film γ + shadow cast):",
+                &stats::channel_stats(&image)
+            )
+        );
     } else if options.debug_pipeline_step < 4 {
         let _ = writeln!(dbg, "Step 4: SKIPPED (pipeline_step < 4)");
     }
     let _ = writeln!(dbg);
 
     // Step 5: density matrix / LUT, saturation, zones (shared pipeline step).
-    let lut3d_preview = options.lut3d_path.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+    let lut3d_preview = options
+        .lut3d_path
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
     if options.debug_pipeline_step >= 5 {
-        let _ = writeln!(dbg, "Step 5: density matrix [...], lut3d: {}", lut3d_preview.is_some());
+        let _ = writeln!(
+            dbg,
+            "Step 5: density matrix [...], lut3d: {}",
+            lut3d_preview.is_some()
+        );
     }
     pipeline::step_5_calibration(&mut image, options, lut3d_preview.as_ref());
     if options.debug_pipeline_step >= 5 && options.verbose_debug {
-        let _ = write!(dbg, "{}", stats::fmt_stats("Step 5 (after density matrix):", &stats::channel_stats(&image)));
-        let _ = writeln!(dbg, "Step 5.5: saturation={:.2} zones ...", options.saturation);
-        let _ = write!(dbg, "{}", stats::fmt_stats("  after saturation+zones:", &stats::channel_stats(&image)));
+        let _ = write!(
+            dbg,
+            "{}",
+            stats::fmt_stats(
+                "Step 5 (after density matrix):",
+                &stats::channel_stats(&image)
+            )
+        );
+        let _ = writeln!(
+            dbg,
+            "Step 5.5: saturation={:.2} zones ...",
+            options.saturation
+        );
+        let _ = write!(
+            dbg,
+            "{}",
+            stats::fmt_stats("  after saturation+zones:", &stats::channel_stats(&image))
+        );
     } else if options.debug_pipeline_step < 5 {
         let _ = writeln!(dbg, "Step 5: SKIPPED (pipeline_step < 5)");
     }
@@ -791,8 +1121,12 @@ pub fn process_one_to_preview(
         gamma: options.curve_gamma,
         pivot: options.curve_pivot,
     };
-    let output_lut_preview = options.output_lut_cube.as_ref().and_then(|p| lut3d::read_cube(p).ok());
-    let mut display = pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
+    let output_lut_preview = options
+        .output_lut_cube
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
+    let mut display =
+        pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
     pipeline::apply_bujack(&mut display, options);
 
     if options.debug_pipeline_step >= 6 {
@@ -818,7 +1152,11 @@ pub fn process_one_to_preview(
                     s[ch] = (
                         vals.first().copied().unwrap_or(0),
                         vals.last().copied().unwrap_or(0),
-                        if vals.is_empty() { 0 } else { vals[vals.len() / 2] },
+                        if vals.is_empty() {
+                            0
+                        } else {
+                            vals[vals.len() / 2]
+                        },
                     );
                 }
                 let _ = writeln!(dbg, "  u16 output: R min={} max={} med={}  G min={} max={} med={}  B min={} max={} med={}",
@@ -952,7 +1290,11 @@ pub fn process_one_to_preview_with_cache(
         new_cache.after_load = Some((h1, img.clone(), true_src_w, true_src_h));
         image = Some(img);
     } else {
-        let _ = writeln!(dbg, "=== Pipeline Debug (cached from step {}) ===", start_step);
+        let _ = writeln!(
+            dbg,
+            "=== Pipeline Debug (cached from step {}) ===",
+            start_step
+        );
     }
 
     let mut image = image.expect("image set by load or cache");
@@ -961,13 +1303,19 @@ pub fn process_one_to_preview_with_cache(
         .flat_field_path
         .as_ref()
         .and_then(|p| flat_field::load_flat_field_map(p).ok());
-    let lut3d_preview = options.lut3d_path.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+    let lut3d_preview = options
+        .lut3d_path
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
     let ra4_params = curve::PrintCurveParams {
         offset: options.curve_offset,
         gamma: options.curve_gamma,
         pivot: options.curve_pivot,
     };
-    let output_lut_preview = options.output_lut_cube.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+    let output_lut_preview = options
+        .output_lut_cube
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
 
     if start_step <= 3 {
         pipeline::step_3_dmin(&mut image, options, flat_map_preview.as_ref())?;
@@ -985,7 +1333,8 @@ pub fn process_one_to_preview_with_cache(
     let (orig_h, orig_w, _) = image.dim();
     let orig_w = orig_w as u32;
     let orig_h = orig_h as u32;
-    let mut display = pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
+    let mut display =
+        pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
     pipeline::apply_bujack(&mut display, options);
     let rgb_u8 = pipeline::step6_display_to_u8(&display);
 
@@ -1019,7 +1368,13 @@ pub fn process_one_to_preview_with_cache_gpu(
     let use_gpu = gpu.is_some() && options.use_gpu;
     if !use_gpu {
         return process_one_to_preview_with_cache(
-            path, options, max_width, max_height, cache, capture_debug, sensor,
+            path,
+            options,
+            max_width,
+            max_height,
+            cache,
+            capture_debug,
+            sensor,
         );
     }
     let gpu = gpu.unwrap();
@@ -1028,7 +1383,13 @@ pub fn process_one_to_preview_with_cache_gpu(
 
     if options.debug_preview_simple_debayer {
         return process_one_to_preview_with_cache(
-            path, options, max_width, max_height, cache, capture_debug, sensor,
+            path,
+            options,
+            max_width,
+            max_height,
+            cache,
+            capture_debug,
+            sensor,
         );
     }
 
@@ -1081,10 +1442,18 @@ pub fn process_one_to_preview_with_cache_gpu(
 
     let mut new_cache = PreviewStepCache::default();
     if let Some(c) = cache {
-        if start_step > 1 { new_cache.after_load = c.after_load.clone(); }
-        if start_step > 3 { new_cache.after_step3 = c.after_step3.clone(); }
-        if start_step > 4 { new_cache.after_step4 = c.after_step4.clone(); }
-        if start_step > 5 { new_cache.after_step5 = c.after_step5.clone(); }
+        if start_step > 1 {
+            new_cache.after_load = c.after_load.clone();
+        }
+        if start_step > 3 {
+            new_cache.after_step3 = c.after_step3.clone();
+        }
+        if start_step > 4 {
+            new_cache.after_step4 = c.after_step4.clone();
+        }
+        if start_step > 5 {
+            new_cache.after_step5 = c.after_step5.clone();
+        }
     }
 
     if start_step == 1 {
@@ -1111,7 +1480,11 @@ pub fn process_one_to_preview_with_cache_gpu(
         new_cache.after_load = Some((h1, img.clone(), true_src_w, true_src_h));
         image = Some(img);
     } else {
-        let _ = writeln!(dbg, "=== Pipeline Debug (GPU, cached from step {}) ===", start_step);
+        let _ = writeln!(
+            dbg,
+            "=== Pipeline Debug (GPU, cached from step {}) ===",
+            start_step
+        );
     }
 
     let mut image = image.expect("image set by load or cache");
@@ -1133,13 +1506,19 @@ pub fn process_one_to_preview_with_cache_gpu(
 
     // Steps 4→5→6 on GPU (unified: single upload/readback)
     let gpu_start = start_step.max(4);
-    let lut3d_preview = options.lut3d_path.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+    let lut3d_preview = options
+        .lut3d_path
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
     let ra4_params = curve::PrintCurveParams {
         offset: options.curve_offset,
         gamma: options.curve_gamma,
         pivot: options.curve_pivot,
     };
-    let output_lut_preview = options.output_lut_cube.as_ref().and_then(|p| lut3d::read_cube(p).ok());
+    let output_lut_preview = options
+        .output_lut_cube
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
 
     let mut display = gpu.run_from_step(
         &image,
@@ -1166,21 +1545,13 @@ pub fn process_one_to_preview_with_cache_gpu(
 
 /// Demosaic backend: CPU-only or GPU when available.
 trait DemosaicBackend {
-    fn demosaic(
-        &self,
-        bayer: &Array3<f32>,
-        pattern: CfaPattern,
-    ) -> anyhow::Result<Array3<f32>>;
+    fn demosaic(&self, bayer: &Array3<f32>, pattern: CfaPattern) -> anyhow::Result<Array3<f32>>;
 }
 
 struct CpuDemosaic;
 
 impl DemosaicBackend for CpuDemosaic {
-    fn demosaic(
-        &self,
-        bayer: &Array3<f32>,
-        pattern: CfaPattern,
-    ) -> anyhow::Result<Array3<f32>> {
+    fn demosaic(&self, bayer: &Array3<f32>, pattern: CfaPattern) -> anyhow::Result<Array3<f32>> {
         let mut rgb = demosaic::demosaic_quality(bayer, pattern)?;
         rgb.mapv_inplace(|v| v.max(0.0));
         Ok(rgb)
@@ -1189,11 +1560,7 @@ impl DemosaicBackend for CpuDemosaic {
 
 #[cfg(feature = "gpu")]
 impl DemosaicBackend for &gpu::demosaic::DemosaicPipeline {
-    fn demosaic(
-        &self,
-        bayer: &Array3<f32>,
-        pattern: CfaPattern,
-    ) -> anyhow::Result<Array3<f32>> {
+    fn demosaic(&self, bayer: &Array3<f32>, pattern: CfaPattern) -> anyhow::Result<Array3<f32>> {
         gpu::demosaic::demosaic_gpu_or_cpu(bayer, pattern, Some(self))
     }
 }
@@ -1209,13 +1576,14 @@ fn load_preview_from_sensor<D: DemosaicBackend>(
     match sensor {
         CachedSensor::Bayer { data, pattern } => {
             let (bh, bw, _) = data.dim();
-            let small_bayer = downsample_raw_for_preview(
-                data,
-                *pattern,
-                preview_mosaic_working_width(max_width),
-            );
+            let small_bayer =
+                downsample_raw_for_preview(data, *pattern, preview_mosaic_working_width(max_width));
             let img = demosaic_backend.demosaic(&small_bayer, *pattern)?;
-            Ok((finish_preview_rgb(img, max_width, max_height), bw as u32, bh as u32))
+            Ok((
+                finish_preview_rgb(img, max_width, max_height),
+                bw as u32,
+                bh as u32,
+            ))
         }
         CachedSensor::Rgb(img) => {
             let mut img = img.clone();

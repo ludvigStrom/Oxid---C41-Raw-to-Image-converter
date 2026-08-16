@@ -10,50 +10,18 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use c41_raw_tool::{
-    auto_tune,
-    blur_flat_field,
-    calibration,
-    color,
-    demosaic,
-    dmin,
-    load_flat_field_linear,
-    png_reader,
-    process_files_with_control,
-    process_one_to_preview,
-    process_one_to_preview_with_cache,
-    AutoTuneResult,
-    ExportCancelled,
-    ExportControl,
-    raw_reader,
-    tiff_export,
-    PipelineOptions,
-    PreviewStepCache,
-    Rect,
-    TiffFormat,
-    OutputStage,
-    OutputLutEncoding,
-    DminMode,
-    WbMode,
-    reset_wb_for_picker,
-    sync_wb_flags_from_mode,
-    CachedSensor,
-    PreviewSceneStats,
-    load_sensor_from_path,
-    compute_preview_scene_stats,
-    crop_sensor_for_oriented_rect,
-    oriented_sensor_size,
-    preview_scene_stats_key,
-    load_develop_preset,
-    save_develop_preset,
-    load_project,
-    save_project,
-    LoadedProject,
-    ProjectExportFormat,
-    ProjectImage,
-};
 #[cfg(feature = "gpu")]
 use c41_raw_tool::process_one_to_preview_with_cache_gpu;
+use c41_raw_tool::{
+    auto_tune, blur_flat_field, calibration, color, compute_preview_scene_stats,
+    crop_sensor_for_oriented_rect, demosaic, dmin, load_develop_preset, load_flat_field_linear,
+    load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
+    process_export_jobs, process_one_to_preview, process_one_to_preview_with_cache, raw_reader,
+    reset_wb_for_picker, save_develop_preset, save_project, sync_wb_flags_from_mode, tiff_export,
+    AutoTuneResult, CachedSensor, DminMode, ExportCancelled, ExportControl, ExportJobSpec,
+    LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions, PreviewSceneStats,
+    PreviewStepCache, ProjectExportFormat, ProjectImage, Rect, TiffFormat, WbMode,
+};
 use eframe::egui;
 
 const PREVIEW_MAX_WIDTH: u32 = 1920;
@@ -365,15 +333,19 @@ struct AutoProgressState {
 }
 
 enum AutoJobOutcome {
-    Done { index: usize, result: AutoTuneResult },
-    Error { message: String },
+    Done {
+        index: usize,
+        result: AutoTuneResult,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct AutoJob {
     receiver: mpsc::Receiver<AutoJobOutcome>,
     progress: Arc<Mutex<AutoProgressState>>,
 }
-
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
 ///
@@ -558,9 +530,7 @@ fn load_linear_transmittance_for_calibration(
     Ok(image)
 }
 
-fn compute_patch_centers_normalized(
-    corners: [egui::Pos2; 4],
-) -> [[f32; 2]; 24] {
+fn compute_patch_centers_normalized(corners: [egui::Pos2; 4]) -> [[f32; 2]; 24] {
     let mut centers = [[0.0_f32; 2]; 24];
     let rows = 4usize;
     let cols = 6usize;
@@ -669,16 +639,8 @@ fn default_options() -> PipelineOptions {
         curve_pivot: 3.0,
         curve_white: 1.0,
         apply_color_profile: false,
-        density_matrix: [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        idt_matrix: [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
+        density_matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        idt_matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         flat_field_path: None,
         export_aces_exr: false,
         write_aces2065_only: false,
@@ -766,7 +728,12 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
         g.to_bits().hash(&mut h);
         b.to_bits().hash(&mut h);
     }
-    (opts.wb_r.to_bits(), opts.wb_g.to_bits(), opts.wb_b.to_bits()).hash(&mut h);
+    (
+        opts.wb_r.to_bits(),
+        opts.wb_g.to_bits(),
+        opts.wb_b.to_bits(),
+    )
+        .hash(&mut h);
     opts.temp_k.map(|k| k.to_bits()).hash(&mut h);
     opts.no_curve.hash(&mut h);
     opts.no_invert.hash(&mut h);
@@ -789,10 +756,16 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
             v.to_bits().hash(&mut h);
         }
     }
-    opts.flat_field_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
+    opts.flat_field_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .hash(&mut h);
     opts.export_aces_exr.hash(&mut h);
     opts.write_aces2065_only.hash(&mut h);
-    opts.lut3d_path.as_ref().map(|p| p.display().to_string()).hash(&mut h);
+    opts.lut3d_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .hash(&mut h);
     opts.output_stage.hash(&mut h);
     opts.output_lut_cube
         .as_ref()
@@ -851,7 +824,10 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
 
 /// Flip a rect horizontally (mirror left–right) within an image of `img_w` × `img_h`.
 fn flip_rect_horizontal(rect: Rect, img_w: u32, _img_h: u32) -> Rect {
-    let new_x = img_w.saturating_sub(rect.x).saturating_sub(rect.width).max(0);
+    let new_x = img_w
+        .saturating_sub(rect.x)
+        .saturating_sub(rect.width)
+        .max(0);
     Rect {
         x: new_x,
         y: rect.y,
@@ -862,7 +838,10 @@ fn flip_rect_horizontal(rect: Rect, img_w: u32, _img_h: u32) -> Rect {
 
 /// Flip a rect vertically (mirror top–bottom) within an image of `img_w` × `img_h`.
 fn flip_rect_vertical(rect: Rect, _img_w: u32, img_h: u32) -> Rect {
-    let new_y = img_h.saturating_sub(rect.y).saturating_sub(rect.height).max(0);
+    let new_y = img_h
+        .saturating_sub(rect.y)
+        .saturating_sub(rect.height)
+        .max(0);
     Rect {
         x: rect.x,
         y: new_y,
@@ -922,8 +901,12 @@ fn scale_rect_to_size(
         Some((ref_w, ref_h)) if ref_w > 0 && ref_h > 0 => Rect {
             x: (x as f32 * current_w as f32 / ref_w as f32).round() as u32,
             y: (y as f32 * current_h as f32 / ref_h as f32).round() as u32,
-            width: (rw as f32 * current_w as f32 / ref_w as f32).round().max(1.0) as u32,
-            height: (rh as f32 * current_h as f32 / ref_h as f32).round().max(1.0) as u32,
+            width: (rw as f32 * current_w as f32 / ref_w as f32)
+                .round()
+                .max(1.0) as u32,
+            height: (rh as f32 * current_h as f32 / ref_h as f32)
+                .round()
+                .max(1.0) as u32,
         },
         _ => Rect {
             x,
@@ -974,23 +957,23 @@ fn sample_border_color(
     dmin_rect: Option<Rect>,
     auto_norm_buffer: f32,
 ) -> Option<(f32, f32, f32, f32)> {
-    let accumulate = |x: u32, y: u32,
-                      sums:   &mut [f64; 3],
-                      sq_sum: &mut [f64; 3],
-                      count:  &mut u64| {
-        if x >= width || y >= height { return; }
-        let i = ((y * width + x) * 3) as usize;
-        for c in 0..3 {
-            let v = pixels[i + c] as f64;
-            sums[c]   += v;
-            sq_sum[c] += v * v;
-        }
-        *count += 1;
-    };
+    let accumulate =
+        |x: u32, y: u32, sums: &mut [f64; 3], sq_sum: &mut [f64; 3], count: &mut u64| {
+            if x >= width || y >= height {
+                return;
+            }
+            let i = ((y * width + x) * 3) as usize;
+            for c in 0..3 {
+                let v = pixels[i + c] as f64;
+                sums[c] += v;
+                sq_sum[c] += v * v;
+            }
+            *count += 1;
+        };
 
-    let mut sums   = [0.0f64; 3];
+    let mut sums = [0.0f64; 3];
     let mut sq_sum = [0.0f64; 3];
-    let mut count  = 0u64;
+    let mut count = 0u64;
 
     // ── Source 1: explicit D-min rect ────────────────────────────────────────
     if let Some(r) = dmin_rect {
@@ -1009,25 +992,47 @@ fn sample_border_color(
             return None; // Buffer too small; no reliable border source.
         }
 
-        let bw = ((width  as f32 * auto_norm_buffer) as u32).max(2).min(width  / 3);
-        let bh = ((height as f32 * auto_norm_buffer) as u32).max(2).min(height / 3);
+        let bw = ((width as f32 * auto_norm_buffer) as u32)
+            .max(2)
+            .min(width / 3);
+        let bh = ((height as f32 * auto_norm_buffer) as u32)
+            .max(2)
+            .min(height / 3);
 
         // Collect all pixels in the outer strip.
         let mut strip: Vec<(u8, u8, u8)> = Vec::new();
-        for y in 0..bh {                        // top
-            for x in 0..width  { let i = ((y*width+x)*3) as usize; strip.push((pixels[i],pixels[i+1],pixels[i+2])); }
+        for y in 0..bh {
+            // top
+            for x in 0..width {
+                let i = ((y * width + x) * 3) as usize;
+                strip.push((pixels[i], pixels[i + 1], pixels[i + 2]));
+            }
         }
-        for y in (height-bh)..height {          // bottom
-            for x in 0..width  { let i = ((y*width+x)*3) as usize; strip.push((pixels[i],pixels[i+1],pixels[i+2])); }
+        for y in (height - bh)..height {
+            // bottom
+            for x in 0..width {
+                let i = ((y * width + x) * 3) as usize;
+                strip.push((pixels[i], pixels[i + 1], pixels[i + 2]));
+            }
         }
-        for x in 0..bw {                        // left (excluding already-counted rows)
-            for y in bh..(height-bh) { let i = ((y*width+x)*3) as usize; strip.push((pixels[i],pixels[i+1],pixels[i+2])); }
+        for x in 0..bw {
+            // left (excluding already-counted rows)
+            for y in bh..(height - bh) {
+                let i = ((y * width + x) * 3) as usize;
+                strip.push((pixels[i], pixels[i + 1], pixels[i + 2]));
+            }
         }
-        for x in (width-bw)..width {            // right
-            for y in bh..(height-bh) { let i = ((y*width+x)*3) as usize; strip.push((pixels[i],pixels[i+1],pixels[i+2])); }
+        for x in (width - bw)..width {
+            // right
+            for y in bh..(height - bh) {
+                let i = ((y * width + x) * 3) as usize;
+                strip.push((pixels[i], pixels[i + 1], pixels[i + 2]));
+            }
         }
 
-        if strip.is_empty() { return None; }
+        if strip.is_empty() {
+            return None;
+        }
 
         // Sort by luminance ascending; keep the darkest 10 % – after
         // inversion the film base is the darkest region of the output.
@@ -1038,23 +1043,28 @@ fn sample_border_color(
         });
         let keep = ((strip.len() as f32 * 0.10) as usize).max(1);
         for &(r, g, b) in &strip[..keep] {
-            sums[0]   += r as f64; sq_sum[0] += (r as f64) * (r as f64);
-            sums[1]   += g as f64; sq_sum[1] += (g as f64) * (g as f64);
-            sums[2]   += b as f64; sq_sum[2] += (b as f64) * (b as f64);
-            count     += 1;
+            sums[0] += r as f64;
+            sq_sum[0] += (r as f64) * (r as f64);
+            sums[1] += g as f64;
+            sq_sum[1] += (g as f64) * (g as f64);
+            sums[2] += b as f64;
+            sq_sum[2] += (b as f64) * (b as f64);
+            count += 1;
         }
     }
 
-    if count == 0 { return None; }
+    if count == 0 {
+        return None;
+    }
 
     let n = count as f64;
-    let mut means   = [0.0f32; 3];
+    let mut means = [0.0f32; 3];
     let mut max_std = 0.0f32;
     for c in 0..3 {
         let mean = sums[c] / n;
-        let var  = (sq_sum[c] / n - mean * mean).max(0.0);
+        let var = (sq_sum[c] / n - mean * mean).max(0.0);
         means[c] = mean as f32;
-        max_std   = max_std.max(var.sqrt() as f32);
+        max_std = max_std.max(var.sqrt() as f32);
     }
 
     // Sanity check: after inversion the film base is always very dark (near
@@ -1087,8 +1097,7 @@ fn otsu_threshold_1d(values: &[f32], num_bins: usize) -> Option<(f32, f64)> {
     let mut hist = vec![0u32; num_bins];
     let bin_w = range / num_bins as f32;
     for &v in values {
-        let b = ((v - min_v) / range * num_bins as f32)
-            .clamp(0.0, (num_bins - 1) as f32) as usize;
+        let b = ((v - min_v) / range * num_bins as f32).clamp(0.0, (num_bins - 1) as f32) as usize;
         hist[b] = hist[b].saturating_add(1);
     }
     let n: f64 = hist.iter().map(|&c| c as f64).sum();
@@ -1193,9 +1202,7 @@ fn auto_detect_crop(
     // Rec. 709 weighted luminance, 0–255 scale.
     let lum_px = |x: u32, y: u32| -> f32 {
         let i = ((y * width + x) * 3) as usize;
-        0.2126 * pixels[i] as f32
-            + 0.7152 * pixels[i + 1] as f32
-            + 0.0722 * pixels[i + 2] as f32
+        0.2126 * pixels[i] as f32 + 0.7152 * pixels[i + 1] as f32 + 0.0722 * pixels[i + 2] as f32
     };
 
     // Mean luminance for every row and every column.
@@ -1299,7 +1306,10 @@ fn auto_detect_crop(
     };
 
     // Scan from centre outward. Prefer 2-run (two consecutive border rows/cols); fall back to 1-run, then image edge.
-    let top_2run = (1..cy).rev().find(|&y| br_row(y) && br_row(y - 1)).map(|y| y + 1);
+    let top_2run = (1..cy)
+        .rev()
+        .find(|&y| br_row(y) && br_row(y - 1))
+        .map(|y| y + 1);
     let top_1run = (1..cy).rev().find(|&y| br_row(y)).map(|y| y + 1);
     let top = top_2run.or(top_1run).unwrap_or(0);
 
@@ -1307,7 +1317,10 @@ fn auto_detect_crop(
     let bottom_1run = (cy + 1..height).find(|&y| br_row(y));
     let bottom = bottom_2run.or(bottom_1run).unwrap_or(height);
 
-    let left_2run = (1..cx).rev().find(|&x| bc_col(x) && bc_col(x - 1)).map(|x| x + 1);
+    let left_2run = (1..cx)
+        .rev()
+        .find(|&x| bc_col(x) && bc_col(x - 1))
+        .map(|x| x + 1);
     let left_1run = (1..cx).rev().find(|&x| bc_col(x)).map(|x| x + 1);
     let left = left_2run.or(left_1run).unwrap_or(0);
 
@@ -1316,10 +1329,26 @@ fn auto_detect_crop(
     let right = right_2run.or(right_1run).unwrap_or(width);
 
     // Edge pull only when edge is border by mean (not just dark_frac), so we don't pull on mixed/ambiguous edges.
-    let top = if top > 0 && br_row_mean_only(0) { 0 } else { top };
-    let bottom = if bottom < height && br_row_mean_only(height - 1) { height } else { bottom };
-    let left = if left > 0 && bc_col_mean_only(0) { 0 } else { left };
-    let right = if right < width && bc_col_mean_only(width - 1) { width } else { right };
+    let top = if top > 0 && br_row_mean_only(0) {
+        0
+    } else {
+        top
+    };
+    let bottom = if bottom < height && br_row_mean_only(height - 1) {
+        height
+    } else {
+        bottom
+    };
+    let left = if left > 0 && bc_col_mean_only(0) {
+        0
+    } else {
+        left
+    };
+    let right = if right < width && bc_col_mean_only(width - 1) {
+        width
+    } else {
+        right
+    };
 
     // Inward trim to avoid including sprocket holes (detected border can sit just inside the frame).
     const SPROCKET_TRIM: u32 = 4;
@@ -1376,12 +1405,8 @@ fn compute_histogram_from_rgb(
 
     let crop_in_preview = if opts.apply_crop {
         opts.crop_rect.map(|crop_rect| {
-            let scaled = scale_rect_to_size(
-                crop_rect,
-                opts.crop_rect_reference_size,
-                input_w,
-                input_h,
-            );
+            let scaled =
+                scale_rect_to_size(crop_rect, opts.crop_rect_reference_size, input_w, input_h);
             scale_rect_to_size(scaled, Some((input_w, input_h)), w, h)
         })
     } else {
@@ -1436,7 +1461,9 @@ fn dmin_values_to_clipboard_text(opts: &PipelineOptions) -> Option<String> {
     None
 }
 
-fn parse_dmin_clipboard_text(text: &str) -> Option<(Option<(f32, f32, f32)>, Option<Rect>, Option<bool>)> {
+fn parse_dmin_clipboard_text(
+    text: &str,
+) -> Option<(Option<(f32, f32, f32)>, Option<Rect>, Option<bool>)> {
     let t = text.trim();
     if t.is_empty() {
         return None;
@@ -1643,7 +1670,11 @@ fn icon_candidate_paths(path_hint: &str) -> Vec<PathBuf> {
     candidates
 }
 
-fn load_icon_texture(ctx: &egui::Context, texture_name: &str, path_hint: &str) -> Option<egui::TextureHandle> {
+fn load_icon_texture(
+    ctx: &egui::Context,
+    texture_name: &str,
+    path_hint: &str,
+) -> Option<egui::TextureHandle> {
     let image = icon_candidate_paths(path_hint)
         .into_iter()
         .find_map(|candidate| image::open(candidate).ok())?
@@ -1651,10 +1682,19 @@ fn load_icon_texture(ctx: &egui::Context, texture_name: &str, path_hint: &str) -
     let size = [image.width() as usize, image.height() as usize];
     let pixels = image.into_vec();
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-    Some(ctx.load_texture(texture_name.to_string(), color_image, egui::TextureOptions::default()))
+    Some(ctx.load_texture(
+        texture_name.to_string(),
+        color_image,
+        egui::TextureOptions::default(),
+    ))
 }
 
-fn make_thumbnail_from_rgb(rgb: &[u8], src_w: u32, src_h: u32, max_side: u32) -> Option<egui::ColorImage> {
+fn make_thumbnail_from_rgb(
+    rgb: &[u8],
+    src_w: u32,
+    src_h: u32,
+    max_side: u32,
+) -> Option<egui::ColorImage> {
     if src_w == 0 || src_h == 0 || max_side == 0 {
         return None;
     }
@@ -1930,9 +1970,18 @@ fn paint_preview_image(
     let i0 = mesh.vertices.len() as u32;
     for (pos, uv) in [
         (dest.left_top(), map_display_uv_to_tex(l, t, desired, baked)),
-        (dest.right_top(), map_display_uv_to_tex(r, t, desired, baked)),
-        (dest.right_bottom(), map_display_uv_to_tex(r, b, desired, baked)),
-        (dest.left_bottom(), map_display_uv_to_tex(l, b, desired, baked)),
+        (
+            dest.right_top(),
+            map_display_uv_to_tex(r, t, desired, baked),
+        ),
+        (
+            dest.right_bottom(),
+            map_display_uv_to_tex(r, b, desired, baked),
+        ),
+        (
+            dest.left_bottom(),
+            map_display_uv_to_tex(l, b, desired, baked),
+        ),
     ] {
         mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
     }
@@ -2131,7 +2180,11 @@ impl C41Gui {
             .map(|img| {
                 let mut opts = img.options;
                 apply_runtime_gui_defaults(&mut opts);
-                image_entry(img.path, opts, ExportFormat::from_project(img.export_format))
+                image_entry(
+                    img.path,
+                    opts,
+                    ExportFormat::from_project(img.export_format),
+                )
             })
             .collect();
         self.selected_index = if self.images.is_empty() {
@@ -2180,11 +2233,10 @@ impl C41Gui {
             return false;
         }
         let path = self.images[index].path.clone();
-        let entry = &mut self.images[index];
-        if entry.cached_sensor.is_none() {
+        if self.images[index].cached_sensor.is_none() {
             match load_sensor_from_path(&path) {
                 Ok(sensor) => {
-                    entry.cached_sensor = Some(Arc::new(sensor));
+                    self.images[index].cached_sensor = Some(Arc::new(sensor));
                 }
                 Err(e) => {
                     self.status = format!("Failed to load sensor data: {}", e);
@@ -2192,22 +2244,60 @@ impl C41Gui {
                 }
             }
         }
-        if self.full_res_preview_active {
-            return true;
-        }
-        let mut options = entry.options.clone();
-        options.flat_field_path = self.flat_field_path.clone();
-        let key = preview_scene_stats_key(&options);
-        let stale = entry.scene_stats.as_ref().map(|(k, _)| *k) != Some(key);
-        if stale {
-            if let Some(sensor) = entry.cached_sensor.clone() {
-                match compute_preview_scene_stats(sensor.as_ref(), &options) {
-                    Ok(stats) => entry.scene_stats = Some((key, stats)),
-                    Err(_) => entry.scene_stats = None,
+        if !self.full_res_preview_active {
+            let mut options = self.images[index].options.clone();
+            options.flat_field_path = self.flat_field_path.clone();
+            let key = preview_scene_stats_key(&options);
+            let stale = self.images[index].scene_stats.as_ref().map(|(k, _)| *k) != Some(key);
+            if stale {
+                if let Some(sensor) = self.images[index].cached_sensor.clone() {
+                    match compute_preview_scene_stats(sensor.as_ref(), &options) {
+                        Ok(stats) => self.images[index].scene_stats = Some((key, stats)),
+                        Err(_) => self.images[index].scene_stats = None,
+                    }
                 }
             }
         }
+        self.evict_unselected_heavy_caches();
         true
+    }
+
+    /// Drop full-res sensor / step caches / tiles / RGB buffers on every image.
+    /// Keeps strip thumbnails and the current preview texture so the UI stays visible.
+    fn release_heavy_caches(&mut self) {
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        self.tile_gen = self.tile_gen.wrapping_add(1);
+        self.preview_receiver = None;
+        self.preview_started_at = None;
+        self.preview_job_hash = None;
+        self.pending_preview_key = None;
+        self.pending_preview_since = None;
+        self.tile_receiver = None;
+        self.tile_inflight = None;
+        self.tile_failed.clear();
+        for entry in &mut self.images {
+            entry.cached_sensor = None;
+            entry.preview_step_cache = None;
+            entry.draft_step_cache = None;
+            entry.screen_step_cache = None;
+            entry.tile_cache.clear();
+            entry.preview_full_rgb = None;
+        }
+    }
+
+    /// Keep `cached_sensor` and step caches for the selected image only.
+    fn evict_unselected_heavy_caches(&mut self) {
+        let keep = self.selected_index;
+        for (i, entry) in self.images.iter_mut().enumerate() {
+            if Some(i) == keep {
+                continue;
+            }
+            entry.cached_sensor = None;
+            entry.preview_step_cache = None;
+            entry.draft_step_cache = None;
+            entry.screen_step_cache = None;
+            entry.tile_cache.clear();
+        }
     }
 
     fn request_preview_for(&mut self, index: usize, ctx: &egui::Context, lod: PreviewLod) {
@@ -2222,11 +2312,9 @@ impl C41Gui {
 
         let (max_width, max_height) = match lod {
             PreviewLod::Draft => preview_draft_limits(),
-            PreviewLod::Screen => preview_working_limits(
-                self.preview_canvas_size,
-                ctx.pixels_per_point(),
-                false,
-            ),
+            PreviewLod::Screen => {
+                preview_working_limits(self.preview_canvas_size, ctx.pixels_per_point(), false)
+            }
             PreviewLod::FullRes => (u32::MAX, u32::MAX),
         };
         if lod == PreviewLod::Screen {
@@ -2240,7 +2328,9 @@ impl C41Gui {
 
         let cache = match lod {
             PreviewLod::Draft => self.images[index].draft_step_cache.clone(),
-            PreviewLod::Screen | PreviewLod::FullRes => self.images[index].screen_step_cache.clone(),
+            PreviewLod::Screen | PreviewLod::FullRes => {
+                self.images[index].screen_step_cache.clone()
+            }
         };
         let sensor = self.images[index].cached_sensor.clone();
         let gen = self.preview_gen;
@@ -2271,33 +2361,28 @@ impl C41Gui {
                 capture_debug,
                 sensor.as_deref(),
             );
-            let res = res.map(|(input_w, input_h, w, h, rgb, dbg_log, new_cache)| {
-                PreviewJobResult {
-                    gen,
-                    lod,
-                    index,
-                    input_w,
-                    input_h,
-                    w,
-                    h,
-                    rgb,
-                    dbg_log,
-                    captured_debug: capture_debug,
-                    new_cache,
-                }
-            });
+            let res =
+                res.map(
+                    |(input_w, input_h, w, h, rgb, dbg_log, new_cache)| PreviewJobResult {
+                        gen,
+                        lod,
+                        index,
+                        input_w,
+                        input_h,
+                        w,
+                        h,
+                        rgb,
+                        dbg_log,
+                        captured_debug: capture_debug,
+                        new_cache,
+                    },
+                );
             let _ = tx.send(res);
         });
         ctx.request_repaint();
     }
 
-    fn request_tile_for(
-        &mut self,
-        index: usize,
-        ix: i32,
-        iy: i32,
-        ctx: &egui::Context,
-    ) {
+    fn request_tile_for(&mut self, index: usize, ix: i32, iy: i32, ctx: &egui::Context) {
         if !self.ensure_sensor_and_scene_stats(index) {
             return;
         }
@@ -2353,10 +2438,8 @@ impl C41Gui {
         let inner_t = (y as f32 - overlap).max(0.0) / ohf;
         let inner_r = ((x + tw) as f32 + overlap).min(owf) / owf;
         let inner_b = ((y + th) as f32 + overlap).min(ohf) / ohf;
-        let uv = egui::Rect::from_min_max(
-            egui::pos2(inner_l, inner_t),
-            egui::pos2(inner_r, inner_b),
-        );
+        let uv =
+            egui::Rect::from_min_max(egui::pos2(inner_l, inner_t), egui::pos2(inner_r, inner_b));
         let crop_uw = (crop.uv_right - crop.uv_left).max(1e-6);
         let crop_uh = (crop.uv_bottom - crop.uv_top).max(1e-6);
         let tex_uv = egui::Rect::from_min_max(
@@ -2720,13 +2803,17 @@ impl C41Gui {
             return;
         };
 
-        let jobs: Vec<(PathBuf, PipelineOptions)> = if selected_only {
+        let jobs: Vec<ExportJobSpec> = if selected_only {
             match self.selected_index {
                 Some(idx) if idx < self.images.len() => {
                     let img = &self.images[idx];
                     let mut opts = img.options.clone();
                     opts.flat_field_path = self.flat_field_path.clone();
-                    vec![(img.path.clone(), opts)]
+                    vec![ExportJobSpec {
+                        path: img.path.clone(),
+                        options: opts,
+                        source_size: img.raw_source_size.map(|[w, h]| (w, h)),
+                    }]
                 }
                 _ => return,
             }
@@ -2742,7 +2829,11 @@ impl C41Gui {
                     opts.write_jpeg_only = export_template.write_jpeg_only;
                     opts.export_aces_exr = export_template.export_aces_exr;
                     opts.write_aces2065_only = export_template.write_aces2065_only;
-                    (img.path.clone(), opts)
+                    ExportJobSpec {
+                        path: img.path.clone(),
+                        options: opts,
+                        source_size: img.raw_source_size.map(|[w, h]| (w, h)),
+                    }
                 })
                 .collect()
         };
@@ -2750,41 +2841,28 @@ impl C41Gui {
             return;
         }
 
+        self.release_heavy_caches();
+
         let total = jobs.len();
         let control = Arc::new(ExportControl::new(total));
         let (tx, rx) = mpsc::channel();
         let control_thread = control.clone();
         thread::spawn(move || {
-            let mut completed = 0usize;
-            for (i, (path, opts)) in jobs.iter().enumerate() {
-                if control_thread.is_cancelled() {
-                    let _ = tx.send(ExportJobOutcome::Cancelled { completed });
-                    return;
+            match process_export_jobs(&jobs, &output_dir, Some(control_thread.as_ref())) {
+                Ok(()) => {
+                    let _ = tx.send(ExportJobOutcome::Done {
+                        count: control_thread.completed(),
+                    });
                 }
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("image")
-                    .to_string();
-                control_thread.begin_file(i, total, name);
-                match process_files_with_control(
-                    std::slice::from_ref(path),
-                    &output_dir,
-                    opts,
-                    Some(control_thread.as_ref()),
-                ) {
-                    Ok(()) => completed += 1,
-                    Err(e) if e.downcast_ref::<ExportCancelled>().is_some() => {
-                        let _ = tx.send(ExportJobOutcome::Cancelled { completed });
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(ExportJobOutcome::Error(e.to_string()));
-                        return;
-                    }
+                Err(e) if e.downcast_ref::<ExportCancelled>().is_some() => {
+                    let _ = tx.send(ExportJobOutcome::Cancelled {
+                        completed: control_thread.completed(),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ExportJobOutcome::Error(e.to_string()));
                 }
             }
-            let _ = tx.send(ExportJobOutcome::Done { count: completed });
         });
 
         self.export_job = Some(ExportJob {
@@ -2841,7 +2919,8 @@ impl C41Gui {
         };
         if job.started_at.elapsed() < Duration::from_millis(EXPORT_PROGRESS_DELAY_MS) {
             ctx.request_repaint_after(Duration::from_millis(
-                EXPORT_PROGRESS_DELAY_MS.saturating_sub(job.started_at.elapsed().as_millis() as u64),
+                EXPORT_PROGRESS_DELAY_MS
+                    .saturating_sub(job.started_at.elapsed().as_millis() as u64),
             ));
             return;
         }
@@ -2850,13 +2929,13 @@ impl C41Gui {
         let progress = control.snapshot();
         let cancelling = control.is_cancelled();
         let fraction = progress.fraction.clamp(0.0, 1.0);
+        let shown = if progress.completed < progress.total && !progress.file_name.is_empty() {
+            progress.completed.saturating_add(1).min(progress.total)
+        } else {
+            progress.completed.min(progress.total)
+        };
         let label = if progress.total > 1 {
-            format!(
-                "{}  ({}/{})",
-                progress.file_name,
-                progress.current.saturating_add(1).min(progress.total),
-                progress.total
-            )
+            format!("{}  ({}/{})", progress.file_name, shown, progress.total)
         } else if !progress.file_name.is_empty() {
             progress.file_name.clone()
         } else {
@@ -2898,6 +2977,9 @@ impl C41Gui {
     }
 
     fn start_auto(&mut self, ctx: &egui::Context) {
+        if self.export_job.is_some() {
+            return;
+        }
         if self.auto_job.is_some() {
             return;
         }
@@ -2973,17 +3055,15 @@ impl C41Gui {
                         false,
                         sensor.as_deref(),
                     ) {
-                        Ok((_, _, _, _, _, _, new_cache)) => {
-                            match new_cache.after_step3 {
-                                Some((_, img)) => img,
-                                None => {
-                                    let _ = tx.send(AutoJobOutcome::Error {
-                                        message: "Auto: no D-min buffer to analyse.".to_string(),
-                                    });
-                                    return;
-                                }
+                        Ok((_, _, _, _, _, _, new_cache)) => match new_cache.after_step3 {
+                            Some((_, img)) => img,
+                            None => {
+                                let _ = tx.send(AutoJobOutcome::Error {
+                                    message: "Auto: no D-min buffer to analyse.".to_string(),
+                                });
+                                return;
                             }
-                        }
+                        },
                         Err(e) => {
                             let _ = tx.send(AutoJobOutcome::Error {
                                 message: format!("Auto: failed to load preview ({e})"),
@@ -3141,10 +3221,12 @@ impl eframe::App for C41Gui {
             self.ui_icons.close = load_icon_texture(ctx, "ui_icon_close", ICON_CLOSE_PATH);
         }
         if self.ui_icons.rotate_left.is_none() {
-            self.ui_icons.rotate_left = load_icon_texture(ctx, "ui_icon_rotate_left", ICON_ROTATE_LEFT_PATH);
+            self.ui_icons.rotate_left =
+                load_icon_texture(ctx, "ui_icon_rotate_left", ICON_ROTATE_LEFT_PATH);
         }
         if self.ui_icons.rotate_right.is_none() {
-            self.ui_icons.rotate_right = load_icon_texture(ctx, "ui_icon_rotate_right", ICON_ROTATE_RIGHT_PATH);
+            self.ui_icons.rotate_right =
+                load_icon_texture(ctx, "ui_icon_rotate_right", ICON_ROTATE_RIGHT_PATH);
         }
         if self.ui_icons.logo.is_none() {
             self.ui_icons.logo = load_icon_texture(ctx, "ui_icon_logo", ICON_LOGO_PATH);
@@ -3181,11 +3263,8 @@ impl eframe::App for C41Gui {
                                 opts.output_lut_cube = Some(path);
                             }
                             Err(e) => {
-                                self.status = format!(
-                                    "Failed to parse output LUT {}: {}",
-                                    path.display(),
-                                    e
-                                );
+                                self.status =
+                                    format!("Failed to parse output LUT {}: {}", path.display(), e);
                             }
                         },
                         None => {
@@ -3211,17 +3290,12 @@ impl eframe::App for C41Gui {
                         } else {
                             egui::TextureOptions::LINEAR
                         };
-                        let tex = ctx.load_texture(
-                            format!("preview_full_{}", idx),
-                            image,
-                            tex_opts,
-                        );
+                        let tex =
+                            ctx.load_texture(format!("preview_full_{}", idx), image, tex_opts);
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_texture_nearest = nearest;
-                        self.images[idx].preview_hash =
-                            self.preview_job_hash.unwrap_or(0);
-                        self.images[idx].preview_options_hash =
-                            self.preview_job_hash.unwrap_or(0);
+                        self.images[idx].preview_hash = self.preview_job_hash.unwrap_or(0);
+                        self.images[idx].preview_options_hash = self.preview_job_hash.unwrap_or(0);
                         self.images[idx].preview_lod = job.lod;
                         if job.lod == PreviewLod::Screen || job.lod == PreviewLod::FullRes {
                             self.images[idx].preview_screen_wh = (job.w, job.h);
@@ -3343,12 +3417,10 @@ impl eframe::App for C41Gui {
         self.poll_auto_job(ctx);
 
         // Request thumbnail for one image at a time (strip icons).
-        if self.thumbnail_receiver.is_none() {
-            if let Some(entry) = self
-                .images
-                .iter()
-                .find(|e| e.thumbnail_texture.is_none() && !self.thumbnail_pending.contains(&e.path))
-            {
+        if self.export_job.is_none() && self.thumbnail_receiver.is_none() {
+            if let Some(entry) = self.images.iter().find(|e| {
+                e.thumbnail_texture.is_none() && !self.thumbnail_pending.contains(&e.path)
+            }) {
                 let path = entry.path.clone();
                 let mut options = entry.options.clone();
                 options.flat_field_path = self.flat_field_path.clone();
@@ -3356,13 +3428,9 @@ impl eframe::App for C41Gui {
                 self.thumbnail_receiver = Some(rx);
                 self.thumbnail_pending.insert(path.clone());
                 thread::spawn(move || {
-                    let result = process_one_to_preview(
-                        &path,
-                        &options,
-                        THUMB_MAX_SIZE,
-                        THUMB_MAX_SIZE,
-                    )
-                    .map(|(_orig_w, _orig_h, new_w, new_h, rgb, _dbg)| (new_w, new_h, rgb));
+                    let result =
+                        process_one_to_preview(&path, &options, THUMB_MAX_SIZE, THUMB_MAX_SIZE)
+                            .map(|(_orig_w, _orig_h, new_w, new_h, rgb, _dbg)| (new_w, new_h, rgb));
                     let _ = tx.send((path, result));
                 });
             }
@@ -3382,7 +3450,13 @@ impl eframe::App for C41Gui {
                             pixels,
                         };
                         let tex = ctx.load_texture(
-                            format!("thumb_{}", path.display().to_string().replace('\\', "_").replace('/', "_")),
+                            format!(
+                                "thumb_{}",
+                                path.display()
+                                    .to_string()
+                                    .replace('\\', "_")
+                                    .replace('/', "_")
+                            ),
                             image,
                             egui::TextureOptions::default(),
                         );
@@ -3437,8 +3511,8 @@ impl eframe::App for C41Gui {
                                 .add_filter(
                                     "RAW & images",
                                     &[
-                                        "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf", "orf", "rw2",
-                                        "png", "jpeg", "jpg", "tiff", "tif",
+                                        "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf",
+                                        "orf", "rw2", "png", "jpeg", "jpg", "tiff", "tif",
                                     ],
                                 )
                                 .pick_files()
@@ -3464,6 +3538,7 @@ impl eframe::App for C41Gui {
                     ui.add_space(10.0);
 
                     let mut to_remove = Vec::new();
+                    let mut selection_changed = false;
                     const CARD_WIDTH: f32 = 88.0;
                     const CARD_HEIGHT: f32 = 96.0; // more space in bottom panel
                     const THUMB_SIZE: f32 = 44.0;
@@ -3490,9 +3565,8 @@ impl eframe::App for C41Gui {
                                 };
                                 let selected = self.selected_index == Some(i);
 
-                                let card_response = ui.allocate_ui(
-                                    egui::vec2(CARD_WIDTH, CARD_HEIGHT),
-                                    |ui| {
+                                let card_response =
+                                    ui.allocate_ui(egui::vec2(CARD_WIDTH, CARD_HEIGHT), |ui| {
                                         let card_rect = ui.available_rect_before_wrap();
                                         let id = ui.make_persistent_id(("strip_card", i));
                                         let interact_resp =
@@ -3500,7 +3574,10 @@ impl eframe::App for C41Gui {
 
                                         // Card background and border (drawn first so content is on top)
                                         let stroke = if selected {
-                                            egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255))
+                                            egui::Stroke::new(
+                                                2.0,
+                                                egui::Color32::from_rgb(100, 150, 255),
+                                            )
                                         } else if interact_resp.hovered() {
                                             egui::Stroke::new(1.0, egui::Color32::from_gray(120))
                                         } else {
@@ -3522,51 +3599,74 @@ impl eframe::App for C41Gui {
                                             egui::vec2(X_BUTTON_SIZE, X_BUTTON_SIZE),
                                         );
                                         let x_clicked = ui
-                                            .allocate_new_ui(egui::UiBuilder::new().max_rect(x_rect), |ui| {
-                                                if let Some(icon) = &self.ui_icons.close {
-                                                    ui.add(
-                                                        egui::ImageButton::new((
-                                                            icon.id(),
-                                                            egui::vec2(X_BUTTON_SIZE - 6.0, X_BUTTON_SIZE - 6.0),
-                                                        ))
-                                                        .frame(false),
-                                                    )
-                                                    .clicked()
-                                                } else {
-                                                    ui.small_button("X").clicked()
-                                                }
-                                            })
+                                            .allocate_new_ui(
+                                                egui::UiBuilder::new().max_rect(x_rect),
+                                                |ui| {
+                                                    if let Some(icon) = &self.ui_icons.close {
+                                                        ui.add(
+                                                            egui::ImageButton::new((
+                                                                icon.id(),
+                                                                egui::vec2(
+                                                                    X_BUTTON_SIZE - 6.0,
+                                                                    X_BUTTON_SIZE - 6.0,
+                                                                ),
+                                                            ))
+                                                            .frame(false),
+                                                        )
+                                                        .clicked()
+                                                    } else {
+                                                        ui.small_button("X").clicked()
+                                                    }
+                                                },
+                                            )
                                             .inner;
 
                                         // Content area: thumbnail + name, clipped to card (below X row)
-                                        let content_top = card_rect.top() + CARD_PADDING + X_BUTTON_SIZE + 2.0;
+                                        let content_top =
+                                            card_rect.top() + CARD_PADDING + X_BUTTON_SIZE + 2.0;
                                         let content_rect = egui::Rect::from_min_max(
-                                            egui::pos2(card_rect.left() + CARD_PADDING, content_top),
-                                            egui::pos2(card_rect.right() - CARD_PADDING, card_rect.bottom() - CARD_PADDING),
+                                            egui::pos2(
+                                                card_rect.left() + CARD_PADDING,
+                                                content_top,
+                                            ),
+                                            egui::pos2(
+                                                card_rect.right() - CARD_PADDING,
+                                                card_rect.bottom() - CARD_PADDING,
+                                            ),
                                         );
-                                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
-                                            ui.set_clip_rect(card_rect);
-                                            ui.vertical_centered(|ui| {
-                                                if let Some(ref thumb) = entry.thumbnail_texture {
-                                                    let size = thumb.size();
-                                                    let (w, h) = (size[0] as f32, size[1] as f32);
-                                                    let scale =
-                                                        (THUMB_SIZE / w).min(THUMB_SIZE / h).min(1.0);
-                                                    ui.image((thumb.id(), egui::vec2(w * scale, h * scale)));
-                                                } else {
-                                                    ui.allocate_space(egui::vec2(THUMB_SIZE, THUMB_SIZE));
-                                                }
-                                                ui.add_space(2.0);
-                                                ui.label(
+                                        ui.allocate_new_ui(
+                                            egui::UiBuilder::new().max_rect(content_rect),
+                                            |ui| {
+                                                ui.set_clip_rect(card_rect);
+                                                ui.vertical_centered(|ui| {
+                                                    if let Some(ref thumb) = entry.thumbnail_texture
+                                                    {
+                                                        let size = thumb.size();
+                                                        let (w, h) =
+                                                            (size[0] as f32, size[1] as f32);
+                                                        let scale = (THUMB_SIZE / w)
+                                                            .min(THUMB_SIZE / h)
+                                                            .min(1.0);
+                                                        ui.image((
+                                                            thumb.id(),
+                                                            egui::vec2(w * scale, h * scale),
+                                                        ));
+                                                    } else {
+                                                        ui.allocate_space(egui::vec2(
+                                                            THUMB_SIZE, THUMB_SIZE,
+                                                        ));
+                                                    }
+                                                    ui.add_space(2.0);
+                                                    ui.label(
                                                     egui::RichText::new(&display_name).small(),
                                                 )
                                                 .on_hover_text(entry.path.display().to_string());
-                                            });
-                                        });
+                                                });
+                                            },
+                                        );
 
                                         (interact_resp, x_clicked)
-                                    },
-                                );
+                                    });
 
                                 let (interact_resp, x_clicked) = card_response.inner;
 
@@ -3575,6 +3675,7 @@ impl eframe::App for C41Gui {
                                 } else if interact_resp.clicked() {
                                     self.selected_index = Some(i);
                                     self.full_res_preview_active = false;
+                                    selection_changed = true;
                                 }
 
                                 if i + 1 < self.images.len() {
@@ -3606,6 +3707,9 @@ impl eframe::App for C41Gui {
                     }
                     if had_removals {
                         self.status = format!("{} file(s)", self.images.len());
+                    }
+                    if selection_changed || had_removals {
+                        self.evict_unselected_heavy_caches();
                     }
                 });
             });
@@ -5289,11 +5393,18 @@ impl eframe::App for C41Gui {
                             scale_rect_to_size(
                                 r,
                                 self.images[idx].options.dmin_rect_reference_size,
-                                w, h,
+                                w,
+                                h,
                             )
                         });
                         let auto_norm_buffer = self.images[idx].options.auto_norm_buffer;
-                        match sample_border_color(w, h, &pixels, dmin_rect_preview, auto_norm_buffer) {
+                        match sample_border_color(
+                            w,
+                            h,
+                            &pixels,
+                            dmin_rect_preview,
+                            auto_norm_buffer,
+                        ) {
                             None => {
                                 self.status = "Auto crop: set a D-min region first so the film-base colour is known.".to_string();
                             }
@@ -5301,17 +5412,20 @@ impl eframe::App for C41Gui {
                                 match auto_detect_crop(w, h, &pixels, (br, bg, bb), tol) {
                                     Some(rect) => {
                                         self.images[idx].options.crop_rect = Some(rect);
-                                        self.images[idx].options.crop_rect_reference_size = Some((w, h));
+                                        self.images[idx].options.crop_rect_reference_size =
+                                            Some((w, h));
                                         self.images[idx].options.apply_crop = true;
                                     }
                                     None => {
-                                        self.status = "Auto crop: no clear frame boundary found.".to_string();
+                                        self.status =
+                                            "Auto crop: no clear frame boundary found.".to_string();
                                     }
                                 }
                             }
                         }
                     } else {
-                        self.status = "Auto crop: waiting for preview to finish processing.".to_string();
+                        self.status =
+                            "Auto crop: waiting for preview to finish processing.".to_string();
                     }
                 }
             }
@@ -6403,146 +6517,151 @@ impl eframe::App for C41Gui {
         }
 
         // Draft → screen refine. Runs after UI so drag/release is available for debounce.
-        if let Some(idx) = self.selected_index {
-            if idx < self.images.len() {
-                let (screen_w, screen_h) = preview_working_limits(
-                    self.preview_canvas_size,
-                    ctx.pixels_per_point(),
-                    self.full_res_preview_active,
-                );
-                let hash_now = preview_options_hash(
-                    &self.images[idx].path,
-                    &self.images[idx].options,
-                    self.full_res_preview_active,
-                );
-                if self.capture_pipeline_debug_next {
-                    self.images[idx].preview_options_hash = 0;
-                }
-                let have_rgb = self.images[idx].preview_full_rgb.is_some();
-                let have_current = have_rgb && self.images[idx].preview_options_hash == hash_now;
-                let need_options = !have_current;
-                let lod = self.images[idx].preview_lod;
-                let proxy_soft = self
-                    .visible_tile_grid(idx)
-                    .map(|g| g.proxy_soft)
-                    .unwrap_or(false);
-                let (req_sw, req_sh) = self.images[idx].preview_screen_requested_wh;
-                // Do not compare CFA output size to the request cap — downsample often
-                // comes in smaller and that used to restart screen refine forever,
-                // which blocked 1:1 tiles. Skip refine only when tiles will actually run.
-                let pointer_down = ctx.input(|i| i.pointer.any_down());
-                let slider_dragging =
-                    pointer_down && !self.rect_dragging && !self.preview_view_dragging;
-                let need_screen = have_current
-                    && !self.full_res_preview_active
-                    && !proxy_soft
-                    && !pointer_down
-                    && (lod == PreviewLod::Draft
-                        || (lod == PreviewLod::Screen
-                            && (req_sw + 64 < screen_w || req_sh + 64 < screen_h)));
-
-                if need_options {
-                    let now = Instant::now();
-                    let key = (idx, hash_now);
-                    if self.pending_preview_key != Some(key) {
-                        self.pending_preview_key = Some(key);
-                        self.pending_preview_since = Some(now);
-                        // Keep an in-flight draft so the proxy can update while dragging.
-                        // Tiles wait until the pointer is released.
-                        self.tile_gen = self.tile_gen.wrapping_add(1);
-                        self.tile_inflight = None;
-                        self.tile_failed.clear();
+        if self.export_job.is_none() {
+            if let Some(idx) = self.selected_index {
+                if idx < self.images.len() {
+                    let (screen_w, screen_h) = preview_working_limits(
+                        self.preview_canvas_size,
+                        ctx.pixels_per_point(),
+                        self.full_res_preview_active,
+                    );
+                    let hash_now = preview_options_hash(
+                        &self.images[idx].path,
+                        &self.images[idx].options,
+                        self.full_res_preview_active,
+                    );
+                    if self.capture_pipeline_debug_next {
+                        self.images[idx].preview_options_hash = 0;
                     }
-
-                    let geometry_pending = self
-                        .geometry_coalesce_until
-                        .map(|t| Instant::now() < t)
+                    let have_rgb = self.images[idx].preview_full_rgb.is_some();
+                    let have_current =
+                        have_rgb && self.images[idx].preview_options_hash == hash_now;
+                    let need_options = !have_current;
+                    let lod = self.images[idx].preview_lod;
+                    let proxy_soft = self
+                        .visible_tile_grid(idx)
+                        .map(|g| g.proxy_soft)
                         .unwrap_or(false);
-                    // Any pointer-down (including rotate/flip buttons) used to look like a
-                    // slider drag and start a preview after 50ms — that blocked further clicks.
-                    let debounce_ms = if geometry_pending {
-                        GEOMETRY_COALESCE_MS
-                    } else if slider_dragging {
-                        PREVIEW_LIVE_DEBOUNCE_MS
-                    } else {
-                        PREVIEW_DEBOUNCE_MS
-                    };
-                    let settled = self
-                        .pending_preview_since
-                        .map(|t| {
-                            now.saturating_duration_since(t) >= Duration::from_millis(debounce_ms)
-                        })
-                        .unwrap_or(false);
-
-                    if self.preview_receiver.is_none()
-                        && !self.rect_dragging
-                        && !geometry_pending
+                    let (req_sw, req_sh) = self.images[idx].preview_screen_requested_wh;
+                    // Do not compare CFA output size to the request cap — downsample often
+                    // comes in smaller and that used to restart screen refine forever,
+                    // which blocked 1:1 tiles. Skip refine only when tiles will actually run.
+                    let pointer_down = ctx.input(|i| i.pointer.any_down());
+                    let slider_dragging =
+                        pointer_down && !self.rect_dragging && !self.preview_view_dragging;
+                    let need_screen = have_current
+                        && !self.full_res_preview_active
+                        && !proxy_soft
                         && !pointer_down
-                        && settled
-                    {
-                        if self.full_res_preview_active && !self.full_res_preview_button_clicked {
-                            self.full_res_preview_active = false;
-                        }
-                        let lod = if self.full_res_preview_active && !slider_dragging {
-                            PreviewLod::FullRes
-                        } else if slider_dragging {
-                            PreviewLod::Draft
-                        } else {
-                            // Fit / settled view: screen-res proxy (2× demosaic + filter).
-                            PreviewLod::Screen
-                        };
-                        self.request_preview_for(idx, ctx, lod);
-                        self.full_res_preview_button_clicked = false;
-                        self.pending_preview_since = None;
-                        self.geometry_coalesce_until = None;
-                    } else {
-                        ctx.request_repaint_after(Duration::from_millis(16));
-                    }
-                } else if need_screen && self.preview_receiver.is_none() {
-                    self.pending_preview_key = None;
-                    self.pending_preview_since = None;
-                    self.request_preview_for(idx, ctx, PreviewLod::Screen);
-                } else if self.pending_preview_key.map(|(i, _)| i) == Some(idx) {
-                    self.pending_preview_key = None;
-                    self.pending_preview_since = None;
-                }
+                        && (lod == PreviewLod::Draft
+                            || (lod == PreviewLod::Screen
+                                && (req_sw + 64 < screen_w || req_sh + 64 < screen_h)));
 
-                if !pointer_down {
-                    self.preview_view_dragging = false;
-                }
-                let view_settling = self.preview_view_settling();
-                // 1:1 tiles: after pan/zoom/slider release, when the proxy is soft.
-                // Over-cap views still fetch a center-first window of PREVIEW_TILE_MAX.
-                if proxy_soft
-                    && self.preview_receiver.is_none()
-                    && self.tile_receiver.is_none()
-                    && have_current
-                    && !self.full_res_preview_active
-                    && !self.rect_dragging
-                    && !self.preview_view_dragging
-                    && !view_settling
-                    && !need_options
-                    && !pointer_down
-                {
-                    self.drop_tiles_outside_view(idx);
-                    if let Some(missing) = self.visible_tile_to_request(idx) {
-                        self.request_tile_for(idx, missing.0, missing.1, ctx);
+                    if need_options {
+                        let now = Instant::now();
+                        let key = (idx, hash_now);
+                        if self.pending_preview_key != Some(key) {
+                            self.pending_preview_key = Some(key);
+                            self.pending_preview_since = Some(now);
+                            // Keep an in-flight draft so the proxy can update while dragging.
+                            // Tiles wait until the pointer is released.
+                            self.tile_gen = self.tile_gen.wrapping_add(1);
+                            self.tile_inflight = None;
+                            self.tile_failed.clear();
+                        }
+
+                        let geometry_pending = self
+                            .geometry_coalesce_until
+                            .map(|t| Instant::now() < t)
+                            .unwrap_or(false);
+                        // Any pointer-down (including rotate/flip buttons) used to look like a
+                        // slider drag and start a preview after 50ms — that blocked further clicks.
+                        let debounce_ms = if geometry_pending {
+                            GEOMETRY_COALESCE_MS
+                        } else if slider_dragging {
+                            PREVIEW_LIVE_DEBOUNCE_MS
+                        } else {
+                            PREVIEW_DEBOUNCE_MS
+                        };
+                        let settled = self
+                            .pending_preview_since
+                            .map(|t| {
+                                now.saturating_duration_since(t)
+                                    >= Duration::from_millis(debounce_ms)
+                            })
+                            .unwrap_or(false);
+
+                        if self.preview_receiver.is_none()
+                            && !self.rect_dragging
+                            && !geometry_pending
+                            && !pointer_down
+                            && settled
+                        {
+                            if self.full_res_preview_active && !self.full_res_preview_button_clicked
+                            {
+                                self.full_res_preview_active = false;
+                            }
+                            let lod = if self.full_res_preview_active && !slider_dragging {
+                                PreviewLod::FullRes
+                            } else if slider_dragging {
+                                PreviewLod::Draft
+                            } else {
+                                // Fit / settled view: screen-res proxy (2× demosaic + filter).
+                                PreviewLod::Screen
+                            };
+                            self.request_preview_for(idx, ctx, lod);
+                            self.full_res_preview_button_clicked = false;
+                            self.pending_preview_since = None;
+                            self.geometry_coalesce_until = None;
+                        } else {
+                            ctx.request_repaint_after(Duration::from_millis(16));
+                        }
+                    } else if need_screen && self.preview_receiver.is_none() {
+                        self.pending_preview_key = None;
+                        self.pending_preview_since = None;
+                        self.request_preview_for(idx, ctx, PreviewLod::Screen);
+                    } else if self.pending_preview_key.map(|(i, _)| i) == Some(idx) {
+                        self.pending_preview_key = None;
+                        self.pending_preview_since = None;
+                    }
+
+                    if !pointer_down {
+                        self.preview_view_dragging = false;
+                    }
+                    let view_settling = self.preview_view_settling();
+                    // 1:1 tiles: after pan/zoom/slider release, when the proxy is soft.
+                    // Over-cap views still fetch a center-first window of PREVIEW_TILE_MAX.
+                    if proxy_soft
+                        && self.preview_receiver.is_none()
+                        && self.tile_receiver.is_none()
+                        && have_current
+                        && !self.full_res_preview_active
+                        && !self.rect_dragging
+                        && !self.preview_view_dragging
+                        && !view_settling
+                        && !need_options
+                        && !pointer_down
+                    {
+                        self.drop_tiles_outside_view(idx);
+                        if let Some(missing) = self.visible_tile_to_request(idx) {
+                            self.request_tile_for(idx, missing.0, missing.1, ctx);
+                        }
+                    }
+                    if self.tile_receiver.is_some() {
+                        ctx.request_repaint();
+                    } else if view_settling {
+                        if let Some(t) = self.preview_view_changed_at {
+                            let left = PREVIEW_VIEW_SETTLE_MS
+                                .saturating_sub(t.elapsed().as_millis() as u64)
+                                .max(16);
+                            ctx.request_repaint_after(Duration::from_millis(left));
+                        }
                     }
                 }
-                if self.tile_receiver.is_some() {
-                    ctx.request_repaint();
-                } else if view_settling {
-                    if let Some(t) = self.preview_view_changed_at {
-                        let left = PREVIEW_VIEW_SETTLE_MS
-                            .saturating_sub(t.elapsed().as_millis() as u64)
-                            .max(16);
-                        ctx.request_repaint_after(Duration::from_millis(left));
-                    }
-                }
+            } else {
+                self.pending_preview_key = None;
+                self.pending_preview_since = None;
             }
-        } else {
-            self.pending_preview_key = None;
-            self.pending_preview_since = None;
         }
 
         self.show_export_progress(ctx);
@@ -6564,4 +6683,3 @@ impl eframe::App for C41Gui {
         }
     }
 }
-

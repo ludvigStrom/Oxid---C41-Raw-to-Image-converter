@@ -168,10 +168,7 @@ pub fn save_profile_to_path(
 
 /// Save a calibration profile as a `.c41` zip (profile.json + lut.cube).
 /// LUT is generated from the profile matrix (17³, d_max 4.0).
-pub fn save_c41_profile(
-    profile: &CalibrationProfile,
-    path: &Path,
-) -> anyhow::Result<()> {
+pub fn save_c41_profile(profile: &CalibrationProfile, path: &Path) -> anyhow::Result<()> {
     let lut = lut3d::Lut3d::generate_from_matrix(&profile.matrix, 17, 4.0);
     let cube_content = lut3d::cube_to_string(&lut);
     let json_content = serde_json::to_string_pretty(profile)?;
@@ -194,9 +191,7 @@ pub fn load_c41_profile(path: &Path) -> anyhow::Result<(CalibrationProfile, std:
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
 
-    let parent = path
-        .parent()
-        .unwrap_or_else(|| path.as_ref());
+    let parent = path.parent().unwrap_or_else(|| path.as_ref());
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -224,7 +219,13 @@ pub fn load_c41_profile(path: &Path) -> anyhow::Result<(CalibrationProfile, std:
 /// For .json the third element is None; for .c41 it is the path to the extracted lut.cube.
 pub fn load_profiles_from_dir(
     dir: &std::path::Path,
-) -> anyhow::Result<Vec<(std::path::PathBuf, CalibrationProfile, Option<std::path::PathBuf>)>> {
+) -> anyhow::Result<
+    Vec<(
+        std::path::PathBuf,
+        CalibrationProfile,
+        Option<std::path::PathBuf>,
+    )>,
+> {
     let mut out = Vec::new();
     if !dir.exists() {
         return Ok(out);
@@ -255,5 +256,3 @@ pub fn load_profiles_from_dir(
     }
     Ok(out)
 }
-
-

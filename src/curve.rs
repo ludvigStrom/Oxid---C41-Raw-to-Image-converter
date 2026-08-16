@@ -10,8 +10,8 @@
 //!   gamma  — paper grade / contrast
 //!   pivot  — mid-gray pivot for the S-curve
 
-use ndarray::{Array3, Axis, Zip};
 use ndarray::parallel::prelude::*;
+use ndarray::{Array3, Axis, Zip};
 
 const LUT_LEN: usize = 65_536;
 const THRESHOLD: f32 = 1e-6;
@@ -107,38 +107,38 @@ pub fn apply_curve_and_quantize(
         }
         let total: u64 = hist.iter().sum();
         if total > 0 {
-        let mut min_bin = 0usize;
-        while min_bin < 256 && hist[min_bin] == 0 {
-            min_bin += 1;
-        }
-        let mut max_bin = 255usize;
-        while max_bin > 0 && hist[max_bin] == 0 {
-            max_bin -= 1;
-        }
+            let mut min_bin = 0usize;
+            while min_bin < 256 && hist[min_bin] == 0 {
+                min_bin += 1;
+            }
+            let mut max_bin = 255usize;
+            while max_bin > 0 && hist[max_bin] == 0 {
+                max_bin -= 1;
+            }
 
-        let mut cum = 0u64;
-        let mut p50 = 0usize;
-        let mut p90 = 0usize;
-        let mut p99 = 0usize;
-        for (i, &count) in hist.iter().enumerate() {
-            cum += count;
-            let frac = cum as f64 / total as f64;
-            if p50 == 0 && frac >= 0.50 {
-                p50 = i;
+            let mut cum = 0u64;
+            let mut p50 = 0usize;
+            let mut p90 = 0usize;
+            let mut p99 = 0usize;
+            for (i, &count) in hist.iter().enumerate() {
+                cum += count;
+                let frac = cum as f64 / total as f64;
+                if p50 == 0 && frac >= 0.50 {
+                    p50 = i;
+                }
+                if p90 == 0 && frac >= 0.90 {
+                    p90 = i;
+                }
+                if p99 == 0 && frac >= 0.99 {
+                    p99 = i;
+                    break;
+                }
             }
-            if p90 == 0 && frac >= 0.90 {
-                p90 = i;
-            }
-            if p99 == 0 && frac >= 0.99 {
-                p99 = i;
-                break;
-            }
-        }
 
-        println!(
-            "Histogram (8-bit bins of u16 output): min={} p50={} p90={} p99={} max={}",
-            min_bin, p50, p90, p99, max_bin
-        );
+            println!(
+                "Histogram (8-bit bins of u16 output): min={} p50={} p90={} p99={} max={}",
+                min_bin, p50, p90, p99, max_bin
+            );
         }
     }
 

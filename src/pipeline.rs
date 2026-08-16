@@ -54,12 +54,8 @@ pub fn step_3_dmin(
             DminMode::SampleRegion => {
                 if let Some(rect) = options.dmin_rect {
                     let (h, w, _) = image.dim();
-                    let (x, y, rw, rh) = scale_dmin_rect(
-                        rect,
-                        options.dmin_rect_reference_size,
-                        w as u32,
-                        h as u32,
-                    );
+                    let (x, y, rw, rh) =
+                        scale_dmin_rect(rect, options.dmin_rect_reference_size, w as u32, h as u32);
                     crate::dmin::neutralize(image, x, y, rw, rh, options.dmin_neutral_only)?;
                 }
             }
@@ -107,12 +103,8 @@ pub fn step_3_dmin_gpu(
             DminMode::SampleRegion => {
                 if let Some(rect) = options.dmin_rect {
                     let (h, w, _) = image.dim();
-                    let (x, y, rw, rh) = scale_dmin_rect(
-                        rect,
-                        options.dmin_rect_reference_size,
-                        w as u32,
-                        h as u32,
-                    );
+                    let (x, y, rw, rh) =
+                        scale_dmin_rect(rect, options.dmin_rect_reference_size, w as u32, h as u32);
                     crate::dmin::compute_neutralize_divisors(
                         image,
                         x,
@@ -126,10 +118,7 @@ pub fn step_3_dmin_gpu(
                 }
             }
             DminMode::AutoPercentile => {
-                crate::dmin::compute_auto_percentile_divisors(
-                    image,
-                    options.auto_norm_buffer,
-                )?
+                crate::dmin::compute_auto_percentile_divisors(image, options.auto_norm_buffer)?
             }
             DminMode::Off => (1.0, 1.0, 1.0),
         };
@@ -198,18 +187,30 @@ pub fn step_4_t_to_d_wb(image: &mut Array3<f32>, options: &PipelineOptions) {
     let s_g = auto_s_g * man_s_g * inv_gamma;
     let s_b = auto_s_b * man_s_b * inv_gamma;
 
-    image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * s_r);
-    image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * s_g);
-    image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * s_b);
+    image
+        .slice_mut(ndarray::s![.., .., 0])
+        .mapv_inplace(|v| v * s_r);
+    image
+        .slice_mut(ndarray::s![.., .., 1])
+        .mapv_inplace(|v| v * s_g);
+    image
+        .slice_mut(ndarray::s![.., .., 2])
+        .mapv_inplace(|v| v * s_b);
 
     if let Some(k) = options.temp_k {
         let (tr, tg, tb) = crate::color::temp_k_to_wb_gains(k);
         let off_r = -(tr.max(1e-6) as f64).log10() as f32;
         let off_g = -(tg.max(1e-6) as f64).log10() as f32;
         let off_b = -(tb.max(1e-6) as f64).log10() as f32;
-        image.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v + off_r);
-        image.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v + off_g);
-        image.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v + off_b);
+        image
+            .slice_mut(ndarray::s![.., .., 0])
+            .mapv_inplace(|v| v + off_r);
+        image
+            .slice_mut(ndarray::s![.., .., 1])
+            .mapv_inplace(|v| v + off_g);
+        image
+            .slice_mut(ndarray::s![.., .., 2])
+            .mapv_inplace(|v| v + off_b);
     }
 
     if options.shadow_cast_strength > 0.0 {
@@ -360,6 +361,92 @@ pub fn step_6_render_gpu(
     step_6_render(image, options, ra4_params, output_lut_cube)
 }
 
+fn density_levels_active(options: &PipelineOptions) -> bool {
+    options.lut_in_black != 0.0
+        || options.lut_in_white != 1.0
+        || (options.lut_in_mid - 1.0).abs() > 1e-6
+}
+
+fn apply_ra4_levels_in_place(image: &mut Array3<f32>, options: &PipelineOptions) {
+    crate::color::apply_density_levels(
+        image,
+        4.0,
+        options.lut_in_black,
+        options.lut_in_white,
+        options.lut_in_mid,
+    );
+    image.mapv_inplace(|v| v * 4.0);
+}
+
+fn finish_u16_display(mut image_u16: Array3<u16>, options: &PipelineOptions) -> Step6Display {
+    crate::post_curve::apply_toe_shoulder_u16(
+        &mut image_u16,
+        options.toe_strength,
+        options.shoulder_strength,
+    );
+    crate::post_curve::apply_soft_knee_u16(&mut image_u16, options.soft_clip);
+    if options.apply_lab {
+        crate::color::apply_lab_separation_u16(&mut image_u16, options.lab_separation);
+    }
+    crate::color::apply_skin_magenta_shift_u16(&mut image_u16, options.skin_magenta_shift);
+    crate::post_curve::apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
+    Step6Display::U16(image_u16)
+}
+
+fn finish_none_display(mut display: Array3<f32>, options: &PipelineOptions) -> Step6Display {
+    if !options.no_invert {
+        const D_DISP_MAX: f32 = 2.5;
+        display.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+    }
+    Step6Display::F32(display)
+}
+
+fn finish_lut2383_display(
+    mut display: Array3<f32>,
+    options: &PipelineOptions,
+    output_lut_cube: Option<&lut3d::Lut3d>,
+) -> Step6Display {
+    match options.output_lut_encoding {
+        OutputLutEncoding::Rec709 => {
+            crate::color::density_to_rec709_leveled(
+                &mut display,
+                options.lut_in_black,
+                options.lut_in_white,
+                options.lut_in_mid,
+            );
+        }
+        enc => {
+            let d_max = match enc {
+                OutputLutEncoding::CineonLog => 2.046_f32,
+                OutputLutEncoding::LinearDensity => 2.5_f32,
+                OutputLutEncoding::Rec709 => unreachable!(),
+            };
+            crate::color::apply_density_levels(
+                &mut display,
+                d_max,
+                options.lut_in_black,
+                options.lut_in_white,
+                options.lut_in_mid,
+            );
+        }
+    }
+    if let Some(lut) = output_lut_cube {
+        crate::post_curve::apply_output_cube_rgb(&mut display, lut);
+    }
+    let encoded_srgb = options.output_lut_encoding == OutputLutEncoding::Rec709;
+    if options.apply_lab {
+        crate::color::apply_lab_separation_f32(&mut display, options.lab_separation, encoded_srgb);
+    }
+    crate::color::apply_skin_magenta_shift_f32(
+        &mut display,
+        options.skin_magenta_shift,
+        encoded_srgb,
+    );
+    crate::post_curve::apply_soft_knee_f32(&mut display, options.soft_clip);
+    crate::post_curve::apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
+    Step6Display::F32(display)
+}
+
 /// Step 6: render to display buffer (RA-4, FilmPrint, None, or Lut2383).
 /// If debug_pipeline_step < 6, returns PassthroughDensity with the current image.
 pub fn step_6_render(
@@ -374,120 +461,74 @@ pub fn step_6_render(
 
     match options.output_stage {
         OutputStage::Ra4 => {
-            let mut leveled = image.clone();
-            let levels_active = options.lut_in_black != 0.0
-                || options.lut_in_white != 1.0
-                || (options.lut_in_mid - 1.0).abs() > 1e-6;
-            if levels_active {
-                crate::color::apply_density_levels(
-                    &mut leveled,
-                    4.0,
-                    options.lut_in_black,
-                    options.lut_in_white,
-                    options.lut_in_mid,
-                );
-                leveled.mapv_inplace(|v| v * 4.0);
+            if density_levels_active(options) {
+                let mut leveled = image.clone();
+                apply_ra4_levels_in_place(&mut leveled, options);
+                finish_u16_display(
+                    curve::apply_ra4_from_density(&leveled, *ra4_params, 4.0, options.curve_white),
+                    options,
+                )
+            } else {
+                finish_u16_display(
+                    curve::apply_ra4_from_density(image, *ra4_params, 4.0, options.curve_white),
+                    options,
+                )
             }
-            let mut image_u16 =
-                curve::apply_ra4_from_density(&leveled, *ra4_params, 4.0, options.curve_white);
-            crate::post_curve::apply_toe_shoulder_u16(
-                &mut image_u16,
-                options.toe_strength,
-                options.shoulder_strength,
-            );
-            crate::post_curve::apply_soft_knee_u16(&mut image_u16, options.soft_clip);
-            if options.apply_lab {
-                crate::color::apply_lab_separation_u16(&mut image_u16, options.lab_separation);
-            }
-            crate::color::apply_skin_magenta_shift_u16(&mut image_u16, options.skin_magenta_shift);
-            crate::post_curve::apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
-            Step6Display::U16(image_u16)
         }
         OutputStage::FilmPrint => {
             let fp_params = crate::post_curve::build_film_print_params(options);
-            let mut leveled = image.clone();
-            let levels_active = options.lut_in_black != 0.0
-                || options.lut_in_white != 1.0
-                || (options.lut_in_mid - 1.0).abs() > 1e-6;
-            if levels_active {
-                crate::color::apply_density_levels(
-                    &mut leveled,
-                    4.0,
-                    options.lut_in_black,
-                    options.lut_in_white,
-                    options.lut_in_mid,
-                );
-                leveled.mapv_inplace(|v| v * 4.0);
+            if density_levels_active(options) {
+                let mut leveled = image.clone();
+                apply_ra4_levels_in_place(&mut leveled, options);
+                finish_u16_display(
+                    curve::apply_film_print_from_density(&leveled, &fp_params, 4.0),
+                    options,
+                )
+            } else {
+                finish_u16_display(
+                    curve::apply_film_print_from_density(image, &fp_params, 4.0),
+                    options,
+                )
             }
-            let mut image_u16 =
-                curve::apply_film_print_from_density(&leveled, &fp_params, 4.0);
-            crate::post_curve::apply_toe_shoulder_u16(
-                &mut image_u16,
-                options.toe_strength,
-                options.shoulder_strength,
-            );
-            crate::post_curve::apply_soft_knee_u16(&mut image_u16, options.soft_clip);
-            if options.apply_lab {
-                crate::color::apply_lab_separation_u16(&mut image_u16, options.lab_separation);
-            }
-            crate::color::apply_skin_magenta_shift_u16(&mut image_u16, options.skin_magenta_shift);
-            crate::post_curve::apply_highlight_warmth_u16(&mut image_u16, options.highlight_warmth);
-            Step6Display::U16(image_u16)
         }
-        OutputStage::None => {
-            let mut display = image.clone();
-            if !options.no_invert {
-                const D_DISP_MAX: f32 = 2.5;
-                display.mapv_inplace(|v| (v / D_DISP_MAX).clamp(0.0, 1.0));
+        OutputStage::None => finish_none_display(image.clone(), options),
+        OutputStage::Lut2383 => finish_lut2383_display(image.clone(), options, output_lut_cube),
+    }
+}
+
+/// Export-only step 6: takes ownership so levels run in place and the density
+/// buffer can be dropped before TIFF/JPEG write.
+pub fn step_6_render_owned(
+    mut image: Array3<f32>,
+    options: &PipelineOptions,
+    ra4_params: &curve::PrintCurveParams,
+    output_lut_cube: Option<&lut3d::Lut3d>,
+) -> Step6Display {
+    if options.debug_pipeline_step < 6 {
+        return Step6Display::PassthroughDensity(image);
+    }
+
+    match options.output_stage {
+        OutputStage::Ra4 => {
+            if density_levels_active(options) {
+                apply_ra4_levels_in_place(&mut image, options);
             }
-            Step6Display::F32(display)
+            let image_u16 =
+                curve::apply_ra4_from_density(&image, *ra4_params, 4.0, options.curve_white);
+            drop(image);
+            finish_u16_display(image_u16, options)
         }
-        OutputStage::Lut2383 => {
-            let mut display = image.clone();
-            match options.output_lut_encoding {
-                OutputLutEncoding::Rec709 => {
-                    crate::color::density_to_rec709_leveled(
-                        &mut display,
-                        options.lut_in_black,
-                        options.lut_in_white,
-                        options.lut_in_mid,
-                    );
-                }
-                enc => {
-                    let d_max = match enc {
-                        OutputLutEncoding::CineonLog => 2.046_f32,
-                        OutputLutEncoding::LinearDensity => 2.5_f32,
-                        OutputLutEncoding::Rec709 => unreachable!(),
-                    };
-                    crate::color::apply_density_levels(
-                        &mut display,
-                        d_max,
-                        options.lut_in_black,
-                        options.lut_in_white,
-                        options.lut_in_mid,
-                    );
-                }
+        OutputStage::FilmPrint => {
+            let fp_params = crate::post_curve::build_film_print_params(options);
+            if density_levels_active(options) {
+                apply_ra4_levels_in_place(&mut image, options);
             }
-            if let Some(lut) = output_lut_cube {
-                crate::post_curve::apply_output_cube_rgb(&mut display, lut);
-            }
-            let encoded_srgb = options.output_lut_encoding == OutputLutEncoding::Rec709;
-            if options.apply_lab {
-                crate::color::apply_lab_separation_f32(
-                    &mut display,
-                    options.lab_separation,
-                    encoded_srgb,
-                );
-            }
-            crate::color::apply_skin_magenta_shift_f32(
-                &mut display,
-                options.skin_magenta_shift,
-                encoded_srgb,
-            );
-            crate::post_curve::apply_soft_knee_f32(&mut display, options.soft_clip);
-            crate::post_curve::apply_highlight_warmth_f32(&mut display, options.highlight_warmth);
-            Step6Display::F32(display)
+            let image_u16 = curve::apply_film_print_from_density(&image, &fp_params, 4.0);
+            drop(image);
+            finish_u16_display(image_u16, options)
         }
+        OutputStage::None => finish_none_display(image, options),
+        OutputStage::Lut2383 => finish_lut2383_display(image, options, output_lut_cube),
     }
 }
 

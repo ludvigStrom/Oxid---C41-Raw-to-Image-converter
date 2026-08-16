@@ -20,15 +20,10 @@ pub fn write_exr_f32(image: &Array3<f32>, path: &Path) -> Result<()> {
         .as_slice()
         .ok_or_else(|| anyhow!("EXR export requires contiguous f32 image data"))?;
 
-    write_rgb_file(
-        path,
-        width,
-        height,
-        |x, y| {
-            let base = (y * width + x) * 3;
-            (data[base], data[base + 1], data[base + 2])
-        },
-    )
+    write_rgb_file(path, width, height, |x, y| {
+        let base = (y * width + x) * 3;
+        (data[base], data[base + 1], data[base + 2])
+    })
     .map_err(|e| anyhow!("Failed to write EXR file {}: {}", path.display(), e))?;
 
     Ok(())
@@ -61,20 +56,14 @@ pub fn write_exr_u16(image: &Array3<u16>, path: &Path) -> Result<()> {
 
     let max_u16 = std::u16::MAX as f32;
 
-    write_rgb_file(
-        path,
-        width,
-        height,
-        |x, y| {
-            let base = (y * width + x) * 3;
-            let r = data[base] as f32 / max_u16;
-            let g = data[base + 1] as f32 / max_u16;
-            let b = data[base + 2] as f32 / max_u16;
-            (r, g, b)
-        },
-    )
+    write_rgb_file(path, width, height, |x, y| {
+        let base = (y * width + x) * 3;
+        let r = data[base] as f32 / max_u16;
+        let g = data[base + 1] as f32 / max_u16;
+        let b = data[base + 2] as f32 / max_u16;
+        (r, g, b)
+    })
     .map_err(|e| anyhow!("Failed to write EXR file {}: {}", path.display(), e))?;
 
     Ok(())
 }
-

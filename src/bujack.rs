@@ -90,7 +90,13 @@ fn sample_lab(lab: &[[f32; 3]], w: usize, h: usize, x: i32, y: i32) -> [f32; 3] 
 }
 
 /// Separable bilateral blur in OkLab (horizontal, then vertical).
-fn bilateral_base(lab: &[[f32; 3]], w: usize, h: usize, radius: i32, edge_sigma: f32) -> Vec<[f32; 3]> {
+fn bilateral_base(
+    lab: &[[f32; 3]],
+    w: usize,
+    h: usize,
+    radius: i32,
+    edge_sigma: f32,
+) -> Vec<[f32; 3]> {
     let radius = radius.clamp(2, 48);
     let sigma = (radius as f32 * 0.5).max(0.6);
     let rs = 1.0 / (2.0 * sigma * sigma);

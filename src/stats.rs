@@ -27,16 +27,15 @@ pub(crate) fn channel_stats(image: &Array3<f32>) -> [(f32, f32, f32); 3] {
 
 /// Channel stats source for Auto WB.
 /// When crop is enabled, evaluate statistics inside the crop only.
-pub(crate) fn wb_channel_stats(image: &Array3<f32>, options: &PipelineOptions) -> [(f32, f32, f32); 3] {
+pub(crate) fn wb_channel_stats(
+    image: &Array3<f32>,
+    options: &PipelineOptions,
+) -> [(f32, f32, f32); 3] {
     if options.apply_crop {
         if let Some(rect) = options.crop_rect {
             let (h, w, _) = image.dim();
-            let (x, y, rw, rh) = scale_dmin_rect(
-                rect,
-                options.crop_rect_reference_size,
-                w as u32,
-                h as u32,
-            );
+            let (x, y, rw, rh) =
+                scale_dmin_rect(rect, options.crop_rect_reference_size, w as u32, h as u32);
             let cropped = crop_array3(image, x, y, rw, rh);
             return channel_stats(&cropped);
         }

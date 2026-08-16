@@ -53,7 +53,12 @@ pub fn compute_neutralize_divisors(
     if x_start >= x_end || y_start >= y_end {
         bail!(
             "D-min rect [{}, {}] + {}x{} is outside or zero-size for image {}x{}",
-            x, y, rw, rh, w, h
+            x,
+            y,
+            rw,
+            rh,
+            w,
+            h
         );
     }
 
@@ -184,10 +189,7 @@ pub fn compute_auto_percentile_divisors(
 
     for ch in 0..3 {
         let chan = analysis_region.slice(ndarray::s![.., .., ch]);
-        let mut vals: Vec<f32> = chan
-            .iter()
-            .map(|&v| -(v.max(epsilon).log10()))
-            .collect();
+        let mut vals: Vec<f32> = chan.iter().map(|&v| -(v.max(epsilon).log10())).collect();
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         if vals.is_empty() {
@@ -243,9 +245,12 @@ pub fn neutralize_with_medians(
     let div_b = if med_b > 0.0 { med_b } else { 1.0 };
 
     let mut im = image.view_mut();
-    im.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v / div_r);
-    im.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v / div_g);
-    im.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v / div_b);
+    im.slice_mut(ndarray::s![.., .., 0])
+        .mapv_inplace(|v| v / div_r);
+    im.slice_mut(ndarray::s![.., .., 1])
+        .mapv_inplace(|v| v / div_g);
+    im.slice_mut(ndarray::s![.., .., 2])
+        .mapv_inplace(|v| v / div_b);
 
     Ok(())
 }

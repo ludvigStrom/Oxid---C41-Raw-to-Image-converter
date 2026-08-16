@@ -89,13 +89,13 @@ impl Step4Pipeline {
                     ],
                 });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("step4_pipeline_layout"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("step4_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let pipeline = ctx
             .device
@@ -120,11 +120,7 @@ impl Step4Pipeline {
     /// CPU precomputes all reduction-based values (auto WB medians, shadow cast
     /// analysis) on a temporary density copy, then the GPU does the full per-pixel
     /// transform in one dispatch.
-    pub fn run(
-        &self,
-        image: &mut Array3<f32>,
-        options: &PipelineOptions,
-    ) -> anyhow::Result<()> {
+    pub fn run(&self, image: &mut Array3<f32>, options: &PipelineOptions) -> anyhow::Result<()> {
         let (height, width, channels) = image.dim();
         anyhow::ensure!(channels == 3, "Expected 3-channel image");
 

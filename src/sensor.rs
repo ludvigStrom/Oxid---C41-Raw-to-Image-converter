@@ -9,7 +9,6 @@ use anyhow::Result;
 use ndarray::Array3;
 
 use crate::apply_rotation;
-use crate::{flip_array3_horizontal, flip_array3_vertical};
 use crate::color_space;
 use crate::demosaic;
 use crate::dmin;
@@ -21,6 +20,7 @@ use crate::stats;
 use crate::DminMode;
 use crate::PipelineOptions;
 use crate::Rect;
+use crate::{flip_array3_horizontal, flip_array3_vertical};
 
 /// Raw sensor data cached for fast previews/exports.
 #[derive(Debug, Clone)]
@@ -45,7 +45,10 @@ pub fn load_sensor_from_path(path: &Path) -> Result<CachedSensor> {
     match ext.as_str() {
         "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
             let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
-            Ok(CachedSensor::Bayer { data: bayer, pattern })
+            Ok(CachedSensor::Bayer {
+                data: bayer,
+                pattern,
+            })
         }
         "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
             let img = png_reader::load_png_as_ndarray(path)?;
@@ -221,10 +224,7 @@ pub fn preview_scene_stats_key(opts: &PipelineOptions) -> u64 {
     h.finish()
 }
 
-fn sensor_to_working_rgb(
-    sensor: &CachedSensor,
-    options: &PipelineOptions,
-) -> Result<Array3<f32>> {
+fn sensor_to_working_rgb(sensor: &CachedSensor, options: &PipelineOptions) -> Result<Array3<f32>> {
     let mut rgb: Array3<f32> = match sensor {
         CachedSensor::Bayer { data, pattern } => {
             let mut img = demosaic::demosaic_quality(data, *pattern)?;
@@ -274,9 +274,10 @@ pub fn compute_preview_scene_stats(
     let dmin = match options.dmin_mode {
         DminMode::Off => None,
         DminMode::Fixed => options.dmin_fixed,
-        DminMode::AutoPercentile => {
-            Some(dmin::compute_auto_percentile_divisors(&rgb, options.auto_norm_buffer)?)
-        }
+        DminMode::AutoPercentile => Some(dmin::compute_auto_percentile_divisors(
+            &rgb,
+            options.auto_norm_buffer,
+        )?),
         DminMode::SampleRegion => {
             if let Some(rect) = options.dmin_rect {
                 let (h, w, _) = rgb.dim();
@@ -334,9 +335,12 @@ pub fn compute_preview_scene_stats(
     let s_r = ar * mr * inv_gamma;
     let s_g = ag * mg * inv_gamma;
     let s_b = ab * mb * inv_gamma;
-    rgb.slice_mut(ndarray::s![.., .., 0]).mapv_inplace(|v| v * s_r);
-    rgb.slice_mut(ndarray::s![.., .., 1]).mapv_inplace(|v| v * s_g);
-    rgb.slice_mut(ndarray::s![.., .., 2]).mapv_inplace(|v| v * s_b);
+    rgb.slice_mut(ndarray::s![.., .., 0])
+        .mapv_inplace(|v| v * s_r);
+    rgb.slice_mut(ndarray::s![.., .., 1])
+        .mapv_inplace(|v| v * s_g);
+    rgb.slice_mut(ndarray::s![.., .., 2])
+        .mapv_inplace(|v| v * s_b);
     if options.apply_color_profile {
         let m = options.density_matrix;
         let (h, w, _) = rgb.dim();
@@ -355,7 +359,11 @@ pub fn compute_preview_scene_stats(
     let zp = crate::density_ops::zone_density_range(&rgb, 0.0);
     let zone = Some((zp.d_min, zp.d_p33, zp.d_p66, zp.d_max));
 
-    Ok(PreviewSceneStats { dmin, auto_wb, zone })
+    Ok(PreviewSceneStats {
+        dmin,
+        auto_wb,
+        zone,
+    })
 }
 
 impl CachedSensor {
@@ -501,12 +509,7 @@ pub fn crop_sensor_for_oriented_rect(
     let x1 = (oriented_x + oriented_w) as i32 + halo as i32;
     let y1 = (oriented_y + oriented_h) as i32 + halo as i32;
 
-    let corners = [
-        (x0, y0),
-        (x1 - 1, y0),
-        (x0, y1 - 1),
-        (x1 - 1, y1 - 1),
-    ];
+    let corners = [(x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)];
     let mut min_sx = sw as i32;
     let mut min_sy = sh as i32;
     let mut max_sx = 0;
@@ -611,10 +614,8 @@ mod tests {
                 for flip_v in [false, true] {
                     for sy in 0..sh {
                         for sx in 0..sw {
-                            let (ox, oy) =
-                                sensor_to_oriented(sx, sy, sw, sh, rot, flip_h, flip_v);
-                            let (rx, ry) =
-                                oriented_to_sensor(ox, oy, sw, sh, rot, flip_h, flip_v);
+                            let (ox, oy) = sensor_to_oriented(sx, sy, sw, sh, rot, flip_h, flip_v);
+                            let (rx, ry) = oriented_to_sensor(ox, oy, sw, sh, rot, flip_h, flip_v);
                             assert_eq!(
                                 (rx, ry),
                                 (sx, sy),

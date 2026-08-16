@@ -65,11 +65,7 @@ pub(crate) fn limit_highlight_density_spread(image: &mut Array3<f32>) {
 /// Reinhard-style highlight roll-off in density space. Compresses high densities
 /// to mask noise in dense negative areas (skies). Per-channel: d_out = lerp(d, d/(1 + d/d_mid), strength).
 /// When strength is 0, no change. d_mid is the knee density (e.g. 1.5).
-pub(crate) fn apply_reinhard_highlight_rolloff(
-    image: &mut Array3<f32>,
-    d_mid: f32,
-    strength: f32,
-) {
+pub(crate) fn apply_reinhard_highlight_rolloff(image: &mut Array3<f32>, d_mid: f32, strength: f32) {
     if strength.abs() < 1e-6 {
         return;
     }
@@ -133,7 +129,10 @@ pub(crate) fn apply_zone_density_saturation(
     let gap_low = (zp.d_p33 - zp.d_min).max(0.01);
     let gap_high = (zp.d_max - zp.d_p66).max(0.01);
     let gap_mid = (zp.d_p66 - zp.d_p33).max(0.01);
-    let tw = (gap_mid * 0.3).min(gap_low * 0.5).min(gap_high * 0.5).max(0.005);
+    let tw = (gap_mid * 0.3)
+        .min(gap_low * 0.5)
+        .min(gap_high * 0.5)
+        .max(0.005);
 
     for y in 0..h {
         for x in 0..w {
@@ -258,7 +257,12 @@ pub(crate) fn zone_density_range(image: &Array3<f32>, curve_offset: f32) -> Zone
     let (h, w, _) = image.dim();
     let n = h * w;
     if n == 0 {
-        return ZonePercentiles { d_min: 0.0, d_p33: 0.33, d_p66: 0.66, d_max: 1.0 };
+        return ZonePercentiles {
+            d_min: 0.0,
+            d_p33: 0.33,
+            d_p66: 0.66,
+            d_max: 1.0,
+        };
     }
     let step = (n / 4096).max(1);
     let mut d_effs: Vec<f32> = (0..n)
@@ -312,7 +316,12 @@ pub(crate) fn zone_density_range_from_transmittance(
     let (h, w, _) = image.dim();
     let n = h * w;
     if n == 0 {
-        return ZonePercentiles { d_min: 0.0, d_p33: 0.33, d_p66: 0.66, d_max: 1.0 };
+        return ZonePercentiles {
+            d_min: 0.0,
+            d_p33: 0.33,
+            d_p66: 0.66,
+            d_max: 1.0,
+        };
     }
     let inv_gamma = 1.0 / options.film_gamma.max(0.1);
     let step = (n / 4096).max(1);
@@ -324,9 +333,7 @@ pub(crate) fn zone_density_range_from_transmittance(
             let tr = image[[y, x, 0]].max(1e-10);
             let tg = image[[y, x, 1]].max(1e-10);
             let tb = image[[y, x, 2]].max(1e-10);
-            let d_mean = ((-tr.log10()).max(0.0)
-                + (-tg.log10()).max(0.0)
-                + (-tb.log10()).max(0.0))
+            let d_mean = ((-tr.log10()).max(0.0) + (-tg.log10()).max(0.0) + (-tb.log10()).max(0.0))
                 / 3.0
                 * inv_gamma;
             d_mean + options.curve_offset
@@ -394,7 +401,10 @@ pub(crate) fn apply_zone_density_adjustments(
     let gap_low = (zp.d_p33 - zp.d_min).max(0.01);
     let gap_high = (zp.d_max - zp.d_p66).max(0.01);
     let gap_mid = (zp.d_p66 - zp.d_p33).max(0.01);
-    let tw = (gap_mid * 0.3).min(gap_low * 0.5).min(gap_high * 0.5).max(0.005);
+    let tw = (gap_mid * 0.3)
+        .min(gap_low * 0.5)
+        .min(gap_high * 0.5)
+        .max(0.005);
 
     const SCALE: f32 = 2.0;
     let s_global = shadows * SCALE;

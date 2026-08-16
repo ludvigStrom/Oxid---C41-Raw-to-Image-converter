@@ -19,8 +19,8 @@ use crate::color_space;
 ///   sRGB decode to a linear 16-bit scan darkens midtones and shifts color.
 /// * Shape: (height, width, 3), channel order R, G, B.
 pub fn load_png_as_ndarray(path: &Path) -> Result<Array3<f32>> {
-    let img = image::open(path)
-        .with_context(|| format!("Failed to open image {}", path.display()))?;
+    let img =
+        image::open(path).with_context(|| format!("Failed to open image {}", path.display()))?;
 
     let decode_srgb = matches!(
         img.color(),

@@ -154,11 +154,7 @@ pub fn auto_tune(
     });
     opts.curve_offset = opts.curve_offset.clamp(OFFSET_LO, OFFSET_HI);
 
-    on_progress(
-        "Adjusting saturation…",
-        0.88,
-        Some("Adjusting saturation…"),
-    );
+    on_progress("Adjusting saturation…", 0.88, Some("Adjusting saturation…"));
     opts.saturation = 1.0;
     let measured = eval.midtone_chroma(&opts);
     let mut sat = solve_saturation(measured, TARGET_MID_CHROMA);
@@ -406,7 +402,13 @@ fn midtone_chroma(image: &Array3<f32>, curve_offset: f32) -> f32 {
     }
 }
 
-fn search_1d(lo: f32, hi: f32, coarse: usize, refine: usize, mut score: impl FnMut(f32, usize, usize) -> f32) -> f32 {
+fn search_1d(
+    lo: f32,
+    hi: f32,
+    coarse: usize,
+    refine: usize,
+    mut score: impl FnMut(f32, usize, usize) -> f32,
+) -> f32 {
     let mut best_x = lo;
     let mut best_s = f32::INFINITY;
     let total = coarse + refine;

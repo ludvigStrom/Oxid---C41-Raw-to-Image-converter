@@ -58,11 +58,7 @@ fn is_xtrans_cfa(cfa: &rawloader::CFA, origin_row: usize, origin_col: usize) -> 
 ///
 /// The returned tile satisfies `tile[y % 6][x % 6] == cfa.color_at(crop_top + y, crop_left + x)`
 /// for any cropped-image coordinate `(y, x)`.
-fn extract_xtrans_tile(
-    cfa: &rawloader::CFA,
-    crop_top: usize,
-    crop_left: usize,
-) -> [[u8; 6]; 6] {
+fn extract_xtrans_tile(cfa: &rawloader::CFA, crop_top: usize, crop_left: usize) -> [[u8; 6]; 6] {
     let mut tile = [[0u8; 6]; 6];
     for r in 0..6 {
         for c in 0..6 {
@@ -129,7 +125,12 @@ pub fn load_raw_as_ndarray(path: &Path) -> Result<(Array3<f32>, CfaPattern)> {
     if cropped_w == 0 || cropped_h == 0 {
         bail!(
             "Crop [{},{},{},{}] leaves no pixels in {}x{} image",
-            crop_top, crop_right, crop_bottom, crop_left, width, height
+            crop_top,
+            crop_right,
+            crop_bottom,
+            crop_left,
+            width,
+            height
         );
     }
 
@@ -137,8 +138,7 @@ pub fn load_raw_as_ndarray(path: &Path) -> Result<(Array3<f32>, CfaPattern)> {
 
     // Detect the CFA type: standard 2×2 Bayer or Fujifilm 6×6 X-Trans.
     let pattern: CfaPattern = if is_bayer_cfa(cfa, crop_top, crop_left) {
-        let bayer = detect_bayer_pattern_at(cfa, crop_top, crop_left)
-            .unwrap_or(BayerPattern::Rggb);
+        let bayer = detect_bayer_pattern_at(cfa, crop_top, crop_left).unwrap_or(BayerPattern::Rggb);
         CfaPattern::Bayer(bayer)
     } else if is_xtrans_cfa(cfa, crop_top, crop_left) {
         let tile = extract_xtrans_tile(cfa, crop_top, crop_left);
@@ -241,8 +241,8 @@ pub fn load_raw_as_ndarray(path: &Path) -> Result<(Array3<f32>, CfaPattern)> {
         }
     };
 
-    let array2: Array2<f32> =
-        Array2::from_shape_vec((cropped_h, cropped_w), float_data).with_context(|| {
+    let array2: Array2<f32> = Array2::from_shape_vec((cropped_h, cropped_w), float_data)
+        .with_context(|| {
             format!(
                 "Failed to reshape RAW data into 2D array (height={}, width={})",
                 cropped_h, cropped_w

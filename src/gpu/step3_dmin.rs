@@ -71,16 +71,16 @@ impl Step3DminPipeline {
                 push_constant_ranges: &[],
             });
 
-        let compute_pipeline = ctx
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("step3_dmin_pipeline"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let compute_pipeline =
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("step3_dmin_pipeline"),
+                    layout: Some(&layout),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
 
         Self {
             compute_pipeline,
@@ -90,7 +90,13 @@ impl Step3DminPipeline {
     }
 
     /// Apply D-min divide on GPU. Divisors come from CPU rect/percentile logic.
-    pub fn run(&self, image: &mut Array3<f32>, div_r: f32, div_g: f32, div_b: f32) -> anyhow::Result<()> {
+    pub fn run(
+        &self,
+        image: &mut Array3<f32>,
+        div_r: f32,
+        div_g: f32,
+        div_b: f32,
+    ) -> anyhow::Result<()> {
         let (height, width, channels) = image.dim();
         anyhow::ensure!(channels == 3, "Expected 3-channel image");
 

@@ -21,11 +21,7 @@ pub struct Lut3d {
 impl Lut3d {
     /// Create a LUT by evaluating the 3×3 matrix at each grid vertex.
     /// Input density at vertex (i,j,k) is (i,j,k)/(size-1) * d_max; output = matrix * input, normalized to [0,1].
-    pub fn generate_from_matrix(
-        matrix: &[[f32; 3]; 3],
-        size: usize,
-        d_max: f32,
-    ) -> Self {
+    pub fn generate_from_matrix(matrix: &[[f32; 3]; 3], size: usize, d_max: f32) -> Self {
         let n = size;
         let mut data = Vec::with_capacity(n * n * n);
         let scale = if n > 1 { (n - 1) as f32 } else { 1.0 };
@@ -52,7 +48,11 @@ impl Lut3d {
             }
         }
 
-        Self { size: n, d_max, data }
+        Self {
+            size: n,
+            d_max,
+            data,
+        }
     }
 
     #[inline]
@@ -262,11 +262,7 @@ pub fn read_cube(path: &Path) -> anyhow::Result<Lut3d> {
         );
     }
 
-    Ok(Lut3d {
-        size,
-        d_max,
-        data,
-    })
+    Ok(Lut3d { size, d_max, data })
 }
 
 /// Apply a 3D LUT to an image in density domain (in place).

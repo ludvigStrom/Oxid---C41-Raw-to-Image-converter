@@ -35,7 +35,12 @@ fn hash_rect(h: &mut impl Hasher, r: &Rect) {
 
 /// Hash of everything that affects output after load (path, rotation, preview size, simple-debayer).
 /// Used as cache key for the "after load" slot.
-pub fn hash_after_load(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
+pub fn hash_after_load(
+    path: &Path,
+    opts: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.display().to_string().hash(&mut h);
     opts.rotation_degrees.hash(&mut h);
@@ -54,7 +59,12 @@ pub fn hash_after_load(path: &Path, opts: &PipelineOptions, max_width: u32, max_
 }
 
 /// Hash for "after step 3": everything that affects steps 1..3 (load + D-min/flat-field).
-pub fn hash_after_step3(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
+pub fn hash_after_step3(
+    path: &Path,
+    opts: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_after_load(path, opts, max_width, max_height).hash(&mut h);
     opts.dmin_mode.hash(&mut h);
@@ -77,7 +87,12 @@ pub fn hash_after_step3(path: &Path, opts: &PipelineOptions, max_width: u32, max
 }
 
 /// Hash for "after step 4": everything that affects steps 1..4 (+ WB, film γ, shadow cast).
-pub fn hash_after_step4(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
+pub fn hash_after_step4(
+    path: &Path,
+    opts: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_after_step3(path, opts, max_width, max_height).hash(&mut h);
     opts.wb_mode.hash(&mut h);
@@ -93,7 +108,12 @@ pub fn hash_after_step4(path: &Path, opts: &PipelineOptions, max_width: u32, max
 }
 
 /// Hash for "after step 5": everything that affects steps 1..5 (+ matrix, LUT, saturation, zones).
-pub fn hash_after_step5(path: &Path, opts: &PipelineOptions, max_width: u32, max_height: u32) -> u64 {
+pub fn hash_after_step5(
+    path: &Path,
+    opts: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     hash_after_step4(path, opts, max_width, max_height).hash(&mut h);
     opts.apply_color_profile.hash(&mut h);

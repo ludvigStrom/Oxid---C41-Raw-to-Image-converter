@@ -6,7 +6,7 @@ use ndarray::Array3;
 use wgpu::util::DeviceExt;
 
 use super::GpuContext;
-use crate::curve::{self, PrintCurveParams, FilmPrintParams};
+use crate::curve::{self, FilmPrintParams, PrintCurveParams};
 use crate::lut3d::Lut3d;
 use crate::pipeline::Step6Display;
 use crate::{OutputLutEncoding, OutputStage, PipelineOptions};
@@ -124,13 +124,13 @@ impl Step6Pipeline {
                     ],
                 });
 
-        let pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("step6_pipeline_layout"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("step6_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let pipeline = ctx
             .device
@@ -210,7 +210,11 @@ impl Step6Pipeline {
                 OutputLutEncoding::LinearDensity => 2,
             },
             output_lut_size: output_lut_cube.map(|l| l.size as u32).unwrap_or(1),
-            use_output_lut: if output_lut_cube.is_some() && mode == 3 { 1 } else { 0 },
+            use_output_lut: if output_lut_cube.is_some() && mode == 3 {
+                1
+            } else {
+                0
+            },
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
@@ -237,8 +241,7 @@ impl Step6Pipeline {
         let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("step6_output"),
             size: (buf_len * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -292,11 +295,26 @@ impl Step6Pipeline {
             label: Some("step6_bg"),
             layout: &self.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: input_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: output_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: curve_lut_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: output_lut_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: curve_lut_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: output_lut_buf.as_entire_binding(),
+                },
             ],
         });
 

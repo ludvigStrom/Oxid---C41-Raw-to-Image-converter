@@ -284,7 +284,11 @@ pub(crate) fn apply_lab_separation_u16(image: &mut Array3<u16>, strength: f32) {
 /// Rotate magenta/red hues in LAB toward orange to correct scanner cast in lips
 /// and eye areas. Strength 0 = off; 0.3–0.8 typical. Uses hue mask (-45° to 60°)
 /// and optional luminance gate (L 20–80) for skin-like regions.
-pub(crate) fn apply_skin_magenta_shift_f32(image: &mut Array3<f32>, strength: f32, encoded_srgb: bool) {
+pub(crate) fn apply_skin_magenta_shift_f32(
+    image: &mut Array3<f32>,
+    strength: f32,
+    encoded_srgb: bool,
+) {
     if strength.abs() < 1e-6 {
         return;
     }
@@ -297,8 +301,8 @@ pub(crate) fn apply_skin_magenta_shift_f32(image: &mut Array3<f32>, strength: f3
 
     // Hue range: magenta (-60°) through red to orange (70°). atan2(b,a) in radians.
     const HUE_LO_RAD: f32 = -1.047; // -60°
-    const HUE_HI_RAD: f32 = 1.222;  // 70°
-    // Luminance: broad range for skin/lips/eyes (L 5–95). Soft falloffs at extremes.
+    const HUE_HI_RAD: f32 = 1.222; // 70°
+                                   // Luminance: broad range for skin/lips/eyes (L 5–95). Soft falloffs at extremes.
     const L_LO: f32 = 5.0;
     const L_HI: f32 = 95.0;
 
@@ -330,7 +334,8 @@ pub(crate) fn apply_skin_magenta_shift_f32(image: &mut Array3<f32>, strength: f3
             let hue_mask = smoothstep(HUE_LO_RAD, HUE_LO_RAD + 0.4, hue)
                 * (1.0 - smoothstep(HUE_HI_RAD - 0.4, HUE_HI_RAD, hue));
             // Broad L range with soft falloffs so dark lips and fair skin are included.
-            let l_mask = smoothstep(L_LO, L_LO + 25.0, l) * (1.0 - smoothstep(L_HI - 25.0, L_HI, l));
+            let l_mask =
+                smoothstep(L_LO, L_LO + 25.0, l) * (1.0 - smoothstep(L_HI - 25.0, L_HI, l));
             let rot = angle * hue_mask * l_mask;
 
             if rot.abs() < 1e-6 {

@@ -341,8 +341,8 @@ pub fn demosaic_gpu_or_cpu(
     pattern: CfaPattern,
     gpu_pipeline: Option<&DemosaicPipeline>,
 ) -> anyhow::Result<Array3<f32>> {
-    let use_gpu = gpu_pipeline.is_some()
-        && matches!(pattern, CfaPattern::Bayer(BayerPattern::Rggb));
+    let use_gpu =
+        gpu_pipeline.is_some() && matches!(pattern, CfaPattern::Bayer(BayerPattern::Rggb));
 
     if use_gpu {
         if let Ok(rgb) = gpu_pipeline.unwrap().run_rggb(bayer) {

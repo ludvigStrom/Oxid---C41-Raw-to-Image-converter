@@ -96,8 +96,8 @@ pub fn save_project(images: &[ProjectImage], path: &Path) -> anyhow::Result<()> 
 /// `missing`. Unknown fields are ignored; missing option fields use defaults.
 pub fn load_project(path: &Path) -> anyhow::Result<LoadedProject> {
     let text = std::fs::read_to_string(path)?;
-    let file: ProjectFile = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("Invalid project JSON: {e}"))?;
+    let file: ProjectFile =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("Invalid project JSON: {e}"))?;
     let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
     let mut images = Vec::new();
@@ -359,9 +359,6 @@ mod tests {
     #[test]
     fn resolve_keeps_absolute_paths() {
         let abs = PathBuf::from("/elsewhere/file.arw");
-        assert_eq!(
-            resolve_project_path(&abs, Path::new("/rolls/summer")),
-            abs
-        );
+        assert_eq!(resolve_project_path(&abs, Path::new("/rolls/summer")), abs);
     }
 }

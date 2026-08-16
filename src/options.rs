@@ -368,16 +368,8 @@ impl Default for PipelineOptions {
             curve_pivot: 3.0,
             curve_white: 1.0,
             apply_color_profile: false,
-            density_matrix: [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            idt_matrix: [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ],
+            density_matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            idt_matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             flat_field_path: None,
             export_aces_exr: false,
             write_aces2065_only: false,
