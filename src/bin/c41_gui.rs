@@ -457,6 +457,8 @@ struct C41Gui {
     export_job: Option<ExportJob>,
     /// One-shot Auto grade job (Develop tab).
     auto_job: Option<AutoJob>,
+    /// True while the WB eyedropper is active (loupe + click-to-sample).
+    wb_picker_armed: bool,
     /// While set and in the future, preview debounce uses [`ROTATE_COALESCE_MS`].
     rotate_coalesce_until: Option<Instant>,
     #[cfg(feature = "gpu")]
@@ -505,6 +507,7 @@ impl Default for C41Gui {
             preview_job_hash: None,
             export_job: None,
             auto_job: None,
+            wb_picker_armed: false,
             rotate_coalesce_until: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
@@ -3428,6 +3431,9 @@ impl eframe::App for C41Gui {
         // ---- Right panel: mode toggle + per-image settings / calibration ----
         let mut auto_crop_requested = false;
         let mut auto_tune_requested = false;
+        let mut arm_wb_picker = false;
+        let mut disarm_wb_picker = false;
+        let wb_picker_armed = self.wb_picker_armed;
         egui::SidePanel::right("settings_panel")
             .resizable(false)
             .exact_width(RIGHT_PANEL_WIDTH)
@@ -3891,11 +3897,10 @@ impl eframe::App for C41Gui {
                                 ui.selectable_value(&mut wb_mode, WbMode::Manual, "Manual");
                             });
                         if wb_mode != opts.wb_mode {
-                            if wb_mode == WbMode::Picker {
-                                reset_wb_for_picker(opts);
-                            } else {
-                                opts.wb_mode = wb_mode;
+                            opts.wb_mode = wb_mode;
+                            if wb_mode != WbMode::Picker {
                                 sync_wb_flags_from_mode(opts);
+                                disarm_wb_picker = true;
                             }
                         }
 
@@ -3909,11 +3914,18 @@ impl eframe::App for C41Gui {
                                 );
                             }
                             WbMode::Picker => {
-                                ui.label(
-                                    egui::RichText::new("Click the preview to sample a 4×4 neutral.")
+                                if wb_picker_armed {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Click the preview to sample a 4×4 neutral.",
+                                        )
                                         .small()
                                         .color(egui::Color32::from_rgb(180, 220, 120)),
-                                );
+                                    );
+                                } else if ui.button("Pick whitepoint").clicked() {
+                                    reset_wb_for_picker(opts);
+                                    arm_wb_picker = true;
+                                }
                             }
                             WbMode::Manual => {
                                 let mut k = opts.temp_k.unwrap_or(5500.0);
@@ -5064,6 +5076,12 @@ impl eframe::App for C41Gui {
         if auto_tune_requested {
             self.start_auto(ctx);
         }
+        if arm_wb_picker {
+            self.wb_picker_armed = true;
+        }
+        if disarm_wb_picker {
+            self.wb_picker_armed = false;
+        }
 
         // ---- Auto-crop: run frame detection after sidebar borrow is released ----
         if auto_crop_requested {
@@ -5396,7 +5414,8 @@ impl eframe::App for C41Gui {
                         }
 
                         // White balance picker: 4×4 loupe + click to set gains.
-                        let picker_armed = self.images[idx].options.wb_mode == WbMode::Picker;
+                        let picker_armed = self.wb_picker_armed
+                            && self.images[idx].options.wb_mode == WbMode::Picker;
                         if picker_armed {
                             if let Some(pos) = canvas_resp
                                 .hover_pos()
@@ -5472,6 +5491,7 @@ impl eframe::App for C41Gui {
                                             opts.wb_b = wb_b;
                                             opts.apply_white_balance = true;
                                             opts.auto_wb = false;
+                                            self.wb_picker_armed = false;
                                             self.status = format!(
                                                 "WB set from 4×4 sample (R={:.3} G={:.3} B={:.3})",
                                                 wb_r, wb_g, wb_b
