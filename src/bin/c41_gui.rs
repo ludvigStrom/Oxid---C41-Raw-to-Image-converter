@@ -6,11 +6,12 @@
 use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use c41_raw_tool::{
+    auto_tune,
     blur_flat_field,
     calibration,
     color,
@@ -20,6 +21,8 @@ use c41_raw_tool::{
     png_reader,
     process_files_with_control,
     process_one_to_preview,
+    process_one_to_preview_with_cache,
+    AutoTuneResult,
     ExportCancelled,
     ExportControl,
     raw_reader,
@@ -350,6 +353,23 @@ struct ExportJob {
     control: Arc<ExportControl>,
 }
 
+#[derive(Clone, Debug)]
+struct AutoProgressState {
+    fraction: f32,
+    message: String,
+    log: Vec<String>,
+}
+
+enum AutoJobOutcome {
+    Done { index: usize, result: AutoTuneResult },
+    Error { message: String },
+}
+
+struct AutoJob {
+    receiver: mpsc::Receiver<AutoJobOutcome>,
+    progress: Arc<Mutex<AutoProgressState>>,
+}
+
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
 ///
@@ -435,6 +455,8 @@ struct C41Gui {
     preview_job_hash: Option<u64>,
     /// Background export (Convert all / Export selected).
     export_job: Option<ExportJob>,
+    /// One-shot Auto grade job (Develop tab).
+    auto_job: Option<AutoJob>,
     /// While set and in the future, preview debounce uses [`ROTATE_COALESCE_MS`].
     rotate_coalesce_until: Option<Instant>,
     #[cfg(feature = "gpu")]
@@ -482,6 +504,7 @@ impl Default for C41Gui {
             preview_canvas_size: None,
             preview_job_hash: None,
             export_job: None,
+            auto_job: None,
             rotate_coalesce_until: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
@@ -2698,6 +2721,197 @@ impl C41Gui {
                 });
             });
     }
+
+    fn start_auto(&mut self, ctx: &egui::Context) {
+        if self.auto_job.is_some() {
+            return;
+        }
+        let Some(index) = self.selected_index else {
+            self.status = "Auto: select an image first.".to_string();
+            return;
+        };
+        if index >= self.images.len() {
+            return;
+        }
+        if !self.ensure_sensor_and_scene_stats(index) {
+            return;
+        }
+
+        let path = self.images[index].path.clone();
+        let options = self.bake_preview_options(&self.images[index]);
+        let after_step3 = self.images[index]
+            .preview_step_cache
+            .as_ref()
+            .and_then(|c| c.after_step3.as_ref().map(|(_, buf)| buf.clone()))
+            .or_else(|| {
+                self.images[index]
+                    .screen_step_cache
+                    .as_ref()
+                    .and_then(|c| c.after_step3.as_ref().map(|(_, buf)| buf.clone()))
+            })
+            .or_else(|| {
+                self.images[index]
+                    .draft_step_cache
+                    .as_ref()
+                    .and_then(|c| c.after_step3.as_ref().map(|(_, buf)| buf.clone()))
+            });
+        let cache = self.images[index]
+            .preview_step_cache
+            .clone()
+            .or_else(|| self.images[index].screen_step_cache.clone())
+            .or_else(|| self.images[index].draft_step_cache.clone());
+        let sensor = self.images[index].cached_sensor.clone();
+        let (max_width, max_height) = preview_draft_limits();
+
+        let progress = Arc::new(Mutex::new(AutoProgressState {
+            fraction: 0.0,
+            message: "Preparing analysis…".to_string(),
+            log: vec!["Preparing analysis…".to_string()],
+        }));
+        let (tx, rx) = mpsc::channel();
+        let progress_worker = progress.clone();
+        let ctx_worker = ctx.clone();
+        thread::spawn(move || {
+            let report = |message: &str, fraction: f32, log_line: Option<&str>| {
+                if let Ok(mut p) = progress_worker.lock() {
+                    p.fraction = fraction.clamp(0.0, 1.0);
+                    p.message = message.to_string();
+                    if let Some(line) = log_line {
+                        if p.log.last().map(|s| s.as_str()) != Some(line) {
+                            p.log.push(line.to_string());
+                        }
+                    }
+                }
+                ctx_worker.request_repaint();
+            };
+
+            let buf = match after_step3 {
+                Some(img) => img,
+                None => {
+                    report("Preparing analysis…", 0.02, Some("Preparing analysis…"));
+                    match process_one_to_preview_with_cache(
+                        &path,
+                        &options,
+                        max_width,
+                        max_height,
+                        cache.as_ref(),
+                        false,
+                        sensor.as_deref(),
+                    ) {
+                        Ok((_, _, _, _, _, _, new_cache)) => {
+                            match new_cache.after_step3 {
+                                Some((_, img)) => img,
+                                None => {
+                                    let _ = tx.send(AutoJobOutcome::Error {
+                                        message: "Auto: no D-min buffer to analyse.".to_string(),
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AutoJobOutcome::Error {
+                                message: format!("Auto: failed to load preview ({e})"),
+                            });
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let mut on_progress = |message: &str, fraction: f32, log_line: Option<&str>| {
+                report(message, fraction, log_line);
+            };
+            match auto_tune(&buf, &options, &mut on_progress) {
+                Ok(result) => {
+                    let _ = tx.send(AutoJobOutcome::Done { index, result });
+                }
+                Err(e) => {
+                    let _ = tx.send(AutoJobOutcome::Error {
+                        message: format!("Auto: {e}"),
+                    });
+                }
+            }
+            ctx_worker.request_repaint();
+        });
+
+        self.auto_job = Some(AutoJob {
+            receiver: rx,
+            progress,
+        });
+        ctx.request_repaint();
+    }
+
+    fn poll_auto_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.auto_job.as_ref() else {
+            return;
+        };
+        match job.receiver.try_recv() {
+            Ok(AutoJobOutcome::Done { index, result }) => {
+                self.auto_job = None;
+                if index < self.images.len() {
+                    result.apply_to(&mut self.images[index].options);
+                    self.images[index].preview_hash = 0;
+                    self.images[index].preview_options_hash = 0;
+                    let hardness = result.lut_in_mid - 1.0;
+                    self.status = format!(
+                        "Auto: γ {:.2}, toe {:+.2}, hardness {:+.2}",
+                        result.film_gamma, result.toe_strength, hardness
+                    );
+                    self.preview_gen = self.preview_gen.wrapping_add(1);
+                    ctx.request_repaint();
+                }
+            }
+            Ok(AutoJobOutcome::Error { message }) => {
+                self.auto_job = None;
+                self.status = message;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.auto_job = None;
+                self.status = "Auto stopped unexpectedly.".to_string();
+            }
+        }
+    }
+
+    fn show_auto_progress(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.auto_job.as_ref() else {
+            return;
+        };
+        let snap = job
+            .progress
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone());
+
+        egui::Window::new("Auto")
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&snap.message).strong());
+                ui.add_space(6.0);
+                ui.add(
+                    egui::ProgressBar::new(snap.fraction.clamp(0.0, 1.0))
+                        .desired_width(320.0)
+                        .show_percentage(),
+                );
+                ui.add_space(8.0);
+                for line in &snap.log {
+                    ui.label(
+                        egui::RichText::new(line)
+                            .small()
+                            .color(egui::Color32::from_gray(170)),
+                    );
+                }
+                ui.add_space(6.0);
+            });
+    }
 }
 
 impl eframe::App for C41Gui {
@@ -2941,6 +3155,7 @@ impl eframe::App for C41Gui {
         }
 
         self.poll_export_job(ctx);
+        self.poll_auto_job(ctx);
 
         // Request thumbnail for one image at a time (strip icons).
         if self.thumbnail_receiver.is_none() {
@@ -3212,6 +3427,7 @@ impl eframe::App for C41Gui {
 
         // ---- Right panel: mode toggle + per-image settings / calibration ----
         let mut auto_crop_requested = false;
+        let mut auto_tune_requested = false;
         egui::SidePanel::right("settings_panel")
             .resizable(false)
             .exact_width(RIGHT_PANEL_WIDTH)
@@ -3434,6 +3650,16 @@ impl eframe::App for C41Gui {
                     ui.label(egui::RichText::new("Preset").strong());
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        let auto_busy = self.auto_job.is_some();
+                        if ui
+                            .add_enabled(!auto_busy, egui::Button::new("Auto"))
+                            .on_hover_text(
+                                "Set Film γ, toe, hardness, highlight roll-off, and saturation from the histogram. Applies Lab 1.5, De-Bujack, and max warmth.",
+                            )
+                            .clicked()
+                        {
+                            auto_tune_requested = true;
+                        }
                         if ui
                             .button("Export JSON…")
                             .on_hover_text(
@@ -4835,6 +5061,10 @@ impl eframe::App for C41Gui {
                 });
             });
 
+        if auto_tune_requested {
+            self.start_auto(ctx);
+        }
+
         // ---- Auto-crop: run frame detection after sidebar borrow is released ----
         if auto_crop_requested {
             if let Some(idx) = self.selected_index {
@@ -6136,6 +6366,7 @@ impl eframe::App for C41Gui {
         }
 
         self.show_export_progress(ctx);
+        self.show_auto_progress(ctx);
     }
 }
 

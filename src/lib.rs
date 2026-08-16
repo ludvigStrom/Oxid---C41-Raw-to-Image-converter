@@ -13,6 +13,7 @@ use image::{
 use ndarray::{self, Array3};
 
 pub mod aces;
+pub mod auto;
 pub mod bujack;
 pub mod calibration;
 pub mod color;
@@ -40,6 +41,7 @@ pub mod sensor;
 pub mod stats;
 pub mod tiff_export;
 
+pub use auto::{auto_tune, AutoTuneResult};
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{
     reset_wb_for_picker, sync_wb_flags_from_mode, DminMode, OutputLutEncoding, OutputStage,
