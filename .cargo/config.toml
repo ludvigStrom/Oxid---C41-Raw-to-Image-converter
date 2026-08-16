@@ -1,0 +1,2 @@
+[alias]
+guigpu = "run --release --bin c41-gui --features gui,gpu"

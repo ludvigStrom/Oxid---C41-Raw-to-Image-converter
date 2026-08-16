@@ -13,10 +13,12 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use ndarray::Array3;
+use serde::{Deserialize, Serialize};
 use tiff::encoder::{colortype::RGB16, colortype::RGB32Float, TiffEncoder};
 
 /// Output bit depth / format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TiffFormat {
     /// 32-bit float per channel — no clipping, no quantization. Preserves all data.
     #[default]

@@ -18,8 +18,10 @@ use c41_raw_tool::{
     dmin,
     load_flat_field_linear,
     png_reader,
-    process_files,
+    process_files_with_control,
     process_one_to_preview,
+    ExportCancelled,
+    ExportControl,
     raw_reader,
     tiff_export,
     PipelineOptions,
@@ -30,6 +32,8 @@ use c41_raw_tool::{
     OutputLutEncoding,
     DminMode,
     WbMode,
+    reset_wb_for_picker,
+    sync_wb_flags_from_mode,
     CachedSensor,
     PreviewSceneStats,
     load_sensor_from_path,
@@ -37,6 +41,13 @@ use c41_raw_tool::{
     crop_sensor_for_oriented_rect,
     oriented_sensor_size,
     preview_scene_stats_key,
+    load_develop_preset,
+    save_develop_preset,
+    load_project,
+    save_project,
+    LoadedProject,
+    ProjectExportFormat,
+    ProjectImage,
 };
 #[cfg(feature = "gpu")]
 use c41_raw_tool::process_one_to_preview_with_cache_gpu;
@@ -58,9 +69,15 @@ const PREVIEW_DEBOUNCE_MS: u64 = 180;
 const PREVIEW_LIVE_DEBOUNCE_MS: u64 = 50;
 /// Wait this long after pan/zoom before fetching 1:1 tiles.
 const PREVIEW_VIEW_SETTLE_MS: u64 = 100;
+/// Coalesce rapid rotate clicks (90° + 90° → one 180° pipeline run).
+const ROTATE_COALESCE_MS: u64 = 300;
+/// Show the export progress dialog only if the job is still running after this.
+const EXPORT_PROGRESS_DELAY_MS: u64 = 400;
 
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
+/// Left inset so the Archive menu clears macOS traffic lights (hidden title bar).
+const MENU_BAR_MACOS_INSET: f32 = 78.0;
 const ICON_CLOSE_PATH: &str = "X.png";
 const ICON_ROTATE_RIGHT_PATH: &str = "rotate_right.png";
 const ICON_ROTATE_LEFT_PATH: &str = "rotate_left.png";
@@ -124,6 +141,8 @@ struct ImageEntry {
     preview_texture: Option<egui::TextureHandle>,
     /// Whether `preview_texture` was uploaded with NEAREST (zoomed) vs LINEAR (fit).
     preview_texture_nearest: bool,
+    /// `rotation_degrees` baked into `preview_texture` / `preview_full_rgb`.
+    preview_texture_rotation: i32,
     /// Hash of options + working size + full-res flag at last completed preview.
     preview_hash: u64,
     /// Full processed preview buffer (post-curve) at `preview_full_size`.
@@ -282,6 +301,28 @@ enum ExportFormat {
     ExrAces2065,
 }
 
+impl ExportFormat {
+    fn to_project(self) -> ProjectExportFormat {
+        match self {
+            Self::Tiff16 => ProjectExportFormat::Tiff16,
+            Self::Tiff32 => ProjectExportFormat::Tiff32,
+            Self::Exr => ProjectExportFormat::Exr,
+            Self::Jpeg => ProjectExportFormat::Jpeg,
+            Self::ExrAces2065 => ProjectExportFormat::ExrAces2065,
+        }
+    }
+
+    fn from_project(fmt: ProjectExportFormat) -> Self {
+        match fmt {
+            ProjectExportFormat::Tiff16 => Self::Tiff16,
+            ProjectExportFormat::Tiff32 => Self::Tiff32,
+            ProjectExportFormat::Exr => Self::Exr,
+            ProjectExportFormat::Jpeg => Self::Jpeg,
+            ProjectExportFormat::ExrAces2065 => Self::ExrAces2065,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UIMode {
     Process,
@@ -290,20 +331,25 @@ enum UIMode {
     Debug,
 }
 
-/// Target for the white balance eyedropper: which neutral to set from the sampled point.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WbPickerTarget {
-    WhitePoint,
-    GrayPoint,
-    BlackPoint,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessTab {
     Input,
     Develop,
     Export,
 }
+
+enum ExportJobOutcome {
+    Done { count: usize },
+    Cancelled { completed: usize },
+    Error(String),
+}
+
+struct ExportJob {
+    receiver: mpsc::Receiver<ExportJobOutcome>,
+    started_at: Instant,
+    control: Arc<ExportControl>,
+}
+
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
 ///
@@ -372,19 +418,25 @@ struct C41Gui {
     /// Debounce state for preview refreshes: (image index, options hash) currently waiting to settle.
     pending_preview_key: Option<(usize, u64)>,
     pending_preview_since: Option<Instant>,
+    /// Path of the last saved/loaded project (Save writes here; Save As always prompts).
+    project_path: Option<PathBuf>,
     /// Deferred file dialog flag: open the output LUT browser outside the egui render loop
     /// to avoid macOS NSOpenPanel re-entrance crashes.
     pending_output_lut_browse: bool,
+    pending_project_save_as: bool,
+    pending_project_load: bool,
     /// When true, preview uses full resolution (export pipeline). Deactivates on option change or image switch.
     full_res_preview_active: bool,
     /// One-shot: set by the full-res button so we don't deactivate on the preview request it triggers.
     full_res_preview_button_clicked: bool,
-    /// When set, the next click on the preview will sample density and set WB gains (white/gray/black point).
-    wb_picker_pending: Option<WbPickerTarget>,
     /// Canvas size (w, h) in points from last layout — used to request preview at screen resolution.
     preview_canvas_size: Option<(f32, f32)>,
     /// Invalidation hash of the in-flight preview job (options + working size, not zoom).
     preview_job_hash: Option<u64>,
+    /// Background export (Convert all / Export selected).
+    export_job: Option<ExportJob>,
+    /// While set and in the future, preview debounce uses [`ROTATE_COALESCE_MS`].
+    rotate_coalesce_until: Option<Instant>,
     #[cfg(feature = "gpu")]
     gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
 }
@@ -421,12 +473,16 @@ impl Default for C41Gui {
             preview_view_changed_at: None,
             pending_preview_key: None,
             pending_preview_since: None,
+            project_path: None,
             pending_output_lut_browse: false,
+            pending_project_save_as: false,
+            pending_project_load: false,
             full_res_preview_active: false,
             full_res_preview_button_clicked: false,
-            wb_picker_pending: None,
             preview_canvas_size: None,
             preview_job_hash: None,
+            export_job: None,
+            rotate_coalesce_until: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
                 .map(std::sync::Arc::new),
@@ -1599,6 +1655,72 @@ fn make_thumbnail_from_rgb(rgb: &[u8], src_w: u32, src_h: u32, max_side: u32) ->
     })
 }
 
+const WB_PICKER_SAMPLE: usize = 4;
+
+fn sample_rgb_u8_4x4(rgb: &[u8], w: u32, h: u32, cx: u32, cy: u32) -> [u8; 3] {
+    let w = w as usize;
+    let h = h as usize;
+    if w == 0 || h == 0 {
+        return [128, 128, 128];
+    }
+    let cx = (cx as usize).min(w - 1);
+    let cy = (cy as usize).min(h - 1);
+    let x0 = cx.saturating_sub(1);
+    let y0 = cy.saturating_sub(1);
+    let x1 = (x0 + WB_PICKER_SAMPLE).min(w);
+    let y1 = (y0 + WB_PICKER_SAMPLE).min(h);
+    let mut sr = 0u32;
+    let mut sg = 0u32;
+    let mut sb = 0u32;
+    let mut n = 0u32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = (y * w + x) * 3;
+            if i + 2 < rgb.len() {
+                sr += rgb[i] as u32;
+                sg += rgb[i + 1] as u32;
+                sb += rgb[i + 2] as u32;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        [128, 128, 128]
+    } else {
+        [(sr / n) as u8, (sg / n) as u8, (sb / n) as u8]
+    }
+}
+
+fn sample_array3_4x4(buf: &ndarray::Array3<f32>, cx: usize, cy: usize) -> (f32, f32, f32) {
+    let (h, w, _) = buf.dim();
+    if w == 0 || h == 0 {
+        return (1.0, 1.0, 1.0);
+    }
+    let cx = cx.min(w - 1);
+    let cy = cy.min(h - 1);
+    let x0 = cx.saturating_sub(1);
+    let y0 = cy.saturating_sub(1);
+    let x1 = (x0 + WB_PICKER_SAMPLE).min(w);
+    let y1 = (y0 + WB_PICKER_SAMPLE).min(h);
+    let mut sr = 0.0f32;
+    let mut sg = 0.0f32;
+    let mut sb = 0.0f32;
+    let mut n = 0.0f32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            sr += buf[[y, x, 0]];
+            sg += buf[[y, x, 1]];
+            sb += buf[[y, x, 2]];
+            n += 1.0;
+        }
+    }
+    if n <= 0.0 {
+        (1.0, 1.0, 1.0)
+    } else {
+        (sr / n, sg / n, sb / n)
+    }
+}
+
 fn rgb_u8_to_color_image(w: u32, h: u32, rgb: &[u8]) -> egui::ColorImage {
     let size = [w as usize, h as usize];
     let pixels: Vec<egui::Color32> = rgb
@@ -1606,6 +1728,70 @@ fn rgb_u8_to_color_image(w: u32, h: u32, rgb: &[u8]) -> egui::ColorImage {
         .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
         .collect();
     egui::ColorImage { size, pixels }
+}
+
+fn preview_view_rotation(entry: &ImageEntry) -> i32 {
+    (entry.options.rotation_degrees - entry.preview_texture_rotation).rem_euclid(360)
+}
+
+fn map_display_uv_to_tex(u: f32, v: f32, rot: i32) -> egui::Pos2 {
+    match rot.rem_euclid(360) {
+        90 => egui::pos2(v, 1.0 - u),
+        180 => egui::pos2(1.0 - u, 1.0 - v),
+        270 => egui::pos2(1.0 - v, u),
+        _ => egui::pos2(u, v),
+    }
+}
+
+fn display_to_tex_px(dx: u32, dy: u32, tex_w: u32, tex_h: u32, rot: i32) -> (u32, u32) {
+    match rot.rem_euclid(360) {
+        90 => {
+            let dx = dx.min(tex_h.saturating_sub(1));
+            let dy = dy.min(tex_w.saturating_sub(1));
+            (dy, tex_h.saturating_sub(1).saturating_sub(dx))
+        }
+        180 => (
+            tex_w.saturating_sub(1).saturating_sub(dx.min(tex_w.saturating_sub(1))),
+            tex_h.saturating_sub(1).saturating_sub(dy.min(tex_h.saturating_sub(1))),
+        ),
+        270 => {
+            let dx = dx.min(tex_h.saturating_sub(1));
+            let dy = dy.min(tex_w.saturating_sub(1));
+            (tex_w.saturating_sub(1).saturating_sub(dy), dx)
+        }
+        _ => (dx.min(tex_w.saturating_sub(1)), dy.min(tex_h.saturating_sub(1))),
+    }
+}
+
+fn paint_preview_image(
+    painter: &egui::Painter,
+    tex: egui::TextureId,
+    dest: egui::Rect,
+    display_uv: egui::Rect,
+    rot: i32,
+) {
+    if rot.rem_euclid(360) == 0 {
+        painter.image(tex, dest, display_uv, egui::Color32::WHITE);
+        return;
+    }
+    let l = display_uv.min.x;
+    let t = display_uv.min.y;
+    let r = display_uv.max.x;
+    let b = display_uv.max.y;
+    let color = egui::Color32::WHITE;
+    let mut mesh = egui::Mesh::with_texture(tex);
+    let i0 = mesh.vertices.len() as u32;
+    for (pos, uv) in [
+        (dest.left_top(), map_display_uv_to_tex(l, t, rot)),
+        (dest.right_top(), map_display_uv_to_tex(r, t, rot)),
+        (dest.right_bottom(), map_display_uv_to_tex(r, b, rot)),
+        (dest.left_bottom(), map_display_uv_to_tex(l, b, rot)),
+    ] {
+        mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
+    }
+    mesh.add_triangle(i0, i0 + 1, i0 + 2);
+    mesh.add_triangle(i0, i0 + 2, i0 + 3);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Working preview size: canvas × DPI, floored at 640 and capped at 1920×1200.
@@ -1658,7 +1844,166 @@ fn crop_histogram_hash(opts: &PipelineOptions) -> u64 {
     h.finish()
 }
 
+fn image_entry(path: PathBuf, options: PipelineOptions, export_format: ExportFormat) -> ImageEntry {
+    ImageEntry {
+        path,
+        options,
+        preview_texture: None,
+        preview_texture_nearest: false,
+        preview_texture_rotation: 0,
+        preview_hash: 0,
+        preview_options_hash: 0,
+        preview_lod: PreviewLod::Draft,
+        preview_screen_wh: (0, 0),
+        preview_screen_requested_wh: (0, 0),
+        tile_cache: Vec::new(),
+        draft_step_cache: None,
+        screen_step_cache: None,
+        preview_full_rgb: None,
+        preview_input_size: None,
+        raw_source_size: None,
+        preview_zoom: 1.0,
+        preview_pan: egui::vec2(0.5, 0.5),
+        thumbnail_texture: None,
+        histogram: None,
+        histogram_crop_hash: 0,
+        export_format,
+        raw_debug_report: None,
+        pipeline_debug_log: None,
+        cached_sensor: None,
+        scene_stats: None,
+        preview_step_cache: None,
+        process_tab: ProcessTab::Input,
+    }
+}
+
+fn apply_runtime_gui_defaults(opts: &mut PipelineOptions) {
+    opts.use_gpu = cfg!(feature = "gpu");
+    opts.debug_pipeline_step = 6;
+    opts.debug_preview_simple_debayer = false;
+    opts.verbose_debug = false;
+    opts.pinned_zone = None;
+    opts.flat_field_path = None;
+}
+
 impl C41Gui {
+    fn request_project_save(&mut self, save_as: bool) {
+        if !save_as {
+            if let Some(path) = self.project_path.clone() {
+                self.write_project_to_path(&path);
+                return;
+            }
+        }
+        self.pending_project_save_as = true;
+    }
+
+    fn write_project_to_path(&mut self, path: &Path) {
+        let images: Vec<ProjectImage> = self
+            .images
+            .iter()
+            .map(|e| ProjectImage {
+                path: e.path.clone(),
+                export_format: e.export_format.to_project(),
+                options: e.options.clone(),
+            })
+            .collect();
+        match save_project(&images, path) {
+            Ok(()) => {
+                self.project_path = Some(path.to_path_buf());
+                self.status = format!("Saved project: {}", path.display());
+            }
+            Err(e) => {
+                self.status = format!("Failed to save project: {e}");
+            }
+        }
+    }
+
+    fn run_project_save_as_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("C-41 Project", &["c41proj"])
+            .add_filter("JSON", &["json"]);
+        if let Some(ref existing) = self.project_path {
+            if let Some(parent) = existing.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+            if let Some(name) = existing.file_name() {
+                dialog = dialog.set_file_name(name.to_string_lossy());
+            }
+        } else if let Some(first) = self.images.first() {
+            if let Some(parent) = first.path.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        if let Some(mut path) = dialog.save_file() {
+            if path.extension().is_none() {
+                path.set_extension("c41proj");
+            }
+            self.write_project_to_path(&path);
+        }
+    }
+
+    fn run_project_load_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("C-41 Project", &["c41proj", "json"]);
+        if let Some(ref existing) = self.project_path {
+            if let Some(parent) = existing.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+        } else if let Some(first) = self.images.first() {
+            if let Some(parent) = first.path.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        if let Some(path) = dialog.pick_file() {
+            match load_project(&path) {
+                Ok(loaded) => self.apply_loaded_project(path, loaded),
+                Err(e) => self.status = format!("Failed to load project: {e}"),
+            }
+        }
+    }
+
+    fn apply_loaded_project(&mut self, path: PathBuf, loaded: LoadedProject) {
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        self.tile_gen = self.tile_gen.wrapping_add(1);
+        self.preview_receiver = None;
+        self.preview_started_at = None;
+        self.preview_job_hash = None;
+        self.tile_receiver = None;
+        self.tile_inflight = None;
+        self.tile_failed.clear();
+        self.thumbnail_receiver = None;
+        self.thumbnail_pending.clear();
+        self.full_res_preview_active = false;
+
+        let missing_count = loaded.missing.len();
+        let total = loaded.images.len() + missing_count;
+        self.images = loaded
+            .images
+            .into_iter()
+            .map(|img| {
+                let mut opts = img.options;
+                apply_runtime_gui_defaults(&mut opts);
+                image_entry(img.path, opts, ExportFormat::from_project(img.export_format))
+            })
+            .collect();
+        self.selected_index = if self.images.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        self.project_path = Some(path);
+
+        if missing_count == 0 {
+            self.status = format!("Loaded {} image(s)", self.images.len());
+        } else {
+            self.status = format!(
+                "Loaded {} of {} images ({} missing)",
+                self.images.len(),
+                total,
+                missing_count
+            );
+        }
+    }
+
     fn bake_preview_options(&self, entry: &ImageEntry) -> PipelineOptions {
         let mut options = entry.options.clone();
         options.flat_field_path = self.flat_field_path.clone();
@@ -2109,6 +2454,250 @@ impl C41Gui {
             preview_options_hash(&entry.path, &entry.options, self.full_res_preview_active);
         entry.preview_options_hash != hash_now
     }
+
+    /// Instant: only update options. The current texture is drawn rotated until
+    /// one coalesced pipeline job replaces it. No pixel work on the UI thread.
+    fn apply_rotate_click(&mut self, idx: usize, clockwise: bool, ctx: &egui::Context) {
+        if idx >= self.images.len() {
+            return;
+        }
+
+        {
+            let entry = &mut self.images[idx];
+            let preview_size = entry.preview_input_size.map(|[w, h]| (w, h));
+            if let Some(rect) = entry.options.dmin_rect {
+                let source_size = entry.options.dmin_rect_reference_size.or(preview_size);
+                if let Some((w, h)) = source_size {
+                    entry.options.dmin_rect = Some(rotate_dmin_rect_90(rect, w, h, clockwise));
+                    entry.options.dmin_rect_reference_size = Some((h, w));
+                }
+            }
+            if let Some(rect) = entry.options.crop_rect {
+                let source_size = entry.options.crop_rect_reference_size.or(preview_size);
+                if let Some((w, h)) = source_size {
+                    entry.options.crop_rect = Some(rotate_dmin_rect_90(rect, w, h, clockwise));
+                    entry.options.crop_rect_reference_size = Some((h, w));
+                }
+            }
+            let delta = if clockwise { 90 } else { -90 };
+            entry.options.rotation_degrees =
+                (entry.options.rotation_degrees + delta).rem_euclid(360);
+            if let Some([iw, ih]) = entry.preview_input_size {
+                entry.preview_input_size = Some([ih, iw]);
+            }
+            if let Some([rw, rh]) = entry.raw_source_size {
+                entry.raw_source_size = Some([rh, rw]);
+            }
+            let (sw, sh) = entry.preview_screen_wh;
+            entry.preview_screen_wh = (sh, sw);
+            entry.tile_cache.clear();
+        }
+
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        self.preview_receiver = None;
+        self.preview_started_at = None;
+        self.tile_gen = self.tile_gen.wrapping_add(1);
+        self.tile_inflight = None;
+        self.tile_failed.clear();
+        self.pending_preview_key = None;
+        self.pending_preview_since = None;
+        self.rotate_coalesce_until =
+            Some(Instant::now() + Duration::from_millis(ROTATE_COALESCE_MS));
+        ctx.request_repaint();
+    }
+
+    fn start_export(&mut self, ctx: &egui::Context, selected_only: bool) {
+        if self.export_job.is_some() {
+            return;
+        }
+        let Some(output_dir) = self.output_dir.clone() else {
+            return;
+        };
+        let export_template = self
+            .selected_index
+            .filter(|&i| i < self.images.len())
+            .map(|i| self.images[i].options.clone())
+            .or_else(|| self.images.first().map(|img| img.options.clone()));
+        let Some(export_template) = export_template else {
+            return;
+        };
+
+        let jobs: Vec<(PathBuf, PipelineOptions)> = if selected_only {
+            match self.selected_index {
+                Some(idx) if idx < self.images.len() => {
+                    let img = &self.images[idx];
+                    let mut opts = img.options.clone();
+                    opts.flat_field_path = self.flat_field_path.clone();
+                    vec![(img.path.clone(), opts)]
+                }
+                _ => return,
+            }
+        } else {
+            self.images
+                .iter()
+                .map(|img| {
+                    let mut opts = img.options.clone();
+                    opts.flat_field_path = self.flat_field_path.clone();
+                    opts.format = export_template.format;
+                    opts.write_exr = export_template.write_exr;
+                    opts.write_jpeg = export_template.write_jpeg;
+                    opts.write_jpeg_only = export_template.write_jpeg_only;
+                    opts.export_aces_exr = export_template.export_aces_exr;
+                    opts.write_aces2065_only = export_template.write_aces2065_only;
+                    (img.path.clone(), opts)
+                })
+                .collect()
+        };
+        if jobs.is_empty() {
+            return;
+        }
+
+        let total = jobs.len();
+        let control = Arc::new(ExportControl::new(total));
+        let (tx, rx) = mpsc::channel();
+        let control_thread = control.clone();
+        thread::spawn(move || {
+            let mut completed = 0usize;
+            for (i, (path, opts)) in jobs.iter().enumerate() {
+                if control_thread.is_cancelled() {
+                    let _ = tx.send(ExportJobOutcome::Cancelled { completed });
+                    return;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                control_thread.begin_file(i, total, name);
+                match process_files_with_control(
+                    std::slice::from_ref(path),
+                    &output_dir,
+                    opts,
+                    Some(control_thread.as_ref()),
+                ) {
+                    Ok(()) => completed += 1,
+                    Err(e) if e.downcast_ref::<ExportCancelled>().is_some() => {
+                        let _ = tx.send(ExportJobOutcome::Cancelled { completed });
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ExportJobOutcome::Error(e.to_string()));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(ExportJobOutcome::Done { count: completed });
+        });
+
+        self.export_job = Some(ExportJob {
+            receiver: rx,
+            started_at: Instant::now(),
+            control,
+        });
+        self.status = if selected_only {
+            "Exporting selected…".to_string()
+        } else {
+            format!("Exporting {} images…", total)
+        };
+        ctx.request_repaint();
+    }
+
+    fn poll_export_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.export_job.as_ref() else {
+            return;
+        };
+        match job.receiver.try_recv() {
+            Ok(ExportJobOutcome::Done { count }) => {
+                self.export_job = None;
+                self.status = if count == 1 {
+                    "Exported 1 image.".to_string()
+                } else {
+                    format!("Exported {} images.", count)
+                };
+            }
+            Ok(ExportJobOutcome::Cancelled { completed }) => {
+                self.export_job = None;
+                self.status = if completed == 0 {
+                    "Export cancelled.".to_string()
+                } else {
+                    format!("Export cancelled after {} image(s).", completed)
+                };
+            }
+            Ok(ExportJobOutcome::Error(e)) => {
+                self.export_job = None;
+                self.status = format!("Error: {}", e);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.export_job = None;
+                self.status = "Export stopped unexpectedly.".to_string();
+            }
+        }
+    }
+
+    fn show_export_progress(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.export_job.as_ref() else {
+            return;
+        };
+        if job.started_at.elapsed() < Duration::from_millis(EXPORT_PROGRESS_DELAY_MS) {
+            ctx.request_repaint_after(Duration::from_millis(
+                EXPORT_PROGRESS_DELAY_MS.saturating_sub(job.started_at.elapsed().as_millis() as u64),
+            ));
+            return;
+        }
+
+        let control = job.control.clone();
+        let progress = control.snapshot();
+        let cancelling = control.is_cancelled();
+        let fraction = progress.fraction.clamp(0.0, 1.0);
+        let label = if progress.total > 1 {
+            format!(
+                "{}  ({}/{})",
+                progress.file_name,
+                progress.current.saturating_add(1).min(progress.total),
+                progress.total
+            )
+        } else if !progress.file_name.is_empty() {
+            progress.file_name.clone()
+        } else {
+            "Exporting…".to_string()
+        };
+        let stage = if cancelling {
+            "Cancelling…".to_string()
+        } else {
+            progress.stage
+        };
+
+        egui::Window::new("Exporting")
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&label).strong());
+                ui.add_space(6.0);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(320.0)
+                        .show_percentage(),
+                );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&stage).small());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let cancel = ui.add_enabled(!cancelling, egui::Button::new("Cancel"));
+                        if cancel.clicked() {
+                            control.request_cancel();
+                        }
+                    });
+                });
+            });
+    }
 }
 
 impl eframe::App for C41Gui {
@@ -2134,6 +2723,23 @@ impl eframe::App for C41Gui {
             };
         }
 
+        let (save_shortcut, save_as_shortcut, load_shortcut) = ctx.input(|i| {
+            let cmd = i.modifiers.command;
+            (
+                cmd && !i.modifiers.shift && i.key_pressed(egui::Key::S),
+                cmd && i.modifiers.shift && i.key_pressed(egui::Key::S),
+                cmd && !i.modifiers.shift && i.key_pressed(egui::Key::O),
+            )
+        });
+        if save_as_shortcut {
+            self.request_project_save(true);
+        } else if save_shortcut {
+            self.request_project_save(false);
+        }
+        if load_shortcut {
+            self.pending_project_load = true;
+        }
+
         self.rect_dragging = false;
 
         if self.ui_icons.close.is_none() {
@@ -2151,6 +2757,15 @@ impl eframe::App for C41Gui {
 
         // Deferred output-LUT file dialog (runs outside the egui panel render loop
         // to avoid macOS NSOpenPanel re-entrance crashes on repeated opens).
+        if self.pending_project_save_as {
+            self.pending_project_save_as = false;
+            self.run_project_save_as_dialog();
+        }
+        if self.pending_project_load {
+            self.pending_project_load = false;
+            self.run_project_load_dialog();
+        }
+
         if self.pending_output_lut_browse {
             self.pending_output_lut_browse = false;
             let picked = rfd::FileDialog::new()
@@ -2223,6 +2838,8 @@ impl eframe::App for C41Gui {
                         self.images[idx].preview_step_cache = Some(job.new_cache);
                         self.images[idx].preview_input_size = Some([job.w, job.h]);
                         self.images[idx].raw_source_size = Some([job.input_w, job.input_h]);
+                        self.images[idx].preview_texture_rotation =
+                            self.images[idx].options.rotation_degrees;
                         if self.images[idx].thumbnail_texture.is_none() {
                             if let Some(thumb_image) =
                                 make_thumbnail_from_rgb(&job.rgb, job.w, job.h, THUMB_MAX_SIZE)
@@ -2323,6 +2940,7 @@ impl eframe::App for C41Gui {
             }
         }
 
+        self.poll_export_job(ctx);
 
         // Request thumbnail for one image at a time (strip icons).
         if self.thumbnail_receiver.is_none() {
@@ -2382,6 +3000,31 @@ impl eframe::App for C41Gui {
             }
         }
 
+        // ---- Archive menu (macOS inset clears the hidden-title-bar traffic lights) ----
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                if cfg!(target_os = "macos") {
+                    ui.add_space(MENU_BAR_MACOS_INSET);
+                }
+                ui.menu_button("Archive", |ui| {
+                    ui.menu_button("Project", |ui| {
+                        if ui.button("Save").clicked() {
+                            self.request_project_save(false);
+                            ui.close_menu();
+                        }
+                        if ui.button("Save As...").clicked() {
+                            self.request_project_save(true);
+                            ui.close_menu();
+                        }
+                        if ui.button("Load").clicked() {
+                            self.pending_project_load = true;
+                            ui.close_menu();
+                        }
+                    });
+                });
+            });
+        });
+
         // ---- Bottom panel: image strip + global output / convert ----
         egui::TopBottomPanel::bottom("bottom_panel")
             .min_height(BOTTOM_PANEL_HEIGHT)
@@ -2402,35 +3045,11 @@ impl eframe::App for C41Gui {
                             {
                                 for p in paths {
                                     if !self.images.iter().any(|e| e.path == p) {
-                                        self.images.push(ImageEntry {
-                                            path: p.clone(),
-                                            options: default_options(),
-                                            preview_texture: None,
-                                            preview_texture_nearest: false,
-                                            preview_hash: 0,
-                                            preview_options_hash: 0,
-                                            preview_lod: PreviewLod::Draft,
-                                            preview_screen_wh: (0, 0),
-                                            preview_screen_requested_wh: (0, 0),
-                                            tile_cache: Vec::new(),
-                                            draft_step_cache: None,
-                                            screen_step_cache: None,
-                                            preview_full_rgb: None,
-                                            preview_input_size: None,
-                                            raw_source_size: None,
-                                            preview_zoom: 1.0,
-                                            preview_pan: egui::vec2(0.5, 0.5),
-                                            thumbnail_texture: None,
-                                            histogram: None,
-                                            histogram_crop_hash: 0,
-                                            export_format: ExportFormat::Tiff16,
-                                            raw_debug_report: None,
-                                            pipeline_debug_log: None,
-                                            cached_sensor: None,
-                                            scene_stats: None,
-                                            preview_step_cache: None,
-                                            process_tab: ProcessTab::Input,
-                                        });
+                                        self.images.push(image_entry(
+                                            p,
+                                            default_options(),
+                                            ExportFormat::Tiff16,
+                                        ));
                                         if self.selected_index.is_none() {
                                             self.selected_index = Some(self.images.len() - 1);
                                             self.full_res_preview_active = false;
@@ -2812,6 +3431,84 @@ impl eframe::App for C41Gui {
                     let in_process = self.mode == UIMode::Process;
 
                   if !in_process || entry.process_tab == ProcessTab::Develop {
+                    ui.label(egui::RichText::new("Preset").strong());
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Export JSON…")
+                            .on_hover_text(
+                                "Save current Develop settings (exposure, WB, color, zones, output, De-Bujack) as a JSON preset. Crop, D-min, and export format are not included.",
+                            )
+                            .clicked()
+                        {
+                            let base_dir = std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join("presets");
+                            let _ = std::fs::create_dir_all(&base_dir);
+                            let default_name = entry
+                                .path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .map(|s| format!("{s}.json"))
+                                .unwrap_or_else(|| "preset.json".to_string());
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_directory(&base_dir)
+                                .add_filter("JSON preset", &["json"])
+                                .set_file_name(&default_name)
+                                .save_file()
+                            {
+                                match save_develop_preset(opts, &path) {
+                                    Ok(()) => {
+                                        self.status = format!(
+                                            "Saved develop preset: {}",
+                                            path.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Failed to save preset: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        if ui
+                            .button("Import JSON…")
+                            .on_hover_text(
+                                "Load Develop settings from a JSON preset onto this image. Crop, D-min, and export format stay as they are.",
+                            )
+                            .clicked()
+                        {
+                            let base_dir = std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join("presets");
+                            let mut dialog = rfd::FileDialog::new()
+                                .add_filter("JSON preset", &["json"]);
+                            if base_dir.is_dir() {
+                                dialog = dialog.set_directory(&base_dir);
+                            }
+                            if let Some(path) = dialog.pick_file() {
+                                match load_develop_preset(&path) {
+                                    Ok(preset) => {
+                                        preset.apply_to(opts);
+                                        entry.preview_hash = 0;
+                                        entry.preview_options_hash = 0;
+                                        let label = if preset.name.trim().is_empty() {
+                                            path.display().to_string()
+                                        } else {
+                                            preset.name
+                                        };
+                                        self.status = format!("Loaded develop preset: {label}");
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Failed to load preset: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
                     // ════════════════════════════════════════════════════════
                     // GROUP 1 — Exposure  (primary editing controls)
                     // ════════════════════════════════════════════════════════
@@ -2956,79 +3653,47 @@ impl eframe::App for C41Gui {
                         let mut wb_mode = opts.wb_mode;
                         egui::ComboBox::from_id_salt(ui.id().with("wb_mode"))
                             .selected_text(match wb_mode {
+                                WbMode::None => "None",
                                 WbMode::Auto => "Auto",
                                 WbMode::Picker => "Picker",
+                                WbMode::Manual => "Manual",
                             })
                             .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut wb_mode, WbMode::None, "None");
                                 ui.selectable_value(&mut wb_mode, WbMode::Auto, "Auto");
                                 ui.selectable_value(&mut wb_mode, WbMode::Picker, "Picker");
+                                ui.selectable_value(&mut wb_mode, WbMode::Manual, "Manual");
                             });
                         if wb_mode != opts.wb_mode {
-                            opts.wb_mode = wb_mode;
                             if wb_mode == WbMode::Picker {
-                                opts.auto_wb = false;
-                                opts.apply_white_balance = true;
+                                reset_wb_for_picker(opts);
+                            } else {
+                                opts.wb_mode = wb_mode;
+                                sync_wb_flags_from_mode(opts);
                             }
                         }
 
                         match opts.wb_mode {
+                            WbMode::None => {}
                             WbMode::Auto => {
-                                ui.checkbox(&mut opts.auto_wb, "Auto white balance")
-                                    .on_hover_text(if opts.auto_wb {
-                                        "Per-channel gamma: D × (mean_D / ch_median). Preserves black point."
-                                    } else {
-                                        "Auto WB disabled."
-                                    });
-                                ui.add_space(4.0);
-                                ui.checkbox(&mut opts.apply_white_balance, "Manual white balance");
+                                ui.label(
+                                    egui::RichText::new("Per-channel median equalization.")
+                                        .small()
+                                        .color(egui::Color32::from_gray(160)),
+                                );
                             }
                             WbMode::Picker => {
-                                ui.horizontal(|ui| {
-                                    if ui.button("Pick white point").clicked() {
-                                        self.wb_picker_pending = Some(WbPickerTarget::WhitePoint);
-                                    }
-                                    if ui.button("Pick gray point").clicked() {
-                                        self.wb_picker_pending = Some(WbPickerTarget::GrayPoint);
-                                    }
-                                    if ui.button("Pick black point").clicked() {
-                                        self.wb_picker_pending = Some(WbPickerTarget::BlackPoint);
-                                    }
-                                })
-                                .response
-                                .on_hover_text("Click a point on the preview to set it as neutral.");
-                                if self.wb_picker_pending.is_some() {
-                                    ui.label(egui::RichText::new("Click on the preview to sample.").small().color(egui::Color32::from_rgb(180, 220, 120)))
-                                        .on_hover_text("Click on the preview image to sample.");
-                                }
+                                ui.label(
+                                    egui::RichText::new("Click the preview to sample a 4×4 neutral.")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(180, 220, 120)),
+                                );
                             }
-                        }
-
-                        ui.add_space(4.0);
-                        if opts.apply_white_balance {
-                            let mut use_temp = opts.temp_k.is_some();
-                            ui.checkbox(&mut use_temp, "Color temperature (K)");
-                            if use_temp {
+                            WbMode::Manual => {
                                 let mut k = opts.temp_k.unwrap_or(5500.0);
                                 ui.add(egui::Slider::new(&mut k, 2500.0..=9000.0).suffix(" K"));
                                 opts.temp_k = Some(k);
-                            } else {
-                                opts.temp_k = None;
                             }
-                            egui::Grid::new("wb_rgb")
-                                .num_columns(2)
-                                .spacing([4.0, 2.0])
-                                .show(ui, |ui| {
-                                    ui.label("R")
-                                        .on_hover_text("Density scale (1.0 = neutral, >1 = more color). Applies to R, G, B.");
-                                    ui.add(egui::Slider::new(&mut opts.wb_r, 0.7..=1.5));
-                                    ui.end_row();
-                                    ui.label("G");
-                                    ui.add(egui::Slider::new(&mut opts.wb_g, 0.7..=1.5));
-                                    ui.end_row();
-                                    ui.label("B");
-                                    ui.add(egui::Slider::new(&mut opts.wb_b, 0.7..=1.5));
-                                    ui.end_row();
-                                });
                         }
                     });
 
@@ -3235,7 +3900,7 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             ui.label("Film γ")
                                 .on_hover_text("C-41 γ ≈ 0.55–0.75. Converts density → scene log-exposure.");
-                            ui.add(egui::Slider::new(&mut opts.film_gamma, 0.4..=0.9));
+                            ui.add(egui::Slider::new(&mut opts.film_gamma, 0.4..=2.0));
                         });
                         ui.add_space(4.0);
                         ui.separator();
@@ -4136,54 +4801,21 @@ impl eframe::App for C41Gui {
                 }
                 ui.label(egui::RichText::new(out_label).small());
 
-                let ready = !self.images.is_empty() && self.output_dir.is_some();
+                let exporting = self.export_job.is_some();
+                let ready = !self.images.is_empty() && self.output_dir.is_some() && !exporting;
                 let selected_ready = self.selected_index.is_some()
                     && self.selected_index.unwrap() < self.images.len()
-                    && self.output_dir.is_some();
+                    && self.output_dir.is_some()
+                    && !exporting;
                 ui.horizontal(|ui| {
                     if ui.add_enabled(ready, egui::Button::new("Convert all")).clicked() {
-                        let output_dir = self.output_dir.clone().unwrap();
-                        let mut err: Option<anyhow::Error> = None;
-                        // Use selected image's export format for all (dropdown only updates the selected image)
-                        let export_template = self
-                            .selected_index
-                            .filter(|&i| i < self.images.len())
-                            .map(|i| &self.images[i].options)
-                            .unwrap_or_else(|| &self.images[0].options);
-                        for img in &self.images {
-                            let mut opts = img.options.clone();
-                            opts.flat_field_path = self.flat_field_path.clone();
-                            // Apply batch export format from the selected/first image
-                            opts.format = export_template.format;
-                            opts.write_exr = export_template.write_exr;
-                            opts.write_jpeg = export_template.write_jpeg;
-                            opts.write_jpeg_only = export_template.write_jpeg_only;
-                            opts.export_aces_exr = export_template.export_aces_exr;
-                            opts.write_aces2065_only = export_template.write_aces2065_only;
-                            if let Err(e) = process_files(&[img.path.clone()], &output_dir, &opts) {
-                                err = Some(e);
-                                break;
-                            }
-                        }
-                        self.status = if let Some(e) = err {
-                            format!("Error: {}", e)
-                        } else {
-                            "Done.".to_string()
-                        };
+                        self.start_export(ui.ctx(), false);
                     }
-                    if ui.add_enabled(selected_ready, egui::Button::new("Export selected")).clicked() {
-                        if let Some(idx) = self.selected_index {
-                            if idx < self.images.len() {
-                                let img = &self.images[idx];
-                                let output_dir = self.output_dir.clone().unwrap();
-                                let mut opts = img.options.clone();
-                                opts.flat_field_path = self.flat_field_path.clone();
-                                match process_files(&[img.path.clone()], &output_dir, &opts) {
-                                    Ok(()) => self.status = "Done.".to_string(),
-                                    Err(e) => self.status = format!("Error: {}", e),
-                                }
-                            }
-                        }
+                    if ui
+                        .add_enabled(selected_ready, egui::Button::new("Export selected"))
+                        .clicked()
+                    {
+                        self.start_export(ui.ctx(), true);
                     }
                 });
 
@@ -4282,8 +4914,13 @@ impl eframe::App for C41Gui {
 
                         // Extract image dims with fallback so the layout is stable before
                         // the first preview arrives (no jump when data loads in).
+                        let view_rot = preview_view_rotation(&self.images[idx]);
                         let (full_w, full_h) = if let Some((w, h, _)) = &self.images[idx].preview_full_rgb {
-                            (*w, *h)
+                            if view_rot == 90 || view_rot == 270 {
+                                (*h, *w)
+                            } else {
+                                (*w, *h)
+                            }
                         } else {
                             self.images[idx].preview_input_size
                                 .map(|s| (s[0], s[1]))
@@ -4355,7 +4992,13 @@ impl eframe::App for C41Gui {
                                     egui::pos2(uv_l, uv_t),
                                     egui::pos2(uv_r, uv_b),
                                 );
-                                canvas_painter.image(tex.id(), vis_rect, uv, egui::Color32::WHITE);
+                                paint_preview_image(
+                                    &canvas_painter,
+                                    tex.id(),
+                                    vis_rect,
+                                    uv,
+                                    view_rot,
+                                );
                             }
 
                             // 1:1 tiles over the proxy when the view is settled.
@@ -4367,6 +5010,7 @@ impl eframe::App for C41Gui {
                             // zoom-out does not flash back to the proxy. Fetch waits.
                             let hide_tiles = !proxy_soft
                                 || self.preview_options_dirty(idx)
+                                || view_rot != 0
                                 || pointer_down
                                 || self.preview_view_dragging
                                 || canvas_resp.dragged();
@@ -4521,44 +5165,97 @@ impl eframe::App for C41Gui {
                             self.mark_preview_view_changed();
                         }
 
-                        // White balance picker: on click, sample density from cache and set WB gains.
-                        if self.wb_picker_pending.is_some() && canvas_resp.clicked() {
-                            if let Some(pos) = canvas_resp.interact_pointer_pos() {
+                        // White balance picker: 4×4 loupe + click to set gains.
+                        let picker_armed = self.images[idx].options.wb_mode == WbMode::Picker;
+                        if picker_armed {
+                            if let Some(pos) = canvas_resp
+                                .hover_pos()
+                                .filter(|p| vir_rect.contains(*p) && canvas_rect.contains(*p))
+                            {
                                 let (px_f, py_f) = screen_to_image(pos.x, pos.y);
                                 let px = (px_f as u32).min(full_w.saturating_sub(1));
                                 let py = (py_f as u32).min(full_h.saturating_sub(1));
-                                if let Some(ref cache) = self.images[idx].preview_step_cache {
-                                    if let Some((_, ref buf)) = cache.after_step3 {
-                                        let (h, w, _) = buf.dim();
-                                        let y = (py as usize).min(h.saturating_sub(1));
-                                        let x = (px as usize).min(w.saturating_sub(1));
-                                        let tr = buf[[y, x, 0]].max(1e-10);
-                                        let tg = buf[[y, x, 1]].max(1e-10);
-                                        let tb = buf[[y, x, 2]].max(1e-10);
-                                        let dr = -(tr as f64).log10() as f32;
-                                        let dg = -(tg as f64).log10() as f32;
-                                        let db = -(tb as f64).log10() as f32;
-                                        let (wb_r, wb_g, wb_b) = color::density_to_wb_gains(dr, dg, db);
-                                        let opts = &mut self.images[idx].options;
-                                        opts.wb_r = wb_r;
-                                        opts.wb_g = wb_g;
-                                        opts.wb_b = wb_b;
-                                        opts.apply_white_balance = true;
-                                        opts.auto_wb = false;
-                                        self.status = format!("WB set from {} point (R={:.3} G={:.3} B={:.3})",
-                                            match self.wb_picker_pending.unwrap() {
-                                                WbPickerTarget::WhitePoint => "white",
-                                                WbPickerTarget::GrayPoint => "gray",
-                                                WbPickerTarget::BlackPoint => "black",
-                                            },
-                                            wb_r, wb_g, wb_b);
-                                    } else {
-                                        self.status = "WB picker: no cache (re-run preview first).".to_string();
-                                    }
-                                } else {
-                                    self.status = "WB picker: no cache (re-run preview first).".to_string();
+                                let [sr, sg, sb] = self.images[idx]
+                                    .preview_full_rgb
+                                    .as_ref()
+                                    .map(|(w, h, rgb)| {
+                                        let (tx, ty) = display_to_tex_px(px, py, *w, *h, view_rot);
+                                        sample_rgb_u8_4x4(rgb, *w, *h, tx, ty)
+                                    })
+                                    .unwrap_or([128, 128, 128]);
+                                let radius = 16.0;
+                                let mut loupe = pos + egui::vec2(radius + 14.0, 0.0);
+                                if loupe.x + radius > canvas_rect.right() {
+                                    loupe.x = pos.x - radius - 14.0;
                                 }
-                                self.wb_picker_pending = None;
+                                canvas_painter.circle_filled(
+                                    loupe,
+                                    radius,
+                                    egui::Color32::from_rgb(sr, sg, sb),
+                                );
+                                canvas_painter.circle_stroke(
+                                    loupe,
+                                    radius,
+                                    egui::Stroke::new(2.0, egui::Color32::from_gray(240)),
+                                );
+                                canvas_painter.circle_stroke(
+                                    loupe,
+                                    radius - 2.0,
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(40)),
+                                );
+                            }
+
+                            if canvas_resp.clicked() {
+                                if let Some(pos) = canvas_resp.interact_pointer_pos() {
+                                    let (px_f, py_f) = screen_to_image(pos.x, pos.y);
+                                    if let Some(ref cache) = self.images[idx].preview_step_cache {
+                                        if let Some((_, ref buf)) = cache.after_step3 {
+                                            let (bh, bw, _) = buf.dim();
+                                            let (tex_w, tex_h) = self.images[idx]
+                                                .preview_full_rgb
+                                                .as_ref()
+                                                .map(|(w, h, _)| (*w, *h))
+                                                .unwrap_or((full_w, full_h));
+                                            let px = (px_f as u32).min(full_w.saturating_sub(1));
+                                            let py = (py_f as u32).min(full_h.saturating_sub(1));
+                                            let (tx, ty) =
+                                                display_to_tex_px(px, py, tex_w, tex_h, view_rot);
+                                            let x = ((tx as f32 + 0.5) / tex_w.max(1) as f32
+                                                * bw as f32)
+                                                .floor()
+                                                .clamp(0.0, bw.saturating_sub(1) as f32)
+                                                as usize;
+                                            let y = ((ty as f32 + 0.5) / tex_h.max(1) as f32
+                                                * bh as f32)
+                                                .floor()
+                                                .clamp(0.0, bh.saturating_sub(1) as f32)
+                                                as usize;
+                                            let (tr, tg, tb) = sample_array3_4x4(buf, x, y);
+                                            let dr = -(tr.max(1e-10) as f64).log10() as f32;
+                                            let dg = -(tg.max(1e-10) as f64).log10() as f32;
+                                            let db = -(tb.max(1e-10) as f64).log10() as f32;
+                                            let (wb_r, wb_g, wb_b) =
+                                                color::density_to_wb_gains(dr, dg, db);
+                                            let opts = &mut self.images[idx].options;
+                                            opts.wb_r = wb_r;
+                                            opts.wb_g = wb_g;
+                                            opts.wb_b = wb_b;
+                                            opts.apply_white_balance = true;
+                                            opts.auto_wb = false;
+                                            self.status = format!(
+                                                "WB set from 4×4 sample (R={:.3} G={:.3} B={:.3})",
+                                                wb_r, wb_g, wb_b
+                                            );
+                                        } else {
+                                            self.status =
+                                                "WB picker: no cache (re-run preview first)."
+                                                    .to_string();
+                                        }
+                                    } else {
+                                        self.status =
+                                            "WB picker: no cache (re-run preview first).".to_string();
+                                    }
+                                }
                             }
                         }
 
@@ -5087,79 +5784,25 @@ impl eframe::App for C41Gui {
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // Order: rotate right, rotate left, mirror right, mirror left (right to left)
-                                let rotate_right_clicked = if let Some(icon) = &self.ui_icons.rotate_right {
+                                let rotate_right = if let Some(icon) = &self.ui_icons.rotate_right {
                                     ui.add(egui::ImageButton::new((icon.id(), egui::vec2(20.0, 20.0))).frame(false))
                                         .on_hover_text("Rotate right")
-                                        .clicked()
                                 } else {
-                                    ui.button("Rotate right").clicked()
+                                    ui.button("Rotate right")
                                 };
-                                if rotate_right_clicked {
-                                    let entry = &mut self.images[idx];
-                                    let preview_size =
-                                        entry.preview_input_size.map(|[w, h]| (w, h));
-                                    if let Some(rect) = entry.options.dmin_rect {
-                                        let source_size = entry
-                                            .options
-                                            .dmin_rect_reference_size
-                                            .or(preview_size);
-                                        if let Some((w, h)) = source_size {
-                                            entry.options.dmin_rect =
-                                                Some(rotate_dmin_rect_90(rect, w, h, true));
-                                            entry.options.dmin_rect_reference_size = Some((h, w));
-                                        }
-                                    }
-                                    if let Some(rect) = entry.options.crop_rect {
-                                        let source_size = entry
-                                            .options
-                                            .crop_rect_reference_size
-                                            .or(preview_size);
-                                        if let Some((w, h)) = source_size {
-                                            entry.options.crop_rect =
-                                                Some(rotate_dmin_rect_90(rect, w, h, true));
-                                            entry.options.crop_rect_reference_size = Some((h, w));
-                                        }
-                                    }
-                                    entry.options.rotation_degrees =
-                                        (entry.options.rotation_degrees + 90).rem_euclid(360);
-                                    self.preview_receiver = None;
-                                }
-                                let rotate_left_clicked = if let Some(icon) = &self.ui_icons.rotate_left {
+                                let rotate_left = if let Some(icon) = &self.ui_icons.rotate_left {
                                     ui.add(egui::ImageButton::new((icon.id(), egui::vec2(20.0, 20.0))).frame(false))
                                         .on_hover_text("Rotate left")
-                                        .clicked()
                                 } else {
-                                    ui.button("Rotate left").clicked()
+                                    ui.button("Rotate left")
                                 };
-                                if rotate_left_clicked {
-                                    let entry = &mut self.images[idx];
-                                    let preview_size =
-                                        entry.preview_input_size.map(|[w, h]| (w, h));
-                                    if let Some(rect) = entry.options.dmin_rect {
-                                        let source_size = entry
-                                            .options
-                                            .dmin_rect_reference_size
-                                            .or(preview_size);
-                                        if let Some((w, h)) = source_size {
-                                            entry.options.dmin_rect =
-                                                Some(rotate_dmin_rect_90(rect, w, h, false));
-                                            entry.options.dmin_rect_reference_size = Some((h, w));
-                                        }
-                                    }
-                                    if let Some(rect) = entry.options.crop_rect {
-                                        let source_size = entry
-                                            .options
-                                            .crop_rect_reference_size
-                                            .or(preview_size);
-                                        if let Some((w, h)) = source_size {
-                                            entry.options.crop_rect =
-                                                Some(rotate_dmin_rect_90(rect, w, h, false));
-                                            entry.options.crop_rect_reference_size = Some((h, w));
-                                        }
-                                    }
-                                    entry.options.rotation_degrees =
-                                        (entry.options.rotation_degrees - 90).rem_euclid(360);
-                                    self.preview_receiver = None;
+                                // Count on press so a second click is not lost waiting for release
+                                // while a preview job starts.
+                                let pressed = ui.input(|i| i.pointer.primary_pressed());
+                                if pressed && rotate_right.hovered() {
+                                    self.apply_rotate_click(idx, true, ui.ctx());
+                                } else if pressed && rotate_left.hovered() {
+                                    self.apply_rotate_click(idx, false, ui.ctx());
                                 }
                                 let mirror_right_clicked = ui
                                     .small_button("↕")
@@ -5401,7 +6044,15 @@ impl eframe::App for C41Gui {
                         self.tile_failed.clear();
                     }
 
-                    let debounce_ms = if slider_dragging {
+                    let rotate_pending = self
+                        .rotate_coalesce_until
+                        .map(|t| Instant::now() < t)
+                        .unwrap_or(false);
+                    // Any pointer-down (including the rotate button) used to look like a
+                    // slider drag and start a preview after 50ms — that blocked further clicks.
+                    let debounce_ms = if rotate_pending {
+                        ROTATE_COALESCE_MS
+                    } else if slider_dragging {
                         PREVIEW_LIVE_DEBOUNCE_MS
                     } else {
                         PREVIEW_DEBOUNCE_MS
@@ -5413,7 +6064,12 @@ impl eframe::App for C41Gui {
                         })
                         .unwrap_or(false);
 
-                    if self.preview_receiver.is_none() && !self.rect_dragging && settled {
+                    if self.preview_receiver.is_none()
+                        && !self.rect_dragging
+                        && !rotate_pending
+                        && !pointer_down
+                        && settled
+                    {
                         if self.full_res_preview_active && !self.full_res_preview_button_clicked {
                             self.full_res_preview_active = false;
                         }
@@ -5428,6 +6084,7 @@ impl eframe::App for C41Gui {
                         self.request_preview_for(idx, ctx, lod);
                         self.full_res_preview_button_clicked = false;
                         self.pending_preview_since = None;
+                        self.rotate_coalesce_until = None;
                     } else {
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }
@@ -5477,6 +6134,8 @@ impl eframe::App for C41Gui {
             self.pending_preview_key = None;
             self.pending_preview_since = None;
         }
+
+        self.show_export_progress(ctx);
     }
 }
 

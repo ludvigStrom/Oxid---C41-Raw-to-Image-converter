@@ -2,10 +2,12 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::tiff_export::TiffFormat;
 
 /// Rectangle for D-min sampling (pixel coordinates).
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
@@ -13,17 +15,73 @@ pub struct Rect {
     pub height: u32,
 }
 
-/// White balance mode: Auto (per-channel median equalization) or Picker (sample a point to set neutral).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// White balance mode. Pipeline still reads `auto_wb` / `apply_white_balance` / `temp_k`;
+/// keep those in sync with [`sync_wb_flags_from_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum WbMode {
-    /// Use auto white balance (per-channel density median equalization when D-min is on).
+    /// No white balance (identity gains, no auto, no temperature).
+    None,
+    /// Per-channel density median equalization when D-min is on.
+    #[default]
     Auto,
-    /// Use manual WB gains; can set them via eyedropper (white/gray/black point) or sliders.
+    /// Eyedropper: sample a neutral 4×4 on the preview.
     Picker,
+    /// Color-temperature slider (`temp_k`) only.
+    Manual,
+}
+
+/// Keep `auto_wb` / `apply_white_balance` / `temp_k` consistent with `wb_mode`.
+/// Picker RGB gains are left as-is (cleared separately when entering the mode).
+pub fn sync_wb_flags_from_mode(opts: &mut PipelineOptions) {
+    match opts.wb_mode {
+        WbMode::None => {
+            opts.auto_wb = false;
+            opts.apply_white_balance = false;
+            opts.temp_k = None;
+            opts.wb_r = 1.0;
+            opts.wb_g = 1.0;
+            opts.wb_b = 1.0;
+        }
+        WbMode::Auto => {
+            opts.auto_wb = true;
+            opts.apply_white_balance = false;
+            opts.temp_k = None;
+            opts.wb_r = 1.0;
+            opts.wb_g = 1.0;
+            opts.wb_b = 1.0;
+        }
+        WbMode::Picker => {
+            opts.auto_wb = false;
+            opts.temp_k = None;
+        }
+        WbMode::Manual => {
+            opts.auto_wb = false;
+            opts.apply_white_balance = false;
+            opts.wb_r = 1.0;
+            opts.wb_g = 1.0;
+            opts.wb_b = 1.0;
+            if opts.temp_k.is_none() {
+                opts.temp_k = Some(5500.0);
+            }
+        }
+    }
+}
+
+/// Enter Picker with identity WB so the preview shows uncorrected pixels.
+pub fn reset_wb_for_picker(opts: &mut PipelineOptions) {
+    opts.wb_mode = WbMode::Picker;
+    opts.auto_wb = false;
+    opts.apply_white_balance = false;
+    opts.temp_k = None;
+    opts.wb_r = 1.0;
+    opts.wb_g = 1.0;
+    opts.wb_b = 1.0;
 }
 
 /// D-min method selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DminMode {
     /// D-min correction disabled.
     Off,
@@ -37,7 +95,8 @@ pub enum DminMode {
 }
 
 /// Final render/output stage selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputStage {
     /// RA-4 print emulation (current behavior).
     Ra4,
@@ -51,7 +110,8 @@ pub enum OutputStage {
 
 /// Encoding expected by the output LUT. Determines the pre-transform
 /// applied to density values before feeding them into the cube.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputLutEncoding {
     /// Cineon log: printing density ÷ 2.046 (10-bit Cineon full-scale).
     /// Use with Resolve-style "Kodak 2383" cubes whose input is Cineon Film Log.
@@ -66,7 +126,8 @@ pub enum OutputLutEncoding {
 }
 
 /// All pipeline options (CLI flags / GUI state).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PipelineOptions {
     /// Which D-min method to use (Off / Fixed / SampleRegion / AutoPercentile).
     pub dmin_mode: DminMode,
@@ -77,7 +138,7 @@ pub struct PipelineOptions {
     /// When true, automatically equalize per-channel density medians after D-min
     /// using multiplicative correction (per-channel gamma). Preserves D=0 black point.
     pub auto_wb: bool,
-    /// White balance mode: Auto (median equalization) or Picker (eyedropper + manual sliders).
+    /// White balance mode: None / Auto / Picker / Manual. See [`sync_wb_flags_from_mode`].
     pub wb_mode: WbMode,
     /// C-41 film negative gamma. Scene log-exposure = density / film_gamma.
     /// Typical values: 0.55–0.75 for C-41, ~0.65 default. Applied as D *= 1/gamma
@@ -115,6 +176,8 @@ pub struct PipelineOptions {
     pub apply_color_profile: bool,
     pub density_matrix: [[f32; 3]; 3],
     /// Path to a RAW flat-field (unexposed) frame for luminance calibration. Optional.
+    /// Session-global in the GUI; not persisted in project files.
+    #[serde(skip)]
     pub flat_field_path: Option<PathBuf>,
     /// Camera IDT (linear camera RGB → ACEScg). Identity = stay in camera RGB;
     /// the ACEScg→Rec.709 matrix is not applied. Non-identity: IDT then
@@ -168,6 +231,7 @@ pub struct PipelineOptions {
     /// Flip vertical (mirror top–bottom). Applied after rotation.
     pub flip_vertical: bool,
     /// Debug: only run pipeline up to this step (1..=6). Preview and export use this. See TODO_DEBUG.md.
+    #[serde(skip, default = "default_debug_pipeline_step")]
     pub debug_pipeline_step: u32,
     /// Density-domain saturation boost applied before the RA-4 curve.
     /// Scales per-channel density deviation from the neutral axis:
@@ -240,12 +304,15 @@ pub struct PipelineOptions {
     pub synthetic_negative_input: bool,
     /// Debug preview mode: for RAW files, show only a simple bilinear demosaic
     /// (plus optional rotation) and skip the rest of the pipeline.
+    #[serde(skip)]
     pub debug_preview_simple_debayer: bool,
     /// When true, compute per-step channel statistics (min/max/median) in the
     /// debug log. Expensive (sorts entire image per channel per step). Only
     /// enable when the Debug tab is active.
+    #[serde(skip)]
     pub verbose_debug: bool,
     /// When true (and the `gpu` feature is enabled), offload eligible pipeline steps to the GPU.
+    #[serde(skip)]
     pub use_gpu: bool,
     /// De-Bujack: non-local OkLab difference stretch after the output transform.
     /// Off by default. Runs after step 6, before encode.
@@ -262,7 +329,12 @@ pub struct PipelineOptions {
     pub bujack_edge: f32,
     /// When set, zone masks use these full-frame percentiles (d_min, p33, p66, d_max)
     /// at curve_offset 0 instead of measuring the current buffer. Preview/tiles only.
+    #[serde(skip)]
     pub pinned_zone: Option<(f32, f32, f32, f32)>,
+}
+
+fn default_debug_pipeline_step() -> u32 {
+    6
 }
 
 impl Default for PipelineOptions {

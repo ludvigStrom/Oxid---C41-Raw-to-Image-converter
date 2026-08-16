@@ -2,6 +2,8 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use anyhow::Context;
 use image::{
@@ -24,6 +26,8 @@ pub mod flat_field;
 pub mod inversion;
 pub mod lut3d;
 pub mod options;
+pub mod preset;
+pub mod project;
 pub mod pipeline_cache;
 pub mod png_reader;
 pub mod pipeline;
@@ -37,7 +41,17 @@ pub mod stats;
 pub mod tiff_export;
 
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
-pub use options::{DminMode, OutputLutEncoding, OutputStage, PipelineOptions, Rect, WbMode};
+pub use options::{
+    reset_wb_for_picker, sync_wb_flags_from_mode, DminMode, OutputLutEncoding, OutputStage,
+    PipelineOptions, Rect, WbMode,
+};
+pub use preset::{
+    load_develop_preset, save_develop_preset, DevelopPreset, PRESET_VERSION,
+};
+pub use project::{
+    load_project, save_project, LoadedProject, ProjectExportFormat, ProjectFile, ProjectImage,
+    PROJECT_VERSION,
+};
 pub use pipeline_cache::{PreviewStepCache, hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5};
 pub use sensor::{
     compute_dmin_from_sensor, compute_preview_scene_stats, crop_sensor_for_oriented_rect,
@@ -286,6 +300,96 @@ fn downsample_rgb_for_preview(
     out
 }
 
+/// Snapshot of an in-flight export for the GUI progress dialog.
+#[derive(Clone, Debug)]
+pub struct ExportProgress {
+    /// 0-based index of the file currently being processed.
+    pub current: usize,
+    pub total: usize,
+    pub file_name: String,
+    pub stage: String,
+    /// Overall 0–1 progress across the batch.
+    pub fraction: f32,
+}
+
+/// Cooperative cancel + progress for [`process_files_with_control`].
+pub struct ExportControl {
+    cancel: AtomicBool,
+    progress: Mutex<ExportProgress>,
+}
+
+impl ExportControl {
+    pub fn new(total: usize) -> Self {
+        Self {
+            cancel: AtomicBool::new(false),
+            progress: Mutex::new(ExportProgress {
+                current: 0,
+                total,
+                file_name: String::new(),
+                stage: "Starting".to_string(),
+                fraction: 0.0,
+            }),
+        }
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> ExportProgress {
+        self.progress
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// Mark which file in a batch is being processed. Call before each
+    /// [`process_files_with_control`] when options differ per image.
+    pub fn begin_file(&self, index: usize, total: usize, file_name: impl Into<String>) {
+        if let Ok(mut p) = self.progress.lock() {
+            p.current = index;
+            p.total = total;
+            p.file_name = file_name.into();
+            p.stage = "Starting".to_string();
+            p.fraction = index as f32 / total.max(1) as f32;
+        }
+    }
+
+    fn set_stage(&self, stage: &str, within_file: f32) {
+        if let Ok(mut p) = self.progress.lock() {
+            p.stage = stage.to_string();
+            let n = p.total.max(1) as f32;
+            p.fraction = (p.current as f32 + within_file.clamp(0.0, 1.0)) / n;
+        }
+    }
+}
+
+/// Returned from [`process_files_with_control`] when the user cancels.
+#[derive(Debug)]
+pub struct ExportCancelled;
+
+impl std::fmt::Display for ExportCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Export cancelled")
+    }
+}
+
+impl std::error::Error for ExportCancelled {}
+
+fn export_tick(control: Option<&ExportControl>, stage: &str, within_file: f32) -> anyhow::Result<()> {
+    if let Some(c) = control {
+        if c.is_cancelled() {
+            return Err(anyhow::Error::new(ExportCancelled));
+        }
+        c.set_stage(stage, within_file);
+    }
+    Ok(())
+}
+
 /// **Pipeline order (do not reorder without updating this comment).**
 ///
 /// 1. **Load** RAW (linear Bayer) or PNG → demosaic → **linear RGB**.
@@ -298,6 +402,17 @@ pub fn process_files(
     output_dir: &Path,
     options: &PipelineOptions,
 ) -> anyhow::Result<()> {
+    process_files_with_control(paths, output_dir, options, None)
+}
+
+/// Same as [`process_files`], with optional cancel / progress for the GUI.
+pub fn process_files_with_control(
+    paths: &[PathBuf],
+    output_dir: &Path,
+    options: &PipelineOptions,
+    control: Option<&ExportControl>,
+) -> anyhow::Result<()> {
+    export_tick(control, "Preparing", 0.0)?;
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory {}", output_dir.display()))?;
 
@@ -327,6 +442,7 @@ pub fn process_files(
         };
 
     for path in paths {
+        export_tick(control, "Loading", 0.05)?;
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -336,6 +452,7 @@ pub fn process_files(
         let mut image = match ext.as_str() {
             "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" => {
                 let (bayer, pattern) = raw_reader::load_raw_as_ndarray(path)?;
+                export_tick(control, "Demosaic", 0.15)?;
                 let mut img = demosaic::demosaic_quality(&bayer, pattern)?;
                 img.mapv_inplace(|v| v.max(0.0));
                 img
@@ -350,6 +467,7 @@ pub fn process_files(
             _ => continue,
         };
 
+        export_tick(control, "Geometry", 0.30)?;
         if options.rotation_degrees != 0 {
             image = apply_rotation(&image, options.rotation_degrees);
         }
@@ -362,8 +480,11 @@ pub fn process_files(
 
         color_space::apply_input_idt_to_working_space(&mut image, &options.idt_matrix);
 
+        export_tick(control, "D-min", 0.40)?;
         pipeline::step_3_dmin(&mut image, options, flat_field_map.as_ref())?;
+        export_tick(control, "White balance", 0.52)?;
         pipeline::step_4_t_to_d_wb(&mut image, options);
+        export_tick(control, "Color", 0.65)?;
         pipeline::step_5_calibration(&mut image, options, lut3d.as_ref());
 
         // Optional crop (export path only): keep only selected region.
@@ -392,6 +513,7 @@ pub fn process_files(
         // ACES export: density → linear print, then Rec.709→AP0 only if an IDT ran.
         // Never treat density (or camera RGB) as ACEScg — that was a magenta shift.
         if options.write_aces2065_only || options.export_aces_exr {
+            export_tick(control, "ACES", 0.78)?;
             let mut aces2065 = curve::apply_ra4_from_density_f32(&image, ra4_params, 4.0);
             let rec709 = !aces::is_identity(&options.idt_matrix);
             aces::linear_print_to_aces2065_1(&mut aces2065, rec709);
@@ -403,6 +525,7 @@ pub fn process_files(
 
         let write_jpeg_this = options.write_jpeg || options.write_jpeg_only;
 
+        export_tick(control, "Rendering", 0.82)?;
         let mut display = pipeline::step_6_render(
             &image,
             options,
@@ -411,6 +534,7 @@ pub fn process_files(
         );
         pipeline::apply_bujack(&mut display, options);
 
+        export_tick(control, "Writing", 0.92)?;
         match &display {
             pipeline::Step6Display::PassthroughDensity(img) => {
                 if !options.write_jpeg_only {
