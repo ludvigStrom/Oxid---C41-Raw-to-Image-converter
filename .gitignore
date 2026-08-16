@@ -2,6 +2,8 @@
 /target/
 Cargo.lock
 /vendor/
+/test files/
+/synthetic targets/
 
 # IDE / editor
 .idea/
