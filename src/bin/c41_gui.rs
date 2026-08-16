@@ -309,6 +309,80 @@ impl ExportFormat {
             ProjectExportFormat::ExrAces2065 => Self::ExrAces2065,
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tiff16 => "TIFF 16-bit",
+            Self::Tiff32 => "TIFF 32-bit float",
+            Self::Exr => "EXR (32-bit float)",
+            Self::Jpeg => "JPEG",
+            Self::ExrAces2065 => "EXR ACES2065-1 (32-bit float)",
+        }
+    }
+}
+
+fn apply_export_format_to_options(opts: &mut PipelineOptions, format: ExportFormat) {
+    match format {
+        ExportFormat::Tiff16 => {
+            opts.format = TiffFormat::U16;
+            opts.write_exr = false;
+            opts.write_jpeg_only = false;
+            opts.export_aces_exr = false;
+            opts.write_aces2065_only = false;
+        }
+        ExportFormat::Tiff32 => {
+            opts.format = TiffFormat::Float32;
+            opts.write_exr = false;
+            opts.write_jpeg_only = false;
+            opts.export_aces_exr = false;
+            opts.write_aces2065_only = false;
+        }
+        ExportFormat::Exr => {
+            opts.format = TiffFormat::Float32;
+            opts.write_exr = true;
+            opts.write_jpeg_only = false;
+            opts.export_aces_exr = false;
+            opts.write_aces2065_only = false;
+        }
+        ExportFormat::Jpeg => {
+            opts.format = TiffFormat::U16;
+            opts.write_exr = false;
+            opts.write_jpeg_only = true;
+            opts.write_jpeg = false;
+            opts.export_aces_exr = false;
+            opts.write_aces2065_only = false;
+        }
+        ExportFormat::ExrAces2065 => {
+            opts.format = TiffFormat::Float32;
+            opts.write_exr = false;
+            opts.write_jpeg_only = false;
+            opts.export_aces_exr = false;
+            opts.write_aces2065_only = true;
+        }
+    }
+}
+
+fn export_format_combo(ui: &mut egui::Ui, format: &mut ExportFormat) {
+    egui::ComboBox::from_label("Output format")
+        .selected_text(format.label())
+        .show_ui(ui, |ui| {
+            for (value, text) in [
+                (ExportFormat::Tiff16, "TIFF 16-bit"),
+                (ExportFormat::Tiff32, "TIFF 32-bit float"),
+                (ExportFormat::Exr, "EXR (32-bit float)"),
+                (ExportFormat::ExrAces2065, "EXR ACES2065-1 (32-bit float)"),
+                (ExportFormat::Jpeg, "JPEG"),
+            ] {
+                if ui.selectable_label(*format == value, text).clicked() {
+                    *format = value;
+                }
+            }
+        });
+}
+
+struct BatchExportDialog {
+    format: ExportFormat,
+    write_jpeg: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,6 +541,8 @@ struct C41Gui {
     export_job: Option<ExportJob>,
     /// One-shot Auto grade job (Develop tab).
     auto_job: Option<AutoJob>,
+    /// Archive → Batch → Export settings dialog.
+    batch_export_dialog: Option<BatchExportDialog>,
     /// True while the WB eyedropper is active (loupe + click-to-sample).
     wb_picker_armed: bool,
     /// Show a wait cursor until the next preview lands (Picker select / Pick whitepoint).
@@ -519,6 +595,7 @@ impl Default for C41Gui {
             preview_job_hash: None,
             export_job: None,
             auto_job: None,
+            batch_export_dialog: None,
             wb_picker_armed: false,
             wb_picker_wait_cursor: false,
             geometry_coalesce_until: None,
@@ -2588,6 +2665,110 @@ impl C41Gui {
             });
     }
 
+    fn open_batch_export_dialog(&mut self) {
+        if self.images.is_empty() || self.heavy_job_running() {
+            return;
+        }
+        let template = self
+            .selected_index
+            .filter(|&i| i < self.images.len())
+            .and_then(|i| self.images.get(i))
+            .or_else(|| self.images.first());
+        let Some(img) = template else {
+            return;
+        };
+        self.batch_export_dialog = Some(BatchExportDialog {
+            format: img.export_format,
+            write_jpeg: img.options.write_jpeg && img.export_format != ExportFormat::Jpeg,
+        });
+    }
+
+    fn apply_batch_export_dialog(&mut self, dialog: &BatchExportDialog) {
+        let idx = self
+            .selected_index
+            .filter(|&i| i < self.images.len())
+            .unwrap_or(0);
+        let Some(img) = self.images.get_mut(idx) else {
+            return;
+        };
+        img.export_format = dialog.format;
+        apply_export_format_to_options(&mut img.options, dialog.format);
+        if dialog.format != ExportFormat::Jpeg {
+            img.options.write_jpeg = dialog.write_jpeg;
+        }
+    }
+
+    fn show_batch_export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.batch_export_dialog.take() else {
+            return;
+        };
+        if dialog.format == ExportFormat::Jpeg {
+            dialog.write_jpeg = false;
+        }
+
+        let mut close = false;
+        let mut start = false;
+        let ready = !self.images.is_empty() && !self.heavy_job_running();
+        let out_label = self
+            .output_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "No output folder".to_string());
+
+        egui::Window::new("Export")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.add_space(4.0);
+                export_format_combo(ui, &mut dialog.format);
+                ui.add_enabled(
+                    dialog.format != ExportFormat::Jpeg,
+                    egui::Checkbox::new(&mut dialog.write_jpeg, "Also export JPG"),
+                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                if ui.button("Output folder…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.output_dir = Some(path);
+                    }
+                }
+                ui.label(egui::RichText::new(out_label).small());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Export"))
+                            .clicked()
+                        {
+                            if self.output_dir.is_none() {
+                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                    self.output_dir = Some(path);
+                                }
+                            }
+                            if self.output_dir.is_some() {
+                                start = true;
+                                close = true;
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if start {
+            self.apply_batch_export_dialog(&dialog);
+            self.start_export(ctx, false);
+        }
+        if !close {
+            self.batch_export_dialog = Some(dialog);
+        }
+    }
+
     fn start_auto(&mut self, ctx: &egui::Context) {
         if self.heavy_job_running() || self.auto_job.is_some() {
             return;
@@ -3518,6 +3699,16 @@ impl eframe::App for C41Gui {
                             .clicked()
                         {
                             self.start_batch_crop(ui.ctx());
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(enabled, egui::Button::new("Export"))
+                            .on_hover_text(
+                                "Export every loaded image. Choose format and optional JPEG sidecar.",
+                            )
+                            .clicked()
+                        {
+                            self.open_batch_export_dialog();
                             ui.close_menu();
                         }
                     });
@@ -5236,88 +5427,8 @@ impl eframe::App for C41Gui {
                 ui.add_space(8.0);
 
                 // Per-image export options
-                let label = match entry.export_format {
-                    ExportFormat::Tiff16 => "TIFF 16-bit",
-                    ExportFormat::Tiff32 => "TIFF 32-bit float",
-                    ExportFormat::Exr => "EXR (32-bit float)",
-                    ExportFormat::Jpeg => "JPEG",
-                    ExportFormat::ExrAces2065 => "EXR ACES2065-1 (32-bit float)",
-                };
-                egui::ComboBox::from_label("Output format")
-                    .selected_text(label)
-                    .show_ui(ui, |ui| {
-                        if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Tiff16), "TIFF 16-bit")
-                            .clicked()
-                        {
-                            entry.export_format = ExportFormat::Tiff16;
-                        }
-                        if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Tiff32), "TIFF 32-bit float")
-                            .clicked()
-                        {
-                            entry.export_format = ExportFormat::Tiff32;
-                        }
-                        if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Exr), "EXR (32-bit float)")
-                            .clicked()
-                        {
-                            entry.export_format = ExportFormat::Exr;
-                        }
-                        let aces_selected = matches!(entry.export_format, ExportFormat::ExrAces2065);
-                        if ui
-                            .selectable_label(aces_selected, "EXR ACES2065-1 (32-bit float)")
-                            .clicked()
-                        {
-                            entry.export_format = ExportFormat::ExrAces2065;
-                        }
-                        if ui
-                            .selectable_label(matches!(entry.export_format, ExportFormat::Jpeg), "JPEG")
-                            .clicked()
-                        {
-                            entry.export_format = ExportFormat::Jpeg;
-                        }
-                    });
-
-                // Keep PipelineOptions in sync with export dropdown
-                match entry.export_format {
-                    ExportFormat::Tiff16 => {
-                        opts.format = TiffFormat::U16;
-                        opts.write_exr = false;
-                        opts.write_jpeg_only = false;
-                        opts.export_aces_exr = false;
-                        opts.write_aces2065_only = false;
-                    }
-                    ExportFormat::Tiff32 => {
-                        opts.format = TiffFormat::Float32;
-                        opts.write_exr = false;
-                        opts.write_jpeg_only = false;
-                        opts.export_aces_exr = false;
-                        opts.write_aces2065_only = false;
-                    }
-                    ExportFormat::Exr => {
-                        opts.format = TiffFormat::Float32;
-                        opts.write_exr = true;
-                        opts.write_jpeg_only = false;
-                        opts.export_aces_exr = false;
-                        opts.write_aces2065_only = false;
-                    }
-                    ExportFormat::Jpeg => {
-                        opts.format = TiffFormat::U16;
-                        opts.write_exr = false;
-                        opts.write_jpeg_only = true;
-                        opts.write_jpeg = false;
-                        opts.export_aces_exr = false;
-                        opts.write_aces2065_only = false;
-                    }
-                    ExportFormat::ExrAces2065 => {
-                        opts.format = TiffFormat::Float32;
-                        opts.write_exr = false;
-                        opts.write_jpeg_only = false;
-                        opts.export_aces_exr = false;
-                        opts.write_aces2065_only = true;
-                    }
-                }
+                export_format_combo(ui, &mut entry.export_format);
+                apply_export_format_to_options(opts, entry.export_format);
 
                 ui.add_enabled(
                     entry.export_format != ExportFormat::Jpeg,
@@ -6672,6 +6783,7 @@ impl eframe::App for C41Gui {
 
         self.show_export_progress(ctx);
         self.show_auto_progress(ctx);
+        self.show_batch_export_dialog(ctx);
 
         // After choosing Picker / Pick whitepoint, override label I-beams
         // until the preview job has landed.
