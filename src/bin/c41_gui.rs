@@ -15,11 +15,12 @@ use std::time::{Duration, Instant};
 use c41_raw_tool::process_one_to_preview_with_cache_gpu;
 use c41_raw_tool::{
     auto_tune, blur_flat_field, calibration, color, compute_preview_scene_stats,
-    crop_sensor_for_oriented_rect, demosaic, dmin, load_develop_preset, load_flat_field_linear,
-    load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
-    process_export_jobs, process_one_to_preview, process_one_to_preview_with_cache, raw_reader,
-    reset_wb_for_picker, run_auto_for_path, save_develop_preset, save_project,
-    sync_wb_flags_from_mode, tiff_export, AutoTuneResult, CachedSensor, DminMode, ExportCancelled,
+    crop_sensor_for_oriented_rect, demosaic, detect_crop, dmin, load_develop_preset,
+    load_flat_field_linear, load_project, load_sensor_from_path, oriented_sensor_size, png_reader,
+    preview_scene_stats_key, process_export_jobs, process_one_to_preview,
+    process_one_to_preview_with_cache, raw_reader, reset_wb_for_picker, run_auto_crop_for_path,
+    run_auto_for_path, save_develop_preset, save_project, sync_wb_flags_from_mode, tiff_export,
+    AutoCropResult, AutoTuneResult, CachedSensor, CropConfidence, DminMode, ExportCancelled,
     ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions,
     PreviewSceneStats, PreviewStepCache, ProjectExportFormat, ProjectImage, Rect, TiffFormat,
     WbMode,
@@ -55,6 +56,11 @@ const ICON_CLOSE_PATH: &str = "X.png";
 const ICON_ROTATE_RIGHT_PATH: &str = "rotate_right.png";
 const ICON_ROTATE_LEFT_PATH: &str = "rotate_left.png";
 const ICON_LOGO_PATH: &str = "logo.png";
+/// Extensions accepted by Add image… and drag-and-drop.
+const IMPORT_EXTENSIONS: &[&str] = &[
+    "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf", "orf", "rw2", "png", "jpeg", "jpg",
+    "tiff", "tif",
+];
 
 fn app_icon_data() -> Option<egui::IconData> {
     let bytes = include_bytes!("../img/logo.png");
@@ -83,12 +89,17 @@ fn main() -> eframe::Result<()> {
             .clone()
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
-            .with_title_shown(false); // hide OS title so only our white title in the dark bar shows
+            .with_title_shown(false) // hide OS title so only our white title in the dark bar shows
+            .with_drag_and_drop(true);
         o
     } else if cfg!(target_os = "windows") {
-        eframe::NativeOptions::default()
+        let mut o = eframe::NativeOptions::default();
+        o.viewport = o.viewport.clone().with_drag_and_drop(true);
+        o
     } else {
-        eframe::NativeOptions::default()
+        let mut o = eframe::NativeOptions::default();
+        o.viewport = o.viewport.clone().with_drag_and_drop(true);
+        o
     };
     if let Some(icon) = app_icon_data() {
         native_options.viewport = native_options.viewport.clone().with_icon(Arc::new(icon));
@@ -346,6 +357,10 @@ enum AutoJobOutcome {
         path: PathBuf,
         result: AutoTuneResult,
     },
+    CropFileDone {
+        path: PathBuf,
+        result: AutoCropResult,
+    },
     BatchDone {
         completed: usize,
         errors: usize,
@@ -363,6 +378,7 @@ struct AutoJob {
     progress: Arc<Mutex<AutoProgressState>>,
     cancel: Option<Arc<AtomicBool>>,
     batch: bool,
+    title: &'static str,
 }
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
@@ -933,479 +949,6 @@ fn scale_rect_to_size(
             height: rh.max(1),
         },
     }
-}
-
-/// Analyses the processed preview buffer and returns the tightest crop rect
-/// that encloses the actual film frame while excluding the uniform border
-/// (film base / rebate).  Works regardless of whether the border is bright
-/// or dark – it samples the outer perimeter to establish a border colour and
-/// then scans inward row-by-row and column-by-column until it finds content
-/// that differs meaningfully from that border colour.
-///
-/// Returns `None` if the image is too small or no clear frame boundary is
-/// found (e.g. the image is already tightly cropped).
-/// Samples the border (film-base) colour from the *processed* preview output
-/// using only reliable D-min data sources.
-///
-/// Two sources, tried in order:
-///
-/// 1. **D-min rect** (`dmin_rect` already scaled to preview pixel space) –
-///    the user explicitly placed this rectangle over the film base, so these
-///    pixels are guaranteed to be rebate/border.
-///
-/// 2. **Auto-percentile outer strip** – mirrors the `AutoPercentile` D-min
-///    logic: sample the outermost `auto_norm_buffer` fraction of each side
-///    (the same region the pipeline excludes from its percentile calculation),
-///    then take the top-10 % brightest pixels by luminance from that strip as
-///    the film-base reference.  This strip is where the pipeline itself
-///    expects to find film base; it is not guaranteed to be free of image
-///    content on multi-frame strips, but it is the best available estimate
-///    when no explicit rect exists.
-///
-/// Returns `None` when `dmin_rect` is absent *and* `auto_norm_buffer` is too
-/// small to produce a meaningful sample (≤ 0.02), so the caller can
-/// inform the user to set a D-min region.
-///
-/// Otherwise returns `Some((r, g, b, tolerance))` in 0–255 float scale where
-/// `tolerance` is 2.5 × max per-channel std-dev, clamped to [12, 55].
-fn sample_border_color(
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-    dmin_rect: Option<Rect>,
-    auto_norm_buffer: f32,
-) -> Option<(f32, f32, f32, f32)> {
-    let accumulate =
-        |x: u32, y: u32, sums: &mut [f64; 3], sq_sum: &mut [f64; 3], count: &mut u64| {
-            if x >= width || y >= height {
-                return;
-            }
-            let i = ((y * width + x) * 3) as usize;
-            for c in 0..3 {
-                let v = pixels[i + c] as f64;
-                sums[c] += v;
-                sq_sum[c] += v * v;
-            }
-            *count += 1;
-        };
-
-    let mut sums = [0.0f64; 3];
-    let mut sq_sum = [0.0f64; 3];
-    let mut count = 0u64;
-
-    // ── Source 1: explicit D-min rect ────────────────────────────────────────
-    if let Some(r) = dmin_rect {
-        let x1 = (r.x + r.width).min(width);
-        let y1 = (r.y + r.height).min(height);
-        for y in r.y..y1 {
-            for x in r.x..x1 {
-                accumulate(x, y, &mut sums, &mut sq_sum, &mut count);
-            }
-        }
-    }
-
-    // ── Source 2: auto-percentile outer strip ────────────────────────────────
-    if count == 0 {
-        if auto_norm_buffer <= 0.02 {
-            return None; // Buffer too small; no reliable border source.
-        }
-
-        let bw = ((width as f32 * auto_norm_buffer) as u32)
-            .max(2)
-            .min(width / 3);
-        let bh = ((height as f32 * auto_norm_buffer) as u32)
-            .max(2)
-            .min(height / 3);
-
-        // Collect all pixels in the outer strip.
-        let mut strip: Vec<(u8, u8, u8)> = Vec::new();
-        for y in 0..bh {
-            // top
-            for x in 0..width {
-                let i = ((y * width + x) * 3) as usize;
-                strip.push((pixels[i], pixels[i + 1], pixels[i + 2]));
-            }
-        }
-        for y in (height - bh)..height {
-            // bottom
-            for x in 0..width {
-                let i = ((y * width + x) * 3) as usize;
-                strip.push((pixels[i], pixels[i + 1], pixels[i + 2]));
-            }
-        }
-        for x in 0..bw {
-            // left (excluding already-counted rows)
-            for y in bh..(height - bh) {
-                let i = ((y * width + x) * 3) as usize;
-                strip.push((pixels[i], pixels[i + 1], pixels[i + 2]));
-            }
-        }
-        for x in (width - bw)..width {
-            // right
-            for y in bh..(height - bh) {
-                let i = ((y * width + x) * 3) as usize;
-                strip.push((pixels[i], pixels[i + 1], pixels[i + 2]));
-            }
-        }
-
-        if strip.is_empty() {
-            return None;
-        }
-
-        // Sort by luminance ascending; keep the darkest 10 % – after
-        // inversion the film base is the darkest region of the output.
-        strip.sort_unstable_by(|a, b| {
-            let la = a.0 as u32 + a.1 as u32 + a.2 as u32;
-            let lb = b.0 as u32 + b.1 as u32 + b.2 as u32;
-            la.cmp(&lb)
-        });
-        let keep = ((strip.len() as f32 * 0.10) as usize).max(1);
-        for &(r, g, b) in &strip[..keep] {
-            sums[0] += r as f64;
-            sq_sum[0] += (r as f64) * (r as f64);
-            sums[1] += g as f64;
-            sq_sum[1] += (g as f64) * (g as f64);
-            sums[2] += b as f64;
-            sq_sum[2] += (b as f64) * (b as f64);
-            count += 1;
-        }
-    }
-
-    if count == 0 {
-        return None;
-    }
-
-    let n = count as f64;
-    let mut means = [0.0f32; 3];
-    let mut max_std = 0.0f32;
-    for c in 0..3 {
-        let mean = sums[c] / n;
-        let var = (sq_sum[c] / n - mean * mean).max(0.0);
-        means[c] = mean as f32;
-        max_std = max_std.max(var.sqrt() as f32);
-    }
-
-    // Sanity check: after inversion the film base is always very dark (near
-    // black).  If the sampled colour is too bright the outer strip contained
-    // no real border pixels – the frame is larger than auto_norm_buffer, or
-    // the image is too tightly framed.  In that case the colour is useless
-    // and would cause bright image content to be mis-classified as border.
-    let lum = (means[0] + means[1] + means[2]) / 3.0;
-    if lum > 80.0 {
-        return None;
-    }
-
-    let tol = (max_std * 2.5).clamp(12.0, 55.0);
-    Some((means[0], means[1], means[2], tol))
-}
-
-/// Otsu threshold for a 1D distribution: quantize into bins, choose the boundary
-/// that maximizes between-class variance. Returns (threshold, separation_ratio)
-/// where separation_ratio = between_var / total_var (high = clear bimodal split).
-fn otsu_threshold_1d(values: &[f32], num_bins: usize) -> Option<(f32, f64)> {
-    if values.is_empty() || num_bins < 2 {
-        return None;
-    }
-    let min_v = values.iter().copied().fold(f32::INFINITY, f32::min);
-    let max_v = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let range = max_v - min_v;
-    if range <= 0.0 {
-        return None;
-    }
-    let mut hist = vec![0u32; num_bins];
-    let bin_w = range / num_bins as f32;
-    for &v in values {
-        let b = ((v - min_v) / range * num_bins as f32).clamp(0.0, (num_bins - 1) as f32) as usize;
-        hist[b] = hist[b].saturating_add(1);
-    }
-    let n: f64 = hist.iter().map(|&c| c as f64).sum();
-    if n <= 0.0 {
-        return None;
-    }
-    let total_mean: f64 = hist
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| (i as f64 + 0.5) * bin_w as f64 * c as f64)
-        .sum::<f64>()
-        / n;
-    let total_var: f64 = hist
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            let center = min_v as f64 + (i as f64 + 0.5) * bin_w as f64;
-            (center - total_mean).powi(2) * c as f64
-        })
-        .sum::<f64>()
-        / n;
-    if total_var <= 0.0 {
-        return None;
-    }
-    let mut best_t = 0usize;
-    let mut best_var = 0.0f64;
-    for t in 1..num_bins {
-        let n_low: f64 = hist[..t].iter().map(|&c| c as f64).sum();
-        let n_high = n - n_low;
-        if n_low <= 0.0 || n_high <= 0.0 {
-            continue;
-        }
-        let mean_low: f64 = hist[..t]
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (i as f64 + 0.5) * bin_w as f64 * c as f64)
-            .sum::<f64>()
-            / n_low;
-        let mean_high: f64 = hist[t..]
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (t as f64 + i as f64 + 0.5) * bin_w as f64 * c as f64)
-            .sum::<f64>()
-            / n_high;
-        let between = n_low * n_high * (mean_low - mean_high).powi(2);
-        if between > best_var {
-            best_var = between;
-            best_t = t;
-        }
-    }
-    let threshold_value = min_v + (best_t as f32 + 0.5) * bin_w;
-    let separation = best_var / total_var;
-    Some((threshold_value, separation))
-}
-
-/// Percentile of a 1D sample (0.0 = min, 1.0 = max). Uses linear interpolation.
-fn percentile_1d(values: &[f32], p: f32) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let p = p.clamp(0.0, 1.0);
-    let mut sorted: Vec<f32> = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = sorted.len();
-    if n == 1 {
-        return sorted[0];
-    }
-    let idx = p * (n - 1) as f32;
-    let i = idx.floor() as usize;
-    let frac = idx - i as f32;
-    if i >= n - 1 {
-        sorted[n - 1]
-    } else {
-        sorted[i] * (1.0 - frac) + sorted[i + 1] * frac
-    }
-}
-
-/// Detects the film-frame boundary via mean row/column luminance.
-///
-/// 1. Compute mean luminance per row and per column.
-/// 2. Data-driven threshold (Otsu or percentile) plus a hard cap from the
-///    sampled film-base colour: a row/column only counts as "border" if its
-///    mean is both below the threshold and <= border_lum + tolerance.  That
-///    avoids mistaking in-image edges (sky, landscape) for film border.
-/// 3. Scan from centre outward; require minimum crop size so we never return
-///    a tiny or zero-size rect.
-fn auto_detect_crop(
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-    border_color: (f32, f32, f32),
-    tolerance: f32,
-) -> Option<Rect> {
-    if width < 16 || height < 16 || pixels.len() < (width * height * 3) as usize {
-        return None;
-    }
-
-    let (br, bg, bb) = border_color;
-    let border_lum = 0.2126 * br + 0.7152 * bg + 0.0722 * bb;
-    let border_cap = (border_lum + tolerance * 2.0).min(100.0);
-
-    // Rec. 709 weighted luminance, 0–255 scale.
-    let lum_px = |x: u32, y: u32| -> f32 {
-        let i = ((y * width + x) * 3) as usize;
-        0.2126 * pixels[i] as f32 + 0.7152 * pixels[i + 1] as f32 + 0.0722 * pixels[i + 2] as f32
-    };
-
-    // Mean luminance for every row and every column.
-    let row_mean: Vec<f32> = (0..height)
-        .map(|y| (0..width).map(|x| lum_px(x, y)).sum::<f32>() / width as f32)
-        .collect();
-    let col_mean: Vec<f32> = (0..width)
-        .map(|x| (0..height).map(|y| lum_px(x, y)).sum::<f32>() / height as f32)
-        .collect();
-
-    const BINS: usize = 64;
-    const BIMODAL_MIN: f64 = 0.12;
-
-    let row_threshold = {
-        let (otsu_t, separation) = match otsu_threshold_1d(&row_mean, BINS) {
-            Some(x) => x,
-            None => return None,
-        };
-        let use_bimodal = separation >= BIMODAL_MIN;
-        let t = if use_bimodal {
-            otsu_t
-        } else {
-            let p15 = percentile_1d(&row_mean, 0.15);
-            let p50 = percentile_1d(&row_mean, 0.5);
-            p15 + 0.2 * (p50 - p15).max(0.0)
-        };
-        t.min(border_cap)
-    };
-    let col_threshold = {
-        let (otsu_t, separation) = match otsu_threshold_1d(&col_mean, BINS) {
-            Some(x) => x,
-            None => return None,
-        };
-        let use_bimodal = separation >= BIMODAL_MIN;
-        let t = if use_bimodal {
-            otsu_t
-        } else {
-            let p15 = percentile_1d(&col_mean, 0.15);
-            let p50 = percentile_1d(&col_mean, 0.5);
-            p15 + 0.2 * (p50 - p15).max(0.0)
-        };
-        t.min(border_cap)
-    };
-
-    // Fraction of pixels in each row/col that are dark (below threshold and border_cap).
-    // So thin borders (only a few dark pixels) still register.
-    let row_dark_frac: Vec<f32> = (0..height)
-        .map(|y| {
-            let count = (0..width)
-                .filter(|&x| {
-                    let l = lum_px(x, y);
-                    l < row_threshold && l <= border_cap
-                })
-                .count();
-            count as f32 / width as f32
-        })
-        .collect();
-    let col_dark_frac: Vec<f32> = (0..width)
-        .map(|x| {
-            let count = (0..height)
-                .filter(|&y| {
-                    let l = lum_px(x, y);
-                    l < col_threshold && l <= border_cap
-                })
-                .count();
-            count as f32 / height as f32
-        })
-        .collect();
-
-    const DARK_FRAC_MIN: f32 = 0.04;
-    /// Only use dark_frac as "border" when mean is below this (avoid content rows with a few dark pixels).
-    const DARK_FRAC_MEAN_CEILING: f32 = 65.0;
-    /// Only use dark_frac for border when row/col is in this fraction of the image edge (avoids center column/row with dark content).
-    const EDGE_BAND: f32 = 0.05;
-    let row_edge_band = (height as f32 * EDGE_BAND).ceil() as u32;
-    let col_edge_band = (width as f32 * EDGE_BAND).ceil() as u32;
-
-    let cx = width / 2;
-    let cy = height / 2;
-    // Border row/col: mean below threshold, or (in edge band + mean not bright + enough dark pixels for thin edge at margin).
-    let br_row = |y: u32| {
-        let m = row_mean[y as usize];
-        let in_edge = y < row_edge_band || y >= height.saturating_sub(row_edge_band);
-        (m < row_threshold && m <= border_cap)
-            || (in_edge && m < DARK_FRAC_MEAN_CEILING && row_dark_frac[y as usize] >= DARK_FRAC_MIN)
-    };
-    let bc_col = |x: u32| {
-        let m = col_mean[x as usize];
-        let in_edge = x < col_edge_band || x >= width.saturating_sub(col_edge_band);
-        (m < col_threshold && m <= border_cap)
-            || (in_edge && m < DARK_FRAC_MEAN_CEILING && col_dark_frac[x as usize] >= DARK_FRAC_MIN)
-    };
-    // Mean-only border (for edge pull: only pull to image edge when edge is clearly border by luminance, not dark_frac).
-    let br_row_mean_only = |y: u32| {
-        let m = row_mean[y as usize];
-        m < row_threshold && m <= border_cap
-    };
-    let bc_col_mean_only = |x: u32| {
-        let m = col_mean[x as usize];
-        m < col_threshold && m <= border_cap
-    };
-
-    // Scan from centre outward. Prefer 2-run (two consecutive border rows/cols); fall back to 1-run, then image edge.
-    let top_2run = (1..cy)
-        .rev()
-        .find(|&y| br_row(y) && br_row(y - 1))
-        .map(|y| y + 1);
-    let top_1run = (1..cy).rev().find(|&y| br_row(y)).map(|y| y + 1);
-    let top = top_2run.or(top_1run).unwrap_or(0);
-
-    let bottom_2run = (cy + 1..height - 1).find(|&y| br_row(y) && br_row(y + 1));
-    let bottom_1run = (cy + 1..height).find(|&y| br_row(y));
-    let bottom = bottom_2run.or(bottom_1run).unwrap_or(height);
-
-    let left_2run = (1..cx)
-        .rev()
-        .find(|&x| bc_col(x) && bc_col(x - 1))
-        .map(|x| x + 1);
-    let left_1run = (1..cx).rev().find(|&x| bc_col(x)).map(|x| x + 1);
-    let left = left_2run.or(left_1run).unwrap_or(0);
-
-    let right_2run = (cx + 1..width - 1).find(|&x| bc_col(x) && bc_col(x + 1));
-    let right_1run = (cx + 1..width).find(|&x| bc_col(x));
-    let right = right_2run.or(right_1run).unwrap_or(width);
-
-    // Edge pull only when edge is border by mean (not just dark_frac), so we don't pull on mixed/ambiguous edges.
-    let top = if top > 0 && br_row_mean_only(0) {
-        0
-    } else {
-        top
-    };
-    let bottom = if bottom < height && br_row_mean_only(height - 1) {
-        height
-    } else {
-        bottom
-    };
-    let left = if left > 0 && bc_col_mean_only(0) {
-        0
-    } else {
-        left
-    };
-    let right = if right < width && bc_col_mean_only(width - 1) {
-        width
-    } else {
-        right
-    };
-
-    // Inward trim to avoid including sprocket holes (detected border can sit just inside the frame).
-    const SPROCKET_TRIM: u32 = 4;
-    let left = (left + SPROCKET_TRIM).min(cx);
-    let right = right.saturating_sub(SPROCKET_TRIM).max(cx + 1);
-    let top = (top + SPROCKET_TRIM).min(cy);
-    let bottom = bottom.saturating_sub(SPROCKET_TRIM).max(cy + 1);
-
-    if right <= left || bottom <= top {
-        return None;
-    }
-
-    if left >= cx || right <= cx || top >= cy || bottom <= cy {
-        return None;
-    }
-
-    let w = right - left;
-    let h = bottom - top;
-    let min_side = (width.min(height) / 20).max(16);
-    if w < min_side || h < min_side {
-        return None;
-    }
-
-    let rect_cx = (left + right) / 2;
-    let rect_cy = (top + bottom) / 2;
-    let max_shift_x = (width / 5).max(1);
-    let max_shift_y = (height / 5).max(1);
-    let shift_x = rect_cx.abs_diff(cx);
-    let shift_y = rect_cy.abs_diff(cy);
-    if shift_x > max_shift_x || shift_y > max_shift_y {
-        return None;
-    }
-
-    Some(Rect {
-        x: left,
-        y: top,
-        width: w,
-        height: h,
-    })
 }
 
 fn compute_histogram_from_rgb(
@@ -2093,6 +1636,38 @@ fn image_entry(path: PathBuf, options: PipelineOptions, export_format: ExportFor
     }
 }
 
+fn is_importable_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            IMPORT_EXTENSIONS
+                .iter()
+                .any(|ok| e.eq_ignore_ascii_case(ok))
+        })
+        .unwrap_or(false)
+}
+
+/// Files with a supported extension, plus supported files in dropped folders (one level).
+fn collect_importable_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                let mut files: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && is_importable_image(p))
+                    .collect();
+                files.sort();
+                out.extend(files);
+            }
+        } else if is_importable_image(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
 fn apply_runtime_gui_defaults(opts: &mut PipelineOptions) {
     opts.use_gpu = cfg!(feature = "gpu");
     opts.debug_pipeline_step = 6;
@@ -2103,6 +1678,25 @@ fn apply_runtime_gui_defaults(opts: &mut PipelineOptions) {
 }
 
 impl C41Gui {
+    fn add_image_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> usize {
+        let mut added = 0usize;
+        for p in collect_importable_paths(paths) {
+            if !self.images.iter().any(|e| e.path == p) {
+                self.images
+                    .push(image_entry(p, default_options(), ExportFormat::Tiff16));
+                if self.selected_index.is_none() {
+                    self.selected_index = Some(self.images.len() - 1);
+                    self.full_res_preview_active = false;
+                }
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.status = format!("{} file(s)", self.images.len());
+        }
+        added
+    }
+
     fn request_project_save(&mut self, save_as: bool) {
         if !save_as {
             if let Some(path) = self.project_path.clone() {
@@ -3113,6 +2707,7 @@ impl C41Gui {
             progress,
             cancel: None,
             batch: false,
+            title: "Auto",
         });
         ctx.request_repaint();
     }
@@ -3258,8 +2853,152 @@ impl C41Gui {
             progress,
             cancel: Some(cancel),
             batch: true,
+            title: "Auto Develop",
         });
         self.status = format!("Auto Develop: {} images…", total);
+        ctx.request_repaint();
+    }
+
+    fn apply_crop_result_to_path(&mut self, path: &Path, result: &AutoCropResult) -> bool {
+        let Some(entry) = self.images.iter_mut().find(|e| e.path == path) else {
+            return false;
+        };
+        entry.options.crop_rect = Some(result.rect);
+        entry.options.crop_rect_reference_size = Some(result.reference_size);
+        entry.options.apply_crop = true;
+        true
+    }
+
+    fn start_batch_crop(&mut self, ctx: &egui::Context) {
+        if self.heavy_job_running() || self.auto_job.is_some() {
+            return;
+        }
+        if self.images.is_empty() {
+            self.status = "Auto Crop: add images first.".to_string();
+            return;
+        }
+
+        self.release_heavy_caches();
+
+        let jobs: Vec<(PathBuf, PipelineOptions)> = self
+            .images
+            .iter()
+            .map(|img| {
+                let mut opts = img.options.clone();
+                opts.flat_field_path = self.flat_field_path.clone();
+                (img.path.clone(), opts)
+            })
+            .collect();
+        let total = jobs.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::new(Mutex::new(AutoProgressState {
+            fraction: 0.0,
+            message: "Starting…".to_string(),
+            log: Vec::new(),
+            file_name: String::new(),
+            completed: 0,
+            total,
+        }));
+        let (tx, rx) = mpsc::channel();
+        let workers = if total > 1 { 2 } else { 1 };
+        let cancel_thread = cancel.clone();
+        let progress_thread = progress.clone();
+        let ctx_thread = ctx.clone();
+
+        thread::spawn(move || {
+            let queue = Arc::new(Mutex::new(jobs.into_iter().collect::<VecDeque<_>>()));
+            let errors = Arc::new(AtomicUsize::new(0));
+
+            thread::scope(|scope| {
+                for _ in 0..workers {
+                    let tx = tx.clone();
+                    let ctx = ctx_thread.clone();
+                    let cancel_thread = cancel_thread.clone();
+                    let progress_thread = progress_thread.clone();
+                    let completed = completed.clone();
+                    let queue = queue.clone();
+                    let errors = errors.clone();
+                    scope.spawn(move || loop {
+                        if cancel_thread.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let Some((path, opts)) = queue.lock().ok().and_then(|mut q| q.pop_front())
+                        else {
+                            return;
+                        };
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image")
+                            .to_string();
+                        if let Ok(mut p) = progress_thread.lock() {
+                            p.file_name = name.clone();
+                            p.message = "Loading…".to_string();
+                        }
+                        ctx.request_repaint();
+
+                        if cancel_thread.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        let done_at_start = completed.load(Ordering::Relaxed);
+                        let mut on_progress = |message: &str, frac: f32, _log: Option<&str>| {
+                            if let Ok(mut p) = progress_thread.lock() {
+                                p.message = message.to_string();
+                                p.file_name = name.clone();
+                                p.completed = done_at_start;
+                                let n = total.max(1) as f32;
+                                p.fraction = (done_at_start as f32 + frac.clamp(0.0, 1.0)) / n;
+                            }
+                            ctx.request_repaint();
+                        };
+
+                        match run_auto_crop_for_path(&path, &opts, &mut on_progress) {
+                            Ok(result) => {
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if let Ok(mut p) = progress_thread.lock() {
+                                    p.completed = done;
+                                    p.fraction = done as f32 / total.max(1) as f32;
+                                }
+                                let _ = tx.send(AutoJobOutcome::CropFileDone { path, result });
+                            }
+                            Err(_) => {
+                                errors.fetch_add(1, Ordering::Relaxed);
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if let Ok(mut p) = progress_thread.lock() {
+                                    p.completed = done;
+                                    p.fraction = done as f32 / total.max(1) as f32;
+                                    p.message = format!("Skipped {}", name);
+                                }
+                            }
+                        }
+                        ctx.request_repaint();
+                    });
+                }
+            });
+
+            let done = completed.load(Ordering::Relaxed);
+            let err_n = errors.load(Ordering::Relaxed);
+            if cancel_thread.load(Ordering::Relaxed) {
+                let _ = tx.send(AutoJobOutcome::Cancelled { completed: done });
+            } else {
+                let _ = tx.send(AutoJobOutcome::BatchDone {
+                    completed: done.saturating_sub(err_n),
+                    errors: err_n,
+                });
+            }
+            ctx_thread.request_repaint();
+        });
+
+        self.auto_job = Some(AutoJob {
+            receiver: rx,
+            progress,
+            cancel: Some(cancel),
+            batch: true,
+            title: "Auto Crop",
+        });
+        self.status = format!("Auto Crop: {} images…", total);
         ctx.request_repaint();
     }
 
@@ -3309,14 +3048,19 @@ impl C41Gui {
                     self.apply_auto_result_to_path(&path, &result);
                     ctx.request_repaint();
                 }
+                AutoJobOutcome::CropFileDone { path, result } => {
+                    self.apply_crop_result_to_path(&path, &result);
+                    ctx.request_repaint();
+                }
                 AutoJobOutcome::BatchDone { completed, errors } => {
+                    let title = self.auto_job.as_ref().map(|j| j.title).unwrap_or("Batch");
                     self.auto_job = None;
                     self.preview_gen = self.preview_gen.wrapping_add(1);
                     self.status = if errors == 0 {
-                        format!("Auto Develop: graded {} image(s).", completed)
+                        format!("{title}: finished {} image(s).", completed)
                     } else {
                         format!(
-                            "Auto Develop: graded {} image(s), {} failed.",
+                            "{title}: finished {} image(s), {} failed.",
                             completed, errors
                         )
                     };
@@ -3324,12 +3068,13 @@ impl C41Gui {
                     return;
                 }
                 AutoJobOutcome::Cancelled { completed } => {
+                    let title = self.auto_job.as_ref().map(|j| j.title).unwrap_or("Batch");
                     self.auto_job = None;
                     self.preview_gen = self.preview_gen.wrapping_add(1);
                     self.status = if completed == 0 {
-                        "Auto Develop cancelled.".to_string()
+                        format!("{title} cancelled.")
                     } else {
-                        format!("Auto Develop cancelled after {} image(s).", completed)
+                        format!("{title} cancelled after {} image(s).", completed)
                     };
                     ctx.request_repaint();
                     return;
@@ -3356,7 +3101,7 @@ impl C41Gui {
             .unwrap_or_else(|e| e.into_inner().clone());
         let cancelling = cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
-        let title = if batch { "Auto Develop" } else { "Auto" };
+        let title = job.title;
         let shown = if snap.completed < snap.total && !snap.file_name.is_empty() {
             snap.completed.saturating_add(1).min(snap.total)
         } else {
@@ -3520,6 +3265,14 @@ impl eframe::App for C41Gui {
                         }
                     }
                 }
+            }
+        }
+
+        let dropped_files = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+        if !dropped_files.is_empty() {
+            let paths: Vec<PathBuf> = dropped_files.into_iter().filter_map(|f| f.path).collect();
+            if !paths.is_empty() && self.add_image_paths(paths) == 0 {
+                self.status = "No supported files in drop (RAW, PNG, JPEG, TIFF).".into();
             }
         }
 
@@ -3757,6 +3510,16 @@ impl eframe::App for C41Gui {
                             self.start_batch_auto(ui.ctx());
                             ui.close_menu();
                         }
+                        if ui
+                            .add_enabled(enabled, egui::Button::new("Crop"))
+                            .on_hover_text(
+                                "Auto-crop every loaded image (detect the film frame, exclude holder and lightbox).",
+                            )
+                            .clicked()
+                        {
+                            self.start_batch_crop(ui.ctx());
+                            ui.close_menu();
+                        }
                     });
                 });
             });
@@ -3771,31 +3534,17 @@ impl eframe::App for C41Gui {
                     ui.horizontal(|ui| {
                         if ui.button("Add image…").clicked() {
                             if let Some(paths) = rfd::FileDialog::new()
-                                .add_filter(
-                                    "RAW & images",
-                                    &[
-                                        "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf",
-                                        "orf", "rw2", "png", "jpeg", "jpg", "tiff", "tif",
-                                    ],
-                                )
+                                .add_filter("RAW & images", IMPORT_EXTENSIONS)
                                 .pick_files()
                             {
-                                for p in paths {
-                                    if !self.images.iter().any(|e| e.path == p) {
-                                        self.images.push(image_entry(
-                                            p,
-                                            default_options(),
-                                            ExportFormat::Tiff16,
-                                        ));
-                                        if self.selected_index.is_none() {
-                                            self.selected_index = Some(self.images.len() - 1);
-                                            self.full_res_preview_active = false;
-                                        }
-                                    }
-                                }
-                                self.status = format!("{} file(s)", self.images.len());
+                                self.add_image_paths(paths);
                             }
                         }
+                        ui.label(
+                            egui::RichText::new("or drop files here")
+                                .small()
+                                .color(egui::Color32::from_gray(150)),
+                        );
                     });
 
                     ui.add_space(10.0);
@@ -5643,47 +5392,41 @@ impl eframe::App for C41Gui {
             self.wb_picker_wait_cursor = true;
         }
 
-        // ---- Auto-crop: run frame detection after sidebar borrow is released ----
+        // ---- Auto-crop: detect on post–D-min linear T after sidebar borrow is released ----
         if auto_crop_requested {
             if let Some(idx) = self.selected_index {
                 if idx < self.images.len() {
-                    // Clone the pixel buffer so we can mutably write options
-                    // on the same entry without a borrow conflict.
-                    let preview_clone = self.images[idx].preview_full_rgb.clone();
-                    if let Some((w, h, pixels)) = preview_clone {
-                        // Scale the D-min rect to preview pixel space if one is set.
-                        let dmin_rect_preview = self.images[idx].options.dmin_rect.map(|r| {
-                            scale_rect_to_size(
-                                r,
-                                self.images[idx].options.dmin_rect_reference_size,
-                                w,
-                                h,
-                            )
-                        });
-                        let auto_norm_buffer = self.images[idx].options.auto_norm_buffer;
-                        match sample_border_color(
-                            w,
-                            h,
-                            &pixels,
-                            dmin_rect_preview,
-                            auto_norm_buffer,
-                        ) {
-                            None => {
-                                self.status = "Auto crop: set a D-min region first so the film-base colour is known.".to_string();
-                            }
-                            Some((br, bg, bb, tol)) => {
-                                match auto_detect_crop(w, h, &pixels, (br, bg, bb), tol) {
-                                    Some(rect) => {
-                                        self.images[idx].options.crop_rect = Some(rect);
-                                        self.images[idx].options.crop_rect_reference_size =
-                                            Some((w, h));
-                                        self.images[idx].options.apply_crop = true;
-                                    }
-                                    None => {
-                                        self.status =
-                                            "Auto crop: no clear frame boundary found.".to_string();
-                                    }
+                    let after_step3 =
+                        self.images[idx]
+                            .preview_step_cache
+                            .as_ref()
+                            .and_then(|c| c.after_step3.as_ref().map(|(_, buf)| buf.clone()))
+                            .or_else(|| {
+                                self.images[idx].screen_step_cache.as_ref().and_then(|c| {
+                                    c.after_step3.as_ref().map(|(_, buf)| buf.clone())
+                                })
+                            })
+                            .or_else(|| {
+                                self.images[idx].draft_step_cache.as_ref().and_then(|c| {
+                                    c.after_step3.as_ref().map(|(_, buf)| buf.clone())
+                                })
+                            });
+                    if let Some(buf) = after_step3 {
+                        let dmin_rect = self.images[idx].options.dmin_rect;
+                        let dmin_ref = self.images[idx].options.dmin_rect_reference_size;
+                        match detect_crop(&buf, dmin_rect, dmin_ref) {
+                            Some(result) => {
+                                self.images[idx].options.crop_rect = Some(result.rect);
+                                self.images[idx].options.crop_rect_reference_size =
+                                    Some(result.reference_size);
+                                self.images[idx].options.apply_crop = true;
+                                if result.confidence == CropConfidence::Low {
+                                    self.status = "Auto crop: weak edge — check crop.".to_string();
                                 }
+                            }
+                            None => {
+                                self.status =
+                                    "Auto crop: no clear frame boundary found.".to_string();
                             }
                         }
                     } else {
@@ -6752,7 +6495,7 @@ impl eframe::App for C41Gui {
             } else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 2.0 - 20.0);
-                    ui.label("Select an image in the strip below to see a preview.");
+                    ui.label("Drop RAW or image files here, or use Add image…");
                 });
             }
         });
@@ -6943,6 +6686,32 @@ impl eframe::App for C41Gui {
             } else {
                 self.wb_picker_wait_cursor = false;
             }
+        }
+
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("file_drop_overlay"),
+            ));
+            painter.rect_filled(
+                screen,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(20, 20, 20, 170),
+            );
+            let inset = screen.shrink(18.0);
+            painter.rect_stroke(
+                inset,
+                8.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 150, 255)),
+            );
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop RAW or image files to add them",
+                egui::FontId::proportional(20.0),
+                egui::Color32::from_gray(240),
+            );
         }
     }
 }

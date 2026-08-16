@@ -16,6 +16,7 @@ use ndarray::{self, Array3};
 
 pub mod aces;
 pub mod auto;
+pub mod auto_crop;
 pub mod bujack;
 pub mod calibration;
 pub mod color;
@@ -44,6 +45,9 @@ pub mod stats;
 pub mod tiff_export;
 
 pub use auto::{auto_tune, AutoTuneResult, AUTO_PROXY_MAX_SIDE};
+pub use auto_crop::{
+    detect_crop, AutoCropResult, CropConfidence, FilmFormat, SurroundClass, CROP_PROXY_MAX_SIDE,
+};
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{
     reset_wb_for_picker, sync_wb_flags_from_mode, DminMode, OutputLutEncoding, OutputStage,
@@ -1384,6 +1388,38 @@ pub fn run_auto_for_path(
         .map(|(_, img)| img)
         .ok_or_else(|| anyhow::anyhow!("Auto: no D-min buffer to analyse."))?;
     auto_tune(&after_step3, &baked, on_progress)
+}
+
+/// Load one file, pin full-res D-min / auto-WB, build a proxy after-step-3
+/// buffer, then run [`detect_crop`].
+pub fn run_auto_crop_for_path(
+    path: &Path,
+    options: &PipelineOptions,
+    on_progress: &mut auto::AutoProgressCb<'_>,
+) -> anyhow::Result<AutoCropResult> {
+    on_progress("Loading…", 0.0, Some("Loading…"));
+    let sensor = load_sensor_from_path(path)?;
+    let stats = compute_preview_scene_stats(&sensor, options)?;
+    let mut baked = options.clone();
+    bake_scene_stats_into_options(&mut baked, &stats);
+
+    on_progress("Detecting frame…", 0.35, Some("Detecting frame…"));
+    let side = CROP_PROXY_MAX_SIDE as u32;
+    let (_, _, _, _, _, _, cache) =
+        process_one_to_preview_with_cache(path, &baked, side, side, None, false, Some(&sensor))?;
+    drop(sensor);
+
+    let after_step3 = cache
+        .after_step3
+        .map(|(_, img)| img)
+        .ok_or_else(|| anyhow::anyhow!("Auto crop: no D-min buffer to analyse."))?;
+    on_progress("Detecting frame…", 0.85, Some("Detecting frame…"));
+    detect_crop(
+        &after_step3,
+        baked.dmin_rect,
+        baked.dmin_rect_reference_size,
+    )
+    .ok_or_else(|| anyhow::anyhow!("Auto crop: no clear frame boundary found."))
 }
 
 /// GPU-accelerated version of `process_one_to_preview_with_cache`.
