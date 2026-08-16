@@ -35,7 +35,28 @@ pub enum FilmFormat {
     SixBySeven,
     FourByThree,
     FourByFive,
+    Wide,
 }
+
+/// Landscape and portrait of each still-film gate. Used to accept a crop or
+/// reject it and try another detector.
+const KNOWN_ASPECTS: &[(f32, FilmFormat)] = &[
+    (3.0 / 2.0, FilmFormat::Still35),
+    (2.0 / 3.0, FilmFormat::Still35),
+    (4.0 / 3.0, FilmFormat::FourByThree),
+    (3.0 / 4.0, FilmFormat::FourByThree),
+    (1.0, FilmFormat::Square),
+    (7.0 / 6.0, FilmFormat::SixBySeven),
+    (6.0 / 7.0, FilmFormat::SixBySeven),
+    (5.0 / 4.0, FilmFormat::FourByFive),
+    (4.0 / 5.0, FilmFormat::FourByFive),
+    (16.0 / 9.0, FilmFormat::Wide),
+    (9.0 / 16.0, FilmFormat::Wide),
+];
+/// Relative error that still counts as a known gate (both orientations).
+const ASPECT_VALID: f32 = 0.08;
+/// Tighter band used when shrinking a crop onto a known ratio.
+const ASPECT_SNAP: f32 = 0.045;
 
 /// Successful auto-crop. `rect` is in the input buffer's pixel space.
 #[derive(Debug, Clone, Copy)]
@@ -240,10 +261,11 @@ fn detect_on_proxy(image: &Array3<f32>, dmin_rect: Option<Rect>) -> Option<AutoC
     let max_margin = margin_l.max(margin_r).max(margin_t).max(margin_b);
     let strong_edge = min_margin > 0.025 && max_margin < 0.45;
     let surround_ok = !matches!(surround, SurroundClass::Mixed);
+    let aspect_ok = match_known_aspect(rw as f32 / rh.max(1) as f32, ASPECT_VALID).is_some();
 
-    let confidence = if strong_edge && surround_ok {
+    let confidence = if strong_edge && surround_ok && aspect_ok {
         CropConfidence::High
-    } else if strong_edge || surround_ok || min_margin > 0.015 {
+    } else if (strong_edge || surround_ok || min_margin > 0.015) && aspect_ok {
         CropConfidence::Medium
     } else {
         CropConfidence::Low
@@ -619,6 +641,60 @@ fn bounds_from_bright_seed(
     }
 }
 
+fn bounds_ratio((left, right, top, bottom): (usize, usize, usize, usize)) -> f32 {
+    let rw = right.saturating_sub(left).max(1) as f32;
+    let rh = bottom.saturating_sub(top).max(1) as f32;
+    rw / rh
+}
+
+fn match_known_aspect(ratio: f32, max_err: f32) -> Option<(FilmFormat, f32)> {
+    let mut best: Option<(FilmFormat, f32)> = None;
+    for &(target, fmt) in KNOWN_ASPECTS {
+        let err = (ratio - target).abs() / target;
+        if err <= max_err && best.map(|(_, e)| err < e).unwrap_or(true) {
+            best = Some((fmt, err));
+        }
+    }
+    best
+}
+
+fn aspect_is_known(bounds: (usize, usize, usize, usize)) -> bool {
+    match_known_aspect(bounds_ratio(bounds), ASPECT_VALID).is_some()
+}
+
+fn min_margin_frac(
+    w: usize,
+    h: usize,
+    (left, right, top, bottom): (usize, usize, usize, usize),
+) -> f32 {
+    let l = left as f32 / w.max(1) as f32;
+    let r = w.saturating_sub(right) as f32 / w.max(1) as f32;
+    let t = top as f32 / h.max(1) as f32;
+    let b = h.saturating_sub(bottom) as f32 / h.max(1) as f32;
+    l.min(r).min(t).min(b)
+}
+
+fn swallowed_frame(
+    w: usize,
+    h: usize,
+    bounds: (usize, usize, usize, usize),
+    area_frac: f32,
+) -> bool {
+    area_frac > 0.88 || (area_frac > 0.68 && min_margin_frac(w, h, bounds) < 0.02)
+}
+
+fn nearest_known_aspect(ratio: f32) -> (f32, FilmFormat, f32) {
+    KNOWN_ASPECTS
+        .iter()
+        .copied()
+        .map(|(target, fmt)| {
+            let err = (ratio - target).abs() / target;
+            (target, fmt, err)
+        })
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((1.0, FilmFormat::Square, 1.0))
+}
+
 fn seed_looks_complete(
     w: usize,
     h: usize,
@@ -630,12 +706,11 @@ fn seed_looks_complete(
     let rw = (right - left) as f32;
     let rh = (bottom - top) as f32;
     let area = (rw * rh) / (w.max(1) * h.max(1)) as f32;
-    let ratio = rw / rh.max(1.0);
-    let aspect_err = [1.333, 1.5, 0.75, 0.667]
-        .into_iter()
-        .map(|target| (ratio - target).abs() / target)
-        .fold(1.0f32, f32::min);
-    area >= 0.40 && rw / w as f32 >= 0.52 && rh / h as f32 >= 0.45 && aspect_err < 0.10
+    area >= 0.40
+        && rw / w as f32 >= 0.52
+        && rh / h as f32 >= 0.45
+        && aspect_is_known((left, right, top, bottom))
+        && !swallowed_frame(w, h, (left, right, top, bottom), area)
 }
 
 fn grow_bright_seed(
@@ -774,7 +849,10 @@ fn pick_bounds(
     let area =
         |c: (usize, usize, usize, usize)| (c.1.saturating_sub(c.0)) * (c.3.saturating_sub(c.2));
     let frame = (w * h).max(1) as f32;
-    if seed_looks_complete(w, h, grown) {
+    let grown_area = area(grown) as f32 / frame;
+    // Trust the primary detector when it already landed on a still-film
+    // ratio. Switching to another "known" box often picks a 2:3 half-frame.
+    if aspect_is_known(grown) && grown_area >= 0.32 && !swallowed_frame(w, h, grown, grown_area) {
         if let Some(px) = image_px {
             let pa = area(px) as f32 / frame;
             if pa > 0.88 {
@@ -786,38 +864,56 @@ fn pick_bounds(
 
     let score = |c: (usize, usize, usize, usize)| {
         let area_frac = area(c) as f32 / frame;
-        if area_frac < 0.22 || area_frac > 0.92 {
+        if area_frac < 0.22 || swallowed_frame(w, h, c, area_frac) {
             return -1.0;
         }
-        let rw = c.1.saturating_sub(c.0).max(1) as f32;
-        let rh = c.3.saturating_sub(c.2).max(1) as f32;
-        let ratio = rw / rh;
-        let aspect = [1.333, 1.5, 0.75, 0.667]
-            .into_iter()
-            .map(|target| (ratio - target).abs() / target)
-            .fold(1.0f32, f32::min);
+        let aspect_err = match_known_aspect(bounds_ratio(c), 1.0)
+            .map(|(_, e)| e)
+            .unwrap_or_else(|| nearest_known_aspect(bounds_ratio(c)).2);
+        let known = aspect_err <= ASPECT_VALID;
         let gates = count_side_gates(t, w, h, c) as f32;
-        0.35 * gates + (1.0 - aspect).max(0.0) + area_frac.min(0.72)
+        let aspect_term = if known {
+            1.2 - aspect_err
+        } else {
+            (0.45 - aspect_err).max(-0.4)
+        };
+        0.35 * gates + aspect_term + area_frac.min(0.72)
+    };
+
+    let mut candidates: Vec<(usize, usize, usize, usize)> = vec![grown];
+    if let Some(px) = image_px {
+        candidates.push(px);
+    }
+    if grown_area < 0.30 {
+        if let Some(g) = gate {
+            candidates.push(g);
+        }
+    }
+
+    // Another approach must be a known still-film ratio *and* at least as
+    // large as the seed. A 2:3 half-frame is a valid ratio but is the
+    // usual failure mode, not a recovery.
+    let matching: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|&c| {
+            let a = area(c) as f32 / frame;
+            aspect_is_known(c) && a >= grown_area.max(0.40) && !swallowed_frame(w, h, c, a)
+        })
+        .collect();
+    let pool = if matching.is_empty() {
+        &candidates
+    } else {
+        &matching
     };
 
     let mut best = grown;
     let mut best_s = score(grown);
-    if let Some(px) = image_px {
-        let s = score(px);
-        if s > best_s + 0.20 {
+    for c in pool.iter().copied() {
+        let s = score(c);
+        if s > best_s + 0.12 {
             best_s = s;
-            best = px;
-        }
-    }
-    // Gate edges are a last resort for highlight islands. They can lock
-    // onto rebate / sprocket steps, so ignore them when a decent seed exists.
-    let grown_area = area(grown) as f32 / frame;
-    if grown_area < 0.30 {
-        if let Some(g) = gate {
-            let s = score(g);
-            if seed_looks_complete(w, h, g) && s > best_s + 0.20 {
-                best = g;
-            }
+            best = c;
         }
     }
     best
@@ -1399,31 +1495,13 @@ fn snap_aspect(
     let rw = (right - left).max(1);
     let rh = (bottom - top).max(1);
     let ratio = rw as f32 / rh as f32;
-    const CANDIDATES: [(f32, FilmFormat); 9] = [
-        (3.0 / 2.0, FilmFormat::Still35),
-        (2.0 / 3.0, FilmFormat::Still35),
-        (1.0, FilmFormat::Square),
-        (6.0 / 7.0, FilmFormat::SixBySeven),
-        (7.0 / 6.0, FilmFormat::SixBySeven),
-        (4.0 / 3.0, FilmFormat::FourByThree),
-        (3.0 / 4.0, FilmFormat::FourByThree),
-        (5.0 / 4.0, FilmFormat::FourByFive),
-        (4.0 / 5.0, FilmFormat::FourByFive),
-    ];
-    let mut best: Option<(f32, FilmFormat)> = None;
-    for (target, fmt) in CANDIDATES {
-        let err = (ratio - target).abs() / target;
-        if err < 0.045 && best.map(|(e, _)| err < e).unwrap_or(true) {
-            best = Some((err, fmt));
-        }
-    }
-    let Some((err, fmt)) = best else {
+    let Some((fmt, err)) = match_known_aspect(ratio, ASPECT_SNAP) else {
         return (left, right, top, bottom, None);
     };
     if err < 0.012 {
         return (left, right, top, bottom, Some(fmt));
     }
-    let target = CANDIDATES
+    let target = KNOWN_ASPECTS
         .iter()
         .filter(|(_, f)| *f == fmt)
         .min_by(|(a, _), (b, _)| {
@@ -1889,5 +1967,56 @@ mod tests {
             "missed the dark half: {:?}",
             r.rect
         );
+    }
+
+    #[test]
+    fn known_aspects_include_both_orientations() {
+        assert_eq!(
+            match_known_aspect(1.5, ASPECT_VALID).map(|(f, _)| f),
+            Some(FilmFormat::Still35)
+        );
+        assert_eq!(
+            match_known_aspect(2.0 / 3.0, ASPECT_VALID).map(|(f, _)| f),
+            Some(FilmFormat::Still35)
+        );
+        assert_eq!(
+            match_known_aspect(4.0 / 3.0, ASPECT_VALID).map(|(f, _)| f),
+            Some(FilmFormat::FourByThree)
+        );
+        assert_eq!(
+            match_known_aspect(0.75, ASPECT_VALID).map(|(f, _)| f),
+            Some(FilmFormat::FourByThree)
+        );
+        assert_eq!(
+            match_known_aspect(1.0, ASPECT_VALID).map(|(f, _)| f),
+            Some(FilmFormat::Square)
+        );
+        // 35mm image area after sprockets sits near 4:3.
+        assert_eq!(
+            match_known_aspect(1.37, ASPECT_VALID).map(|(f, _)| f),
+            Some(FilmFormat::FourByThree)
+        );
+        assert!(match_known_aspect(2.2, ASPECT_VALID).is_none());
+    }
+
+    #[test]
+    fn rejects_implausible_aspect_for_complete_seed() {
+        // 90px × 200px strip: not a still-film gate.
+        assert!(!seed_looks_complete(320, 240, (20, 110, 20, 220)));
+        // 4:3 frame filling most of the canvas.
+        assert!(seed_looks_complete(320, 240, (20, 260, 20, 200)));
+        // Same gate rotated 90° on a tall canvas.
+        assert!(seed_looks_complete(240, 320, (20, 200, 20, 260)));
+    }
+
+    #[test]
+    fn pick_bounds_prefers_known_ratio_over_highlight_island() {
+        let (w, h) = (120, 80);
+        let t = vec![0.2f32; w * h];
+        let island = (70, 100, 30, 45); // 2:1 strip, not a still gate
+        let frame = (12, 108, 10, 70); // 96×60 ≈ 3:2
+        let picked = pick_bounds(&t, w, h, island, Some(frame), None);
+        assert_eq!(picked, frame);
+        assert!(aspect_is_known(picked));
     }
 }
