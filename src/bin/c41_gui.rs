@@ -507,7 +507,9 @@ struct C41Gui {
     calibration_profile_name: String,
     calibration_light_source: String,
     /// (path, profile, LUT path for .c41 or None for .json)
+    #[allow(dead_code)]
     calibration_profiles: Vec<(PathBuf, calibration::CalibrationProfile, Option<PathBuf>)>,
+    #[allow(dead_code)]
     selected_profile_idx: Option<usize>,
     /// Luminance calibration: path and linearized flat-field image (RAW → demosaic only).
     flat_field_path: Option<PathBuf>,
@@ -4579,15 +4581,6 @@ impl eframe::App for C41Gui {
 
                   if !in_process || entry.process_tab == ProcessTab::Input {
                     // ════════════════════════════════════════════════════════
-                    // Input — Synthetic negative (PNG/TIFF only)
-                    // ════════════════════════════════════════════════════════
-                        ui.checkbox(
-                            &mut opts.synthetic_negative_input,
-                            "Synthetic negative (invert before T→D)",
-                        )
-                        .on_hover_text("For PNG/TIFF: invert (T=1−V) before T→D. Use when input is a synthetic negative (positive+orange) rather than camera scan.");
-                        ui.add_space(4.0);
-                    // ════════════════════════════════════════════════════════
                     // Input — Crop
                     // ════════════════════════════════════════════════════════
                         ui.horizontal(|ui| {
@@ -5222,120 +5215,6 @@ impl eframe::App for C41Gui {
                             m[1][0], m[1][1], m[1][2],
                             m[2][0], m[2][1], m[2][2],
                         ));
-                    }
-                }
-
-                if self.mode == UIMode::Process && entry.process_tab == ProcessTab::Input {
-                    ui.add_space(4.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Color Calibration").strong());
-                    ui.add_space(2.0);
-                    let apply_color_prev = opts.apply_color_profile;
-                    ui.checkbox(&mut opts.apply_color_profile, "Color calibration profile");
-                    if apply_color_prev && !opts.apply_color_profile {
-                        opts.density_matrix = [
-                            [1.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0],
-                            [0.0, 0.0, 1.0],
-                        ];
-                        self.selected_profile_idx = None;
-                        opts.lut3d_path = None;
-                    }
-                    if opts.apply_color_profile {
-                    ui.collapsing("Color calibration profile settings", |ui| {
-                        ui.label("Profile (open dropdown to scan profiles/ folder)");
-                        let mut current_idx = self.selected_profile_idx.unwrap_or(usize::MAX);
-                        let selected_label = if let Some(i) = self.selected_profile_idx {
-                            if let Some((_, p, _)) = self.calibration_profiles.get(i) {
-                                p.name.as_str()
-                            } else {
-                                "None"
-                            }
-                        } else {
-                            "None"
-                        };
-
-                        egui::ComboBox::from_label("Profile")
-                            .selected_text(selected_label)
-                            .show_ui(ui, |ui| {
-                                // Refresh list when dropdown is open
-                                let base_dir = std::env::current_dir()
-                                    .unwrap_or_else(|_| PathBuf::from("."))
-                                    .join("profiles");
-                                if let Ok(list) = calibration::load_profiles_from_dir(&base_dir) {
-                                    self.calibration_profiles = list;
-                                }
-                                if ui
-                                    .selectable_label(
-                                        self.selected_profile_idx.is_none(),
-                                        "None",
-                                    )
-                                    .clicked()
-                                {
-                                    current_idx = usize::MAX;
-                                }
-                                for (i, (_, profile, _)) in
-                                    self.calibration_profiles.iter().enumerate()
-                                {
-                                    let is_selected = self.selected_profile_idx == Some(i);
-                                    if ui
-                                        .selectable_label(is_selected, &profile.name)
-                                        .clicked()
-                                    {
-                                        current_idx = i;
-                                    }
-                                }
-                                if self.calibration_profiles.is_empty() {
-                                    ui.label("No .json or .c41 profiles in profiles/");
-                                }
-                            });
-
-                        // Apply selection to current image options.
-                        if current_idx == usize::MAX {
-                            self.selected_profile_idx = None;
-                            opts.lut3d_path = None;
-                        } else if let Some((_, profile, lut_path)) =
-                            self.calibration_profiles.get(current_idx).cloned()
-                        {
-                            self.selected_profile_idx = Some(current_idx);
-                            opts.density_matrix = profile.matrix;
-                            if let Some(dmin) = profile.dmin_medians {
-                                opts.dmin_fixed = Some(dmin);
-                                opts.dmin_rect = None;
-                                opts.dmin_rect_reference_size = None;
-                            }
-                            opts.lut3d_path = lut_path;
-                            self.status = format!(
-                                "Applied color calibration profile '{}' to current image.",
-                                profile.name
-                            );
-                        }
-
-                        ui.separator();
-                        ui.label("Or use 3D LUT (generated in Color calibration tab):");
-                        ui.horizontal(|ui| {
-                            let path_str = opts
-                                .lut3d_path
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "None".to_string());
-                            ui.label(path_str.as_str());
-                            if ui.button("Browse…").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("CUBE LUT", &["cube"])
-                                    .pick_file()
-                                {
-                                    opts.lut3d_path = Some(path.clone());
-                                    self.status = format!("Using 3D LUT: {}", path.display());
-                                }
-                            }
-                            if opts.lut3d_path.is_some() && ui.button("Clear").clicked() {
-                                opts.lut3d_path = None;
-                                self.status = "Cleared 3D LUT; using profile matrix.".to_string();
-                            }
-                        });
-                    });
                     }
                 }
 
