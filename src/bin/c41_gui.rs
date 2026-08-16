@@ -72,8 +72,8 @@ const PREVIEW_DEBOUNCE_MS: u64 = 180;
 const PREVIEW_LIVE_DEBOUNCE_MS: u64 = 50;
 /// Wait this long after pan/zoom before fetching 1:1 tiles.
 const PREVIEW_VIEW_SETTLE_MS: u64 = 100;
-/// Coalesce rapid rotate clicks (90° + 90° → one 180° pipeline run).
-const ROTATE_COALESCE_MS: u64 = 300;
+/// Coalesce rapid rotate/flip clicks into one pipeline run.
+const GEOMETRY_COALESCE_MS: u64 = 300;
 /// Show the export progress dialog only if the job is still running after this.
 const EXPORT_PROGRESS_DELAY_MS: u64 = 400;
 
@@ -146,6 +146,10 @@ struct ImageEntry {
     preview_texture_nearest: bool,
     /// `rotation_degrees` baked into `preview_texture` / `preview_full_rgb`.
     preview_texture_rotation: i32,
+    /// `flip_horizontal` baked into `preview_texture` / `preview_full_rgb`.
+    preview_texture_flip_h: bool,
+    /// `flip_vertical` baked into `preview_texture` / `preview_full_rgb`.
+    preview_texture_flip_v: bool,
     /// Hash of options + working size + full-res flag at last completed preview.
     preview_hash: u64,
     /// Full processed preview buffer (post-curve) at `preview_full_size`.
@@ -461,8 +465,8 @@ struct C41Gui {
     wb_picker_armed: bool,
     /// Show a wait cursor until the next preview lands (Picker select / Pick whitepoint).
     wb_picker_wait_cursor: bool,
-    /// While set and in the future, preview debounce uses [`ROTATE_COALESCE_MS`].
-    rotate_coalesce_until: Option<Instant>,
+    /// While set and in the future, preview debounce uses [`GEOMETRY_COALESCE_MS`].
+    geometry_coalesce_until: Option<Instant>,
     #[cfg(feature = "gpu")]
     gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
 }
@@ -511,7 +515,7 @@ impl Default for C41Gui {
             auto_job: None,
             wb_picker_armed: false,
             wb_picker_wait_cursor: false,
-            rotate_coalesce_until: None,
+            geometry_coalesce_until: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
                 .map(std::sync::Arc::new),
@@ -1759,11 +1763,54 @@ fn rgb_u8_to_color_image(w: u32, h: u32, rgb: &[u8]) -> egui::ColorImage {
     egui::ColorImage { size, pixels }
 }
 
+/// Pipeline geometry: rotate, then flip H, then flip V.
+#[derive(Clone, Copy)]
+struct ViewOrient {
+    rot: i32,
+    flip_h: bool,
+    flip_v: bool,
+}
+
+impl ViewOrient {
+    fn from_parts(rot: i32, flip_h: bool, flip_v: bool) -> Self {
+        Self {
+            rot: rot.rem_euclid(360),
+            flip_h,
+            flip_v,
+        }
+    }
+
+    fn matches(self, other: Self) -> bool {
+        self.rot == other.rot && self.flip_h == other.flip_h && self.flip_v == other.flip_v
+    }
+}
+
+fn preview_desired_orient(entry: &ImageEntry) -> ViewOrient {
+    ViewOrient::from_parts(
+        entry.options.rotation_degrees,
+        entry.options.flip_horizontal,
+        entry.options.flip_vertical,
+    )
+}
+
+fn preview_baked_orient(entry: &ImageEntry) -> ViewOrient {
+    ViewOrient::from_parts(
+        entry.preview_texture_rotation,
+        entry.preview_texture_flip_h,
+        entry.preview_texture_flip_v,
+    )
+}
+
 fn preview_view_rotation(entry: &ImageEntry) -> i32 {
     (entry.options.rotation_degrees - entry.preview_texture_rotation).rem_euclid(360)
 }
 
-fn map_display_uv_to_tex(u: f32, v: f32, rot: i32) -> egui::Pos2 {
+fn preview_view_geometry_pending(entry: &ImageEntry) -> bool {
+    !preview_desired_orient(entry).matches(preview_baked_orient(entry))
+}
+
+/// Dest UV after rotation `rot` → source UV (texture unrotated).
+fn unrotate_uv(u: f32, v: f32, rot: i32) -> egui::Pos2 {
     match rot.rem_euclid(360) {
         90 => egui::pos2(v, 1.0 - u),
         180 => egui::pos2(1.0 - u, 1.0 - v),
@@ -1772,24 +1819,94 @@ fn map_display_uv_to_tex(u: f32, v: f32, rot: i32) -> egui::Pos2 {
     }
 }
 
-fn display_to_tex_px(dx: u32, dy: u32, tex_w: u32, tex_h: u32, rot: i32) -> (u32, u32) {
-    match rot.rem_euclid(360) {
-        90 => {
-            let dx = dx.min(tex_h.saturating_sub(1));
-            let dy = dy.min(tex_w.saturating_sub(1));
-            (dy, tex_h.saturating_sub(1).saturating_sub(dx))
-        }
-        180 => (
-            tex_w.saturating_sub(1).saturating_sub(dx.min(tex_w.saturating_sub(1))),
-            tex_h.saturating_sub(1).saturating_sub(dy.min(tex_h.saturating_sub(1))),
-        ),
-        270 => {
-            let dx = dx.min(tex_h.saturating_sub(1));
-            let dy = dy.min(tex_w.saturating_sub(1));
-            (tex_w.saturating_sub(1).saturating_sub(dy), dx)
-        }
-        _ => (dx.min(tex_w.saturating_sub(1)), dy.min(tex_h.saturating_sub(1))),
+fn rotate_uv(u: f32, v: f32, rot: i32) -> egui::Pos2 {
+    unrotate_uv(u, v, (360 - rot.rem_euclid(360)) % 360)
+}
+
+/// Display UV in desired-output space → UV in the baked preview texture.
+fn map_display_uv_to_tex(u: f32, v: f32, desired: ViewOrient, baked: ViewOrient) -> egui::Pos2 {
+    let mut x = u;
+    let mut y = v;
+    if desired.flip_v {
+        y = 1.0 - y;
     }
+    if desired.flip_h {
+        x = 1.0 - x;
+    }
+    let src = unrotate_uv(x, y, desired.rot);
+    let mid = rotate_uv(src.x, src.y, baked.rot);
+    let mut tx = mid.x;
+    let mut ty = mid.y;
+    if baked.flip_h {
+        tx = 1.0 - tx;
+    }
+    if baked.flip_v {
+        ty = 1.0 - ty;
+    }
+    egui::pos2(tx, ty)
+}
+
+fn unrotate_px(dx: i32, dy: i32, dw: i32, dh: i32, rot: i32) -> (i32, i32) {
+    match rot.rem_euclid(360) {
+        90 => (dy, dw - 1 - dx),
+        180 => (dw - 1 - dx, dh - 1 - dy),
+        270 => (dh - 1 - dy, dx),
+        _ => (dx, dy),
+    }
+}
+
+fn rotate_px(sx: i32, sy: i32, sw: i32, sh: i32, rot: i32) -> (i32, i32) {
+    match rot.rem_euclid(360) {
+        90 => (sh - 1 - sy, sx),
+        180 => (sw - 1 - sx, sh - 1 - sy),
+        270 => (sy, sw - 1 - sx),
+        _ => (sx, sy),
+    }
+}
+
+fn display_to_tex_px(
+    dx: u32,
+    dy: u32,
+    tex_w: u32,
+    tex_h: u32,
+    desired: ViewOrient,
+    baked: ViewOrient,
+) -> (u32, u32) {
+    let view_rot = (desired.rot - baked.rot).rem_euclid(360);
+    let (disp_w, disp_h) = if view_rot == 90 || view_rot == 270 {
+        (tex_h, tex_w)
+    } else {
+        (tex_w, tex_h)
+    };
+    let mut x = dx.min(disp_w.saturating_sub(1)) as i32;
+    let mut y = dy.min(disp_h.saturating_sub(1)) as i32;
+    let dw = disp_w as i32;
+    let dh = disp_h as i32;
+    if desired.flip_v {
+        y = dh - 1 - y;
+    }
+    if desired.flip_h {
+        x = dw - 1 - x;
+    }
+    let (sx, sy) = unrotate_px(x, y, dw, dh, desired.rot);
+    let (sw, sh) = if desired.rot == 90 || desired.rot == 270 {
+        (dh, dw)
+    } else {
+        (dw, dh)
+    };
+    let (bx, by) = rotate_px(sx, sy, sw, sh, baked.rot);
+    let mut tx = bx;
+    let mut ty = by;
+    if baked.flip_h {
+        tx = tex_w as i32 - 1 - tx;
+    }
+    if baked.flip_v {
+        ty = tex_h as i32 - 1 - ty;
+    }
+    (
+        tx.clamp(0, tex_w.saturating_sub(1) as i32) as u32,
+        ty.clamp(0, tex_h.saturating_sub(1) as i32) as u32,
+    )
 }
 
 fn paint_preview_image(
@@ -1797,9 +1914,10 @@ fn paint_preview_image(
     tex: egui::TextureId,
     dest: egui::Rect,
     display_uv: egui::Rect,
-    rot: i32,
+    desired: ViewOrient,
+    baked: ViewOrient,
 ) {
-    if rot.rem_euclid(360) == 0 {
+    if desired.matches(baked) {
         painter.image(tex, dest, display_uv, egui::Color32::WHITE);
         return;
     }
@@ -1811,10 +1929,10 @@ fn paint_preview_image(
     let mut mesh = egui::Mesh::with_texture(tex);
     let i0 = mesh.vertices.len() as u32;
     for (pos, uv) in [
-        (dest.left_top(), map_display_uv_to_tex(l, t, rot)),
-        (dest.right_top(), map_display_uv_to_tex(r, t, rot)),
-        (dest.right_bottom(), map_display_uv_to_tex(r, b, rot)),
-        (dest.left_bottom(), map_display_uv_to_tex(l, b, rot)),
+        (dest.left_top(), map_display_uv_to_tex(l, t, desired, baked)),
+        (dest.right_top(), map_display_uv_to_tex(r, t, desired, baked)),
+        (dest.right_bottom(), map_display_uv_to_tex(r, b, desired, baked)),
+        (dest.left_bottom(), map_display_uv_to_tex(l, b, desired, baked)),
     ] {
         mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
     }
@@ -1880,6 +1998,8 @@ fn image_entry(path: PathBuf, options: PipelineOptions, export_format: ExportFor
         preview_texture: None,
         preview_texture_nearest: false,
         preview_texture_rotation: 0,
+        preview_texture_flip_h: false,
+        preview_texture_flip_v: false,
         preview_hash: 0,
         preview_options_hash: 0,
         preview_lod: PreviewLod::Draft,
@@ -2522,6 +2642,55 @@ impl C41Gui {
             entry.tile_cache.clear();
         }
 
+        self.begin_geometry_coalesce(ctx);
+    }
+
+    /// Instant: only update options. The current texture is drawn flipped until
+    /// one coalesced pipeline job replaces it. No pixel work on the UI thread.
+    fn apply_flip_click(&mut self, idx: usize, horizontal: bool, ctx: &egui::Context) {
+        if idx >= self.images.len() {
+            return;
+        }
+
+        {
+            let entry = &mut self.images[idx];
+            let preview_size = entry.preview_input_size.map(|[w, h]| (w, h));
+            if horizontal {
+                if let Some(rect) = entry.options.dmin_rect {
+                    let source_size = entry.options.dmin_rect_reference_size.or(preview_size);
+                    if let Some((w, h)) = source_size {
+                        entry.options.dmin_rect = Some(flip_rect_horizontal(rect, w, h));
+                    }
+                }
+                if let Some(rect) = entry.options.crop_rect {
+                    let source_size = entry.options.crop_rect_reference_size.or(preview_size);
+                    if let Some((w, h)) = source_size {
+                        entry.options.crop_rect = Some(flip_rect_horizontal(rect, w, h));
+                    }
+                }
+                entry.options.flip_horizontal = !entry.options.flip_horizontal;
+            } else {
+                if let Some(rect) = entry.options.dmin_rect {
+                    let source_size = entry.options.dmin_rect_reference_size.or(preview_size);
+                    if let Some((w, h)) = source_size {
+                        entry.options.dmin_rect = Some(flip_rect_vertical(rect, w, h));
+                    }
+                }
+                if let Some(rect) = entry.options.crop_rect {
+                    let source_size = entry.options.crop_rect_reference_size.or(preview_size);
+                    if let Some((w, h)) = source_size {
+                        entry.options.crop_rect = Some(flip_rect_vertical(rect, w, h));
+                    }
+                }
+                entry.options.flip_vertical = !entry.options.flip_vertical;
+            }
+            entry.tile_cache.clear();
+        }
+
+        self.begin_geometry_coalesce(ctx);
+    }
+
+    fn begin_geometry_coalesce(&mut self, ctx: &egui::Context) {
         self.preview_gen = self.preview_gen.wrapping_add(1);
         self.preview_receiver = None;
         self.preview_started_at = None;
@@ -2530,8 +2699,8 @@ impl C41Gui {
         self.tile_failed.clear();
         self.pending_preview_key = None;
         self.pending_preview_since = None;
-        self.rotate_coalesce_until =
-            Some(Instant::now() + Duration::from_millis(ROTATE_COALESCE_MS));
+        self.geometry_coalesce_until =
+            Some(Instant::now() + Duration::from_millis(GEOMETRY_COALESCE_MS));
         ctx.request_repaint();
     }
 
@@ -3060,6 +3229,10 @@ impl eframe::App for C41Gui {
                         self.images[idx].raw_source_size = Some([job.input_w, job.input_h]);
                         self.images[idx].preview_texture_rotation =
                             self.images[idx].options.rotation_degrees;
+                        self.images[idx].preview_texture_flip_h =
+                            self.images[idx].options.flip_horizontal;
+                        self.images[idx].preview_texture_flip_v =
+                            self.images[idx].options.flip_vertical;
                         if self.images[idx].thumbnail_texture.is_none() {
                             if let Some(thumb_image) =
                                 make_thumbnail_from_rgb(&job.rgb, job.w, job.h, THUMB_MAX_SIZE)
@@ -5177,6 +5350,9 @@ impl eframe::App for C41Gui {
                         // Extract image dims with fallback so the layout is stable before
                         // the first preview arrives (no jump when data loads in).
                         let view_rot = preview_view_rotation(&self.images[idx]);
+                        let desired_orient = preview_desired_orient(&self.images[idx]);
+                        let baked_orient = preview_baked_orient(&self.images[idx]);
+                        let geometry_pending = preview_view_geometry_pending(&self.images[idx]);
                         let (full_w, full_h) = if let Some((w, h, _)) = &self.images[idx].preview_full_rgb {
                             if view_rot == 90 || view_rot == 270 {
                                 (*h, *w)
@@ -5259,7 +5435,8 @@ impl eframe::App for C41Gui {
                                     tex.id(),
                                     vis_rect,
                                     uv,
-                                    view_rot,
+                                    desired_orient,
+                                    baked_orient,
                                 );
                             }
 
@@ -5272,7 +5449,7 @@ impl eframe::App for C41Gui {
                             // zoom-out does not flash back to the proxy. Fetch waits.
                             let hide_tiles = !proxy_soft
                                 || self.preview_options_dirty(idx)
-                                || view_rot != 0
+                                || geometry_pending
                                 || pointer_down
                                 || self.preview_view_dragging
                                 || canvas_resp.dragged();
@@ -5442,7 +5619,14 @@ impl eframe::App for C41Gui {
                                     .preview_full_rgb
                                     .as_ref()
                                     .map(|(w, h, rgb)| {
-                                        let (tx, ty) = display_to_tex_px(px, py, *w, *h, view_rot);
+                                        let (tx, ty) = display_to_tex_px(
+                                            px,
+                                            py,
+                                            *w,
+                                            *h,
+                                            desired_orient,
+                                            baked_orient,
+                                        );
                                         sample_rgb_u8_4x4(rgb, *w, *h, tx, ty)
                                     })
                                     .unwrap_or([128, 128, 128]);
@@ -5481,8 +5665,14 @@ impl eframe::App for C41Gui {
                                                 .unwrap_or((full_w, full_h));
                                             let px = (px_f as u32).min(full_w.saturating_sub(1));
                                             let py = (py_f as u32).min(full_h.saturating_sub(1));
-                                            let (tx, ty) =
-                                                display_to_tex_px(px, py, tex_w, tex_h, view_rot);
+                                            let (tx, ty) = display_to_tex_px(
+                                                px,
+                                                py,
+                                                tex_w,
+                                                tex_h,
+                                                desired_orient,
+                                                baked_orient,
+                                            );
                                             let x = ((tx as f32 + 0.5) / tex_w.max(1) as f32
                                                 * bw as f32)
                                                 .floor()
@@ -6062,73 +6252,23 @@ impl eframe::App for C41Gui {
                                 };
                                 // Count on press so a second click is not lost waiting for release
                                 // while a preview job starts.
+                                let mirror_v = ui
+                                    .small_button("↕")
+                                    .on_hover_text("Mirror right (flip vertical)");
+                                let mirror_h = ui
+                                    .small_button("↔")
+                                    .on_hover_text("Mirror left (flip horizontal)");
+                                // Count on press so a second click is not lost waiting for release
+                                // while a preview job starts.
                                 let pressed = ui.input(|i| i.pointer.primary_pressed());
                                 if pressed && rotate_right.hovered() {
                                     self.apply_rotate_click(idx, true, ui.ctx());
                                 } else if pressed && rotate_left.hovered() {
                                     self.apply_rotate_click(idx, false, ui.ctx());
-                                }
-                                let mirror_right_clicked = ui
-                                    .small_button("↕")
-                                    .on_hover_text("Mirror right (flip vertical)")
-                                    .clicked();
-                                if mirror_right_clicked {
-                                    let entry = &mut self.images[idx];
-                                    let preview_size =
-                                        entry.preview_input_size.map(|[w, h]| (w, h));
-                                    if let Some(rect) = entry.options.dmin_rect {
-                                        let source_size = entry
-                                            .options
-                                            .dmin_rect_reference_size
-                                            .or(preview_size);
-                                        if let Some((w, h)) = source_size {
-                                            entry.options.dmin_rect =
-                                                Some(flip_rect_vertical(rect, w, h));
-                                        }
-                                    }
-                                    if let Some(rect) = entry.options.crop_rect {
-                                        let source_size = entry
-                                            .options
-                                            .crop_rect_reference_size
-                                            .or(preview_size);
-                                        if let Some((w, h)) = source_size {
-                                            entry.options.crop_rect =
-                                                Some(flip_rect_vertical(rect, w, h));
-                                        }
-                                    }
-                                    entry.options.flip_vertical = !entry.options.flip_vertical;
-                                    self.preview_receiver = None;
-                                }
-                                let mirror_left_clicked = ui
-                                    .small_button("↔")
-                                    .on_hover_text("Mirror left (flip horizontal)")
-                                    .clicked();
-                                if mirror_left_clicked {
-                                    let entry = &mut self.images[idx];
-                                    let preview_size =
-                                        entry.preview_input_size.map(|[w, h]| (w, h));
-                                    if let Some(rect) = entry.options.dmin_rect {
-                                        let source_size = entry
-                                            .options
-                                            .dmin_rect_reference_size
-                                            .or(preview_size);
-                                        if let Some((w, h)) = source_size {
-                                            entry.options.dmin_rect =
-                                                Some(flip_rect_horizontal(rect, w, h));
-                                        }
-                                    }
-                                    if let Some(rect) = entry.options.crop_rect {
-                                        let source_size = entry
-                                            .options
-                                            .crop_rect_reference_size
-                                            .or(preview_size);
-                                        if let Some((w, h)) = source_size {
-                                            entry.options.crop_rect =
-                                                Some(flip_rect_horizontal(rect, w, h));
-                                        }
-                                    }
-                                    entry.options.flip_horizontal = !entry.options.flip_horizontal;
-                                    self.preview_receiver = None;
+                                } else if pressed && mirror_v.hovered() {
+                                    self.apply_flip_click(idx, false, ui.ctx());
+                                } else if pressed && mirror_h.hovered() {
+                                    self.apply_flip_click(idx, true, ui.ctx());
                                 }
                             });
                         });
@@ -6308,14 +6448,14 @@ impl eframe::App for C41Gui {
                         self.tile_failed.clear();
                     }
 
-                    let rotate_pending = self
-                        .rotate_coalesce_until
+                    let geometry_pending = self
+                        .geometry_coalesce_until
                         .map(|t| Instant::now() < t)
                         .unwrap_or(false);
-                    // Any pointer-down (including the rotate button) used to look like a
+                    // Any pointer-down (including rotate/flip buttons) used to look like a
                     // slider drag and start a preview after 50ms — that blocked further clicks.
-                    let debounce_ms = if rotate_pending {
-                        ROTATE_COALESCE_MS
+                    let debounce_ms = if geometry_pending {
+                        GEOMETRY_COALESCE_MS
                     } else if slider_dragging {
                         PREVIEW_LIVE_DEBOUNCE_MS
                     } else {
@@ -6330,7 +6470,7 @@ impl eframe::App for C41Gui {
 
                     if self.preview_receiver.is_none()
                         && !self.rect_dragging
-                        && !rotate_pending
+                        && !geometry_pending
                         && !pointer_down
                         && settled
                     {
@@ -6348,7 +6488,7 @@ impl eframe::App for C41Gui {
                         self.request_preview_for(idx, ctx, lod);
                         self.full_res_preview_button_clicked = false;
                         self.pending_preview_since = None;
-                        self.rotate_coalesce_until = None;
+                        self.geometry_coalesce_until = None;
                     } else {
                         ctx.request_repaint_after(Duration::from_millis(16));
                     }

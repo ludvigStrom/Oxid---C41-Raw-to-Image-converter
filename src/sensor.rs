@@ -185,10 +185,8 @@ pub fn preview_scene_stats_key(opts: &PipelineOptions) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // Rotation/flip do not change full-frame channel stats (same pixels).
-    // Including rotation here forced a full-res remosaic+rotate on the UI thread
-    // after every rotate click.
-    opts.flip_horizontal.hash(&mut h);
-    opts.flip_vertical.hash(&mut h);
+    // Including them here forced a full-res remosaic on the UI thread after
+    // every rotate/flip click.
     opts.synthetic_negative_input.hash(&mut h);
     for row in &opts.idt_matrix {
         for &v in row {
