@@ -8,7 +8,6 @@ alwaysApply: true
 - **CPU is the single source of truth.** Pipeline logic lives in `src/pipeline.rs`, `curve.rs`, `density_ops.rs`, `post_curve.rs`. New behaviour: implement there first.
 - **GPU is a port.** `src/gpu/*.wgsl` and `src/gpu/*.rs` replicate steps 4–6 only. When changing CPU behaviour that affects steps 4–6, port the same math to the corresponding shader and run `cargo test --features gpu`.
 - **Fallback:** GPU paths return `Err` on failure; callers fall back to CPU. No "GPU or crash."
-- **Reference:** [DEVELOPMENT.md](DEVELOPMENT.md) for adding options, porting to GPU, and test commands.
 
 Key paths:
 - Options: `src/options.rs`. Pipeline: `src/pipeline.rs`. GUI: `src/bin/c41_gui.rs`.

@@ -19,8 +19,6 @@ out     = E^gamma / (E^gamma + pivot^gamma)
 
 This is the exact function in [`src/curve.rs`](src/curve.rs), computed once into a 65 536-entry f32 LUT (`build_density_to_ra4_lut`). A simple `1 - T` inversion is therefore never needed when the curve is active.
 
-For a **development guide** (adding options, porting to GPU, testing), see [DEVELOPMENT.md](DEVELOPMENT.md).
-
 ---
 
 ## Prerequisites

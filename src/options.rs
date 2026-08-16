@@ -230,7 +230,7 @@ pub struct PipelineOptions {
     pub flip_horizontal: bool,
     /// Flip vertical (mirror top–bottom). Applied after rotation.
     pub flip_vertical: bool,
-    /// Debug: only run pipeline up to this step (1..=6). Preview and export use this. See TODO_DEBUG.md.
+    /// Debug: only run pipeline up to this step (1..=6). Preview and export use this.
     #[serde(skip, default = "default_debug_pipeline_step")]
     pub debug_pipeline_step: u32,
     /// Density-domain saturation boost applied before the RA-4 curve.
