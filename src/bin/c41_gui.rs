@@ -459,6 +459,8 @@ struct C41Gui {
     auto_job: Option<AutoJob>,
     /// True while the WB eyedropper is active (loupe + click-to-sample).
     wb_picker_armed: bool,
+    /// Show a wait cursor until the next preview lands (Picker select / Pick whitepoint).
+    wb_picker_wait_cursor: bool,
     /// While set and in the future, preview debounce uses [`ROTATE_COALESCE_MS`].
     rotate_coalesce_until: Option<Instant>,
     #[cfg(feature = "gpu")]
@@ -508,6 +510,7 @@ impl Default for C41Gui {
             export_job: None,
             auto_job: None,
             wb_picker_armed: false,
+            wb_picker_wait_cursor: false,
             rotate_coalesce_until: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
@@ -3433,6 +3436,7 @@ impl eframe::App for C41Gui {
         let mut auto_tune_requested = false;
         let mut arm_wb_picker = false;
         let mut disarm_wb_picker = false;
+        let mut start_wb_wait_cursor = false;
         let wb_picker_armed = self.wb_picker_armed;
         egui::SidePanel::right("settings_panel")
             .resizable(false)
@@ -3898,7 +3902,9 @@ impl eframe::App for C41Gui {
                             });
                         if wb_mode != opts.wb_mode {
                             opts.wb_mode = wb_mode;
-                            if wb_mode != WbMode::Picker {
+                            if wb_mode == WbMode::Picker {
+                                start_wb_wait_cursor = true;
+                            } else {
                                 sync_wb_flags_from_mode(opts);
                                 disarm_wb_picker = true;
                             }
@@ -3915,16 +3921,20 @@ impl eframe::App for C41Gui {
                             }
                             WbMode::Picker => {
                                 if wb_picker_armed {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Click the preview to sample a 4×4 neutral.",
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(
+                                                "Click the preview to sample a 4×4 neutral.",
+                                            )
+                                            .small()
+                                            .color(egui::Color32::from_rgb(180, 220, 120)),
                                         )
-                                        .small()
-                                        .color(egui::Color32::from_rgb(180, 220, 120)),
+                                        .selectable(false),
                                     );
                                 } else if ui.button("Pick whitepoint").clicked() {
                                     reset_wb_for_picker(opts);
                                     arm_wb_picker = true;
+                                    start_wb_wait_cursor = true;
                                 }
                             }
                             WbMode::Manual => {
@@ -5081,6 +5091,10 @@ impl eframe::App for C41Gui {
         }
         if disarm_wb_picker {
             self.wb_picker_armed = false;
+            self.wb_picker_wait_cursor = false;
+        }
+        if start_wb_wait_cursor {
+            self.wb_picker_wait_cursor = true;
         }
 
         // ---- Auto-crop: run frame detection after sidebar borrow is released ----
@@ -6387,6 +6401,21 @@ impl eframe::App for C41Gui {
 
         self.show_export_progress(ctx);
         self.show_auto_progress(ctx);
+
+        // After choosing Picker / Pick whitepoint, override label I-beams
+        // until the preview job has landed.
+        if self.wb_picker_wait_cursor {
+            let pending = self.preview_receiver.is_some()
+                || self
+                    .selected_index
+                    .map(|idx| self.preview_options_dirty(idx))
+                    .unwrap_or(false);
+            if pending {
+                ctx.set_cursor_icon(egui::CursorIcon::Wait);
+            } else {
+                self.wb_picker_wait_cursor = false;
+            }
+        }
     }
 }
 
