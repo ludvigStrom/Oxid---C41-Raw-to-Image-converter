@@ -3,6 +3,7 @@
 Cargo.lock
 /vendor/
 /test files/
+/syntetic targets/
 /synthetic targets/
 
 # IDE / editor
