@@ -1,8 +1,10 @@
 # c41-raw-tool
 
-A command-line and GUI RAW processor for **C-41 color negative film**. The pipeline is physically grounded: film transmittance is converted to optical density, white balance and film gamma are applied in the density domain, and a Michaelis-Menten S-curve models RA-4 paper. No hidden tone curves or auto-adjustments run unless explicitly enabled.
+A GPU-accelerated GUI Application for **C-41 color-negative film** written in Rust. It takes RAW camera captures and turns them into photographs by working in optical density, the space the dyes occupy, so color is treated as the film intended, not flipped as an RGB negative. White balance and film gamma are applied there; an RA-4 paper curve (Michaelis-Menten) forms the image. No hidden tone curves or auto-adjustments run unless you enable them.
 
 **Supported cameras:** any `rawloader`-supported Bayer RAW (Sony `.arw`, Nikon `.nef`/`.nrw`, Canon `.cr2`/`.cr3`/`.crw`, Adobe `.dng`, Fujifilm `.raf`, Olympus `.orf`, Panasonic `.rw2`). PNG, JPEG (`.jpg`/`.jpeg`), and TIFF (`.tiff`/`.tif`) input are also accepted and run the same D-min / curve / export pipeline (skips raw decode and demosaic).
+
+Allthough supported in theory its only tested with SOny and Fujifilm cameras as this is a hobby project with limited resources.
 
 ---
 
@@ -30,9 +32,13 @@ This is the exact function in [`src/curve.rs`](src/curve.rs), computed once into
 
 ## Build and run
 
+Launch the GPU-accelerated GUI:
+
 ```bash
-cargo build --release
+cargo guigpu
 ```
+
+This is an alias for `cargo run --release --bin c41-gui --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)).
 
 **CLI (convert subcommand):**
 
@@ -66,13 +72,13 @@ cargo run --release -- debug-raw /path/to/file.arw
 
 Prints rawloader metadata and sample pixel values without running the full pipeline.
 
-**GUI:**
+**GUI (CPU only):**
 
 ```bash
 cargo run --release --bin c41-gui --features gui
 ```
 
-Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Provides three tabs: **Process** (main development with per-step checkboxes), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).
+Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Prefer `cargo guigpu` for the GPU build. The GUI has three tabs: **Process** (main development with per-step checkboxes), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).
 
 **GPU-accelerated build:**
 
@@ -94,13 +100,7 @@ The GPU path produces results virtually identical to the CPU reference:
 
 If no GPU adapter is available, the pipeline falls back to CPU automatically.
 
-To build the GUI with GPU acceleration:
-
-```bash
-cargo run --release --bin c41-gui --features gui,gpu
-```
-
-The GUI initializes the GPU at startup and adds a **GPU acceleration** checkbox in the Debug tab. Toggling it switches between GPU and CPU paths instantly. The step cache (steps 1–3) remains valid across GPU/CPU switches.
+`cargo guigpu` initializes the GPU at startup and adds a **GPU acceleration** checkbox in the Debug tab. Toggling it switches between GPU and CPU paths instantly. The step cache (steps 1–3) remains valid across GPU/CPU switches.
 
 To run the CPU-vs-GPU comparison tests:
 
@@ -361,17 +361,11 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 
 ## License
 
-See repository for license information.
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
 
+## Credits
 
-TODO:
-DONE! White balance picker
-DONE! Remove duplicate color gain settings
-DONE! Reorder color exposure highlight rolloff etc
-DONE! histogram normalization?
-DONE! Color zones are not functioning properly
-DONE! Resolution at startap is to low?
-DONE! Saturation per color zone?
-DONE! Input Develop Export
-DONE! Mirror left/right
-Colorwheels?
+This project is a port of, and is heavily inspired by:
+
+- **[Negadoctor](https://github.com/darktable-org/darktable/blob/master/src/iop/negadoctor.c)** — darktable’s film-negative inversion module, © darktable developers, GPL-3.0-or-later.
+- **[NegPy](https://github.com/marcinz606/NegPy)** by Marcin Zawalski, GPL-3.0.

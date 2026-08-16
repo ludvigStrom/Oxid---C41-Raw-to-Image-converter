@@ -14,6 +14,15 @@ Cargo.lock
 *.arw
 *.tiff
 *.tif
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.heic
+*.heif
+*.heif
 
 # macOS
 .DS_Store
