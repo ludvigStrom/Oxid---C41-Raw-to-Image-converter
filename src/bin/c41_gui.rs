@@ -3,9 +3,10 @@
 // On Windows, use GUI subsystem so closing the window exits with code 0 instead of 0xC000013A (STATUS_CONTROL_C_EXIT).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,10 +18,11 @@ use c41_raw_tool::{
     crop_sensor_for_oriented_rect, demosaic, dmin, load_develop_preset, load_flat_field_linear,
     load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
     process_export_jobs, process_one_to_preview, process_one_to_preview_with_cache, raw_reader,
-    reset_wb_for_picker, save_develop_preset, save_project, sync_wb_flags_from_mode, tiff_export,
-    AutoTuneResult, CachedSensor, DminMode, ExportCancelled, ExportControl, ExportJobSpec,
-    LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions, PreviewSceneStats,
-    PreviewStepCache, ProjectExportFormat, ProjectImage, Rect, TiffFormat, WbMode,
+    reset_wb_for_picker, run_auto_for_path, save_develop_preset, save_project,
+    sync_wb_flags_from_mode, tiff_export, AutoTuneResult, CachedSensor, DminMode, ExportCancelled,
+    ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions,
+    PreviewSceneStats, PreviewStepCache, ProjectExportFormat, ProjectImage, Rect, TiffFormat,
+    WbMode,
 };
 use eframe::egui;
 
@@ -330,12 +332,26 @@ struct AutoProgressState {
     fraction: f32,
     message: String,
     log: Vec<String>,
+    file_name: String,
+    completed: usize,
+    total: usize,
 }
 
 enum AutoJobOutcome {
     Done {
         index: usize,
         result: AutoTuneResult,
+    },
+    FileDone {
+        path: PathBuf,
+        result: AutoTuneResult,
+    },
+    BatchDone {
+        completed: usize,
+        errors: usize,
+    },
+    Cancelled {
+        completed: usize,
     },
     Error {
         message: String,
@@ -345,6 +361,8 @@ enum AutoJobOutcome {
 struct AutoJob {
     receiver: mpsc::Receiver<AutoJobOutcome>,
     progress: Arc<Mutex<AutoProgressState>>,
+    cancel: Option<Arc<AtomicBool>>,
+    batch: bool,
 }
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
@@ -2788,7 +2806,7 @@ impl C41Gui {
     }
 
     fn start_export(&mut self, ctx: &egui::Context, selected_only: bool) {
-        if self.export_job.is_some() {
+        if self.heavy_job_running() {
             return;
         }
         let Some(output_dir) = self.output_dir.clone() else {
@@ -2977,10 +2995,7 @@ impl C41Gui {
     }
 
     fn start_auto(&mut self, ctx: &egui::Context) {
-        if self.export_job.is_some() {
-            return;
-        }
-        if self.auto_job.is_some() {
+        if self.heavy_job_running() || self.auto_job.is_some() {
             return;
         }
         let Some(index) = self.selected_index else {
@@ -3024,6 +3039,9 @@ impl C41Gui {
             fraction: 0.0,
             message: "Preparing analysis…".to_string(),
             log: vec!["Preparing analysis…".to_string()],
+            file_name: String::new(),
+            completed: 0,
+            total: 1,
         }));
         let (tx, rx) = mpsc::channel();
         let progress_worker = progress.clone();
@@ -3093,46 +3111,234 @@ impl C41Gui {
         self.auto_job = Some(AutoJob {
             receiver: rx,
             progress,
+            cancel: None,
+            batch: false,
         });
         ctx.request_repaint();
     }
 
-    fn poll_auto_job(&mut self, ctx: &egui::Context) {
-        let Some(job) = self.auto_job.as_ref() else {
-            return;
+    fn heavy_job_running(&self) -> bool {
+        self.export_job.is_some() || self.auto_job.as_ref().is_some_and(|j| j.batch)
+    }
+
+    fn apply_auto_result_to_path(&mut self, path: &Path, result: &AutoTuneResult) -> bool {
+        let Some(entry) = self.images.iter_mut().find(|e| e.path == path) else {
+            return false;
         };
-        match job.receiver.try_recv() {
-            Ok(AutoJobOutcome::Done { index, result }) => {
-                self.auto_job = None;
-                if index < self.images.len() {
-                    result.apply_to(&mut self.images[index].options);
-                    self.images[index].preview_hash = 0;
-                    self.images[index].preview_options_hash = 0;
-                    let hardness = result.lut_in_mid - 1.0;
-                    let density = 1.0 + result.curve_offset;
-                    let grade = if result.curve_gamma > 0.0 {
-                        result.curve_gamma / 2.5
-                    } else {
-                        1.0
-                    };
-                    self.status = format!(
-                        "Auto: γ {:.2}, density {:.2}, grade {:.2}, toe {:+.2}, hardness {:+.2}",
-                        result.film_gamma, density, grade, result.toe_strength, hardness
-                    );
-                    self.preview_gen = self.preview_gen.wrapping_add(1);
+        result.apply_to(&mut entry.options);
+        entry.preview_hash = 0;
+        entry.preview_options_hash = 0;
+        true
+    }
+
+    fn start_batch_auto(&mut self, ctx: &egui::Context) {
+        if self.heavy_job_running() || self.auto_job.is_some() {
+            return;
+        }
+        if self.images.is_empty() {
+            self.status = "Auto Develop: add images first.".to_string();
+            return;
+        }
+
+        self.release_heavy_caches();
+
+        let jobs: Vec<(PathBuf, PipelineOptions)> = self
+            .images
+            .iter()
+            .map(|img| {
+                let mut opts = img.options.clone();
+                opts.flat_field_path = self.flat_field_path.clone();
+                (img.path.clone(), opts)
+            })
+            .collect();
+        let total = jobs.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::new(Mutex::new(AutoProgressState {
+            fraction: 0.0,
+            message: "Starting…".to_string(),
+            log: Vec::new(),
+            file_name: String::new(),
+            completed: 0,
+            total,
+        }));
+        let (tx, rx) = mpsc::channel();
+        let workers = if total > 1 { 2 } else { 1 };
+        let cancel_thread = cancel.clone();
+        let progress_thread = progress.clone();
+        let ctx_thread = ctx.clone();
+
+        thread::spawn(move || {
+            let queue = Arc::new(Mutex::new(jobs.into_iter().collect::<VecDeque<_>>()));
+            let errors = Arc::new(AtomicUsize::new(0));
+
+            thread::scope(|scope| {
+                for _ in 0..workers {
+                    let tx = tx.clone();
+                    let ctx = ctx_thread.clone();
+                    let cancel_thread = cancel_thread.clone();
+                    let progress_thread = progress_thread.clone();
+                    let completed = completed.clone();
+                    let queue = queue.clone();
+                    let errors = errors.clone();
+                    scope.spawn(move || loop {
+                        if cancel_thread.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let Some((path, opts)) = queue.lock().ok().and_then(|mut q| q.pop_front())
+                        else {
+                            return;
+                        };
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image")
+                            .to_string();
+                        if let Ok(mut p) = progress_thread.lock() {
+                            p.file_name = name.clone();
+                            p.message = "Loading…".to_string();
+                        }
+                        ctx.request_repaint();
+
+                        if cancel_thread.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        let done_at_start = completed.load(Ordering::Relaxed);
+                        let mut on_progress = |message: &str, frac: f32, _log: Option<&str>| {
+                            if let Ok(mut p) = progress_thread.lock() {
+                                p.message = message.to_string();
+                                p.file_name = name.clone();
+                                p.completed = done_at_start;
+                                let n = total.max(1) as f32;
+                                p.fraction = (done_at_start as f32 + frac.clamp(0.0, 1.0)) / n;
+                            }
+                            ctx.request_repaint();
+                        };
+
+                        match run_auto_for_path(&path, &opts, &mut on_progress) {
+                            Ok(result) => {
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if let Ok(mut p) = progress_thread.lock() {
+                                    p.completed = done;
+                                    p.fraction = done as f32 / total.max(1) as f32;
+                                }
+                                let _ = tx.send(AutoJobOutcome::FileDone { path, result });
+                            }
+                            Err(_) => {
+                                errors.fetch_add(1, Ordering::Relaxed);
+                                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if let Ok(mut p) = progress_thread.lock() {
+                                    p.completed = done;
+                                    p.fraction = done as f32 / total.max(1) as f32;
+                                    p.message = format!("Skipped {}", name);
+                                }
+                            }
+                        }
+                        ctx.request_repaint();
+                    });
+                }
+            });
+
+            let done = completed.load(Ordering::Relaxed);
+            let err_n = errors.load(Ordering::Relaxed);
+            if cancel_thread.load(Ordering::Relaxed) {
+                let _ = tx.send(AutoJobOutcome::Cancelled { completed: done });
+            } else {
+                let _ = tx.send(AutoJobOutcome::BatchDone {
+                    completed: done.saturating_sub(err_n),
+                    errors: err_n,
+                });
+            }
+            ctx_thread.request_repaint();
+        });
+
+        self.auto_job = Some(AutoJob {
+            receiver: rx,
+            progress,
+            cancel: Some(cancel),
+            batch: true,
+        });
+        self.status = format!("Auto Develop: {} images…", total);
+        ctx.request_repaint();
+    }
+
+    fn poll_auto_job(&mut self, ctx: &egui::Context) {
+        loop {
+            let outcome = {
+                let Some(job) = self.auto_job.as_ref() else {
+                    return;
+                };
+                match job.receiver.try_recv() {
+                    Ok(outcome) => outcome,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint();
+                        return;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.auto_job = None;
+                        self.status = "Auto stopped unexpectedly.".to_string();
+                        return;
+                    }
+                }
+            };
+            match outcome {
+                AutoJobOutcome::Done { index, result } => {
+                    self.auto_job = None;
+                    if index < self.images.len() {
+                        result.apply_to(&mut self.images[index].options);
+                        self.images[index].preview_hash = 0;
+                        self.images[index].preview_options_hash = 0;
+                        let hardness = result.lut_in_mid - 1.0;
+                        let density = 1.0 + result.curve_offset;
+                        let grade = if result.curve_gamma > 0.0 {
+                            result.curve_gamma / 2.5
+                        } else {
+                            1.0
+                        };
+                        self.status = format!(
+                            "Auto: γ {:.2}, density {:.2}, grade {:.2}, toe {:+.2}, hardness {:+.2}",
+                            result.film_gamma, density, grade, result.toe_strength, hardness
+                        );
+                        self.preview_gen = self.preview_gen.wrapping_add(1);
+                        ctx.request_repaint();
+                    }
+                    return;
+                }
+                AutoJobOutcome::FileDone { path, result } => {
+                    self.apply_auto_result_to_path(&path, &result);
                     ctx.request_repaint();
                 }
-            }
-            Ok(AutoJobOutcome::Error { message }) => {
-                self.auto_job = None;
-                self.status = message;
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint();
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.auto_job = None;
-                self.status = "Auto stopped unexpectedly.".to_string();
+                AutoJobOutcome::BatchDone { completed, errors } => {
+                    self.auto_job = None;
+                    self.preview_gen = self.preview_gen.wrapping_add(1);
+                    self.status = if errors == 0 {
+                        format!("Auto Develop: graded {} image(s).", completed)
+                    } else {
+                        format!(
+                            "Auto Develop: graded {} image(s), {} failed.",
+                            completed, errors
+                        )
+                    };
+                    ctx.request_repaint();
+                    return;
+                }
+                AutoJobOutcome::Cancelled { completed } => {
+                    self.auto_job = None;
+                    self.preview_gen = self.preview_gen.wrapping_add(1);
+                    self.status = if completed == 0 {
+                        "Auto Develop cancelled.".to_string()
+                    } else {
+                        format!("Auto Develop cancelled after {} image(s).", completed)
+                    };
+                    ctx.request_repaint();
+                    return;
+                }
+                AutoJobOutcome::Error { message } => {
+                    self.auto_job = None;
+                    self.status = message;
+                    return;
+                }
             }
         }
     }
@@ -3141,13 +3347,37 @@ impl C41Gui {
         let Some(job) = self.auto_job.as_ref() else {
             return;
         };
+        let batch = job.batch;
+        let cancel = job.cancel.clone();
         let snap = job
             .progress
             .lock()
             .map(|g| g.clone())
             .unwrap_or_else(|e| e.into_inner().clone());
+        let cancelling = cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
-        egui::Window::new("Auto")
+        let title = if batch { "Auto Develop" } else { "Auto" };
+        let shown = if snap.completed < snap.total && !snap.file_name.is_empty() {
+            snap.completed.saturating_add(1).min(snap.total)
+        } else {
+            snap.completed.min(snap.total)
+        };
+        let heading = if batch && snap.total > 1 {
+            format!("{}  ({}/{})", snap.file_name, shown, snap.total)
+        } else if batch && !snap.file_name.is_empty() {
+            snap.file_name.clone()
+        } else {
+            snap.message.clone()
+        };
+        let stage = if cancelling {
+            "Cancelling…".to_string()
+        } else if batch {
+            snap.message.clone()
+        } else {
+            String::new()
+        };
+
+        egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .movable(false)
@@ -3155,22 +3385,40 @@ impl C41Gui {
             .show(ctx, |ui| {
                 ui.set_min_width(320.0);
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(&snap.message).strong());
+                ui.label(egui::RichText::new(&heading).strong());
                 ui.add_space(6.0);
                 ui.add(
                     egui::ProgressBar::new(snap.fraction.clamp(0.0, 1.0))
                         .desired_width(320.0)
                         .show_percentage(),
                 );
-                ui.add_space(8.0);
-                for line in &snap.log {
-                    ui.label(
-                        egui::RichText::new(line)
-                            .small()
-                            .color(egui::Color32::from_gray(170)),
-                    );
+                if batch {
+                    if !stage.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(&stage).small());
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let btn = ui.add_enabled(!cancelling, egui::Button::new("Cancel"));
+                            if btn.clicked() {
+                                if let Some(c) = &cancel {
+                                    c.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    });
+                } else {
+                    ui.add_space(8.0);
+                    for line in &snap.log {
+                        ui.label(
+                            egui::RichText::new(line)
+                                .small()
+                                .color(egui::Color32::from_gray(170)),
+                        );
+                    }
+                    ui.add_space(6.0);
                 }
-                ui.add_space(6.0);
             });
     }
 }
@@ -3417,7 +3665,7 @@ impl eframe::App for C41Gui {
         self.poll_auto_job(ctx);
 
         // Request thumbnail for one image at a time (strip icons).
-        if self.export_job.is_none() && self.thumbnail_receiver.is_none() {
+        if !self.heavy_job_running() && self.thumbnail_receiver.is_none() {
             if let Some(entry) = self.images.iter().find(|e| {
                 e.thumbnail_texture.is_none() && !self.thumbnail_pending.contains(&e.path)
             }) {
@@ -3492,6 +3740,21 @@ impl eframe::App for C41Gui {
                         }
                         if ui.button("Load").clicked() {
                             self.pending_project_load = true;
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Batch", |ui| {
+                        let enabled = !self.images.is_empty()
+                            && !self.heavy_job_running()
+                            && self.auto_job.is_none();
+                        if ui
+                            .add_enabled(enabled, egui::Button::new("Auto Develop"))
+                            .on_hover_text(
+                                "Run Auto on every loaded image (Film γ, density, grade, toe, hardness, saturation).",
+                            )
+                            .clicked()
+                        {
+                            self.start_batch_auto(ui.ctx());
                             ui.close_menu();
                         }
                     });
@@ -5332,7 +5595,7 @@ impl eframe::App for C41Gui {
                 }
                 ui.label(egui::RichText::new(out_label).small());
 
-                let exporting = self.export_job.is_some();
+                let exporting = self.heavy_job_running();
                 let ready = !self.images.is_empty() && self.output_dir.is_some() && !exporting;
                 let selected_ready = self.selected_index.is_some()
                     && self.selected_index.unwrap() < self.images.len()
@@ -6517,7 +6780,7 @@ impl eframe::App for C41Gui {
         }
 
         // Draft → screen refine. Runs after UI so drag/release is available for debounce.
-        if self.export_job.is_none() {
+        if !self.heavy_job_running() {
             if let Some(idx) = self.selected_index {
                 if idx < self.images.len() {
                     let (screen_w, screen_h) = preview_working_limits(

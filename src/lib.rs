@@ -43,7 +43,7 @@ pub mod sensor;
 pub mod stats;
 pub mod tiff_export;
 
-pub use auto::{auto_tune, AutoTuneResult};
+pub use auto::{auto_tune, AutoTuneResult, AUTO_PROXY_MAX_SIDE};
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{
     reset_wb_for_picker, sync_wb_flags_from_mode, DminMode, OutputLutEncoding, OutputStage,
@@ -1343,6 +1343,47 @@ pub fn process_one_to_preview_with_cache(
         .ok_or_else(|| anyhow::anyhow!("Invalid image dimensions"))?;
     let out = img.into_raw();
     Ok((true_src_w, true_src_h, orig_w, orig_h, out, dbg, new_cache))
+}
+
+fn bake_scene_stats_into_options(options: &mut PipelineOptions, stats: &PreviewSceneStats) {
+    if let Some(dmin) = stats.dmin {
+        options.dmin_mode = DminMode::Fixed;
+        options.dmin_fixed = Some(dmin);
+    }
+    if let Some((ar, ag, ab)) = stats.auto_wb {
+        options.auto_wb = false;
+        options.apply_white_balance = true;
+        options.wb_r *= ar;
+        options.wb_g *= ag;
+        options.wb_b *= ab;
+    }
+    options.pinned_zone = stats.zone;
+}
+
+/// Load one file, pin full-res D-min / auto-WB, build a 384 px after-step-3
+/// buffer, then run [`auto_tune`]. The sensor is dropped before the search.
+pub fn run_auto_for_path(
+    path: &Path,
+    options: &PipelineOptions,
+    on_progress: &mut auto::AutoProgressCb<'_>,
+) -> anyhow::Result<AutoTuneResult> {
+    on_progress("Loading…", 0.0, Some("Loading…"));
+    let sensor = load_sensor_from_path(path)?;
+    let stats = compute_preview_scene_stats(&sensor, options)?;
+    let mut baked = options.clone();
+    bake_scene_stats_into_options(&mut baked, &stats);
+
+    on_progress("Preparing analysis…", 0.02, Some("Preparing analysis…"));
+    let side = AUTO_PROXY_MAX_SIDE as u32;
+    let (_, _, _, _, _, _, cache) =
+        process_one_to_preview_with_cache(path, &baked, side, side, None, false, Some(&sensor))?;
+    drop(sensor);
+
+    let after_step3 = cache
+        .after_step3
+        .map(|(_, img)| img)
+        .ok_or_else(|| anyhow::anyhow!("Auto: no D-min buffer to analyse."))?;
+    auto_tune(&after_step3, &baked, on_progress)
 }
 
 /// GPU-accelerated version of `process_one_to_preview_with_cache`.

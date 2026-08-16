@@ -9,7 +9,9 @@ use crate::lut3d;
 use crate::pipeline;
 use crate::PipelineOptions;
 
-const PROXY_MAX_SIDE: usize = 384;
+/// Max side length for the Auto analysis proxy (and for `run_auto_for_path` preview).
+pub const AUTO_PROXY_MAX_SIDE: usize = 384;
+const PROXY_MAX_SIDE: usize = AUTO_PROXY_MAX_SIDE;
 const TARGET_CENTROID: f32 = 118.0;
 const TARGET_P1: f32 = 8.0;
 const TARGET_MID_CHROMA: f32 = 0.10;
