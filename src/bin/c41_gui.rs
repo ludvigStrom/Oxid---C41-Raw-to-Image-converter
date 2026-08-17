@@ -56,6 +56,8 @@ const EXPORT_PROGRESS_DELAY_MS: u64 = 400;
 
 const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
+const RIGHT_PANEL_MIN_WIDTH: f32 = 240.0;
+const RIGHT_PANEL_MAX_WIDTH: f32 = 560.0;
 /// Left inset so the Archive menu clears macOS traffic lights (hidden title bar).
 const MENU_BAR_MACOS_INSET: f32 = 78.0;
 const PROJECT_SAVE_SHORTCUT: egui::KeyboardShortcut =
@@ -4488,9 +4490,14 @@ impl eframe::App for C41Gui {
         let mut disarm_wb_picker = false;
         let wb_picker_armed = self.wb_picker_armed;
         egui::SidePanel::right("settings_panel")
-            .resizable(false)
-            .exact_width(RIGHT_PANEL_WIDTH)
+            .resizable(true)
+            .default_width(RIGHT_PANEL_WIDTH)
+            .width_range(RIGHT_PANEL_MIN_WIDTH..=RIGHT_PANEL_MAX_WIDTH)
             .show(ctx, |ui| {
+                // SidePanel persists the content min-rect. Lock to the allocated
+                // width so sliders/paths/combos cannot snap the panel to max.
+                ui.set_width(ui.available_width());
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
@@ -4508,11 +4515,14 @@ impl eframe::App for C41Gui {
                 ui.allocate_space(egui::vec2(ui.available_width(), 4.0));
                 ui.add_space(8.0);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
                         ui.vertical(|ui| {
-                ui.set_max_width((ui.available_width() - 8.0).max(80.0));
+                ui.set_width((ui.available_width() - 8.0).max(80.0));
                 match self.mode {
                     UIMode::Process => {
                         ui.heading("Image Settings");
@@ -4561,7 +4571,7 @@ impl eframe::App for C41Gui {
                 ui.add_space(8.0);
 
                 if self.mode == UIMode::Process {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.selectable_value(
                             &mut entry.process_tab,
                             ProcessTab::Input,
@@ -4636,7 +4646,7 @@ impl eframe::App for C41Gui {
                         "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2"
                     );
                     if is_raw {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("Run rawloader debug for selected file").clicked() {
                                 match raw_reader::debug_raw_report(&entry.path) {
                                     Ok(report) => {
@@ -4681,7 +4691,7 @@ impl eframe::App for C41Gui {
                     ui.label(egui::RichText::new("Pipeline debug log").strong())
                         .on_hover_text("Captured on demand. Click the button to snapshot current settings.");
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui
                             .button("Capture pipeline log for current settings")
                             .on_hover_text("Snapshot current settings into the pipeline debug log")
@@ -4721,7 +4731,7 @@ impl eframe::App for C41Gui {
                   if !in_process || entry.process_tab == ProcessTab::Develop {
                     ui.label(egui::RichText::new("Preset").strong());
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let auto_busy = self.auto_job.is_some();
                         if ui
                             .add_enabled(
@@ -5364,7 +5374,7 @@ impl eframe::App for C41Gui {
                             ui.add_space(4.0);
                             ui.separator();
                             ui.label("Flat-field override (luminance calibration)");
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui
                                     .button(theme::icon_label(theme::FOLDER, "Load flat-field map…"))
                                     .clicked()
@@ -5888,7 +5898,7 @@ impl eframe::App for C41Gui {
                     && self.selected_index.unwrap() < self.images.len()
                     && self.output_dir.is_some()
                     && !exporting;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
                             ready,
