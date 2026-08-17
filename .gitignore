@@ -1,6 +1,6 @@
 # Build
 /target/
-/Build/
+/build/
 Cargo.lock
 /vendor/
 /test files/

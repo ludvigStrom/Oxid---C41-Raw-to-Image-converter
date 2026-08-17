@@ -83,6 +83,7 @@ pub fn hash_after_step3(
         .as_ref()
         .map(|p| p.display().to_string())
         .hash(&mut h);
+    opts.dust_mask_hash.hash(&mut h);
     h.finish()
 }
 
@@ -193,6 +194,15 @@ mod tests {
         let h1 = hash_after_load(Path::new("/a.raw"), &opts, 800, 600);
         let h2 = hash_after_load(Path::new("/a.raw"), &opts, 800, 600);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_after_step3_differs_with_dust() {
+        let mut opts = PipelineOptions::default();
+        let h_off = hash_after_step3(Path::new("/a.raw"), &opts, 800, 600);
+        opts.dust_mask_hash = 42;
+        let h_dust = hash_after_step3(Path::new("/a.raw"), &opts, 800, 600);
+        assert_ne!(h_off, h_dust);
     }
 
     #[test]

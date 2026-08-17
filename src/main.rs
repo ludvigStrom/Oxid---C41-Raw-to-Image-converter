@@ -364,6 +364,8 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         bujack_radius: 16.0,
         bujack_edge: 0.25,
         pinned_zone: None,
+        dust_mask_hash: 0,
+        dust_mask: None,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

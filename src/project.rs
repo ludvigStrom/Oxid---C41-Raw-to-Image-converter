@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::dust::ProjectDust;
 use crate::options::PipelineOptions;
 
 /// Current project schema version. Bump when the JSON shape changes in a way
@@ -37,6 +38,8 @@ pub struct ProjectImage {
     pub export_format: ProjectExportFormat,
     #[serde(default)]
     pub options: PipelineOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dust: Option<ProjectDust>,
 }
 
 /// On-disk project document.
@@ -243,6 +246,7 @@ mod tests {
                 path: img_path.clone(),
                 export_format: ProjectExportFormat::Jpeg,
                 options: opts,
+                dust: None,
             }],
             &project_path,
         )
@@ -290,6 +294,7 @@ mod tests {
                 path: img_path,
                 export_format: ProjectExportFormat::Tiff16,
                 options: opts,
+                dust: None,
             }],
             &project_path,
         )
@@ -309,6 +314,43 @@ mod tests {
             loaded.images[0].options.output_lut_cube.as_deref(),
             Some(lut_path.as_path())
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dust_strokes_roundtrip() {
+        use crate::dust::{DustStroke, DustTool, ProjectDust};
+
+        let dir = temp_dir();
+        let img_path = dir.join("frame.arw");
+        std::fs::write(&img_path, b"not-a-real-raw").unwrap();
+
+        let project_path = dir.join("dust.oxidProj");
+        save_project(
+            &[ProjectImage {
+                path: img_path.clone(),
+                export_format: ProjectExportFormat::Tiff16,
+                options: PipelineOptions::default(),
+                dust: Some(ProjectDust {
+                    reference_size: (800, 600),
+                    strokes: vec![DustStroke {
+                        tool: DustTool::Pen,
+                        radius: 6.0,
+                        points: vec![(10.0, 20.0), (12.0, 22.0)],
+                    }],
+                }),
+            }],
+            &project_path,
+        )
+        .unwrap();
+
+        let loaded = load_project(&project_path).unwrap();
+        let dust = loaded.images[0].dust.as_ref().unwrap();
+        assert_eq!(dust.reference_size, (800, 600));
+        assert_eq!(dust.strokes.len(), 1);
+        assert_eq!(dust.strokes[0].tool, DustTool::Pen);
+        assert_eq!(dust.strokes[0].points.len(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }

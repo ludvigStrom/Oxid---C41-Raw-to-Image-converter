@@ -16,18 +16,18 @@ use c41_raw_tool::apply_preview_from_cache;
 #[cfg(feature = "gpu")]
 use c41_raw_tool::{apply_preview_from_cache_gpu, process_one_to_preview_with_cache_gpu};
 use c41_raw_tool::{
-    auto_tune, blur_flat_field, cached_start_step, calibration, color, compute_preview_scene_stats,
-    crop_sensor_for_oriented_rect, demosaic, detect_crop, dmin, load_develop_preset,
-    load_flat_field_linear, load_project, load_sensor_from_path, oriented_sensor_size, png_reader,
-    apply_preview_from_cache_on_progress, preview_scene_stats_key, process_export_jobs,
-    process_one_to_preview, process_one_to_preview_with_cache,
-    process_one_to_preview_with_cache_on_progress, raw_reader, reset_wb_for_picker,
-    run_auto_crop_for_path,
-    run_auto_for_path, save_develop_preset, save_project, sync_wb_flags_from_mode, tiff_export,
-    AutoCropResult, AutoTuneResult, CachedSensor, CropConfidence, DminMode, ExportCancelled,
+    apply_preview_from_cache_on_progress, auto_tune, blur_flat_field, cached_start_step,
+    calibration, color, compute_preview_scene_stats, crop_mask_uv, crop_sensor_for_oriented_rect,
+    demosaic, detect_crop, dmin, hash_strokes, load_develop_preset, load_flat_field_linear,
+    load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
+    process_export_jobs, process_one_to_preview, process_one_to_preview_with_cache,
+    process_one_to_preview_with_cache_on_progress, rasterize_strokes, raw_reader,
+    reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path, save_develop_preset,
+    save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export, AutoCropResult, AutoTuneResult,
+    CachedSensor, CropConfidence, DminMode, DustMask, DustStroke, DustTool, ExportCancelled,
     ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions,
-    PreviewSceneStats, PreviewStepCache, ProjectExportFormat, ProjectImage, Rect, TiffFormat,
-    UndoManager, WbMode, PROJECT_EXTENSION, PROJECT_EXTENSION_LEGACY, UNDO_LIMIT,
+    PreviewSceneStats, PreviewStepCache, ProjectDust, ProjectExportFormat, ProjectImage, Rect,
+    TiffFormat, UndoManager, WbMode, PROJECT_EXTENSION, PROJECT_EXTENSION_LEGACY, UNDO_LIMIT,
 };
 use eframe::egui;
 
@@ -195,6 +195,15 @@ struct ImageEntry {
     tile_cache: Vec<PreviewTile>,
     /// Process tab (Input/Develop/Export) — persists per image when switching.
     process_tab: ProcessTab,
+    dust_strokes: Vec<DustStroke>,
+    dust_reference_size: Option<(u32, u32)>,
+    dust_mask: Vec<u8>,
+    dust_mask_size: (u32, u32),
+    dust_view: DustView,
+    dust_tool: DustTool,
+    dust_brush_radius: f32,
+    dust_overlay_texture: Option<egui::TextureHandle>,
+    dust_overlay_dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +344,8 @@ struct TileJobResult {
 struct EditSnapshot {
     options: PipelineOptions,
     export_format: ExportFormat,
+    dust_strokes: Vec<DustStroke>,
+    dust_reference_size: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -455,7 +466,14 @@ enum UIMode {
 enum ProcessTab {
     Input,
     Develop,
+    Dust,
     Export,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DustView {
+    Edit,
+    Process,
 }
 
 enum ExportJobOutcome {
@@ -584,6 +602,8 @@ struct C41Gui {
     ui_icons: UiIcons,
     /// Suppresses preview reprocessing while the user is dragging a rect handle (crop / d-min).
     rect_dragging: bool,
+    /// True while painting or erasing on the Dust tab.
+    dust_painting: bool,
     /// True while the preview is being panned (left/middle drag).
     preview_view_dragging: bool,
     /// True while the pointer is down on the preview canvas (not a slider).
@@ -659,6 +679,7 @@ impl Default for C41Gui {
             flat_field_image: None,
             ui_icons: UiIcons::default(),
             rect_dragging: false,
+            dust_painting: false,
             preview_view_dragging: false,
             preview_canvas_pointer: false,
             preview_view_changed_at: None,
@@ -896,6 +917,8 @@ fn default_options() -> PipelineOptions {
         bujack_radius: 16.0,
         bujack_edge: 0.25,
         pinned_zone: None,
+        dust_mask_hash: 0,
+        dust_mask: None,
     }
 }
 
@@ -1013,6 +1036,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.bujack_strength.to_bits().hash(&mut h);
     opts.bujack_radius.to_bits().hash(&mut h);
     opts.bujack_edge.to_bits().hash(&mut h);
+    opts.dust_mask_hash.hash(&mut h);
     h.finish()
 }
 
@@ -1840,6 +1864,15 @@ fn image_entry(
         scene_stats: None,
         preview_step_cache: None,
         process_tab: ProcessTab::Input,
+        dust_strokes: Vec::new(),
+        dust_reference_size: None,
+        dust_mask: Vec::new(),
+        dust_mask_size: (0, 0),
+        dust_view: DustView::Edit,
+        dust_tool: DustTool::Pen,
+        dust_brush_radius: 8.0,
+        dust_overlay_texture: None,
+        dust_overlay_dirty: true,
     }
 }
 
@@ -1882,6 +1915,7 @@ fn apply_runtime_gui_defaults(opts: &mut PipelineOptions) {
     opts.verbose_debug = false;
     opts.pinned_zone = None;
     opts.flat_field_path = None;
+    opts.dust_mask = None;
 }
 
 fn normalize_runtime_options(opts: &mut PipelineOptions) {
@@ -1891,6 +1925,7 @@ fn normalize_runtime_options(opts: &mut PipelineOptions) {
     opts.verbose_debug = false;
     opts.pinned_zone = None;
     opts.flat_field_path = None;
+    opts.dust_mask = None;
 }
 
 fn edit_snapshot(entry: &ImageEntry) -> EditSnapshot {
@@ -1899,6 +1934,8 @@ fn edit_snapshot(entry: &ImageEntry) -> EditSnapshot {
     EditSnapshot {
         options,
         export_format: entry.export_format,
+        dust_strokes: entry.dust_strokes.clone(),
+        dust_reference_size: entry.dust_reference_size,
     }
 }
 
@@ -1917,6 +1954,103 @@ fn restore_edit_snapshot(entry: &mut ImageEntry, snap: &EditSnapshot) {
     entry.options.pinned_zone = pinned_zone;
     entry.options.flat_field_path = flat_field_path;
     entry.export_format = snap.export_format;
+    entry.dust_strokes = snap.dust_strokes.clone();
+    entry.dust_reference_size = snap.dust_reference_size;
+    rebuild_dust_raster(entry);
+}
+
+fn rebuild_dust_raster(entry: &mut ImageEntry) {
+    let (w, h) = entry
+        .dust_reference_size
+        .or_else(|| entry.preview_input_size.map(|s| (s[0], s[1])))
+        .unwrap_or((0, 0));
+    if w == 0 || h == 0 {
+        entry.dust_mask.clear();
+        entry.dust_mask_size = (0, 0);
+        entry.dust_overlay_dirty = true;
+        return;
+    }
+    let mask = rasterize_strokes(
+        &entry.dust_strokes,
+        w,
+        h,
+        entry.dust_reference_size.unwrap_or((w, h)),
+    );
+    entry.dust_mask = mask.data;
+    entry.dust_mask_size = (w, h);
+    entry.dust_overlay_dirty = true;
+}
+
+fn ensure_dust_working_mask(entry: &mut ImageEntry, w: u32, h: u32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    if entry.dust_reference_size.is_none() {
+        entry.dust_reference_size = Some((w, h));
+    }
+    if entry.dust_mask_size == (w, h) && entry.dust_mask.len() == w as usize * h as usize {
+        return;
+    }
+    let mask = rasterize_strokes(
+        &entry.dust_strokes,
+        w,
+        h,
+        entry.dust_reference_size.unwrap_or((w, h)),
+    );
+    entry.dust_mask = mask.data;
+    entry.dust_mask_size = (w, h);
+    entry.dust_overlay_dirty = true;
+}
+
+fn dust_mask_from_entry(entry: &ImageEntry) -> Option<Arc<DustMask>> {
+    if entry.dust_strokes.is_empty() {
+        return None;
+    }
+    let (w, h) = entry
+        .dust_reference_size
+        .or(Some(entry.dust_mask_size))
+        .filter(|(w, h)| *w > 0 && *h > 0)?;
+    if entry.dust_mask_size == (w, h) && entry.dust_mask.len() == w as usize * h as usize {
+        return Some(Arc::new(DustMask {
+            width: w,
+            height: h,
+            data: entry.dust_mask.clone(),
+        }));
+    }
+    Some(Arc::new(rasterize_strokes(
+        &entry.dust_strokes,
+        w,
+        h,
+        entry.dust_reference_size.unwrap_or((w, h)),
+    )))
+}
+
+fn oriented_export_size(entry: &ImageEntry) -> Option<(u32, u32)> {
+    let [w, h] = entry.raw_source_size?;
+    Some(oriented_sensor_size(w, h, entry.options.rotation_degrees))
+}
+
+fn attach_export_dust(opts: &mut PipelineOptions, entry: &ImageEntry) {
+    if entry.dust_strokes.is_empty() {
+        opts.dust_mask_hash = 0;
+        opts.dust_mask = None;
+        return;
+    }
+    let (fw, fh) = oriented_export_size(entry)
+        .or(entry.dust_reference_size)
+        .unwrap_or((0, 0));
+    if fw == 0 || fh == 0 {
+        opts.dust_mask_hash = 0;
+        opts.dust_mask = None;
+        return;
+    }
+    opts.dust_mask_hash = hash_strokes(&entry.dust_strokes);
+    opts.dust_mask = Some(Arc::new(rasterize_strokes(
+        &entry.dust_strokes,
+        fw,
+        fh,
+        entry.dust_reference_size.unwrap_or((fw, fh)),
+    )));
 }
 
 impl C41Gui {
@@ -1987,7 +2121,7 @@ impl C41Gui {
             return;
         }
         let pointer_down = ctx.input(|i| i.pointer.any_down());
-        let interacting = pointer_down || self.rect_dragging;
+        let interacting = pointer_down || self.rect_dragging || self.dust_painting;
         let skip_id = if interacting {
             self.selected_index
                 .and_then(|i| self.images.get(i).map(|e| e.id))
@@ -2020,6 +2154,14 @@ impl C41Gui {
                 path: e.path.clone(),
                 export_format: e.export_format.to_project(),
                 options: e.options.clone(),
+                dust: if e.dust_strokes.is_empty() {
+                    None
+                } else {
+                    Some(ProjectDust {
+                        reference_size: e.dust_reference_size.unwrap_or(e.dust_mask_size),
+                        strokes: e.dust_strokes.clone(),
+                    })
+                },
             })
             .collect();
         match save_project(&images, path) {
@@ -2100,11 +2242,18 @@ impl C41Gui {
         for img in loaded.images {
             let mut opts = img.options;
             apply_runtime_gui_defaults(&mut opts);
-            let entry = self.make_image_entry(
+            let mut entry = self.make_image_entry(
                 img.path,
                 opts,
                 ExportFormat::from_project(img.export_format),
             );
+            if let Some(dust) = img.dust {
+                if !dust.strokes.is_empty() {
+                    entry.dust_strokes = dust.strokes;
+                    entry.dust_reference_size = Some(dust.reference_size);
+                    rebuild_dust_raster(&mut entry);
+                }
+            }
             self.images.push(entry);
         }
         self.selected_index = if self.images.is_empty() {
@@ -2147,7 +2296,27 @@ impl C41Gui {
                 options.pinned_zone = stats.zone;
             }
         }
+        if self.dust_should_apply(entry) {
+            options.dust_mask_hash = hash_strokes(&entry.dust_strokes);
+            options.dust_mask = dust_mask_from_entry(entry);
+        } else {
+            options.dust_mask_hash = 0;
+            options.dust_mask = None;
+        }
         options
+    }
+
+    fn dust_should_apply(&self, entry: &ImageEntry) -> bool {
+        if entry.dust_strokes.is_empty() {
+            return false;
+        }
+        if self.mode == UIMode::Process
+            && entry.process_tab == ProcessTab::Dust
+            && entry.dust_view == DustView::Edit
+        {
+            return false;
+        }
+        true
     }
 
     fn ensure_sensor_and_scene_stats(&mut self, index: usize) -> bool {
@@ -2226,8 +2395,7 @@ impl C41Gui {
     fn request_preview_for(&mut self, index: usize, ctx: &egui::Context, lod: PreviewLod) {
         // Auto's last step must not remosaic the full sensor on the UI thread
         // (that froze the progress dialog at 97%). Use cached scene stats instead.
-        if self.auto_waiting_preview() != Some(index)
-            && !self.ensure_sensor_and_scene_stats(index)
+        if self.auto_waiting_preview() != Some(index) && !self.ensure_sensor_and_scene_stats(index)
         {
             return;
         }
@@ -2467,6 +2635,19 @@ impl C41Gui {
         );
         let mut options = self.bake_preview_options(entry);
         options.verbose_debug = false;
+        if let Some(mask) = options.dust_mask.take() {
+            let tw = (((crop.uv_right - crop.uv_left) * mask.width as f32).round() as u32).max(1);
+            let th = (((crop.uv_bottom - crop.uv_top) * mask.height as f32).round() as u32).max(1);
+            options.dust_mask = Some(Arc::new(crop_mask_uv(
+                &mask,
+                crop.uv_left,
+                crop.uv_top,
+                crop.uv_right,
+                crop.uv_bottom,
+                tw,
+                th,
+            )));
+        }
         // Same hash the cache lookup uses, so a finished tile is never "missing".
         let options_hash = entry.preview_options_hash;
         let gen = self.tile_gen;
@@ -2825,6 +3006,7 @@ impl C41Gui {
                     let img = &self.images[idx];
                     let mut opts = img.options.clone();
                     opts.flat_field_path = self.flat_field_path.clone();
+                    attach_export_dust(&mut opts, img);
                     vec![ExportJobSpec {
                         path: img.path.clone(),
                         options: opts,
@@ -2839,6 +3021,7 @@ impl C41Gui {
                 .map(|img| {
                     let mut opts = img.options.clone();
                     opts.flat_field_path = self.flat_field_path.clone();
+                    attach_export_dust(&mut opts, img);
                     opts.format = export_template.format;
                     opts.write_exr = export_template.write_exr;
                     opts.write_jpeg = export_template.write_jpeg;
@@ -3363,8 +3546,8 @@ impl C41Gui {
                     sensor.as_deref(),
                     &mut report,
                 )
-                .map(
-                    |(input_w, input_h, w, h, rgb, dbg_log, new_cache)| PreviewJobResult {
+                .map(|(input_w, input_h, w, h, rgb, dbg_log, new_cache)| {
+                    PreviewJobResult {
                         gen,
                         lod: PreviewLod::Screen,
                         index,
@@ -3377,8 +3560,8 @@ impl C41Gui {
                         dbg_log,
                         captured_debug: false,
                         new_cache,
-                    },
-                )
+                    }
+                })
             };
             let _ = tx.send(res);
             ctx_worker.request_repaint();
@@ -4544,8 +4727,8 @@ impl eframe::App for C41Gui {
         if let Some(resp) = ctx.read_response(resize_id) {
             if resp.dragged() {
                 if let Some(pointer) = resp.interact_pointer_pos() {
-                    self.right_panel_width = (available.right() - pointer.x)
-                        .clamp(RIGHT_PANEL_MIN_WIDTH, panel_max_w);
+                    self.right_panel_width =
+                        (available.right() - pointer.x).clamp(RIGHT_PANEL_MIN_WIDTH, panel_max_w);
                 }
             }
         }
@@ -4640,6 +4823,11 @@ impl eframe::App for C41Gui {
                             &mut entry.process_tab,
                             ProcessTab::Develop,
                             theme::icon_label(theme::TUNE, "Develop"),
+                        );
+                        ui.selectable_value(
+                            &mut entry.process_tab,
+                            ProcessTab::Dust,
+                            theme::icon_label(theme::HEALING, "Dust"),
                         );
                         ui.selectable_value(
                             &mut entry.process_tab,
@@ -5912,6 +6100,77 @@ impl eframe::App for C41Gui {
                     });
                 }
 
+                if self.mode == UIMode::Process && entry.process_tab == ProcessTab::Dust {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.heading("Dust");
+                    ui.add_space(8.0);
+
+                    ui.label(egui::RichText::new("View").strong());
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut entry.dust_view,
+                            DustView::Edit,
+                            theme::icon_label(theme::EDIT, "Edit"),
+                        );
+                        ui.selectable_value(
+                            &mut entry.dust_view,
+                            DustView::Process,
+                            theme::icon_label(theme::AUTO_FIX, "Process"),
+                        );
+                    });
+                    ui.add_space(8.0);
+
+                    ui.add_enabled_ui(entry.dust_view == DustView::Edit, |ui| {
+                        ui.label(egui::RichText::new("Tool").strong());
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut entry.dust_tool,
+                                DustTool::Pen,
+                                theme::icon_label(theme::BRUSH, "Pen"),
+                            );
+                            ui.selectable_value(
+                                &mut entry.dust_tool,
+                                DustTool::Eraser,
+                                theme::icon_label(theme::CANCEL, "Eraser"),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        theme::slider_row(
+                            ui,
+                            "Size",
+                            &mut entry.dust_brush_radius,
+                            1.0..=80.0,
+                            0,
+                        );
+                    });
+
+                    if ui.input(|i| i.key_pressed(egui::Key::OpenBracket)) {
+                        entry.dust_brush_radius = (entry.dust_brush_radius - 1.0).max(1.0);
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
+                        entry.dust_brush_radius = (entry.dust_brush_radius + 1.0).min(80.0);
+                    }
+
+                    ui.add_space(8.0);
+                    let has_mask = !entry.dust_strokes.is_empty();
+                    if ui
+                        .add_enabled(has_mask, egui::Button::new("Clear mask"))
+                        .clicked()
+                    {
+                        entry.dust_strokes.clear();
+                        entry.dust_mask.fill(0);
+                        entry.dust_overlay_dirty = true;
+                    }
+                    if has_mask {
+                        ui.small(format!("{} stroke(s)", entry.dust_strokes.len()));
+                    } else {
+                        ui.small("Paint over dust, then switch to Process.");
+                    }
+                    ui.small("Hold Space or middle-drag to pan.");
+                }
+
                 if self.mode == UIMode::Process && entry.process_tab == ProcessTab::Export {
                 ui.add_space(12.0);
                 ui.separator();
@@ -6274,6 +6533,163 @@ impl eframe::App for C41Gui {
                                 ((sy - vir_top_c)  / img_h_c) * full_h_f,
                             )
                         };
+
+                        let dust_edit = self.mode == UIMode::Process
+                            && self.images[idx].process_tab == ProcessTab::Dust
+                            && self.images[idx].dust_view == DustView::Edit;
+                        if dust_edit {
+                            ensure_dust_working_mask(&mut self.images[idx], full_w, full_h);
+                            let space_down = ui.input(|i| i.key_down(egui::Key::Space));
+                            let pointer_down = canvas_resp.is_pointer_button_down_on()
+                                && ui.input(|i| i.pointer.primary_down())
+                                && !ui.input(|i| i.pointer.middle_down())
+                                && !space_down;
+                            if pointer_down {
+                                if let Some(pos) = canvas_resp.interact_pointer_pos() {
+                                    if vir_rect.contains(pos) && canvas_rect.contains(pos) {
+                                        let (ix, iy) = screen_to_image(pos.x, pos.y);
+                                        let entry = &mut self.images[idx];
+                                        let (rw, rh) = entry
+                                            .dust_reference_size
+                                            .unwrap_or((full_w, full_h));
+                                        let sx = rw as f32 / full_w_f;
+                                        let sy = rh as f32 / full_h_f;
+                                        let pt = (ix * sx, iy * sy);
+                                        let radius_ref =
+                                            entry.dust_brush_radius * (sx + sy) * 0.5;
+                                        let prev_img = if !self.dust_painting {
+                                            None
+                                        } else {
+                                            entry.dust_strokes.last().and_then(|s| {
+                                                s.points.last().copied().map(|(px, py)| {
+                                                    (px / sx, py / sy)
+                                                })
+                                            })
+                                        };
+                                        if !self.dust_painting {
+                                            entry.dust_strokes.push(DustStroke {
+                                                tool: entry.dust_tool,
+                                                radius: radius_ref,
+                                                points: vec![pt],
+                                            });
+                                            self.dust_painting = true;
+                                        } else if let Some(stroke) = entry.dust_strokes.last_mut()
+                                        {
+                                            if stroke
+                                                .points
+                                                .last()
+                                                .map(|p| (p.0 - pt.0).hypot(p.1 - pt.1) > 0.25)
+                                                .unwrap_or(true)
+                                            {
+                                                stroke.points.push(pt);
+                                            }
+                                        }
+                                        let mut working = DustMask {
+                                            width: entry.dust_mask_size.0,
+                                            height: entry.dust_mask_size.1,
+                                            data: std::mem::take(&mut entry.dust_mask),
+                                        };
+                                        let tool = entry.dust_tool;
+                                        let radius = entry.dust_brush_radius;
+                                        if let Some((ox, oy)) = prev_img {
+                                            let dx = ix - ox;
+                                            let dy = iy - oy;
+                                            let dist = (dx * dx + dy * dy).sqrt();
+                                            let steps = (dist * 2.0).ceil().max(1.0) as i32;
+                                            for s in 1..=steps {
+                                                let t = s as f32 / steps as f32;
+                                                stamp_disc(
+                                                    &mut working,
+                                                    ox + dx * t,
+                                                    oy + dy * t,
+                                                    radius,
+                                                    tool,
+                                                );
+                                            }
+                                        } else {
+                                            stamp_disc(&mut working, ix, iy, radius, tool);
+                                        }
+                                        entry.dust_mask = working.data;
+                                        entry.dust_overlay_dirty = true;
+                                    }
+                                }
+                            } else if self.dust_painting {
+                                self.dust_painting = false;
+                            }
+
+                            let vis_rect = vir_rect.intersect(canvas_rect);
+                            if vis_rect.width() > 0.0 && vis_rect.height() > 0.0 {
+                                let entry = &mut self.images[idx];
+                                if entry.dust_overlay_dirty
+                                    || entry.dust_overlay_texture.is_none()
+                                {
+                                    if entry.dust_mask_size.0 > 0
+                                        && entry.dust_mask.len()
+                                            == entry.dust_mask_size.0 as usize
+                                                * entry.dust_mask_size.1 as usize
+                                    {
+                                        let (mw, mh) = entry.dust_mask_size;
+                                        let mut pixels =
+                                            Vec::with_capacity(entry.dust_mask.len());
+                                        for &c in &entry.dust_mask {
+                                            let a = (c as u16 * 120 / 255) as u8;
+                                            pixels.push(
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    220, 36, 36, a,
+                                                ),
+                                            );
+                                        }
+                                        let image = egui::ColorImage {
+                                            size: [mw as usize, mh as usize],
+                                            pixels,
+                                        };
+                                        entry.dust_overlay_texture = Some(
+                                            ui.ctx().load_texture(
+                                                format!("dust_overlay_{}", idx),
+                                                image,
+                                                egui::TextureOptions::LINEAR,
+                                            ),
+                                        );
+                                        entry.dust_overlay_dirty = false;
+                                    }
+                                }
+                                if let Some(tex) = entry.dust_overlay_texture.as_ref() {
+                                    let uv_l = (vis_rect.left() - vir_rect.left()) / img_w;
+                                    let uv_t = (vis_rect.top() - vir_rect.top()) / img_h;
+                                    let uv_r = (vis_rect.right() - vir_rect.left()) / img_w;
+                                    let uv_b = (vis_rect.bottom() - vir_rect.top()) / img_h;
+                                    canvas_painter.image(
+                                        tex.id(),
+                                        vis_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(uv_l, uv_t),
+                                            egui::pos2(uv_r, uv_b),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            }
+
+                            if let Some(pos) = canvas_resp.hover_pos().filter(|p| {
+                                vir_rect.contains(*p) && canvas_rect.contains(*p)
+                            }) {
+                                let radius_screen =
+                                    self.images[idx].dust_brush_radius * (img_w / full_w_f);
+                                let color = if self.images[idx].dust_tool == DustTool::Eraser {
+                                    egui::Color32::from_rgb(220, 220, 220)
+                                } else {
+                                    egui::Color32::from_rgb(230, 70, 70)
+                                };
+                                canvas_painter.circle_stroke(
+                                    pos,
+                                    radius_screen.max(2.0),
+                                    egui::Stroke::new(1.5, color),
+                                );
+                            }
+                        } else if self.dust_painting {
+                            self.dust_painting = false;
+                        }
+
                         ui.add_space(IMAGE_PREVIEW_BOTTOM_PADDING);
 
                         // Loading spinner overlay — drawn entirely via canvas_painter so it
@@ -6341,9 +6757,19 @@ impl eframe::App for C41Gui {
                         }
 
                         // Pan with left drag (when no rect handle hit) or middle drag.
+                        let dust_edit = self.mode == UIMode::Process
+                            && self.images[idx].process_tab == ProcessTab::Dust
+                            && self.images[idx].dust_view == DustView::Edit;
+                        let space_down = ui.input(|i| i.key_down(egui::Key::Space));
                         let middle_drag = ui.input(|i| i.pointer.middle_down()) && canvas_resp.dragged();
-                        let left_drag = canvas_resp.dragged() && !self.rect_dragging;
-                        if middle_drag || left_drag {
+                        let space_drag = space_down
+                            && canvas_resp.dragged()
+                            && ui.input(|i| i.pointer.primary_down());
+                        let left_drag = canvas_resp.dragged()
+                            && !self.rect_dragging
+                            && !self.dust_painting
+                            && (!dust_edit || space_down);
+                        if middle_drag || space_drag || left_drag {
                             let delta = canvas_resp.drag_delta();
                             {
                                 let entry = &mut self.images[idx];
@@ -7201,6 +7627,16 @@ impl eframe::App for C41Gui {
                         ctx.pixels_per_point(),
                         self.full_res_preview_active,
                     );
+                    {
+                        let apply = self.dust_should_apply(&self.images[idx]);
+                        let entry = &mut self.images[idx];
+                        entry.options.dust_mask_hash = if apply {
+                            hash_strokes(&entry.dust_strokes)
+                        } else {
+                            0
+                        };
+                        entry.options.dust_mask = None;
+                    }
                     let hash_now = preview_options_hash(
                         &self.images[idx].path,
                         &self.images[idx].options,
@@ -7227,6 +7663,7 @@ impl eframe::App for C41Gui {
                     // for develop widgets (and crop/d-min rects use rect_dragging).
                     let slider_dragging = pointer_down
                         && !self.rect_dragging
+                        && !self.dust_painting
                         && !self.preview_view_dragging
                         && !self.preview_canvas_pointer;
                     let need_screen = have_current
@@ -7258,6 +7695,7 @@ impl eframe::App for C41Gui {
                             .unwrap_or(false);
                         let can_live = !geometry_pending
                             && !self.rect_dragging
+                            && !self.dust_painting
                             && self.live_preview_available(idx, ctx);
                         // Any pointer-down (including rotate/flip buttons) used to look like a
                         // slider drag and start a preview after 50ms — that blocked further clicks.
@@ -7296,6 +7734,7 @@ impl eframe::App for C41Gui {
                             self.pending_preview_since = None;
                         } else if self.preview_receiver.is_none()
                             && !self.rect_dragging
+                            && !self.dust_painting
                             && !geometry_pending
                             && !pointer_down
                             && settled

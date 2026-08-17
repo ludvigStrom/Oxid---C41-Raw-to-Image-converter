@@ -26,7 +26,8 @@ pub const PROFILE_EXTENSION: &str = "oxid";
 pub const PROFILE_EXTENSION_LEGACY: &str = "c41";
 
 fn is_profile_zip_ext(ext: &str) -> bool {
-    ext.eq_ignore_ascii_case(PROFILE_EXTENSION) || ext.eq_ignore_ascii_case(PROFILE_EXTENSION_LEGACY)
+    ext.eq_ignore_ascii_case(PROFILE_EXTENSION)
+        || ext.eq_ignore_ascii_case(PROFILE_EXTENSION_LEGACY)
 }
 
 /// Manufacturer sRGB patch colors for ColorChecker Classic (24 patches).

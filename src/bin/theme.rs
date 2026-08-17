@@ -44,6 +44,8 @@ pub const WB_AUTO: &str = "\u{e42c}";
 pub const PALETTE: &str = "\u{e40a}";
 pub const LAYERS: &str = "\u{e53b}";
 pub const BLUR: &str = "\u{e3a5}";
+pub const BRUSH: &str = "\u{e3ae}";
+pub const HEALING: &str = "\u{e3f3}";
 pub const MOVIE: &str = "\u{e02c}";
 pub const HD: &str = "\u{e052}";
 

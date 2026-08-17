@@ -138,7 +138,7 @@ PROJECT_FSTYPE="$(volume_fstype "${PROJECT_DIR}")"
 PACKAGING_ROOT="${PACKAGING_ROOT:-}"
 if [[ -z "${PACKAGING_ROOT}" ]]; then
   if fstype_ok_for_codesign "${PROJECT_FSTYPE}"; then
-    PACKAGING_ROOT="${PROJECT_DIR}/Build"
+    PACKAGING_ROOT="${PROJECT_DIR}/build"
   else
     PACKAGING_ROOT="${HOME}/Library/Caches/oxid-release"
     echo "WARN: Project volume is '${PROJECT_FSTYPE}' (not APFS/HFS)."
@@ -155,7 +155,7 @@ APP_COMPONENT_PLIST="${DIST_DIR}/AppComponent.plist"
 APP_COMPONENT_PKG="${COMPONENT_PKG_DIR}/${PKG_FILE_BASENAME}-App-${VERSION}.pkg"
 DIST_XML="${DIST_DIR}/Distribution.xml"
 FINAL_PKG_PATH="${DIST_DIR}/${PKG_FILE_BASENAME}-${VERSION}.pkg"
-LOCAL_DIST_DIR="${PROJECT_DIR}/Build/dist"
+LOCAL_DIST_DIR="${PROJECT_DIR}/build/dist"
 LOCAL_FINAL_PKG_PATH="${LOCAL_DIST_DIR}/${PKG_FILE_BASENAME}-${VERSION}.pkg"
 
 pkg_sha256 () {
@@ -324,7 +324,7 @@ staple_pkg_with_optional_tmp_copy () {
 ensure_rust_target () {
   local triple="$1"
   if ! rustup target list --installed | grep -qx "${triple}"; then
-    echo "==> Installing Rust target ${triple}"
+    echo "==> Installing Rust target ${triple}" >&2
     rustup target add "${triple}"
   fi
 }
@@ -343,7 +343,7 @@ build_gui_binary () {
   local -a cargo_args=(build --release --bin "${CARGO_BIN}" --features "${CARGO_FEATURES}")
 
   if [[ "${UNIVERSAL}" == "1" ]]; then
-    echo "==> Building universal ${CARGO_BIN} (${CARGO_FEATURES})"
+    echo "==> Building universal ${CARGO_BIN} (${CARGO_FEATURES})" >&2
     ensure_rust_target aarch64-apple-darwin
     ensure_rust_target x86_64-apple-darwin
     cargo "${cargo_args[@]}" --target aarch64-apple-darwin
@@ -357,7 +357,7 @@ build_gui_binary () {
     return
   fi
 
-  echo "==> Building ${CARGO_BIN} (${CARGO_FEATURES}, host)"
+  echo "==> Building ${CARGO_BIN} (${CARGO_FEATURES}, host)" >&2
   cargo "${cargo_args[@]}"
   local src
   src="$(built_bin_path)"

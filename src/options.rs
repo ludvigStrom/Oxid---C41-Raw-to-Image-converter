@@ -1,9 +1,11 @@
 //! Pipeline option types: rects, D-min mode, output stage, and full pipeline options.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dust::DustMask;
 use crate::tiff_export::TiffFormat;
 
 /// Rectangle for D-min sampling (pixel coordinates).
@@ -331,6 +333,12 @@ pub struct PipelineOptions {
     /// at curve_offset 0 instead of measuring the current buffer. Preview/tiles only.
     #[serde(skip)]
     pub pinned_zone: Option<(f32, f32, f32, f32)>,
+    /// Hash of the dust stroke list when heal is applied. 0 = skip heal.
+    #[serde(skip)]
+    pub dust_mask_hash: u64,
+    /// Working dust mask applied after load when `dust_mask_hash != 0`.
+    #[serde(skip)]
+    pub dust_mask: Option<Arc<DustMask>>,
 }
 
 fn default_debug_pipeline_step() -> u32 {
@@ -431,6 +439,8 @@ impl Default for PipelineOptions {
             bujack_radius: 16.0,
             bujack_edge: 0.25,
             pinned_zone: None,
+            dust_mask_hash: 0,
+            dust_mask: None,
         }
     }
 }

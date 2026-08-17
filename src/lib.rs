@@ -25,6 +25,7 @@ pub mod curve;
 pub mod demosaic;
 pub mod density_ops;
 pub mod dmin;
+pub mod dust;
 pub mod exr_export;
 pub mod flat_field;
 pub mod inversion;
@@ -49,6 +50,10 @@ pub use auto::{auto_tune, AutoTuneResult, AUTO_PROXY_MAX_SIDE};
 pub use auto_crop::{
     detect_crop, AutoCropResult, CropConfidence, FilmFormat, SurroundClass, CROP_PROXY_MAX_SIDE,
 };
+pub use dust::{
+    apply_dust_removal, crop_mask_uv, hash_strokes, rasterize_strokes, stamp_disc, DustMask,
+    DustStroke, DustTool, ProjectDust,
+};
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{
     reset_wb_for_picker, sync_wb_flags_from_mode, DminMode, OutputLutEncoding, OutputStage,
@@ -72,6 +77,15 @@ pub use tiff_export::TiffFormat;
 pub use undo::{UndoManager, UNDO_LIMIT};
 
 use crate::demosaic::{BayerPattern, CfaPattern};
+
+fn apply_optional_dust(image: &mut Array3<f32>, options: &PipelineOptions) {
+    if options.dust_mask_hash == 0 {
+        return;
+    }
+    if let Some(mask) = options.dust_mask.as_ref() {
+        dust::apply_dust_removal(image, mask);
+    }
+}
 
 /// Scale D-min rect from reference size to current image size. If reference is None or matches current size, returns rect as-is.
 pub(crate) fn scale_dmin_rect(
@@ -824,6 +838,8 @@ fn process_one_export(
 
     color_space::apply_input_idt_to_working_space(&mut image, &options.idt_matrix);
 
+    apply_optional_dust(&mut image, options);
+
     export_tick(control, "D-min", 0.40)?;
     pipeline::step_3_dmin(&mut image, options, assets.flat_field_for(options))?;
     export_tick(control, "White balance", 0.52)?;
@@ -1043,14 +1059,9 @@ mod pack_bayer_tests {
                 bayer[(y, x, 0)] = rggb;
             }
         }
-        let rgb = preview_rgb_from_mosaic(
-            &bayer,
-            CfaPattern::Bayer(BayerPattern::Rggb),
-            2,
-            2,
-            false,
-        )
-        .expect("pack");
+        let rgb =
+            preview_rgb_from_mosaic(&bayer, CfaPattern::Bayer(BayerPattern::Rggb), 2, 2, false)
+                .expect("pack");
         assert_eq!(rgb.dim(), (2, 2, 3));
         assert!((rgb[(0, 0, 0)] - 1.0).abs() < 1e-5);
         assert!((rgb[(0, 0, 1)] - 0.5).abs() < 1e-5);
@@ -1128,6 +1139,8 @@ pub fn process_one_to_preview(
     }
 
     color_space::apply_input_idt_to_working_space(&mut image, &options.idt_matrix);
+
+    apply_optional_dust(&mut image, options);
 
     // Step 1: load + demosaic + rotate
     if options.verbose_debug {
@@ -1519,6 +1532,7 @@ pub fn process_one_to_preview_with_cache_on_progress(
         .and_then(|p| lut3d::read_cube(p).ok());
 
     if start_step <= 3 {
+        apply_optional_dust(&mut image, options);
         on_progress("D-min…", 0.98);
         pipeline::step_3_dmin(&mut image, options, flat_map_preview.as_ref())?;
         new_cache.after_step3 = Some((h3, image.clone()));
@@ -1563,7 +1577,14 @@ pub fn apply_preview_from_cache(
     max_height: u32,
     cache: &PreviewStepCache,
 ) -> Option<(u32, u32, u32, u32, Vec<u8>, PreviewStepCache)> {
-    apply_preview_from_cache_on_progress(path, options, max_width, max_height, cache, &mut |_, _| {})
+    apply_preview_from_cache_on_progress(
+        path,
+        options,
+        max_width,
+        max_height,
+        cache,
+        &mut |_, _| {},
+    )
 }
 
 /// Live preview from cache, reporting 97–100% as steps 4–6 finish.
@@ -2050,6 +2071,7 @@ pub fn process_one_to_preview_with_cache_gpu(
 
     // Step 3: flat-field divide and D-min divide on GPU; rect/percentile on CPU
     if start_step <= 3 {
+        apply_optional_dust(&mut image, options);
         let flat_map_preview = options
             .flat_field_path
             .as_ref()
@@ -2160,7 +2182,11 @@ fn load_preview_from_sensor<D: DemosaicBackend>(
                         *pattern,
                         preview_mosaic_working_width(max_width),
                     );
-                    finish_preview_rgb(demosaic_backend.demosaic(&small, *pattern)?, max_width, max_height)
+                    finish_preview_rgb(
+                        demosaic_backend.demosaic(&small, *pattern)?,
+                        max_width,
+                        max_height,
+                    )
                 }
             } else {
                 demosaic_backend.demosaic(data, *pattern)?
