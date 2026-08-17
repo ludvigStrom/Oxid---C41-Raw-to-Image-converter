@@ -508,7 +508,6 @@ struct AutoJob {
     title: &'static str,
     /// Single-image Auto: keep the dialog up until this preview is current.
     applying_preview: Option<usize>,
-    preview_wait_started: Option<Instant>,
     ticker_stop: Arc<AtomicBool>,
 }
 
@@ -3176,7 +3175,6 @@ impl C41Gui {
             batch: false,
             title: "Auto",
             applying_preview: None,
-            preview_wait_started: None,
             ticker_stop: Arc::new(AtomicBool::new(false)),
         });
         ctx.request_repaint();
@@ -3215,7 +3213,6 @@ impl C41Gui {
         }
         if let Some(job) = self.auto_job.as_mut() {
             job.applying_preview = Some(index);
-            job.preview_wait_started = Some(Instant::now());
         }
         if let Some(stop) = self.auto_job.as_ref().map(|j| j.ticker_stop.clone()) {
             let ctx_tick = ctx.clone();
@@ -3366,31 +3363,6 @@ impl C41Gui {
         }
     }
 
-    fn tick_auto_preview_progress(&mut self) {
-        let Some(started) = self
-            .auto_job
-            .as_ref()
-            .and_then(|j| j.preview_wait_started)
-        else {
-            return;
-        };
-        let t = started.elapsed().as_secs_f32();
-        // Integer walk 97 → 98 → 99 → 100 (display truncates, so we must hit each tenth).
-        let pct = (97 + (t / 0.65).floor() as i32).clamp(97, 100);
-        let message = if pct >= 100 {
-            "Finishing preview…"
-        } else if self.preview_receiver.is_some() {
-            if self.preview_job_live {
-                "Rendering preview…"
-            } else {
-                "Developing preview…"
-            }
-        } else {
-            "Applying settings…"
-        };
-        self.set_auto_progress(message, pct as f32 / 100.0);
-    }
-
     fn apply_auto_result_to_path(&mut self, path: &Path, result: &AutoTuneResult) -> bool {
         let Some(entry) = self.images.iter_mut().find(|e| e.path == path) else {
             return false;
@@ -3530,7 +3502,6 @@ impl C41Gui {
             batch: true,
             title: "Auto Develop",
             applying_preview: None,
-            preview_wait_started: None,
             ticker_stop: Arc::new(AtomicBool::new(false)),
         });
         self.status = format!("Auto Develop: {} images…", total);
@@ -3676,7 +3647,6 @@ impl C41Gui {
             batch: true,
             title: "Auto Crop",
             applying_preview: None,
-            preview_wait_started: None,
             ticker_stop: Arc::new(AtomicBool::new(false)),
         });
         self.status = format!("Auto Crop: {} images…", total);
