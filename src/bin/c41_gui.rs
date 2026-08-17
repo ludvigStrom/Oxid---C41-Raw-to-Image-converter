@@ -1151,6 +1151,31 @@ fn compute_histogram_from_rgb(
     (r_hist, g_hist, b_hist)
 }
 
+/// Shared linear Y-scale for the RGB overlay histogram.
+///
+/// Full height is the tallest interior bin across R/G/B. End bins (0–1, 254–255)
+/// are allowed to clip — those are usually film base, rebate, or hard clips and
+/// would squash the rest of the plot if they set the scale. One scale for all
+/// three channels so relative channel height still reads as colour balance.
+fn histogram_y_scale(r: &[u32; 256], g: &[u32; 256], b: &[u32; 256]) -> f32 {
+    let mut peak = 0u32;
+    for hist in [r, g, b] {
+        for &count in &hist[2..254] {
+            peak = peak.max(count);
+        }
+    }
+    if peak == 0 {
+        peak = r
+            .iter()
+            .chain(g.iter())
+            .chain(b.iter())
+            .copied()
+            .max()
+            .unwrap_or(1);
+    }
+    peak.max(1) as f32
+}
+
 fn parse_decimal_f64(input: &str) -> Option<f64> {
     let normalized = input.trim().replace(',', ".");
     normalized.parse::<f64>().ok()
@@ -7033,11 +7058,7 @@ impl eframe::App for C41Gui {
                             let rect = hist_rect;
                             let draw_rect = rect.shrink(1.0);
 
-                            // Fixed Y-scale: full height = this fraction of total pixels; above that we clip.
-                            // 1% = full height so the curve typically uses most of the vertical space.
-                            const FULL_HEIGHT_FRACTION: f32 = 0.01;
-                            let total_pixels = r_hist.iter().sum::<u32>().max(1) as f32;
-                            let scale_at_full = (total_pixels * FULL_HEIGHT_FRACTION).max(1.0);
+                            let scale_at_full = histogram_y_scale(&r_hist, &g_hist, &b_hist);
 
                             // Axes: X (bottom) and Y (left). Draw first so bin 0 is not hidden by Y-axis.
                             let axis_color = egui::Color32::from_gray(100);
@@ -7052,8 +7073,7 @@ impl eframe::App for C41Gui {
                             );
 
                             // Photoshop/Resolve-style histogram rendering:
-                            // per-channel curve (2px) + semi-transparent fill under each curve.
-                            // Y-scale: full height = FULL_HEIGHT_FRACTION of pixels; clip above that.
+                            // per-channel curve + fill. Shared robust peak scale.
                             let draw_channel =
                                 |hist: &[u32; 256],
                                  line_color: egui::Color32,
