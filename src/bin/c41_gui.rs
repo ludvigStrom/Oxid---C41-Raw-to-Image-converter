@@ -507,6 +507,13 @@ struct AutoJob {
     /// Single-image Auto: keep the dialog up until this preview is current.
     applying_preview: Option<usize>,
     preview_wait_started: Option<Instant>,
+    ticker_stop: Arc<AtomicBool>,
+}
+
+impl Drop for AutoJob {
+    fn drop(&mut self) {
+        self.ticker_stop.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
@@ -2158,7 +2165,11 @@ impl C41Gui {
     }
 
     fn request_preview_for(&mut self, index: usize, ctx: &egui::Context, lod: PreviewLod) {
-        if !self.ensure_sensor_and_scene_stats(index) {
+        // Auto's last step must not remosaic the full sensor on the UI thread
+        // (that froze the progress dialog at 97%). Use cached scene stats instead.
+        if self.auto_waiting_preview() != Some(index)
+            && !self.ensure_sensor_and_scene_stats(index)
+        {
             return;
         }
         let path = self.images[index].path.clone();
@@ -3164,6 +3175,7 @@ impl C41Gui {
             title: "Auto",
             applying_preview: None,
             preview_wait_started: None,
+            ticker_stop: Arc::new(AtomicBool::new(false)),
         });
         ctx.request_repaint();
     }
@@ -3198,6 +3210,15 @@ impl C41Gui {
         if let Some(job) = self.auto_job.as_mut() {
             job.applying_preview = Some(index);
             job.preview_wait_started = Some(Instant::now());
+        }
+        if let Some(stop) = self.auto_job.as_ref().map(|j| j.ticker_stop.clone()) {
+            let ctx_tick = ctx.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    ctx_tick.request_repaint();
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
         }
         // Drop any in-flight job for the pre-Auto settings. The normal
         // end-of-frame preview path starts the new one (live cache if possible).
@@ -3400,6 +3421,7 @@ impl C41Gui {
             title: "Auto Develop",
             applying_preview: None,
             preview_wait_started: None,
+            ticker_stop: Arc::new(AtomicBool::new(false)),
         });
         self.status = format!("Auto Develop: {} images…", total);
         ctx.request_repaint();
@@ -3545,6 +3567,7 @@ impl C41Gui {
             title: "Auto Crop",
             applying_preview: None,
             preview_wait_started: None,
+            ticker_stop: Arc::new(AtomicBool::new(false)),
         });
         self.status = format!("Auto Crop: {} images…", total);
         ctx.request_repaint();
