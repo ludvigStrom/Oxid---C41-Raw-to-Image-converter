@@ -41,7 +41,7 @@ const PREVIEW_MIN_SIDE: u32 = 640;
 const PREVIEW_DRAFT_MAX: u32 = 1920;
 const PREVIEW_TILE_SIZE: u32 = 512;
 const PREVIEW_TILE_LRU: usize = 16;
-const PREVIEW_TILE_MAX: usize = 80;
+const PREVIEW_TILE_MAX: usize = 192;
 const PREVIEW_TILE_HALO: u32 = 32;
 const THUMB_MAX_SIZE: u32 = 64;
 const PREVIEW_DEBOUNCE_MS: u64 = 180;
@@ -134,9 +134,9 @@ struct ImageEntry {
     id: u64,
     path: PathBuf,
     options: PipelineOptions,
-    /// Preview texture uploaded when RGB arrives; filter updated only when zoom crosses 1×.
+    /// Preview texture uploaded when RGB arrives; filter updated only when pixel scale crosses 1×.
     preview_texture: Option<egui::TextureHandle>,
-    /// Whether `preview_texture` was uploaded with NEAREST (zoomed) vs LINEAR (fit).
+    /// Whether `preview_texture` was uploaded with NEAREST (magnified) vs LINEAR (fit / minified).
     preview_texture_nearest: bool,
     /// `rotation_degrees` baked into `preview_texture` / `preview_full_rgb`.
     preview_texture_rotation: i32,
@@ -218,7 +218,7 @@ struct VisibleTileGrid {
     ix1: i32,
     iy1: i32,
     opt_hash: u64,
-    /// True when the screen proxy is magnified past 1:1 (tiles actually help).
+    /// True when 1:1 tiles should run (always: the proxy is CFA-downsampled).
     proxy_soft: bool,
     /// True when the core view fits in `PREVIEW_TILE_MAX` (we can cover it).
     tiles_fit: bool,
@@ -1697,6 +1697,22 @@ fn paint_preview_image(
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// 1.0 = 1 preview-buffer pixel : 1 screen point (same units as the zoom %).
+fn preview_pixel_scale(base_scale: f32, zoom: f32) -> f32 {
+    base_scale * zoom
+}
+
+/// Tiles run at every zoom, including fit / zoom-out. The screen proxy is
+/// always softer than full-res tiles (CFA box-downsample before demosaic).
+fn proxy_is_soft(_pixel_scale: f32) -> bool {
+    true
+}
+
+/// NEAREST only when magnifying the proxy; LINEAR for fit / minification.
+fn want_nearest_filter(pixel_scale: f32) -> bool {
+    pixel_scale > 1.0
+}
+
 /// Working preview size: canvas × DPI, floored at 640 and capped at 1920×1200.
 /// Zoom does not change this; full-res mode requests the export pipeline size.
 fn preview_working_limits(canvas: Option<(f32, f32)>, ppp: f32, full_res: bool) -> (u32, u32) {
@@ -2532,7 +2548,7 @@ impl C41Gui {
             ix1,
             iy1,
             opt_hash: entry.preview_options_hash,
-            proxy_soft: zoom > 1.0 && base_scale * zoom > 1.02,
+            proxy_soft: proxy_is_soft(base_scale * zoom),
             tiles_fit: core_n <= PREVIEW_TILE_MAX,
             core_n,
         };
@@ -3930,17 +3946,15 @@ impl eframe::App for C41Gui {
                     self.preview_job_live = false;
                     if job.gen == self.preview_gen && job.index < self.images.len() {
                         let idx = job.index;
-                        let nearest = self.images[idx].preview_zoom > 1.0;
+                        // Fit / first frame: LINEAR. Draw path recreates if pixel scale needs NEAREST.
                         let image = rgb_u8_to_color_image(job.w, job.h, &job.rgb);
-                        let tex_opts = if nearest {
-                            egui::TextureOptions::NEAREST
-                        } else {
-                            egui::TextureOptions::LINEAR
-                        };
-                        let tex =
-                            ctx.load_texture(format!("preview_full_{}", idx), image, tex_opts);
+                        let tex = ctx.load_texture(
+                            format!("preview_full_{}", idx),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
                         self.images[idx].preview_texture = Some(tex);
-                        self.images[idx].preview_texture_nearest = nearest;
+                        self.images[idx].preview_texture_nearest = false;
                         self.images[idx].preview_hash = job.options_hash;
                         self.images[idx].preview_options_hash = job.options_hash;
                         if self.auto_waiting_preview() == Some(idx) {
@@ -6018,29 +6032,6 @@ impl eframe::App for C41Gui {
                         let full_w_f = (full_w as f32).max(1.0);
                         let full_h_f = (full_h as f32).max(1.0);
 
-                        // Recreate texture only when LINEAR/NEAREST must flip (zoom crosses 1×).
-                        let want_nearest = self.images[idx].preview_zoom > 1.0;
-                        if self.images[idx].preview_texture.is_some()
-                            && self.images[idx].preview_texture_nearest != want_nearest
-                        {
-                            if let Some((fw, fh, rgb)) = self.images[idx].preview_full_rgb.as_ref() {
-                                let image = rgb_u8_to_color_image(*fw, *fh, rgb);
-                                let tex_opts = if want_nearest {
-                                    egui::TextureOptions::NEAREST
-                                } else {
-                                    egui::TextureOptions::LINEAR
-                                };
-                                let tex = ui.ctx().load_texture(
-                                    format!("preview_full_{}", idx),
-                                    image,
-                                    tex_opts,
-                                );
-                                self.images[idx].preview_texture = Some(tex);
-                                self.images[idx].preview_texture_nearest = want_nearest;
-                            }
-                        }
-                        let tex_opt = self.images[idx].preview_texture.clone();
-
                         // Allocate the full canvas area — always, so the layout never jumps.
                         ui.add_space(TOP_PADDING);
                         let (canvas_rect, canvas_resp) = ui.allocate_exact_size(
@@ -6063,8 +6054,32 @@ impl eframe::App for C41Gui {
                         let base_scale = (canvas_w / full_w_f).min(canvas_h / full_h_f);
 
                         let zoom = self.images[idx].preview_zoom.max(1.0);
-                        let img_w = full_w_f * base_scale * zoom;
-                        let img_h = full_h_f * base_scale * zoom;
+                        let pixel_scale = preview_pixel_scale(base_scale, zoom);
+                        let img_w = full_w_f * pixel_scale;
+                        let img_h = full_h_f * pixel_scale;
+
+                        // Recreate texture only when LINEAR/NEAREST must flip (pixel scale crosses 1×).
+                        let want_nearest = want_nearest_filter(pixel_scale);
+                        if self.images[idx].preview_texture.is_some()
+                            && self.images[idx].preview_texture_nearest != want_nearest
+                        {
+                            if let Some((fw, fh, rgb)) = self.images[idx].preview_full_rgb.as_ref() {
+                                let image = rgb_u8_to_color_image(*fw, *fh, rgb);
+                                let tex_opts = if want_nearest {
+                                    egui::TextureOptions::NEAREST
+                                } else {
+                                    egui::TextureOptions::LINEAR
+                                };
+                                let tex = ui.ctx().load_texture(
+                                    format!("preview_full_{}", idx),
+                                    image,
+                                    tex_opts,
+                                );
+                                self.images[idx].preview_texture = Some(tex);
+                                self.images[idx].preview_texture_nearest = want_nearest;
+                            }
+                        }
+                        let tex_opt = self.images[idx].preview_texture.clone();
 
                         // Pan: which image-normalized point sits at canvas center.
                         let pan_x = self.images[idx].preview_pan.x.clamp(0.0, 1.0);
@@ -6113,7 +6128,7 @@ impl eframe::App for C41Gui {
                                 || pointer_down
                                 || self.preview_view_dragging
                                 || canvas_resp.dragged();
-                            if zoom > 1.0 && !hide_tiles {
+                            if !hide_tiles {
                                 let opt_hash = self.images[idx].preview_options_hash;
                                 for tile in &self.images[idx].tile_cache {
                                     if tile.options_hash != opt_hash {
@@ -6809,7 +6824,7 @@ impl eframe::App for C41Gui {
                             };
 
                             // Photoshop-style zoom: 100 % = 1 image pixel : 1 screen pixel.
-                            let zoom_pct = base_scale * entry.preview_zoom * 100.0;
+                            let zoom_pct = pixel_scale * 100.0;
 
                             let mut info_text = if let Some((cw, ch)) = crop_dims {
                                 format!(
@@ -6831,7 +6846,7 @@ impl eframe::App for C41Gui {
                             {
                                 info_text.push_str("  ·  Refining…");
                             }
-                            if zoom > 1.0
+                            if proxy_is_soft(pixel_scale)
                                 && !self.preview_options_dirty(idx)
                                 && !self.preview_view_dragging
                                 && !self.preview_view_settling()
@@ -7076,20 +7091,20 @@ impl eframe::App for C41Gui {
                         have_rgb && self.images[idx].preview_options_hash == hash_now;
                     let need_options = !have_current;
                     let lod = self.images[idx].preview_lod;
-                    let proxy_soft = self
-                        .visible_tile_grid(idx)
-                        .map(|g| g.proxy_soft)
-                        .unwrap_or(false);
+                    let grid_now = self.visible_tile_grid(idx);
+                    let proxy_soft = grid_now.as_ref().map(|g| g.proxy_soft).unwrap_or(false);
+                    let tiles_fit = grid_now.as_ref().map(|g| g.tiles_fit).unwrap_or(false);
                     let (req_sw, req_sh) = self.images[idx].preview_screen_requested_wh;
                     // Do not compare CFA output size to the request cap — downsample often
                     // comes in smaller and that used to restart screen refine forever,
-                    // which blocked 1:1 tiles. Skip refine only when tiles will actually run.
+                    // which blocked 1:1 tiles. Skip refine when tiles can cover the view;
+                    // still refine the proxy when the visible grid exceeds PREVIEW_TILE_MAX.
                     let pointer_down = ctx.input(|i| i.pointer.any_down());
                     let slider_dragging =
                         pointer_down && !self.rect_dragging && !self.preview_view_dragging;
                     let need_screen = have_current
                         && !self.full_res_preview_active
-                        && !proxy_soft
+                        && !tiles_fit
                         && !pointer_down
                         && (lod == PreviewLod::Draft
                             || (lod == PreviewLod::Screen
@@ -7188,7 +7203,7 @@ impl eframe::App for C41Gui {
                         self.preview_view_dragging = false;
                     }
                     let view_settling = self.preview_view_settling();
-                    // 1:1 tiles: after pan/zoom/slider release, when the proxy is soft.
+                    // 1:1 tiles: after pan/zoom/slider release, at every zoom including fit.
                     // Over-cap views still fetch a center-first window of PREVIEW_TILE_MAX.
                     if proxy_soft
                         && self.preview_receiver.is_none()
@@ -7258,7 +7273,10 @@ impl eframe::App for C41Gui {
 
 #[cfg(test)]
 mod tile_grid_tests {
-    use super::{tile_range_intersecting, PREVIEW_TILE_SIZE};
+    use super::{
+        preview_pixel_scale, proxy_is_soft, tile_range_intersecting, want_nearest_filter,
+        PREVIEW_TILE_SIZE,
+    };
 
     #[test]
     fn exclusive_end_on_tile_boundary_does_not_drop_previous_tile() {
@@ -7285,5 +7303,22 @@ mod tile_grid_tests {
         assert_eq!(old_ix1, 0, "documents the old miss");
         let (_, _, ix1, _) = tile_range_intersecting(0.0, 0.0, px1, t, t, 16, 16);
         assert_eq!(ix1, 1);
+    }
+
+    #[test]
+    fn tiles_on_at_fit_and_100_and_110_percent() {
+        assert!(proxy_is_soft(0.25), "fit / zoom-out must request 1:1 tiles");
+        assert!(proxy_is_soft(0.99));
+        assert!(proxy_is_soft(1.0), "100% must request 1:1 tiles");
+        assert!(proxy_is_soft(1.1), "110% must request 1:1 tiles");
+        assert!(proxy_is_soft(preview_pixel_scale(0.25, 1.0)));
+        assert!(proxy_is_soft(preview_pixel_scale(0.5, 2.0)));
+    }
+
+    #[test]
+    fn nearest_only_when_magnifying_proxy() {
+        assert!(!want_nearest_filter(0.5));
+        assert!(!want_nearest_filter(1.0));
+        assert!(want_nearest_filter(1.1));
     }
 }
