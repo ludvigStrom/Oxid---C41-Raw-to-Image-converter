@@ -69,6 +69,7 @@ pub fn install_fonts(ctx: &egui::Context) {
 pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals();
+    style.interaction.selectable_labels = false;
     style.spacing.button_padding = Vec2::new(8.0, 3.0);
     style.spacing.item_spacing = Vec2::new(6.0, 4.0);
     style.spacing.interact_size = Vec2::new(36.0, 18.0);

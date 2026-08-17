@@ -6637,7 +6637,7 @@ impl eframe::App for C41Gui {
 
                             let mut info_text = if let Some((cw, ch)) = crop_dims {
                                 format!(
-                                    "{} × {}  →  {} × {}  ·  {:.0}%",
+                                    "{} × {}  ->  {} × {}  ·  {:.0}%",
                                     src_w, src_h, cw, ch, zoom_pct
                                 )
                             } else {
