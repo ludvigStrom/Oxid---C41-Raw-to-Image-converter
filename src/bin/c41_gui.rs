@@ -4276,6 +4276,7 @@ impl eframe::App for C41Gui {
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
                         ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 8.0).max(80.0));
                 match self.mode {
                     UIMode::Process => {
                         ui.heading("Image Settings");
@@ -4581,36 +4582,24 @@ impl eframe::App for C41Gui {
                     {
                         let mut exp = exposure_from_opts(opts);
                         let mut changed = false;
-                        egui::Grid::new("exposure")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Density");
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut exp.density, 0.5..=1.5).fixed_decimals(2))
-                                    .changed();
-                                ui.end_row();
-                                ui.label("Grade");
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut exp.grade, 0.5..=2.0).fixed_decimals(2))
-                                    .changed();
-                                ui.end_row();
-                                ui.label("Shadows");
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut exp.shadows, -0.3..=0.3).fixed_decimals(3))
-                                    .changed();
-                                ui.end_row();
-                                ui.label("Highlights");
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut exp.highlights, -0.5..=0.5).fixed_decimals(3))
-                                    .changed();
-                                ui.end_row();
-                                ui.label("Hardness");
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut exp.hardness, -0.5..=0.5).fixed_decimals(3))
-                                    .changed();
-                                ui.end_row();
-                            });
+                        changed |= theme::slider_row(ui, "Density", &mut exp.density, 0.5..=1.5, 2)
+                            .changed();
+                        changed |= theme::slider_row(ui, "Grade", &mut exp.grade, 0.5..=2.0, 2)
+                            .changed();
+                        changed |=
+                            theme::slider_row(ui, "Shadows", &mut exp.shadows, -0.3..=0.3, 3)
+                                .changed();
+                        changed |= theme::slider_row(
+                            ui,
+                            "Highlights",
+                            &mut exp.highlights,
+                            -0.5..=0.5,
+                            3,
+                        )
+                        .changed();
+                        changed |=
+                            theme::slider_row(ui, "Hardness", &mut exp.hardness, -0.5..=0.5, 3)
+                                .changed();
                         if changed {
                             apply_exposure_to_opts(&exp, opts);
                         }
@@ -4621,36 +4610,37 @@ impl eframe::App for C41Gui {
                                 .on_hover_text("Per-channel cyan, magenta, yellow adjustments for print balance");
                             let mut pb = print_balance_from_opts(opts);
                             let mut pb_changed = false;
-                            ui.horizontal(|ui| {
-                                ui.label("C");
-                                pb_changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut pb.cyan, -0.5..=0.5)
-                                            .fixed_decimals(2),
-                                    )
+                            pb_changed |=
+                                theme::slider_row(ui, "C", &mut pb.cyan, -0.5..=0.5, 2).changed();
+                            pb_changed |=
+                                theme::slider_row(ui, "M", &mut pb.magenta, -0.5..=0.5, 2)
                                     .changed();
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("M");
-                                pb_changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut pb.magenta, -0.5..=0.5)
-                                            .fixed_decimals(2),
-                                    )
+                            pb_changed |=
+                                theme::slider_row(ui, "Y", &mut pb.yellow, -0.5..=0.5, 2)
                                     .changed();
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Y");
-                                pb_changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut pb.yellow, -0.5..=0.5)
-                                            .fixed_decimals(2),
-                                    )
-                                    .changed();
-                            });
                             if pb_changed {
                                 apply_print_balance_to_opts(&pb, opts);
                             }
+                        }
+                        if theme::section_reset(ui) {
+                            apply_exposure_to_opts(
+                                &ExposureParams {
+                                    density: 1.0,
+                                    grade: 1.0,
+                                    shadows: 0.0,
+                                    highlights: 0.0,
+                                    hardness: 0.0,
+                                },
+                                opts,
+                            );
+                            apply_print_balance_to_opts(
+                                &PrintBalance {
+                                    cyan: 0.0,
+                                    magenta: 0.0,
+                                    yellow: 0.0,
+                                },
+                                opts,
+                            );
                         }
                     }
                     ui.add_space(6.0);
@@ -4663,18 +4653,15 @@ impl eframe::App for C41Gui {
                         theme::icon_label(theme::FILTER_HDR, "Highlight roll-off"),
                         |ui| {
                         ui.add_space(4.0);
-                        egui::Grid::new("highlight_rolloff")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Strength");
-                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff, 0.0..=3.0).fixed_decimals(2));
-                                ui.end_row();
-                                ui.label("Knee");
-                                ui.add(egui::Slider::new(&mut opts.highlight_rolloff_d_mid, 0.5..=3.0).fixed_decimals(2));
-                                ui.end_row();
-                            });
-                        if ui.small_button("Reset").clicked() {
+                        theme::slider_row(ui, "Strength", &mut opts.highlight_rolloff, 0.0..=3.0, 2);
+                        theme::slider_row(
+                            ui,
+                            "Knee",
+                            &mut opts.highlight_rolloff_d_mid,
+                            0.5..=3.0,
+                            2,
+                        );
+                        if theme::section_reset(ui) {
                             opts.highlight_rolloff = 0.0;
                             opts.highlight_rolloff_d_mid = 1.5;
                         }
@@ -4688,29 +4675,26 @@ impl eframe::App for C41Gui {
                         theme::icon_label(theme::CONTRAST, "Tone shaping"),
                         |ui| {
                         ui.add_space(4.0);
-                        egui::Grid::new("tone_shaping")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Toe");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.toe_strength, -0.5..=0.5)
-                                        .fixed_decimals(2),
-                                );
-                                ui.end_row();
-                                ui.label("Shoulder");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.shoulder_strength, -0.5..=0.5)
-                                        .fixed_decimals(2),
-                                );
-                                ui.end_row();
-                                ui.label("Shadow cast");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.shadow_cast_strength, 0.0..=1.0)
-                                        .fixed_decimals(2),
-                                );
-                                ui.end_row();
-                            });
+                        theme::slider_row(ui, "Toe", &mut opts.toe_strength, -0.5..=0.5, 2);
+                        theme::slider_row(
+                            ui,
+                            "Shoulder",
+                            &mut opts.shoulder_strength,
+                            -0.5..=0.5,
+                            2,
+                        );
+                        theme::slider_row(
+                            ui,
+                            "Shadow cast",
+                            &mut opts.shadow_cast_strength,
+                            0.0..=1.0,
+                            2,
+                        );
+                        if theme::section_reset(ui) {
+                            opts.toe_strength = 0.0;
+                            opts.shoulder_strength = 0.0;
+                            opts.shadow_cast_strength = 0.0;
+                        }
                     });
                     cr_tone.header_response.on_hover_text("Toe/shoulder: softer shadows and highlights. Shadow cast: auto-neutralize color cast in shadows.");
 
@@ -4774,9 +4758,16 @@ impl eframe::App for C41Gui {
                             }
                             WbMode::Manual => {
                                 let mut k = opts.temp_k.unwrap_or(5500.0);
-                                ui.add(egui::Slider::new(&mut k, 2500.0..=9000.0).suffix(" K"));
+                                theme::slider_row_with(ui, "Temp", &mut k, 2500.0..=9000.0, |s| {
+                                    s.suffix(" K")
+                                });
                                 opts.temp_k = Some(k);
                             }
+                        }
+                        if theme::section_reset(ui) {
+                            opts.wb_mode = WbMode::Auto;
+                            sync_wb_flags_from_mode(opts);
+                            disarm_wb_picker = true;
                         }
                     });
 
@@ -4785,48 +4776,32 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     let cr_color = ui.collapsing(theme::icon_label(theme::PALETTE, "Color"), |ui| {
                         ui.add_space(4.0);
-                        egui::Grid::new("color_main")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Saturation");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.saturation, 0.7..=1.6)
-                                        .fixed_decimals(2),
-                                );
-                                ui.end_row();
-                                ui.label("Warmth");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.highlight_warmth, 0.0..=0.6)
-                                        .fixed_decimals(2),
-                                );
-                                ui.end_row();
-                            });
+                        theme::slider_row(ui, "Saturation", &mut opts.saturation, 0.7..=1.6, 2);
+                        theme::slider_row(ui, "Warmth", &mut opts.highlight_warmth, 0.0..=0.6, 2);
                         ui.checkbox(&mut opts.apply_lab, "Lab separation");
                         ui.add_enabled_ui(opts.apply_lab, |ui| {
-                            egui::Grid::new("color_lab")
-                                .num_columns(2)
-                                .spacing([4.0, 2.0])
-                                .show(ui, |ui| {
-                                    ui.label("Separation");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.lab_separation, -2.0..=2.0)
-                                            .fixed_decimals(2),
-                                    );
-                                    ui.end_row();
-                                });
+                            theme::slider_row(
+                                ui,
+                                "Separation",
+                                &mut opts.lab_separation,
+                                -2.0..=2.0,
+                                2,
+                            );
                         });
-                        egui::Grid::new("color_skin_magenta")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Skin magenta");
-                                ui.add(
-                                    egui::Slider::new(&mut opts.skin_magenta_shift, 0.0..=1.0)
-                                        .fixed_decimals(2),
-                                );
-                                ui.end_row();
-                            });
+                        theme::slider_row(
+                            ui,
+                            "Skin magenta",
+                            &mut opts.skin_magenta_shift,
+                            0.0..=1.0,
+                            2,
+                        );
+                        if theme::section_reset(ui) {
+                            opts.saturation = 1.0;
+                            opts.highlight_warmth = 0.0;
+                            opts.apply_lab = true;
+                            opts.lab_separation = 1.0;
+                            opts.skin_magenta_shift = 0.0;
+                        }
                     });
                     cr_color.header_response.on_hover_text("Saturation: density chroma. Warmth: golden highlights. Lab: mid-chroma separation in a/b. Skin magenta: rotates lips/eye magenta toward orange.");
 
@@ -4839,75 +4814,83 @@ impl eframe::App for C41Gui {
                         ui.add_space(4.0);
 
                         ui.label(egui::RichText::new("Shadows").strong());
-                        egui::Grid::new("color_zones_shadows")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Gain");
-                                ui.add(egui::Slider::new(&mut opts.zone_shadow_gain, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Saturation");
-                                ui.add(egui::Slider::new(&mut opts.zone_shadow_saturation, 0.5..=1.6).fixed_decimals(2));
-                                ui.end_row();
-                                ui.label("Gain R");
-                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Gain G");
-                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Gain B");
-                                ui.add(egui::Slider::new(&mut opts.color_shadow_gain_b, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                            });
+                        theme::slider_row(ui, "Gain", &mut opts.zone_shadow_gain, -0.5..=0.5, 3);
+                        theme::slider_row(
+                            ui,
+                            "Saturation",
+                            &mut opts.zone_shadow_saturation,
+                            0.5..=1.6,
+                            2,
+                        );
+                        theme::slider_row(
+                            ui,
+                            "Gain R",
+                            &mut opts.color_shadow_gain_r,
+                            -0.3..=0.3,
+                            3,
+                        );
+                        theme::slider_row(
+                            ui,
+                            "Gain G",
+                            &mut opts.color_shadow_gain_g,
+                            -0.3..=0.3,
+                            3,
+                        );
+                        theme::slider_row(
+                            ui,
+                            "Gain B",
+                            &mut opts.color_shadow_gain_b,
+                            -0.3..=0.3,
+                            3,
+                        );
 
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("Midtones").strong());
-                        egui::Grid::new("color_zones_mids")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Gain");
-                                ui.add(egui::Slider::new(&mut opts.zone_mid_gain, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Saturation");
-                                ui.add(egui::Slider::new(&mut opts.zone_mid_saturation, 0.5..=1.6).fixed_decimals(2));
-                                ui.end_row();
-                                ui.label("Gain R");
-                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Gain G");
-                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Gain B");
-                                ui.add(egui::Slider::new(&mut opts.color_mid_gain_b, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                            });
+                        theme::slider_row(ui, "Gain", &mut opts.zone_mid_gain, -0.5..=0.5, 3);
+                        theme::slider_row(
+                            ui,
+                            "Saturation",
+                            &mut opts.zone_mid_saturation,
+                            0.5..=1.6,
+                            2,
+                        );
+                        theme::slider_row(ui, "Gain R", &mut opts.color_mid_gain_r, -0.3..=0.3, 3);
+                        theme::slider_row(ui, "Gain G", &mut opts.color_mid_gain_g, -0.3..=0.3, 3);
+                        theme::slider_row(ui, "Gain B", &mut opts.color_mid_gain_b, -0.3..=0.3, 3);
 
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("Highlights").strong());
-                        egui::Grid::new("color_zones_highlights")
-                            .num_columns(2)
-                            .spacing([4.0, 2.0])
-                            .show(ui, |ui| {
-                                ui.label("Gain");
-                                ui.add(egui::Slider::new(&mut opts.zone_highlight_gain, -0.5..=0.5).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Saturation");
-                                ui.add(egui::Slider::new(&mut opts.zone_highlight_saturation, 0.5..=1.6).fixed_decimals(2));
-                                ui.end_row();
-                                ui.label("Gain R");
-                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_r, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Gain G");
-                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_g, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                                ui.label("Gain B");
-                                ui.add(egui::Slider::new(&mut opts.color_highlight_gain_b, -0.3..=0.3).fixed_decimals(3));
-                                ui.end_row();
-                            });
+                        theme::slider_row(ui, "Gain", &mut opts.zone_highlight_gain, -0.5..=0.5, 3);
+                        theme::slider_row(
+                            ui,
+                            "Saturation",
+                            &mut opts.zone_highlight_saturation,
+                            0.5..=1.6,
+                            2,
+                        );
+                        theme::slider_row(
+                            ui,
+                            "Gain R",
+                            &mut opts.color_highlight_gain_r,
+                            -0.3..=0.3,
+                            3,
+                        );
+                        theme::slider_row(
+                            ui,
+                            "Gain G",
+                            &mut opts.color_highlight_gain_g,
+                            -0.3..=0.3,
+                            3,
+                        );
+                        theme::slider_row(
+                            ui,
+                            "Gain B",
+                            &mut opts.color_highlight_gain_b,
+                            -0.3..=0.3,
+                            3,
+                        );
 
-                        ui.add_space(6.0);
-                        if ui.small_button("Reset all").clicked() {
+                        if theme::section_reset(ui) {
                             opts.zone_shadow_gain = 0.0;
                             opts.zone_mid_gain = 0.0;
                             opts.zone_highlight_gain = 0.0;
@@ -4974,11 +4957,11 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // Input — Film γ
                     // ════════════════════════════════════════════════════════
-                        ui.horizontal(|ui| {
-                            ui.label("Film γ")
-                                .on_hover_text("C-41 γ ≈ 0.55–0.75. Converts density → scene log-exposure.");
-                            ui.add(egui::Slider::new(&mut opts.film_gamma, 0.4..=2.0));
-                        });
+                        theme::slider_row(ui, "Film γ", &mut opts.film_gamma, 0.4..=2.0, 2)
+                            .label
+                            .on_hover_text(
+                                "C-41 γ ≈ 0.55–0.75. Converts density → scene log-exposure.",
+                            );
                         ui.add_space(4.0);
                         ui.separator();
                         ui.add_space(4.0);
@@ -5129,14 +5112,15 @@ impl eframe::App for C41Gui {
                                 ui.checkbox(&mut opts.dmin_neutral_only, "Neutral only (geometric mean)");
                             }
                             DminMode::AutoPercentile => {
-                                ui.horizontal(|ui| {
-                                    ui.label("Border buffer")
-                                        .on_hover_text("Automatic per-channel percentile normalization. Finds film base density (p0.5) and normalizes. Border buffer excludes edges from analysis.");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.auto_norm_buffer, 0.1..=0.3)
-                                            .fixed_decimals(2),
-                                    );
-                                });
+                                theme::slider_row(
+                                    ui,
+                                    "Border buffer",
+                                    &mut opts.auto_norm_buffer,
+                                    0.1..=0.3,
+                                    2,
+                                )
+                                .label
+                                .on_hover_text("Automatic per-channel percentile normalization. Finds film base density (p0.5) and normalizes. Border buffer excludes edges from analysis.");
                             }
                         }
 
@@ -5204,53 +5188,41 @@ impl eframe::App for C41Gui {
                             );
                         ui.add_enabled_ui(opts.bujack_enabled, |ui| {
                             ui.add_space(4.0);
-                            egui::Grid::new("bujack_knobs")
-                                .num_columns(2)
-                                .spacing([4.0, 2.0])
-                                .show(ui, |ui| {
-                                    ui.label("Knee L")
-                                        .on_hover_text("Where lightness differences start to flatten. Smaller = more aggressive.");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.bujack_k_l, 0.05..=0.60)
-                                            .fixed_decimals(3),
-                                    );
-                                    ui.end_row();
-                                    ui.label("Knee C")
-                                        .on_hover_text("Same knee, applied to the (a,b) chroma vector.");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.bujack_k_c, 0.05..=0.60)
-                                            .fixed_decimals(3),
-                                    );
-                                    ui.end_row();
-                                    ui.label("Strength")
-                                        .on_hover_text("Dry/wet mix. Above 1.0 over-corrects.");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.bujack_strength, 0.0..=1.5)
-                                            .fixed_decimals(2),
-                                    );
-                                    ui.end_row();
-                                    ui.label("Radius")
-                                        .on_hover_text(
-                                            "Bilateral radius in pixels of the current buffer. \
-                                             Small = across edges, large = across the frame. \
-                                             Preview is smaller than export, so the same number \
-                                             covers more of the frame in preview.",
-                                        );
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.bujack_radius, 2.0..=48.0)
-                                            .fixed_decimals(0)
-                                            .suffix(" px"),
-                                    );
-                                    ui.end_row();
-                                    ui.label("Edge preserve")
-                                        .on_hover_text("Bilateral range σ. Low keeps edges out of the base (less halo); 1.0 ≈ Gaussian.");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.bujack_edge, 0.03..=1.0)
-                                            .fixed_decimals(2),
-                                    );
-                                    ui.end_row();
-                                });
+                            theme::slider_row(ui, "Knee L", &mut opts.bujack_k_l, 0.05..=0.60, 3)
+                                .label
+                                .on_hover_text("Where lightness differences start to flatten. Smaller = more aggressive.");
+                            theme::slider_row(ui, "Knee C", &mut opts.bujack_k_c, 0.05..=0.60, 3)
+                                .label
+                                .on_hover_text("Same knee, applied to the (a,b) chroma vector.");
+                            theme::slider_row(ui, "Strength", &mut opts.bujack_strength, 0.0..=1.5, 2)
+                                .label
+                                .on_hover_text("Dry/wet mix. Above 1.0 over-corrects.");
+                            theme::slider_row_with(
+                                ui,
+                                "Radius",
+                                &mut opts.bujack_radius,
+                                2.0..=48.0,
+                                |s| s.fixed_decimals(0).suffix(" px"),
+                            )
+                            .label
+                            .on_hover_text(
+                                "Bilateral radius in pixels of the current buffer. \
+                                 Small = across edges, large = across the frame. \
+                                 Preview is smaller than export, so the same number \
+                                 covers more of the frame in preview.",
+                            );
+                            theme::slider_row(ui, "Edge preserve", &mut opts.bujack_edge, 0.03..=1.0, 2)
+                                .label
+                                .on_hover_text("Bilateral range σ. Low keeps edges out of the base (less halo); 1.0 ≈ Gaussian.");
                         });
+                        if theme::section_reset(ui) {
+                            opts.bujack_enabled = false;
+                            opts.bujack_k_l = 0.25;
+                            opts.bujack_k_c = 0.30;
+                            opts.bujack_strength = 0.2;
+                            opts.bujack_radius = 16.0;
+                            opts.bujack_edge = 0.25;
+                        }
                     });
                     cr_bujack.header_response.on_hover_text(
                         "Stretches large OkLab differences from a local mean. \
@@ -5335,68 +5307,34 @@ impl eframe::App for C41Gui {
 
                             if matches!(opts.output_stage, OutputStage::FilmPrint) {
                                 ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("R")
-                                        .on_hover_text("Per-channel offsets (exposure shift)");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.fp_offset_r, -0.3..=0.3)
-                                            .fixed_decimals(3),
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("G");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.fp_offset_g, -0.3..=0.3)
-                                            .fixed_decimals(3),
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("B");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.fp_offset_b, -0.3..=0.3)
-                                            .fixed_decimals(3),
-                                    );
-                                });
+                                theme::slider_row(ui, "R", &mut opts.fp_offset_r, -0.3..=0.3, 3)
+                                    .label
+                                    .on_hover_text("Per-channel offsets (exposure shift)");
+                                theme::slider_row(ui, "G", &mut opts.fp_offset_g, -0.3..=0.3, 3);
+                                theme::slider_row(ui, "B", &mut opts.fp_offset_b, -0.3..=0.3, 3);
 
                                 ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("R")
-                                        .on_hover_text("Per-channel gamma (contrast)");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.fp_gamma_r, 0.7..=1.5)
-                                            .fixed_decimals(2),
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("G");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.fp_gamma_g, 0.7..=1.5)
-                                            .fixed_decimals(2),
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("B");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.fp_gamma_b, 0.7..=1.5)
-                                            .fixed_decimals(2),
-                                    );
-                                });
+                                theme::slider_row(ui, "R", &mut opts.fp_gamma_r, 0.7..=1.5, 2)
+                                    .label
+                                    .on_hover_text("Per-channel gamma (contrast)");
+                                theme::slider_row(ui, "G", &mut opts.fp_gamma_g, 0.7..=1.5, 2);
+                                theme::slider_row(ui, "B", &mut opts.fp_gamma_b, 0.7..=1.5, 2);
 
                                 ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Color bleed");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.fp_color_bleed, 0.0..=0.3)
-                                            .fixed_decimals(2),
-                                    );
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Vibrance");
-                                    ui.add(
-                                        egui::Slider::new(&mut opts.fp_vibrance, 0.0..=1.0)
-                                            .fixed_decimals(2),
-                                    );
-                                });
+                                theme::slider_row(
+                                    ui,
+                                    "Color bleed",
+                                    &mut opts.fp_color_bleed,
+                                    0.0..=0.3,
+                                    2,
+                                );
+                                theme::slider_row(
+                                    ui,
+                                    "Vibrance",
+                                    &mut opts.fp_vibrance,
+                                    0.0..=1.0,
+                                    2,
+                                );
                             }
 
                             if matches!(opts.output_stage, OutputStage::Lut2383) {
@@ -5465,6 +5403,21 @@ impl eframe::App for C41Gui {
                             }
                         }
 
+                        if theme::section_reset(ui) {
+                            let d = PipelineOptions::default();
+                            opts.no_curve = d.no_curve;
+                            opts.output_stage = d.output_stage;
+                            opts.curve_pivot = d.curve_pivot;
+                            opts.fp_offset_r = d.fp_offset_r;
+                            opts.fp_offset_g = d.fp_offset_g;
+                            opts.fp_offset_b = d.fp_offset_b;
+                            opts.fp_gamma_r = d.fp_gamma_r;
+                            opts.fp_gamma_g = d.fp_gamma_g;
+                            opts.fp_gamma_b = d.fp_gamma_b;
+                            opts.fp_color_bleed = d.fp_color_bleed;
+                            opts.fp_vibrance = d.fp_vibrance;
+                            opts.output_lut_encoding = d.output_lut_encoding;
+                        }
                     });
                   } // end Develop tab guard (group 6)
                 }

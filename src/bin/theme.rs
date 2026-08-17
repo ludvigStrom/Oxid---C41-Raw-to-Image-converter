@@ -1,5 +1,7 @@
 //! Darker “pro lab” chrome: near-black panels, steel accent, Material Icons.
 
+use std::ops::RangeInclusive;
+
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontTweak, Rounding, Shadow, Stroke, Vec2,
 };
@@ -87,6 +89,73 @@ pub fn icon_label(icon: &str, text: &str) -> egui::RichText {
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, tip: &str) -> egui::Response {
     ui.add(egui::Button::new(egui::RichText::new(icon).size(18.0)).frame(false))
         .on_hover_text(tip)
+}
+
+/// Full-width slider row: fixed label, expanding rail, fixed value box.
+pub struct SliderRowResponse {
+    pub label: egui::Response,
+    pub slider: egui::Response,
+}
+
+impl SliderRowResponse {
+    pub fn changed(&self) -> bool {
+        self.slider.changed()
+    }
+}
+
+/// Label 34% · rail fills the rest · value 18%. Same start x for every row.
+pub fn slider_row<N: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    value: &mut N,
+    range: RangeInclusive<N>,
+    decimals: usize,
+) -> SliderRowResponse {
+    slider_row_with(ui, label, value, range, |s| s.fixed_decimals(decimals))
+}
+
+pub fn slider_row_with<N: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    value: &mut N,
+    range: RangeInclusive<N>,
+    configure: impl FnOnce(egui::Slider<'_>) -> egui::Slider<'_>,
+) -> SliderRowResponse {
+    const LABEL_FRACTION: f32 = 0.34;
+    const VALUE_FRACTION: f32 = 0.18;
+
+    let gap = ui.spacing().item_spacing.x;
+    let row_h = ui.spacing().interact_size.y;
+    // Extra right inset so the value box is not clipped by the panel/scrollbar.
+    let total = (ui.available_width() - gap).max(0.0);
+    let label_w = total * LABEL_FRACTION;
+    let value_w = total * VALUE_FRACTION;
+    let slider_w = (total - label_w - value_w - gap * 2.0).max(row_h * 2.0);
+
+    let mut label_resp = None;
+    let mut slider_resp = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().slider_width = slider_w;
+        ui.spacing_mut().interact_size.x = value_w;
+        ui.allocate_ui_with_layout(
+            egui::vec2(label_w, row_h),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                label_resp = Some(ui.add(egui::Label::new(label).truncate()));
+            },
+        );
+        slider_resp = Some(ui.add(configure(egui::Slider::new(value, range))));
+    });
+
+    SliderRowResponse {
+        label: label_resp.expect("slider row allocated a label"),
+        slider: slider_resp.expect("slider row allocated a slider"),
+    }
+}
+
+pub fn section_reset(ui: &mut egui::Ui) -> bool {
+    ui.add_space(6.0);
+    ui.small_button("Reset").clicked()
 }
 
 fn visuals() -> egui::Visuals {
