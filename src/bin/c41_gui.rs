@@ -3244,9 +3244,11 @@ impl C41Gui {
             return;
         };
         let t = started.elapsed().as_secs_f32();
-        // Ease 97% → 99.5% so the bar keeps moving on the long preview step.
-        let frac = 0.97 + 0.025 * (1.0 - (-t / 2.4).exp());
-        let message = if self.preview_receiver.is_some() {
+        // Integer walk 97 → 98 → 99 → 100 (display truncates, so we must hit each tenth).
+        let pct = (97 + (t / 0.65).floor() as i32).clamp(97, 100);
+        let message = if pct >= 100 {
+            "Finishing preview…"
+        } else if self.preview_receiver.is_some() {
             if self.preview_job_live {
                 "Rendering preview…"
             } else {
@@ -3255,7 +3257,7 @@ impl C41Gui {
         } else {
             "Applying settings…"
         };
-        self.set_auto_progress(message, frac.min(0.995));
+        self.set_auto_progress(message, pct as f32 / 100.0);
     }
 
     fn apply_auto_result_to_path(&mut self, path: &Path, result: &AutoTuneResult) -> bool {
@@ -3645,6 +3647,15 @@ impl C41Gui {
     }
 
     fn show_auto_progress(&mut self, ctx: &egui::Context) {
+        if self
+            .auto_job
+            .as_ref()
+            .is_some_and(|j| j.applying_preview.is_some() && j.preview_wait_started.is_none())
+        {
+            if let Some(job) = self.auto_job.as_mut() {
+                job.preview_wait_started = Some(Instant::now());
+            }
+        }
         let Some(job) = self.auto_job.as_ref() else {
             return;
         };
@@ -3658,13 +3669,29 @@ impl C41Gui {
         let cancelling = cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
         let title = job.title;
-        let preview_wait = job.applying_preview.is_some();
+        let preview_pct = job.preview_wait_started.map(|started| {
+            (97 + (started.elapsed().as_secs_f32() / 0.5).floor() as i32).clamp(97, 100)
+        });
+        if preview_pct.is_some() {
+            ctx.request_repaint();
+        }
+        let fraction = preview_pct
+            .map(|pct| pct as f32 / 100.0)
+            .unwrap_or(snap.fraction)
+            .clamp(0.0, 1.0);
+        let percent_text = format!("{}%", (fraction * 100.0).round() as i32);
         let shown = if snap.completed < snap.total && !snap.file_name.is_empty() {
             snap.completed.saturating_add(1).min(snap.total)
         } else {
             snap.completed.min(snap.total)
         };
-        let heading = if batch && snap.total > 1 {
+        let heading = if let Some(pct) = preview_pct {
+            if pct >= 100 {
+                "Finishing preview…".to_string()
+            } else {
+                "Loading preview…".to_string()
+            }
+        } else if batch && snap.total > 1 {
             format!("{}  ({}/{})", snap.file_name, shown, snap.total)
         } else if batch && !snap.file_name.is_empty() {
             snap.file_name.clone()
@@ -3690,10 +3717,9 @@ impl C41Gui {
                 ui.label(egui::RichText::new(&heading).strong());
                 ui.add_space(6.0);
                 ui.add(
-                    egui::ProgressBar::new(snap.fraction.clamp(0.0, 1.0))
+                    egui::ProgressBar::new(fraction)
                         .desired_width(320.0)
-                        .show_percentage()
-                        .animate(preview_wait),
+                        .text(percent_text),
                 );
                 if batch {
                     if !stage.is_empty() {
