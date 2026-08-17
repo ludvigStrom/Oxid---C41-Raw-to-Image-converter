@@ -4563,7 +4563,7 @@ impl eframe::App for C41Gui {
                                 .show(ui, |ui| {
                                     ui.label("Separation");
                                     ui.add(
-                                        egui::Slider::new(&mut opts.lab_separation, -1.5..=1.5)
+                                        egui::Slider::new(&mut opts.lab_separation, -2.0..=2.0)
                                             .fixed_decimals(2),
                                     );
                                     ui.end_row();
