@@ -40,12 +40,7 @@ fn get_gpu() -> Option<(Arc<GpuContext>, Step6Pipeline)> {
     Some((ctx, pipeline))
 }
 
-fn compare_u16(
-    cpu: &Step6Display,
-    gpu: &Step6Display,
-    tolerance_lsb: u16,
-    label: &str,
-) {
+fn compare_u16(cpu: &Step6Display, gpu: &Step6Display, tolerance_lsb: u16, label: &str) {
     let (cpu_img, gpu_img) = match (cpu, gpu) {
         (Step6Display::U16(c), Step6Display::U16(g)) => (c, g),
         _ => panic!("{}: expected U16 output from both paths", label),
@@ -88,12 +83,7 @@ fn compare_u16(
     }
 }
 
-fn compare_f32(
-    cpu: &Step6Display,
-    gpu: &Step6Display,
-    tolerance: f32,
-    label: &str,
-) {
+fn compare_f32(cpu: &Step6Display, gpu: &Step6Display, tolerance: f32, label: &str) {
     let (cpu_img, gpu_img) = match (cpu, gpu) {
         (Step6Display::F32(c), Step6Display::F32(g)) => (c, g),
         _ => panic!("{}: expected F32 output from both paths", label),
@@ -140,7 +130,10 @@ fn compare_f32(
 fn step6_ra4_basic() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(120, 80);
     let opts = PipelineOptions::default();
@@ -151,7 +144,9 @@ fn step6_ra4_basic() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, None);
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, None).expect("GPU step6 Ra4 basic");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, None)
+        .expect("GPU step6 Ra4 basic");
     compare_u16(&cpu, &gpu, 2, "Ra4 basic");
 }
 
@@ -159,7 +154,10 @@ fn step6_ra4_basic() {
 fn step6_ra4_full_ops() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(100, 80);
     let mut opts = PipelineOptions::default();
@@ -182,7 +180,9 @@ fn step6_ra4_full_ops() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, None);
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, None).expect("GPU step6 Ra4 full");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, None)
+        .expect("GPU step6 Ra4 full");
     // Lab separation and skin magenta shift use pow()/cbrt/trig with GPU precision, plus
     // the GPU avoids intermediate u16 quantization that CPU does between each
     // post-curve op. 10 LSB = 0.015% — imperceptible.
@@ -195,7 +195,10 @@ fn step6_ra4_full_ops() {
 fn step6_film_print_basic() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(100, 80);
     let mut opts = PipelineOptions::default();
@@ -216,7 +219,9 @@ fn step6_film_print_basic() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, None);
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, None).expect("GPU step6 FilmPrint");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, None)
+        .expect("GPU step6 FilmPrint");
     compare_u16(&cpu, &gpu, 2, "FilmPrint basic");
 }
 
@@ -224,7 +229,10 @@ fn step6_film_print_basic() {
 fn step6_film_print_full_ops() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(100, 80);
     let mut opts = PipelineOptions::default();
@@ -252,7 +260,9 @@ fn step6_film_print_full_ops() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, None);
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, None).expect("GPU step6 FilmPrint full");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, None)
+        .expect("GPU step6 FilmPrint full");
     compare_u16(&cpu, &gpu, 10, "FilmPrint full ops");
 }
 
@@ -262,7 +272,10 @@ fn step6_film_print_full_ops() {
 fn step6_none_mode() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(100, 80);
     let mut opts = PipelineOptions::default();
@@ -275,7 +288,9 @@ fn step6_none_mode() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, None);
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, None).expect("GPU step6 None");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, None)
+        .expect("GPU step6 None");
     compare_f32(&cpu, &gpu, 1e-6, "None mode");
 }
 
@@ -283,7 +298,10 @@ fn step6_none_mode() {
 fn step6_none_no_invert() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(64, 48);
     let mut opts = PipelineOptions::default();
@@ -297,7 +315,9 @@ fn step6_none_no_invert() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, None);
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, None).expect("GPU step6 None no_invert");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, None)
+        .expect("GPU step6 None no_invert");
     compare_f32(&cpu, &gpu, 1e-6, "None no_invert");
 }
 
@@ -307,7 +327,10 @@ fn step6_none_no_invert() {
 fn step6_lut2383_cineon() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(80, 60);
     let lut = make_display_lut(17);
@@ -324,7 +347,9 @@ fn step6_lut2383_cineon() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, Some(&lut));
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, Some(&lut)).expect("GPU step6 Lut2383 Cineon");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, Some(&lut))
+        .expect("GPU step6 Lut2383 Cineon");
     compare_f32(&cpu, &gpu, 1e-5, "Lut2383 CineonLog");
 }
 
@@ -332,7 +357,10 @@ fn step6_lut2383_cineon() {
 fn step6_lut2383_rec709() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(80, 60);
     let lut = make_display_lut(17);
@@ -348,7 +376,9 @@ fn step6_lut2383_rec709() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, Some(&lut));
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, Some(&lut)).expect("GPU step6 Lut2383 Rec709");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, Some(&lut))
+        .expect("GPU step6 Lut2383 Rec709");
     compare_f32(&cpu, &gpu, 5e-5, "Lut2383 Rec709");
 }
 
@@ -356,7 +386,10 @@ fn step6_lut2383_rec709() {
 fn step6_lut2383_full_ops() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_density_image(80, 60);
     let lut = make_display_lut(17);
@@ -379,6 +412,8 @@ fn step6_lut2383_full_ops() {
     };
 
     let cpu = pipeline::step_6_render(&img, &opts, &ra4, Some(&lut));
-    let gpu = gpu_pipe.run(&img, &opts, &ra4, Some(&lut)).expect("GPU step6 Lut2383 full");
+    let gpu = gpu_pipe
+        .run(&img, &opts, &ra4, Some(&lut))
+        .expect("GPU step6 Lut2383 full");
     compare_f32(&cpu, &gpu, 1e-4, "Lut2383 full ops");
 }

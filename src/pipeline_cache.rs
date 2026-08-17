@@ -150,11 +150,42 @@ pub fn hash_after_step5(
     h.finish()
 }
 
+/// Earliest pipeline step that must be re-run given `cache` and current options.
+///
+/// `1` = nothing usable (reload), `3` = from D-min, `4`/`5`/`6` = from that step.
+pub fn cached_start_step(
+    path: &Path,
+    opts: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    cache: &PreviewStepCache,
+) -> u8 {
+    let h1 = hash_after_load(path, opts, max_width, max_height);
+    let h3 = hash_after_step3(path, opts, max_width, max_height);
+    let h4 = hash_after_step4(path, opts, max_width, max_height);
+    let h5 = hash_after_step5(path, opts, max_width, max_height);
+    let mut start = 1u8;
+    if cache.after_load.as_ref().is_some_and(|(h, ..)| *h == h1) {
+        start = 3;
+    }
+    if start <= 3 && cache.after_step3.as_ref().is_some_and(|(h, _)| *h == h3) {
+        start = 4;
+    }
+    if start <= 4 && cache.after_step4.as_ref().is_some_and(|(h, _)| *h == h4) {
+        start = 5;
+    }
+    if start <= 5 && cache.after_step5.as_ref().is_some_and(|(h, _)| *h == h5) {
+        start = 6;
+    }
+    start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::options::DminMode;
     use crate::PipelineOptions;
+    use ndarray::Array3;
 
     #[test]
     fn hash_after_load_deterministic() {
@@ -172,5 +203,46 @@ mod tests {
         opts.dmin_fixed = Some((0.1, 0.2, 0.3));
         let h_fixed = hash_after_step3(Path::new("/a.raw"), &opts, 800, 600);
         assert_ne!(h_off, h_fixed);
+    }
+
+    #[test]
+    fn hash_after_step5_unchanged_by_step6_curve() {
+        let mut opts = PipelineOptions::default();
+        let path = Path::new("/a.raw");
+        let h5 = hash_after_step5(path, &opts, 800, 600);
+        opts.curve_offset = 0.25;
+        opts.curve_gamma = 1.4;
+        opts.lut_in_mid = 1.1;
+        opts.toe_strength = 0.2;
+        assert_eq!(h5, hash_after_step5(path, &opts, 800, 600));
+    }
+
+    #[test]
+    fn cached_start_step_is_6_when_only_curve_changes() {
+        let path = Path::new("/a.raw");
+        let opts = PipelineOptions::default();
+        let buf = Array3::<f32>::zeros((4, 4, 3));
+        let cache = PreviewStepCache {
+            after_step5: Some((hash_after_step5(path, &opts, 800, 600), buf)),
+            ..PreviewStepCache::default()
+        };
+        let mut live = opts.clone();
+        live.curve_offset = 0.3;
+        assert_eq!(cached_start_step(path, &live, 800, 600, &cache), 6);
+    }
+
+    #[test]
+    fn cached_start_step_is_5_when_saturation_changes() {
+        let path = Path::new("/a.raw");
+        let opts = PipelineOptions::default();
+        let buf = Array3::<f32>::zeros((4, 4, 3));
+        let cache = PreviewStepCache {
+            after_step4: Some((hash_after_step4(path, &opts, 800, 600), buf.clone())),
+            after_step5: Some((hash_after_step5(path, &opts, 800, 600), buf)),
+            ..PreviewStepCache::default()
+        };
+        let mut live = opts.clone();
+        live.saturation = 0.4;
+        assert_eq!(cached_start_step(path, &live, 800, 600, &cache), 5);
     }
 }

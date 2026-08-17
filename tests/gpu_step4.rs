@@ -69,7 +69,10 @@ fn get_gpu() -> Option<(Arc<GpuContext>, Step4Pipeline)> {
 fn step4_basic_t_to_d() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_transmittance_image(120, 80);
     let mut opts = PipelineOptions::default();
@@ -91,7 +94,10 @@ fn step4_basic_t_to_d() {
 fn step4_manual_wb() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_transmittance_image(100, 80);
     let mut opts = PipelineOptions::default();
@@ -107,7 +113,9 @@ fn step4_manual_wb() {
     pipeline::step_4_t_to_d_wb(&mut cpu_img, &opts);
 
     let mut gpu_img = img.clone();
-    gpu_pipe.run(&mut gpu_img, &opts).expect("GPU step4 manual WB");
+    gpu_pipe
+        .run(&mut gpu_img, &opts)
+        .expect("GPU step4 manual WB");
 
     compare_images(&cpu_img, &gpu_img, 1e-5, "manual WB + film gamma");
 }
@@ -116,7 +124,10 @@ fn step4_manual_wb() {
 fn step4_auto_wb() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_transmittance_image(100, 80);
     let mut opts = PipelineOptions::default();
@@ -132,7 +143,9 @@ fn step4_auto_wb() {
     pipeline::step_4_t_to_d_wb(&mut cpu_img, &opts);
 
     let mut gpu_img = img.clone();
-    gpu_pipe.run(&mut gpu_img, &opts).expect("GPU step4 auto WB");
+    gpu_pipe
+        .run(&mut gpu_img, &opts)
+        .expect("GPU step4 auto WB");
 
     compare_images(&cpu_img, &gpu_img, 1e-5, "auto WB");
 }
@@ -141,7 +154,10 @@ fn step4_auto_wb() {
 fn step4_temp_k() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_transmittance_image(80, 60);
     let mut opts = PipelineOptions::default();
@@ -164,7 +180,10 @@ fn step4_temp_k() {
 fn step4_shadow_cast() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_transmittance_image(100, 80);
     let mut opts = PipelineOptions::default();
@@ -177,7 +196,9 @@ fn step4_shadow_cast() {
     pipeline::step_4_t_to_d_wb(&mut cpu_img, &opts);
 
     let mut gpu_img = img.clone();
-    gpu_pipe.run(&mut gpu_img, &opts).expect("GPU step4 shadow cast");
+    gpu_pipe
+        .run(&mut gpu_img, &opts)
+        .expect("GPU step4 shadow cast");
 
     compare_images(&cpu_img, &gpu_img, 1e-5, "shadow cast");
 }
@@ -186,7 +207,10 @@ fn step4_shadow_cast() {
 fn step4_full_options() {
     let (_ctx, gpu_pipe) = match get_gpu() {
         Some(v) => v,
-        None => { eprintln!("No GPU; skip"); return; }
+        None => {
+            eprintln!("No GPU; skip");
+            return;
+        }
     };
     let img = make_transmittance_image(120, 80);
     let mut opts = PipelineOptions::default();

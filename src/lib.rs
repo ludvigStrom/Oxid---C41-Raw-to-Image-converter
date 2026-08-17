@@ -54,7 +54,8 @@ pub use options::{
     PipelineOptions, Rect, WbMode,
 };
 pub use pipeline_cache::{
-    hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5, PreviewStepCache,
+    cached_start_step, hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5,
+    PreviewStepCache,
 };
 pub use preset::{load_develop_preset, save_develop_preset, DevelopPreset, PRESET_VERSION};
 pub use project::{
@@ -880,6 +881,60 @@ mod export_mem_tests {
     }
 }
 
+#[cfg(test)]
+mod live_preview_tests {
+    use super::*;
+    use ndarray::Array3;
+
+    fn synthetic_cache(path: &Path, opts: &PipelineOptions, w: u32, h: u32) -> PreviewStepCache {
+        let mut img = Array3::<f32>::from_elem((h as usize, w as usize, 3), 0.35);
+        img[[0, 0, 0]] = 0.55;
+        img[[0, 0, 1]] = 0.40;
+        img[[0, 0, 2]] = 0.30;
+        let h1 = hash_after_load(path, opts, w, h);
+        let h3 = hash_after_step3(path, opts, w, h);
+        let h4 = hash_after_step4(path, opts, w, h);
+        let h5 = hash_after_step5(path, opts, w, h);
+        let mut after4 = img.clone();
+        pipeline::step_4_t_to_d_wb(&mut after4, opts);
+        let mut after5 = after4.clone();
+        pipeline::step_5_calibration(&mut after5, opts, None);
+        PreviewStepCache {
+            after_load: Some((h1, img.clone(), w, h)),
+            after_step3: Some((h3, img)),
+            after_step4: Some((h4, after4)),
+            after_step5: Some((h5, after5)),
+        }
+    }
+
+    #[test]
+    fn live_apply_starts_at_step6_for_curve_only() {
+        let path = Path::new("/live.png");
+        let opts = PipelineOptions::default();
+        let cache = synthetic_cache(path, &opts, 8, 8);
+        let h5 = hash_after_step5(path, &opts, 8, 8);
+        let mut live = opts.clone();
+        live.curve_offset = 0.22;
+        let (iw, ih, w, h, rgb, new_cache) =
+            apply_preview_from_cache(path, &live, 8, 8, &cache).expect("live apply");
+        assert_eq!((iw, ih, w, h), (8, 8, 8, 8));
+        assert_eq!(rgb.len(), 8 * 8 * 3);
+        assert_eq!(
+            new_cache.after_step5.as_ref().map(|(hash, _)| *hash),
+            Some(h5)
+        );
+        assert_eq!(cached_start_step(path, &live, 8, 8, &cache), 6);
+    }
+
+    #[test]
+    fn live_apply_returns_none_without_step3_cache() {
+        let path = Path::new("/live.png");
+        let opts = PipelineOptions::default();
+        let empty = PreviewStepCache::default();
+        assert!(apply_preview_from_cache(path, &opts, 8, 8, &empty).is_none());
+    }
+}
+
 /// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
 /// D-min/flat-field → WB → curve or no-curve.
 ///
@@ -1349,6 +1404,245 @@ pub fn process_one_to_preview_with_cache(
     Ok((true_src_w, true_src_h, orig_w, orig_h, out, dbg, new_cache))
 }
 
+/// Live preview from an existing step cache. Returns `None` if the change
+/// requires steps 1–3 (caller should use the full preview job).
+///
+/// Runs `start_step..=6` and skips De-Bujack. Earlier cache slots are preserved;
+/// slots for steps that actually ran are updated.
+pub fn apply_preview_from_cache(
+    path: &Path,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    cache: &PreviewStepCache,
+) -> Option<(u32, u32, u32, u32, Vec<u8>, PreviewStepCache)> {
+    apply_preview_from_cache_cpu(path, options, max_width, max_height, cache)
+}
+
+fn apply_preview_from_cache_cpu(
+    path: &Path,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    cache: &PreviewStepCache,
+) -> Option<(u32, u32, u32, u32, Vec<u8>, PreviewStepCache)> {
+    use pipeline_cache::{hash_after_step4, hash_after_step5};
+
+    let start_step = cached_start_step(path, options, max_width, max_height, cache);
+    if start_step < 4 {
+        return None;
+    }
+
+    let (mut image, true_src_w, true_src_h) =
+        live_cache_input_buffer(cache, start_step, max_width, max_height)?;
+
+    let mut new_cache = preserve_cache_before(cache, start_step);
+    let h4 = hash_after_step4(path, options, max_width, max_height);
+    let h5 = hash_after_step5(path, options, max_width, max_height);
+    let lut3d = options
+        .lut3d_path
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
+    let output_lut = options
+        .output_lut_cube
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
+    let ra4_params = curve::PrintCurveParams {
+        offset: options.curve_offset,
+        gamma: options.curve_gamma,
+        pivot: options.curve_pivot,
+    };
+
+    if start_step <= 4 {
+        pipeline::step_4_t_to_d_wb(&mut image, options);
+        new_cache.after_step4 = Some((h4, image.clone()));
+    }
+    if start_step <= 5 {
+        pipeline::step_5_calibration(&mut image, options, lut3d.as_ref());
+        new_cache.after_step5 = Some((h5, image.clone()));
+    }
+
+    let (orig_h, orig_w, _) = image.dim();
+    let display = pipeline::step_6_render(&image, options, &ra4_params, output_lut.as_ref());
+    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    Some((
+        true_src_w,
+        true_src_h,
+        orig_w as u32,
+        orig_h as u32,
+        rgb_u8,
+        new_cache,
+    ))
+}
+
+/// GPU live preview from cache. Falls back to CPU if GPU is unavailable or fails.
+#[cfg(feature = "gpu")]
+pub fn apply_preview_from_cache_gpu(
+    path: &Path,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    cache: &PreviewStepCache,
+    gpu: Option<&gpu::unified::GpuPipeline>,
+) -> Option<(u32, u32, u32, u32, Vec<u8>, PreviewStepCache)> {
+    use pipeline_cache::{hash_after_step4, hash_after_step5};
+
+    let use_gpu = gpu.is_some() && options.use_gpu;
+    if !use_gpu {
+        return apply_preview_from_cache_cpu(path, options, max_width, max_height, cache);
+    }
+    let gpu = gpu.unwrap();
+
+    let start_step = cached_start_step(path, options, max_width, max_height, cache);
+    if start_step < 4 {
+        return None;
+    }
+
+    let (image, true_src_w, true_src_h) =
+        live_cache_input_buffer(cache, start_step, max_width, max_height)?;
+
+    let mut new_cache = preserve_cache_before(cache, start_step);
+    let h4 = hash_after_step4(path, options, max_width, max_height);
+    let h5 = hash_after_step5(path, options, max_width, max_height);
+    let lut3d = options
+        .lut3d_path
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
+    let output_lut = options
+        .output_lut_cube
+        .as_ref()
+        .and_then(|p| lut3d::read_cube(p).ok());
+    let ra4_params = curve::PrintCurveParams {
+        offset: options.curve_offset,
+        gamma: options.curve_gamma,
+        pivot: options.curve_pivot,
+    };
+
+    fill_step45_cache(
+        &image,
+        start_step as u32,
+        options,
+        lut3d.as_ref(),
+        h4,
+        h5,
+        &mut new_cache,
+    );
+
+    let display = gpu
+        .run_from_step(
+            &image,
+            start_step as u32,
+            options,
+            lut3d.as_ref(),
+            &ra4_params,
+            output_lut.as_ref(),
+        )
+        .ok()
+        .or_else(|| {
+            let mut cpu_img = image;
+            if start_step <= 4 {
+                pipeline::step_4_t_to_d_wb(&mut cpu_img, options);
+            }
+            if start_step <= 5 {
+                pipeline::step_5_calibration(&mut cpu_img, options, lut3d.as_ref());
+            }
+            Some(pipeline::step_6_render(
+                &cpu_img,
+                options,
+                &ra4_params,
+                output_lut.as_ref(),
+            ))
+        })?;
+
+    let (orig_h, orig_w, _) = match &display {
+        pipeline::Step6Display::PassthroughDensity(img) | pipeline::Step6Display::F32(img) => {
+            img.dim()
+        }
+        pipeline::Step6Display::U16(img) => img.dim(),
+    };
+    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    Some((
+        true_src_w,
+        true_src_h,
+        orig_w as u32,
+        orig_h as u32,
+        rgb_u8,
+        new_cache,
+    ))
+}
+
+fn live_cache_input_buffer(
+    cache: &PreviewStepCache,
+    start_step: u8,
+    _max_width: u32,
+    _max_height: u32,
+) -> Option<(Array3<f32>, u32, u32)> {
+    let (true_src_w, true_src_h) = cache
+        .after_load
+        .as_ref()
+        .map(|(_, _, tw, th)| (*tw, *th))
+        .unwrap_or((0, 0));
+    let buf = if start_step >= 6 {
+        cache.after_step5.as_ref().map(|(_, b)| b.clone())
+    } else if start_step >= 5 {
+        cache.after_step4.as_ref().map(|(_, b)| b.clone())
+    } else {
+        cache.after_step3.as_ref().map(|(_, b)| b.clone())
+    }?;
+    let (h, w, _) = buf.dim();
+    let tw = if true_src_w == 0 {
+        w as u32
+    } else {
+        true_src_w
+    };
+    let th = if true_src_h == 0 {
+        h as u32
+    } else {
+        true_src_h
+    };
+    Some((buf, tw, th))
+}
+
+fn preserve_cache_before(cache: &PreviewStepCache, start_step: u8) -> PreviewStepCache {
+    let mut new_cache = PreviewStepCache::default();
+    if start_step > 1 {
+        new_cache.after_load = cache.after_load.clone();
+    }
+    if start_step > 3 {
+        new_cache.after_step3 = cache.after_step3.clone();
+    }
+    if start_step > 4 {
+        new_cache.after_step4 = cache.after_step4.clone();
+    }
+    if start_step > 5 {
+        new_cache.after_step5 = cache.after_step5.clone();
+    }
+    new_cache
+}
+
+#[cfg(feature = "gpu")]
+fn fill_step45_cache(
+    image: &Array3<f32>,
+    start_step: u32,
+    options: &PipelineOptions,
+    lut3d: Option<&lut3d::Lut3d>,
+    h4: u64,
+    h5: u64,
+    new_cache: &mut PreviewStepCache,
+) {
+    if start_step <= 4 {
+        let mut buf = image.clone();
+        pipeline::step_4_t_to_d_wb(&mut buf, options);
+        new_cache.after_step4 = Some((h4, buf.clone()));
+        pipeline::step_5_calibration(&mut buf, options, lut3d);
+        new_cache.after_step5 = Some((h5, buf));
+    } else if start_step <= 5 {
+        let mut buf = image.clone();
+        pipeline::step_5_calibration(&mut buf, options, lut3d);
+        new_cache.after_step5 = Some((h5, buf));
+    }
+}
+
 fn bake_scene_stats_into_options(options: &mut PipelineOptions, stats: &PreviewSceneStats) {
     if let Some(dmin) = stats.dmin {
         options.dmin_mode = DminMode::Fixed;
@@ -1444,9 +1738,9 @@ pub fn probe_auto_crop_for_path(path: &Path, options: &PipelineOptions) -> anyho
 /// the GPU in a single upload/readback via the unified pipeline. Steps 1–3
 /// (load, demosaic, D-min) still run on CPU.
 ///
-/// Intermediate step 4/5 results are NOT cached when using GPU (the unified
-/// pipeline skips readback for intermediates). The step 3 cache is still
-/// populated and valid.
+/// Display pixels still come from the unified GPU pass. Step 4/5 cache slots
+/// are filled on the worker with the CPU reference so live sliders can start
+/// mid-pipeline without a remosaic.
 #[cfg(feature = "gpu")]
 pub fn process_one_to_preview_with_cache_gpu(
     path: &Path,
@@ -1612,6 +1906,17 @@ pub fn process_one_to_preview_with_cache_gpu(
         .output_lut_cube
         .as_ref()
         .and_then(|p| lut3d::read_cube(p).ok());
+
+    // CPU reference buffers for live slider apply (unified GPU skips intermediates).
+    fill_step45_cache(
+        &image,
+        start_step,
+        options,
+        lut3d_preview.as_ref(),
+        h4,
+        h5,
+        &mut new_cache,
+    );
 
     let mut display = gpu.run_from_step(
         &image,

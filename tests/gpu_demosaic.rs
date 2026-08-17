@@ -91,7 +91,8 @@ fn demosaic_gpu_or_cpu_fallback() {
     let pattern = CfaPattern::Bayer(BayerPattern::Rggb);
 
     let cpu_direct = demosaic_quality(&bayer, pattern).unwrap();
-    let via_helper = c41_raw_tool::gpu::demosaic::demosaic_gpu_or_cpu(&bayer, pattern, None).unwrap();
+    let via_helper =
+        c41_raw_tool::gpu::demosaic::demosaic_gpu_or_cpu(&bayer, pattern, None).unwrap();
 
     assert_eq!(cpu_direct.dim(), via_helper.dim());
     let max_diff: f32 = cpu_direct

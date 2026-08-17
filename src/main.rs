@@ -4,8 +4,10 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 
-use c41_raw_tool::{process_files, PipelineOptions, Rect, TiffFormat, OutputStage, OutputLutEncoding, DminMode};
 use c41_raw_tool::raw_reader;
+use c41_raw_tool::{
+    process_files, DminMode, OutputLutEncoding, OutputStage, PipelineOptions, Rect, TiffFormat,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -122,7 +124,12 @@ fn parse_rect(s: &str) -> Result<Rect, String> {
     if width == 0 || height == 0 {
         return Err("WIDTH and HEIGHT must be > 0".to_string());
     }
-    Ok(Rect { x, y, width, height })
+    Ok(Rect {
+        x,
+        y,
+        width,
+        height,
+    })
 }
 
 fn parse_dmin_fixed(s: &str) -> Result<(f32, f32, f32), String> {
@@ -131,11 +138,18 @@ fn parse_dmin_fixed(s: &str) -> Result<(f32, f32, f32), String> {
         return Err("expected R,G,B".to_string());
     }
     let parse_f32 = |p: &str| p.trim().parse::<f32>().map_err(|e| e.to_string());
-    Ok((parse_f32(parts[0])?, parse_f32(parts[1])?, parse_f32(parts[2])?))
+    Ok((
+        parse_f32(parts[0])?,
+        parse_f32(parts[1])?,
+        parse_f32(parts[2])?,
+    ))
 }
 
 fn parse_curve_gamma(s: &str) -> Result<f32, String> {
-    let g: f32 = s.trim().parse().map_err(|_| "curve-gamma must be a number".to_string())?;
+    let g: f32 = s
+        .trim()
+        .parse()
+        .map_err(|_| "curve-gamma must be a number".to_string())?;
     if !(0.5..=5.0).contains(&g) {
         return Err("curve-gamma must be between 0.5 and 5.0".to_string());
     }
@@ -184,7 +198,10 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
     println!("D-min fixed:      {:?}", cli.dmin_fixed);
     println!("Format:           {:?}", cli.format);
     println!("Write EXR:        {}", cli.write_exr);
-    println!("WB gains:         R={} G={} B={}", cli.wb_r, cli.wb_g, cli.wb_b);
+    println!(
+        "WB gains:         R={} G={} B={}",
+        cli.wb_r, cli.wb_g, cli.wb_b
+    );
     println!(
         "Print curve:      {} (offset={}, gamma={}, pivot={}, white={})",
         !cli.no_curve, cli.curve_offset, cli.curve_gamma, cli.curve_pivot, cli.curve_white
@@ -202,7 +219,21 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "arw" | "nef" | "nrw" | "cr2" | "cr3" | "crw" | "dng" | "raf" | "orf" | "rw2" | "png" | "jpeg" | "jpg" | "tiff" | "tif"
+                "arw"
+                    | "nef"
+                    | "nrw"
+                    | "cr2"
+                    | "cr3"
+                    | "crw"
+                    | "dng"
+                    | "raf"
+                    | "orf"
+                    | "rw2"
+                    | "png"
+                    | "jpeg"
+                    | "jpg"
+                    | "tiff"
+                    | "tif"
             )
         })
         .collect();
@@ -248,9 +279,21 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         curve_pivot: cli.curve_pivot,
         curve_white: cli.curve_white,
         density_matrix: [
-            [cli.density_matrix[0], cli.density_matrix[1], cli.density_matrix[2]],
-            [cli.density_matrix[3], cli.density_matrix[4], cli.density_matrix[5]],
-            [cli.density_matrix[6], cli.density_matrix[7], cli.density_matrix[8]],
+            [
+                cli.density_matrix[0],
+                cli.density_matrix[1],
+                cli.density_matrix[2],
+            ],
+            [
+                cli.density_matrix[3],
+                cli.density_matrix[4],
+                cli.density_matrix[5],
+            ],
+            [
+                cli.density_matrix[6],
+                cli.density_matrix[7],
+                cli.density_matrix[8],
+            ],
         ],
         idt_matrix: [
             [cli.idt_matrix[0], cli.idt_matrix[1], cli.idt_matrix[2]],

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use c41_raw_tool::gpu::{GpuContext, step5::Step5Pipeline};
+use c41_raw_tool::gpu::{step5::Step5Pipeline, GpuContext};
 use c41_raw_tool::lut3d::Lut3d;
 use c41_raw_tool::{pipeline, PipelineOptions};
 use ndarray::Array3;
@@ -98,7 +98,9 @@ fn step5_matrix_cpu_vs_gpu() {
     pipeline::step_5_calibration(&mut cpu_img, &opts, None);
 
     let mut gpu_img = img.clone();
-    pipeline_gpu.run(&mut gpu_img, &opts, None).expect("GPU step 5 failed");
+    pipeline_gpu
+        .run(&mut gpu_img, &opts, None)
+        .expect("GPU step 5 failed");
 
     eprintln!("step5_matrix_cpu_vs_gpu:");
     compare_images(&cpu_img, &gpu_img, 1e-5);
@@ -134,7 +136,9 @@ fn step5_lut_cpu_vs_gpu() {
     pipeline::step_5_calibration(&mut cpu_img, &opts, Some(&lut));
 
     let mut gpu_img = img.clone();
-    pipeline_gpu.run(&mut gpu_img, &opts, Some(&lut)).expect("GPU step 5 with LUT failed");
+    pipeline_gpu
+        .run(&mut gpu_img, &opts, Some(&lut))
+        .expect("GPU step 5 with LUT failed");
 
     eprintln!("step5_lut_cpu_vs_gpu:");
     compare_images(&cpu_img, &gpu_img, 1e-5);
@@ -159,7 +163,9 @@ fn step5_identity_cpu_vs_gpu() {
     pipeline::step_5_calibration(&mut cpu_img, &opts, None);
 
     let mut gpu_img = img.clone();
-    pipeline_gpu.run(&mut gpu_img, &opts, None).expect("GPU step 5 identity failed");
+    pipeline_gpu
+        .run(&mut gpu_img, &opts, None)
+        .expect("GPU step 5 identity failed");
 
     eprintln!("step5_identity_cpu_vs_gpu:");
     compare_images(&cpu_img, &gpu_img, 1e-5);
@@ -190,7 +196,9 @@ fn step5_zone_gain_cpu_vs_gpu() {
     pipeline::step_5_calibration(&mut cpu_img, &opts, None);
 
     let mut gpu_img = img.clone();
-    pipeline_gpu.run(&mut gpu_img, &opts, None).expect("GPU step 5 zone gain failed");
+    pipeline_gpu
+        .run(&mut gpu_img, &opts, None)
+        .expect("GPU step 5 zone gain failed");
 
     eprintln!("step5_zone_gain_cpu_vs_gpu:");
     compare_images(&cpu_img, &gpu_img, 1e-5);
@@ -218,7 +226,9 @@ fn step5_highlight_rolloff_cpu_vs_gpu() {
     pipeline::step_5_calibration(&mut cpu_img, &opts, None);
 
     let mut gpu_img = img.clone();
-    pipeline_gpu.run(&mut gpu_img, &opts, None).expect("GPU step 5 highlight rolloff failed");
+    pipeline_gpu
+        .run(&mut gpu_img, &opts, None)
+        .expect("GPU step 5 highlight rolloff failed");
 
     eprintln!("step5_highlight_rolloff_cpu_vs_gpu:");
     compare_images(&cpu_img, &gpu_img, 1e-5);
@@ -248,7 +258,9 @@ fn step5_zone_saturation_cpu_vs_gpu() {
     pipeline::step_5_calibration(&mut cpu_img, &opts, None);
 
     let mut gpu_img = img.clone();
-    pipeline_gpu.run(&mut gpu_img, &opts, None).expect("GPU step 5 zone saturation failed");
+    pipeline_gpu
+        .run(&mut gpu_img, &opts, None)
+        .expect("GPU step 5 zone saturation failed");
 
     eprintln!("step5_zone_saturation_cpu_vs_gpu:");
     compare_images(&cpu_img, &gpu_img, 1e-5);

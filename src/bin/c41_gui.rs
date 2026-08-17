@@ -11,10 +11,12 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(not(feature = "gpu"))]
+use c41_raw_tool::apply_preview_from_cache;
 #[cfg(feature = "gpu")]
-use c41_raw_tool::process_one_to_preview_with_cache_gpu;
+use c41_raw_tool::{apply_preview_from_cache_gpu, process_one_to_preview_with_cache_gpu};
 use c41_raw_tool::{
-    auto_tune, blur_flat_field, calibration, color, compute_preview_scene_stats,
+    auto_tune, blur_flat_field, cached_start_step, calibration, color, compute_preview_scene_stats,
     crop_sensor_for_oriented_rect, demosaic, detect_crop, dmin, load_develop_preset,
     load_flat_field_linear, load_project, load_sensor_from_path, oriented_sensor_size, png_reader,
     preview_scene_stats_key, process_export_jobs, process_one_to_preview,
@@ -256,6 +258,7 @@ struct PreviewJobResult {
     gen: u64,
     lod: PreviewLod,
     index: usize,
+    options_hash: u64,
     input_w: u32,
     input_h: u32,
     w: u32,
@@ -539,6 +542,8 @@ struct C41Gui {
     preview_canvas_size: Option<(f32, f32)>,
     /// Invalidation hash of the in-flight preview job (options + working size, not zoom).
     preview_job_hash: Option<u64>,
+    /// True when the in-flight preview is a live cache apply (not a full remosaic).
+    preview_job_live: bool,
     /// Background export (Convert all / Export selected).
     export_job: Option<ExportJob>,
     /// One-shot Auto grade job (Develop tab).
@@ -595,6 +600,7 @@ impl Default for C41Gui {
             full_res_preview_button_clicked: false,
             preview_canvas_size: None,
             preview_job_hash: None,
+            preview_job_live: false,
             export_job: None,
             auto_job: None,
             batch_export_dialog: None,
@@ -1856,6 +1862,7 @@ impl C41Gui {
         self.preview_receiver = None;
         self.preview_started_at = None;
         self.preview_job_hash = None;
+        self.preview_job_live = false;
         self.tile_receiver = None;
         self.tile_inflight = None;
         self.tile_failed.clear();
@@ -1961,6 +1968,7 @@ impl C41Gui {
         self.preview_receiver = None;
         self.preview_started_at = None;
         self.preview_job_hash = None;
+        self.preview_job_live = false;
         self.pending_preview_key = None;
         self.pending_preview_since = None;
         self.tile_receiver = None;
@@ -2011,11 +2019,13 @@ impl C41Gui {
         if lod == PreviewLod::Screen {
             self.images[index].preview_screen_requested_wh = (max_width, max_height);
         }
-        self.preview_job_hash = Some(preview_options_hash(
+        let options_hash = preview_options_hash(
             &path,
             &self.images[index].options,
             self.full_res_preview_active,
-        ));
+        );
+        self.preview_job_hash = Some(options_hash);
+        self.preview_job_live = false;
 
         let cache = match lod {
             PreviewLod::Draft => self.images[index].draft_step_cache.clone(),
@@ -2058,6 +2068,7 @@ impl C41Gui {
                         gen,
                         lod,
                         index,
+                        options_hash,
                         input_w,
                         input_h,
                         w,
@@ -2068,6 +2079,88 @@ impl C41Gui {
                         new_cache,
                     },
                 );
+            let _ = tx.send(res);
+        });
+        ctx.request_repaint();
+    }
+
+    fn live_cache_limits(&self, index: usize, ctx: &egui::Context) -> (u32, u32) {
+        let requested = self.images[index].preview_screen_requested_wh;
+        if requested != (0, 0) {
+            requested
+        } else {
+            preview_working_limits(self.preview_canvas_size, ctx.pixels_per_point(), false)
+        }
+    }
+
+    fn live_preview_cache(&self, index: usize) -> Option<&PreviewStepCache> {
+        let entry = self.images.get(index)?;
+        entry
+            .preview_step_cache
+            .as_ref()
+            .or(entry.screen_step_cache.as_ref())
+            .or(entry.draft_step_cache.as_ref())
+    }
+
+    fn live_preview_available(&self, index: usize, ctx: &egui::Context) -> bool {
+        let Some(cache) = self.live_preview_cache(index) else {
+            return false;
+        };
+        let options = self.bake_preview_options(&self.images[index]);
+        let (max_w, max_h) = self.live_cache_limits(index, ctx);
+        cached_start_step(&self.images[index].path, &options, max_w, max_h, cache) >= 4
+    }
+
+    /// Apply remaining pipeline steps from the cached preview buffers. No remosaic.
+    fn request_live_preview_for(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(cache) = self.live_preview_cache(index).cloned() else {
+            return;
+        };
+        let path = self.images[index].path.clone();
+        let options = self.bake_preview_options(&self.images[index]);
+        let (max_width, max_height) = self.live_cache_limits(index, ctx);
+        let options_hash = preview_options_hash(
+            &path,
+            &self.images[index].options,
+            self.full_res_preview_active,
+        );
+        self.preview_job_hash = Some(options_hash);
+        self.preview_job_live = true;
+        let gen = self.preview_gen;
+        #[cfg(feature = "gpu")]
+        let gpu_arc = self.gpu_pipeline.clone();
+        let (tx, rx) = mpsc::channel();
+        self.preview_receiver = Some(rx);
+        self.preview_started_at = Some(Instant::now());
+        thread::spawn(move || {
+            #[cfg(feature = "gpu")]
+            let applied = apply_preview_from_cache_gpu(
+                &path,
+                &options,
+                max_width,
+                max_height,
+                &cache,
+                gpu_arc.as_deref(),
+            );
+            #[cfg(not(feature = "gpu"))]
+            let applied = apply_preview_from_cache(&path, &options, max_width, max_height, &cache);
+            let res = match applied {
+                Some((input_w, input_h, w, h, rgb, new_cache)) => Ok(PreviewJobResult {
+                    gen,
+                    lod: PreviewLod::Draft,
+                    index,
+                    options_hash,
+                    input_w,
+                    input_h,
+                    w,
+                    h,
+                    rgb,
+                    dbg_log: String::new(),
+                    captured_debug: false,
+                    new_cache,
+                }),
+                None => Err(anyhow::anyhow!("Live preview cache miss")),
+            };
             let _ = tx.send(res);
         });
         ctx.request_repaint();
@@ -2468,6 +2561,7 @@ impl C41Gui {
         self.preview_gen = self.preview_gen.wrapping_add(1);
         self.preview_receiver = None;
         self.preview_started_at = None;
+        self.preview_job_live = false;
         self.tile_gen = self.tile_gen.wrapping_add(1);
         self.tile_inflight = None;
         self.tile_failed.clear();
@@ -2741,10 +2835,7 @@ impl C41Gui {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(ready, egui::Button::new("Export"))
-                            .clicked()
-                        {
+                        if ui.add_enabled(ready, egui::Button::new("Export")).clicked() {
                             if self.output_dir.is_none() {
                                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                     self.output_dir = Some(path);
@@ -3465,6 +3556,7 @@ impl eframe::App for C41Gui {
                 Ok(Ok(job)) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
+                    self.preview_job_live = false;
                     if job.gen == self.preview_gen && job.index < self.images.len() {
                         let idx = job.index;
                         let nearest = self.images[idx].preview_zoom > 1.0;
@@ -3478,19 +3570,25 @@ impl eframe::App for C41Gui {
                             ctx.load_texture(format!("preview_full_{}", idx), image, tex_opts);
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_texture_nearest = nearest;
-                        self.images[idx].preview_hash = self.preview_job_hash.unwrap_or(0);
-                        self.images[idx].preview_options_hash = self.preview_job_hash.unwrap_or(0);
+                        self.images[idx].preview_hash = job.options_hash;
+                        self.images[idx].preview_options_hash = job.options_hash;
                         self.images[idx].preview_lod = job.lod;
                         if job.lod == PreviewLod::Screen || job.lod == PreviewLod::FullRes {
                             self.images[idx].preview_screen_wh = (job.w, job.h);
                             self.images[idx].screen_step_cache = Some(job.new_cache.clone());
                         } else {
                             self.images[idx].draft_step_cache = Some(job.new_cache.clone());
+                            let screen_wh = self.images[idx].preview_screen_wh;
+                            if screen_wh == (0, 0) || screen_wh == (job.w, job.h) {
+                                self.images[idx].screen_step_cache = Some(job.new_cache.clone());
+                            }
                         }
                         self.images[idx].preview_full_rgb = Some((job.w, job.h, job.rgb.clone()));
                         self.images[idx].preview_step_cache = Some(job.new_cache);
                         self.images[idx].preview_input_size = Some([job.w, job.h]);
-                        self.images[idx].raw_source_size = Some([job.input_w, job.input_h]);
+                        if job.input_w > 0 && job.input_h > 0 {
+                            self.images[idx].raw_source_size = Some([job.input_w, job.input_h]);
+                        }
                         self.images[idx].preview_texture_rotation =
                             self.images[idx].options.rotation_degrees;
                         self.images[idx].preview_texture_flip_h =
@@ -3544,12 +3642,14 @@ impl eframe::App for C41Gui {
                 Ok(Err(e)) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
+                    self.preview_job_live = false;
                     self.status = format!("Preview error: {}", e);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.preview_receiver = None;
                     self.preview_started_at = None;
+                    self.preview_job_live = false;
                 }
             }
         }
@@ -6570,6 +6670,9 @@ impl eframe::App for C41Gui {
                             .geometry_coalesce_until
                             .map(|t| Instant::now() < t)
                             .unwrap_or(false);
+                        let can_live = !geometry_pending
+                            && !self.rect_dragging
+                            && self.live_preview_available(idx, ctx);
                         // Any pointer-down (including rotate/flip buttons) used to look like a
                         // slider drag and start a preview after 50ms — that blocked further clicks.
                         let debounce_ms = if geometry_pending {
@@ -6587,7 +6690,23 @@ impl eframe::App for C41Gui {
                             })
                             .unwrap_or(false);
 
-                        if self.preview_receiver.is_none()
+                        if can_live && self.preview_receiver.is_some() && !self.preview_job_live {
+                            // Drop a slow full remosaic so the live cache path can start.
+                            self.preview_gen = self.preview_gen.wrapping_add(1);
+                            self.preview_receiver = None;
+                            self.preview_started_at = None;
+                            self.preview_job_live = false;
+                        }
+
+                        if can_live && self.preview_receiver.is_none() {
+                            if self.full_res_preview_active && !self.full_res_preview_button_clicked
+                            {
+                                self.full_res_preview_active = false;
+                            }
+                            self.request_live_preview_for(idx, ctx);
+                            self.full_res_preview_button_clicked = false;
+                            self.pending_preview_since = None;
+                        } else if self.preview_receiver.is_none()
                             && !self.rect_dragging
                             && !geometry_pending
                             && !pointer_down

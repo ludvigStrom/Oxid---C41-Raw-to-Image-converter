@@ -26,6 +26,14 @@ Cargo.lock
 *.heic
 *.heif
 *.heif
+*.nef
+*.dng
+*.raf
+*.rw2
+*.rw1
+*.rwz
+*.rw2
+*.rw1
 
 # macOS
 .DS_Store
