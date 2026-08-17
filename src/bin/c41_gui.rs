@@ -504,6 +504,9 @@ struct AutoJob {
     cancel: Option<Arc<AtomicBool>>,
     batch: bool,
     title: &'static str,
+    /// Single-image Auto: keep the dialog up until this preview is current.
+    applying_preview: Option<usize>,
+    preview_wait_started: Option<Instant>,
 }
 
 /// Calibration overlay state: 4 anchor points in normalized image space.
@@ -3159,12 +3162,100 @@ impl C41Gui {
             cancel: None,
             batch: false,
             title: "Auto",
+            applying_preview: None,
+            preview_wait_started: None,
         });
         ctx.request_repaint();
     }
 
     fn heavy_job_running(&self) -> bool {
         self.export_job.is_some() || self.auto_job.as_ref().is_some_and(|j| j.batch)
+    }
+
+    fn auto_waiting_preview(&self) -> Option<usize> {
+        self.auto_job.as_ref().and_then(|j| j.applying_preview)
+    }
+
+    fn set_auto_progress(&self, message: &str, fraction: f32) {
+        let Some(job) = self.auto_job.as_ref() else {
+            return;
+        };
+        if let Ok(mut p) = job.progress.lock() {
+            p.fraction = fraction.clamp(0.0, 1.0);
+            p.message = message.to_string();
+            if p.log.last().map(|s| s.as_str()) != Some(message) {
+                p.log.push(message.to_string());
+            }
+        }
+    }
+
+    fn begin_auto_preview_wait(&mut self, index: usize, ctx: &egui::Context) {
+        self.set_auto_progress("Applying settings…", 0.97);
+        if index >= self.images.len() {
+            self.auto_job = None;
+            return;
+        }
+        if let Some(job) = self.auto_job.as_mut() {
+            job.applying_preview = Some(index);
+            job.preview_wait_started = Some(Instant::now());
+        }
+        // Drop any in-flight job for the pre-Auto settings. The normal
+        // end-of-frame preview path starts the new one (live cache if possible).
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        self.preview_receiver = None;
+        self.preview_started_at = None;
+        self.preview_job_live = false;
+        self.pending_preview_key = None;
+        self.pending_preview_since = None;
+        ctx.request_repaint();
+    }
+
+    fn finish_auto_if_preview_ready(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.auto_job.as_ref().and_then(|j| j.applying_preview) else {
+            return;
+        };
+        if idx >= self.images.len() {
+            self.auto_job = None;
+            return;
+        }
+        let hash_now = preview_options_hash(
+            &self.images[idx].path,
+            &self.images[idx].options,
+            self.full_res_preview_active,
+        );
+        let ready = self.images[idx].preview_texture.is_some()
+            && self.images[idx].preview_options_hash == hash_now
+            && self.preview_receiver.is_none();
+        if ready {
+            self.set_auto_progress("Done", 1.0);
+            self.auto_job = None;
+        } else {
+            self.tick_auto_preview_progress();
+            ctx.request_repaint();
+        }
+    }
+
+    fn tick_auto_preview_progress(&mut self) {
+        let Some(started) = self
+            .auto_job
+            .as_ref()
+            .and_then(|j| j.preview_wait_started)
+        else {
+            return;
+        };
+        let t = started.elapsed().as_secs_f32();
+        // Ease 97% → 99.5% so the bar keeps moving on the long preview step.
+        let frac = 0.97 + 0.025 * (1.0 - (-t / 2.4).exp());
+        let message = if self.preview_receiver.is_some() {
+            if self.preview_job_live {
+                "Rendering preview…"
+            } else {
+                "Developing preview…"
+            }
+        } else {
+            "Applying settings…"
+        };
+        self.set_auto_progress(message, frac.min(0.995));
     }
 
     fn apply_auto_result_to_path(&mut self, path: &Path, result: &AutoTuneResult) -> bool {
@@ -3305,6 +3396,8 @@ impl C41Gui {
             cancel: Some(cancel),
             batch: true,
             title: "Auto Develop",
+            applying_preview: None,
+            preview_wait_started: None,
         });
         self.status = format!("Auto Develop: {} images…", total);
         ctx.request_repaint();
@@ -3448,6 +3541,8 @@ impl C41Gui {
             cancel: Some(cancel),
             batch: true,
             title: "Auto Crop",
+            applying_preview: None,
+            preview_wait_started: None,
         });
         self.status = format!("Auto Crop: {} images…", total);
         ctx.request_repaint();
@@ -3455,26 +3550,35 @@ impl C41Gui {
 
     fn poll_auto_job(&mut self, ctx: &egui::Context) {
         loop {
-            let outcome = {
+            let waiting_preview = self
+                .auto_job
+                .as_ref()
+                .is_some_and(|j| j.applying_preview.is_some());
+            let recv = {
                 let Some(job) = self.auto_job.as_ref() else {
                     return;
                 };
-                match job.receiver.try_recv() {
-                    Ok(outcome) => outcome,
-                    Err(mpsc::TryRecvError::Empty) => {
-                        ctx.request_repaint();
+                job.receiver.try_recv()
+            };
+            let outcome = match recv {
+                Ok(outcome) => outcome,
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.finish_auto_if_preview_ready(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if waiting_preview {
+                        self.finish_auto_if_preview_ready(ctx);
                         return;
                     }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.auto_job = None;
-                        self.status = "Auto stopped unexpectedly.".to_string();
-                        return;
-                    }
+                    self.auto_job = None;
+                    self.status = "Auto stopped unexpectedly.".to_string();
+                    return;
                 }
             };
             match outcome {
                 AutoJobOutcome::Done { index, result } => {
-                    self.auto_job = None;
                     if index < self.images.len() {
                         result.apply_to(&mut self.images[index].options);
                         self.images[index].preview_hash = 0;
@@ -3490,8 +3594,9 @@ impl C41Gui {
                             "Auto: γ {:.2}, density {:.2}, grade {:.2}, toe {:+.2}, hardness {:+.2}",
                             result.film_gamma, density, grade, result.toe_strength, hardness
                         );
-                        self.preview_gen = self.preview_gen.wrapping_add(1);
-                        ctx.request_repaint();
+                        self.begin_auto_preview_wait(index, ctx);
+                    } else {
+                        self.auto_job = None;
                     }
                     return;
                 }
@@ -3553,6 +3658,7 @@ impl C41Gui {
         let cancelling = cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
         let title = job.title;
+        let preview_wait = job.applying_preview.is_some();
         let shown = if snap.completed < snap.total && !snap.file_name.is_empty() {
             snap.completed.saturating_add(1).min(snap.total)
         } else {
@@ -3586,7 +3692,8 @@ impl C41Gui {
                 ui.add(
                     egui::ProgressBar::new(snap.fraction.clamp(0.0, 1.0))
                         .desired_width(320.0)
-                        .show_percentage(),
+                        .show_percentage()
+                        .animate(preview_wait),
                 );
                 if batch {
                     if !stage.is_empty() {
@@ -5967,6 +6074,7 @@ impl eframe::App for C41Gui {
                         // Also show when no preview data is available yet (first load).
                         if self.images[idx].preview_texture.is_none()
                             && (show_loader || has_inflight)
+                            && self.auto_waiting_preview().is_none()
                         {
                             canvas_painter.rect_filled(
                                 canvas_rect,
@@ -6901,13 +7009,15 @@ impl eframe::App for C41Gui {
                         } else {
                             PREVIEW_DEBOUNCE_MS
                         };
-                        let settled = self
-                            .pending_preview_since
-                            .map(|t| {
-                                now.saturating_duration_since(t)
-                                    >= Duration::from_millis(debounce_ms)
-                            })
-                            .unwrap_or(false);
+                        let auto_waiting = self.auto_waiting_preview() == Some(idx);
+                        let settled = auto_waiting
+                            || self
+                                .pending_preview_since
+                                .map(|t| {
+                                    now.saturating_duration_since(t)
+                                        >= Duration::from_millis(debounce_ms)
+                                })
+                                .unwrap_or(false);
 
                         if can_live && self.preview_receiver.is_some() && !self.preview_job_live {
                             // Drop a slow full remosaic so the live cache path can start.
