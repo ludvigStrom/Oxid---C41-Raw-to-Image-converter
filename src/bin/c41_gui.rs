@@ -29,6 +29,8 @@ use c41_raw_tool::{
 };
 use eframe::egui;
 
+mod theme;
+
 const PREVIEW_MAX_WIDTH: u32 = 1920;
 const PREVIEW_MAX_HEIGHT: u32 = 1200;
 /// Floor so a tiny window still produces a usable working image.
@@ -68,9 +70,6 @@ const REDO_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
     egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
     egui::Key::Z,
 );
-const ICON_CLOSE_PATH: &str = "X.png";
-const ICON_ROTATE_RIGHT_PATH: &str = "rotate_right.png";
-const ICON_ROTATE_LEFT_PATH: &str = "rotate_left.png";
 const ICON_LOGO_PATH: &str = "logo.png";
 /// Extensions accepted by Add image… and drag-and-drop.
 const IMPORT_EXTENSIONS: &[&str] = &[
@@ -91,9 +90,6 @@ fn app_icon_data() -> Option<egui::IconData> {
 
 #[derive(Default)]
 struct UiIcons {
-    close: Option<egui::TextureHandle>,
-    rotate_left: Option<egui::TextureHandle>,
-    rotate_right: Option<egui::TextureHandle>,
     logo: Option<egui::TextureHandle>,
 }
 
@@ -124,11 +120,8 @@ fn main() -> eframe::Result<()> {
         "C-41 RAW Tool",
         native_options,
         Box::new(|cc| {
-            let mut visuals = egui::Visuals::dark();
-            visuals.window_fill = egui::Color32::from_gray(35);
-            visuals.panel_fill = egui::Color32::from_gray(30);
-            visuals.override_text_color = Some(egui::Color32::from_gray(240));
-            cc.egui_ctx.set_visuals(visuals);
+            theme::install_fonts(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx);
             Ok(Box::new(C41Gui::default()))
         }),
     )
@@ -2956,7 +2949,10 @@ impl C41Gui {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
-                if ui.button("Output folder…").clicked() {
+                if ui
+                    .button(theme::icon_label(theme::FOLDER, "Output folder…"))
+                    .clicked()
+                {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.output_dir = Some(path);
                     }
@@ -2965,7 +2961,13 @@ impl C41Gui {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(ready, egui::Button::new("Export")).clicked() {
+                        if ui
+                            .add_enabled(
+                                ready,
+                                egui::Button::new(theme::icon_label(theme::DOWNLOAD, "Export")),
+                            )
+                            .clicked()
+                        {
                             if self.output_dir.is_none() {
                                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                     self.output_dir = Some(path);
@@ -2976,7 +2978,10 @@ impl C41Gui {
                                 close = true;
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui
+                            .button(theme::icon_label(theme::CANCEL, "Cancel"))
+                            .clicked()
+                        {
                             close = true;
                         }
                     });
@@ -3574,15 +3579,8 @@ impl C41Gui {
 
 impl eframe::App for C41Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply dark theme every frame so it sticks (some backends reset after creation)
-        let mut style = (*ctx.style()).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.window_fill = egui::Color32::from_gray(35);
-        style.visuals.panel_fill = egui::Color32::from_gray(30);
-        style.visuals.override_text_color = Some(egui::Color32::from_gray(240));
-        style.visuals.selection.bg_fill = egui::Color32::from_gray(70); // selected tabs/items: gray instead of blue
-        style.spacing.button_padding = egui::vec2(10.0, 4.0); // extra left/right and top/bottom around button text
-        ctx.set_style(style);
+        // Re-apply each frame so backends that reset visuals stay on the lab theme.
+        theme::apply(ctx);
 
         // Global shortcut: Ctrl+Shift+D toggles Debug mode visibility.
         let debug_shortcut =
@@ -3611,17 +3609,6 @@ impl eframe::App for C41Gui {
 
         self.rect_dragging = false;
 
-        if self.ui_icons.close.is_none() {
-            self.ui_icons.close = load_icon_texture(ctx, "ui_icon_close", ICON_CLOSE_PATH);
-        }
-        if self.ui_icons.rotate_left.is_none() {
-            self.ui_icons.rotate_left =
-                load_icon_texture(ctx, "ui_icon_rotate_left", ICON_ROTATE_LEFT_PATH);
-        }
-        if self.ui_icons.rotate_right.is_none() {
-            self.ui_icons.rotate_right =
-                load_icon_texture(ctx, "ui_icon_rotate_right", ICON_ROTATE_RIGHT_PATH);
-        }
         if self.ui_icons.logo.is_none() {
             self.ui_icons.logo = load_icon_texture(ctx, "ui_icon_logo", ICON_LOGO_PATH);
         }
@@ -3886,16 +3873,26 @@ impl eframe::App for C41Gui {
         }
 
         // ---- Archive menu (macOS inset clears the hidden-title-bar traffic lights) ----
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("menu_bar")
+            .frame({
+                let mut frame = egui::Frame::side_top_panel(&ctx.style());
+                frame.inner_margin.top += 5.0;
+                frame.inner_margin.bottom += 5.0;
+                frame
+            })
+            .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 if cfg!(target_os = "macos") {
                     ui.add_space(MENU_BAR_MACOS_INSET);
                 }
-                ui.menu_button("Archive", |ui| {
-                    ui.menu_button("Project", |ui| {
+                egui::menu::menu_custom_button(
+                    ui,
+                    egui::Button::new(theme::icon_label(theme::ARCHIVE, "Archive")).frame(false),
+                    |ui| {
+                    ui.menu_button(theme::icon_label(theme::FOLDER, "Project"), |ui| {
                         if ui
                             .add(
-                                egui::Button::new("Save").shortcut_text(
+                                egui::Button::new(theme::icon_label(theme::DOWNLOAD, "Save")).shortcut_text(
                                     ui.ctx().format_shortcut(&PROJECT_SAVE_SHORTCUT),
                                 ),
                             )
@@ -3906,7 +3903,7 @@ impl eframe::App for C41Gui {
                         }
                         if ui
                             .add(
-                                egui::Button::new("Save As...").shortcut_text(
+                                egui::Button::new(theme::icon_label(theme::DOWNLOAD, "Save As...")).shortcut_text(
                                     ui.ctx().format_shortcut(&PROJECT_SAVE_AS_SHORTCUT),
                                 ),
                             )
@@ -3917,7 +3914,7 @@ impl eframe::App for C41Gui {
                         }
                         if ui
                             .add(
-                                egui::Button::new("Load").shortcut_text(
+                                egui::Button::new(theme::icon_label(theme::FOLDER, "Load")).shortcut_text(
                                     ui.ctx().format_shortcut(&PROJECT_LOAD_SHORTCUT),
                                 ),
                             )
@@ -3927,12 +3924,15 @@ impl eframe::App for C41Gui {
                             ui.close_menu();
                         }
                     });
-                    ui.menu_button("Batch", |ui| {
+                    ui.menu_button(theme::icon_label(theme::INVENTORY, "Batch"), |ui| {
                         let enabled = !self.images.is_empty()
                             && !self.heavy_job_running()
                             && self.auto_job.is_none();
                         if ui
-                            .add_enabled(enabled, egui::Button::new("Auto Develop"))
+                            .add_enabled(
+                                enabled,
+                                egui::Button::new(theme::icon_label(theme::AUTO_FIX, "Auto Develop")),
+                            )
                             .on_hover_text(
                                 "Run Auto on every loaded image (Film γ, density, grade, toe, hardness, saturation).",
                             )
@@ -3942,7 +3942,10 @@ impl eframe::App for C41Gui {
                             ui.close_menu();
                         }
                         if ui
-                            .add_enabled(enabled, egui::Button::new("Crop"))
+                            .add_enabled(
+                                enabled,
+                                egui::Button::new(theme::icon_label(theme::CROP, "Crop")),
+                            )
                             .on_hover_text(
                                 "Auto-crop every loaded image (detect the film frame, exclude holder and lightbox).",
                             )
@@ -3952,7 +3955,10 @@ impl eframe::App for C41Gui {
                             ui.close_menu();
                         }
                         if ui
-                            .add_enabled(enabled, egui::Button::new("Export"))
+                            .add_enabled(
+                                enabled,
+                                egui::Button::new(theme::icon_label(theme::DOWNLOAD, "Export")),
+                            )
                             .on_hover_text(
                                 "Export every loaded image. Choose format and optional JPEG sidecar.",
                             )
@@ -3962,12 +3968,16 @@ impl eframe::App for C41Gui {
                             ui.close_menu();
                         }
                     });
-                });
-                ui.menu_button("Edit", |ui| {
+                },
+                );
+                egui::menu::menu_custom_button(
+                    ui,
+                    egui::Button::new(theme::icon_label(theme::EDIT, "Edit")).frame(false),
+                    |ui| {
                     if ui
                         .add_enabled(
                             self.history.can_undo(),
-                            egui::Button::new("Undo").shortcut_text(
+                            egui::Button::new(theme::icon_label(theme::UNDO, "Undo")).shortcut_text(
                                 ui.ctx().format_shortcut(&UNDO_SHORTCUT),
                             ),
                         )
@@ -3979,7 +3989,7 @@ impl eframe::App for C41Gui {
                     if ui
                         .add_enabled(
                             self.history.can_redo(),
-                            egui::Button::new("Redo").shortcut_text(
+                            egui::Button::new(theme::icon_label(theme::REDO, "Redo")).shortcut_text(
                                 ui.ctx().format_shortcut(&REDO_SHORTCUT),
                             ),
                         )
@@ -3988,7 +3998,8 @@ impl eframe::App for C41Gui {
                         self.redo_edits();
                         ui.close_menu();
                     }
-                });
+                },
+                );
             });
         });
 
@@ -3999,7 +4010,10 @@ impl eframe::App for C41Gui {
                 ui.vertical(|ui| {
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Add image…").clicked() {
+                        if ui
+                            .button(theme::icon_label(theme::ADD, "Add image…"))
+                            .clicked()
+                        {
                             if let Some(paths) = rfd::FileDialog::new()
                                 .add_filter("RAW & images", IMPORT_EXTENSIONS)
                                 .pick_files()
@@ -4081,21 +4095,14 @@ impl eframe::App for C41Gui {
                                             .allocate_new_ui(
                                                 egui::UiBuilder::new().max_rect(x_rect),
                                                 |ui| {
-                                                    if let Some(icon) = &self.ui_icons.close {
-                                                        ui.add(
-                                                            egui::ImageButton::new((
-                                                                icon.id(),
-                                                                egui::vec2(
-                                                                    X_BUTTON_SIZE - 6.0,
-                                                                    X_BUTTON_SIZE - 6.0,
-                                                                ),
-                                                            ))
-                                                            .frame(false),
+                                                    ui.add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new(theme::CLOSE)
+                                                                .size(14.0),
                                                         )
-                                                        .clicked()
-                                                    } else {
-                                                        ui.small_button("X").clicked()
-                                                    }
+                                                        .frame(false),
+                                                    )
+                                                    .clicked()
                                                 },
                                             )
                                             .inner;
@@ -4276,9 +4283,21 @@ impl eframe::App for C41Gui {
 
                 if self.mode == UIMode::Process {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut entry.process_tab, ProcessTab::Input, "Input");
-                        ui.selectable_value(&mut entry.process_tab, ProcessTab::Develop, "Develop");
-                        ui.selectable_value(&mut entry.process_tab, ProcessTab::Export, "Export");
+                        ui.selectable_value(
+                            &mut entry.process_tab,
+                            ProcessTab::Input,
+                            theme::icon_label(theme::IMAGE, "Input"),
+                        );
+                        ui.selectable_value(
+                            &mut entry.process_tab,
+                            ProcessTab::Develop,
+                            theme::icon_label(theme::TUNE, "Develop"),
+                        );
+                        ui.selectable_value(
+                            &mut entry.process_tab,
+                            ProcessTab::Export,
+                            theme::icon_label(theme::DOWNLOAD, "Export"),
+                        );
                     });
                     ui.add_space(6.0);
                     ui.separator();
@@ -4426,7 +4445,10 @@ impl eframe::App for C41Gui {
                     ui.horizontal(|ui| {
                         let auto_busy = self.auto_job.is_some();
                         if ui
-                            .add_enabled(!auto_busy, egui::Button::new("Auto"))
+                            .add_enabled(
+                                !auto_busy,
+                                egui::Button::new(theme::icon_label(theme::AUTO_FIX, "Auto")),
+                            )
                             .on_hover_text(
                                 "Set Film γ, density, grade, toe, hardness, and saturation from the histogram. Applies Lab 1.5 and max warmth.",
                             )
@@ -4435,7 +4457,7 @@ impl eframe::App for C41Gui {
                             auto_tune_requested = true;
                         }
                         if ui
-                            .button("Export JSON…")
+                            .button(theme::icon_label(theme::DOWNLOAD, "Export JSON…"))
                             .on_hover_text(
                                 "Save current Develop settings (exposure, WB, color, zones, output, De-Bujack) as a JSON preset. Crop, D-min, and export format are not included.",
                             )
@@ -4471,7 +4493,7 @@ impl eframe::App for C41Gui {
                             }
                         }
                         if ui
-                            .button("Import JSON…")
+                            .button(theme::icon_label(theme::UPLOAD, "Import JSON…"))
                             .on_hover_text(
                                 "Load Develop settings from a JSON preset onto this image. Crop, D-min, and export format stay as they are.",
                             )
@@ -4512,7 +4534,7 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // GROUP 1 — Exposure  (primary editing controls)
                     // ════════════════════════════════════════════════════════
-                    ui.label(egui::RichText::new("Exposure").strong());
+                    ui.label(theme::icon_label(theme::EXPOSURE, "Exposure").strong());
                     ui.add_space(4.0);
                     {
                         let mut exp = exposure_from_opts(opts);
@@ -4595,7 +4617,9 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // Highlight roll-off (Reinhard) — order matches workflow
                     // ════════════════════════════════════════════════════════
-                    let cr_rolloff = ui.collapsing("Highlight roll-off", |ui| {
+                    let cr_rolloff = ui.collapsing(
+                        theme::icon_label(theme::FILTER_HDR, "Highlight roll-off"),
+                        |ui| {
                         ui.add_space(4.0);
                         egui::Grid::new("highlight_rolloff")
                             .num_columns(2)
@@ -4618,7 +4642,9 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // Tone shaping (advanced shadow/highlight)
                     // ════════════════════════════════════════════════════════
-                    let cr_tone = ui.collapsing("Tone shaping", |ui| {
+                    let cr_tone = ui.collapsing(
+                        theme::icon_label(theme::CONTRAST, "Tone shaping"),
+                        |ui| {
                         ui.add_space(4.0);
                         egui::Grid::new("tone_shaping")
                             .num_columns(2)
@@ -4649,7 +4675,7 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // White balance & color neutrality
                     // ════════════════════════════════════════════════════════
-                    ui.collapsing("White balance", |ui| {
+                    ui.collapsing(theme::icon_label(theme::WB_AUTO, "White balance"), |ui| {
                         let mut wb_mode = opts.wb_mode;
                         egui::ComboBox::from_id_salt(ui.id().with("wb_mode"))
                             .selected_text(match wb_mode {
@@ -4696,7 +4722,10 @@ impl eframe::App for C41Gui {
                                         )
                                         .selectable(false),
                                     );
-                                } else if ui.button("Pick whitepoint").clicked() {
+                                } else if ui
+                                    .button(theme::icon_label(theme::COLORIZE, "Pick whitepoint"))
+                                    .clicked()
+                                {
                                     reset_wb_for_picker(opts);
                                     arm_wb_picker = true;
                                 }
@@ -4712,7 +4741,7 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // Color character & separation
                     // ════════════════════════════════════════════════════════
-                    let cr_color = ui.collapsing("Color", |ui| {
+                    let cr_color = ui.collapsing(theme::icon_label(theme::PALETTE, "Color"), |ui| {
                         ui.add_space(4.0);
                         egui::Grid::new("color_main")
                             .num_columns(2)
@@ -4762,7 +4791,9 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // Color zones (per-channel shadow/mid/highlight)
                     // ════════════════════════════════════════════════════════
-                    let cr_zones = ui.collapsing("Color zones", |ui| {
+                    let cr_zones = ui.collapsing(
+                        theme::icon_label(theme::LAYERS, "Color zones"),
+                        |ui| {
                         ui.add_space(4.0);
 
                         ui.label(egui::RichText::new("Shadows").strong());
@@ -4862,7 +4893,8 @@ impl eframe::App for C41Gui {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut opts.apply_crop, "Crop");
                             if opts.apply_crop {
-                                if ui.button("Auto")
+                                if ui
+                                    .button(theme::icon_label(theme::CROP, "Auto"))
                                     .on_hover_text("Detect film frame boundaries and maximise crop")
                                     .clicked()
                                 {
@@ -5071,7 +5103,10 @@ impl eframe::App for C41Gui {
                             ui.separator();
                             ui.label("Flat-field override (luminance calibration)");
                             ui.horizontal(|ui| {
-                                if ui.button("Load flat-field map…").clicked() {
+                                if ui
+                                    .button(theme::icon_label(theme::FOLDER, "Load flat-field map…"))
+                                    .clicked()
+                                {
                                     if let Some(path) = rfd::FileDialog::new()
                                         .add_filter(
                                             "Flat field",
@@ -5118,7 +5153,7 @@ impl eframe::App for C41Gui {
                     // ════════════════════════════════════════════════════════
                     // GROUP 6 — Curve / LUT & Output
                     // ════════════════════════════════════════════════════════
-                    let cr_bujack = ui.collapsing("De-Bujack", |ui| {
+                    let cr_bujack = ui.collapsing(theme::icon_label(theme::BLUR, "De-Bujack"), |ui| {
                         ui.checkbox(&mut opts.bujack_enabled, "De-Bujack")
                             .on_hover_text(
                                 "Non-local OkLab compensation for diminishing returns. \
@@ -5180,7 +5215,7 @@ impl eframe::App for C41Gui {
                          Pointwise grades cannot undo diminishing returns.",
                     );
 
-                    ui.collapsing("Output", |ui| {
+                    ui.collapsing(theme::icon_label(theme::MOVIE, "Output"), |ui| {
                         let mut apply_curve = !opts.no_curve;
                         if ui.checkbox(&mut apply_curve, "Output curve").changed() {
                             if apply_curve {
@@ -5372,7 +5407,10 @@ impl eframe::App for C41Gui {
                                 lut_combo.response.on_hover_text("Resolve-style Kodak 2383 cubes expect Cineon log input.");
 
                                 ui.add_space(4.0);
-                                if ui.button("Browse output LUT…").clicked() {
+                                if ui
+                                    .button(theme::icon_label(theme::FOLDER, "Browse output LUT…"))
+                                    .clicked()
+                                {
                                     self.pending_output_lut_browse = true;
                                 }
                                 if let Some(ref p) = opts.output_lut_cube {
@@ -5603,7 +5641,10 @@ impl eframe::App for C41Gui {
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "No output folder".to_string());
-                if ui.button("Output folder…").clicked() {
+                if ui
+                    .button(theme::icon_label(theme::FOLDER, "Output folder…"))
+                    .clicked()
+                {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.output_dir = Some(path);
                     }
@@ -5617,11 +5658,20 @@ impl eframe::App for C41Gui {
                     && self.output_dir.is_some()
                     && !exporting;
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(ready, egui::Button::new("Convert all")).clicked() {
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(theme::icon_label(theme::DOWNLOAD, "Convert all")),
+                        )
+                        .clicked()
+                    {
                         self.start_export(ui.ctx(), false);
                     }
                     if ui
-                        .add_enabled(selected_ready, egui::Button::new("Export selected"))
+                        .add_enabled(
+                            selected_ready,
+                            egui::Button::new(theme::icon_label(theme::DOWNLOAD, "Export selected")),
+                        )
                         .clicked()
                     {
                         self.start_export(ui.ctx(), true);
@@ -6605,9 +6655,12 @@ impl eframe::App for C41Gui {
                             // Full resolution/bit depth preview: generates image with export pipeline.
                             // Deactivates on option change or image switch.
                             let full_res_clicked = ui
-                                .selectable_label(
-                                    self.full_res_preview_active,
-                                    "Full resolution preview",
+                                .add(
+                                    egui::Button::new(theme::icon_label(
+                                        theme::HD,
+                                        "Full resolution preview",
+                                    ))
+                                    .selected(self.full_res_preview_active),
                                 )
                                 .on_hover_text("Use full resolution export pipeline for preview. Deactivates when adjusting settings or switching images.")
                                 .clicked();
@@ -6626,26 +6679,22 @@ impl eframe::App for C41Gui {
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // Order: rotate right, rotate left, mirror right, mirror left (right to left)
-                                let rotate_right = if let Some(icon) = &self.ui_icons.rotate_right {
-                                    ui.add(egui::ImageButton::new((icon.id(), egui::vec2(20.0, 20.0))).frame(false))
-                                        .on_hover_text("Rotate right")
-                                } else {
-                                    ui.button("Rotate right")
-                                };
-                                let rotate_left = if let Some(icon) = &self.ui_icons.rotate_left {
-                                    ui.add(egui::ImageButton::new((icon.id(), egui::vec2(20.0, 20.0))).frame(false))
-                                        .on_hover_text("Rotate left")
-                                } else {
-                                    ui.button("Rotate left")
-                                };
+                                let rotate_right =
+                                    theme::icon_button(ui, theme::ROTATE_RIGHT, "Rotate right");
+                                let rotate_left =
+                                    theme::icon_button(ui, theme::ROTATE_LEFT, "Rotate left");
                                 // Count on press so a second click is not lost waiting for release
                                 // while a preview job starts.
-                                let mirror_v = ui
-                                    .small_button("↕")
-                                    .on_hover_text("Mirror right (flip vertical)");
-                                let mirror_h = ui
-                                    .small_button("↔")
-                                    .on_hover_text("Mirror left (flip horizontal)");
+                                let mirror_v = theme::icon_button(
+                                    ui,
+                                    theme::FLIP_V,
+                                    "Mirror right (flip vertical)",
+                                );
+                                let mirror_h = theme::icon_button(
+                                    ui,
+                                    theme::FLIP_H,
+                                    "Mirror left (flip horizontal)",
+                                );
                                 // Count on press so a second click is not lost waiting for release
                                 // while a preview job starts.
                                 let pressed = ui.input(|i| i.pointer.primary_pressed());
