@@ -552,8 +552,6 @@ struct C41Gui {
     batch_export_dialog: Option<BatchExportDialog>,
     /// True while the WB eyedropper is active (loupe + click-to-sample).
     wb_picker_armed: bool,
-    /// Show a wait cursor until the next preview lands (Picker select / Pick whitepoint).
-    wb_picker_wait_cursor: bool,
     /// While set and in the future, preview debounce uses [`GEOMETRY_COALESCE_MS`].
     geometry_coalesce_until: Option<Instant>,
     #[cfg(feature = "gpu")]
@@ -605,7 +603,6 @@ impl Default for C41Gui {
             auto_job: None,
             batch_export_dialog: None,
             wb_picker_armed: false,
-            wb_picker_wait_cursor: false,
             geometry_coalesce_until: None,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
@@ -1913,12 +1910,14 @@ impl C41Gui {
                     options.dmin_mode = DminMode::Fixed;
                     options.dmin_fixed = Some(dmin);
                 }
-                if let Some((ar, ag, ab)) = stats.auto_wb {
-                    options.auto_wb = false;
-                    options.apply_white_balance = true;
-                    options.wb_r *= ar;
-                    options.wb_g *= ag;
-                    options.wb_b *= ab;
+                if entry.options.auto_wb {
+                    if let Some((ar, ag, ab)) = stats.auto_wb {
+                        options.auto_wb = false;
+                        options.apply_white_balance = true;
+                        options.wb_r *= ar;
+                        options.wb_g *= ag;
+                        options.wb_b *= ab;
+                    }
                 }
                 options.pinned_zone = stats.zone;
             }
@@ -4024,7 +4023,6 @@ impl eframe::App for C41Gui {
         let mut auto_tune_requested = false;
         let mut arm_wb_picker = false;
         let mut disarm_wb_picker = false;
-        let mut start_wb_wait_cursor = false;
         let wb_picker_armed = self.wb_picker_armed;
         egui::SidePanel::right("settings_panel")
             .resizable(false)
@@ -4491,7 +4489,8 @@ impl eframe::App for C41Gui {
                         if wb_mode != opts.wb_mode {
                             opts.wb_mode = wb_mode;
                             if wb_mode == WbMode::Picker {
-                                start_wb_wait_cursor = true;
+                                reset_wb_for_picker(opts);
+                                arm_wb_picker = true;
                             } else {
                                 sync_wb_flags_from_mode(opts);
                                 disarm_wb_picker = true;
@@ -4522,7 +4521,6 @@ impl eframe::App for C41Gui {
                                 } else if ui.button("Pick whitepoint").clicked() {
                                     reset_wb_for_picker(opts);
                                     arm_wb_picker = true;
-                                    start_wb_wait_cursor = true;
                                 }
                             }
                             WbMode::Manual => {
@@ -5476,10 +5474,6 @@ impl eframe::App for C41Gui {
         }
         if disarm_wb_picker {
             self.wb_picker_armed = false;
-            self.wb_picker_wait_cursor = false;
-        }
-        if start_wb_wait_cursor {
-            self.wb_picker_wait_cursor = true;
         }
 
         // ---- Auto-crop: detect on post–D-min linear T after sidebar borrow is released ----
@@ -6782,21 +6776,6 @@ impl eframe::App for C41Gui {
         self.show_export_progress(ctx);
         self.show_auto_progress(ctx);
         self.show_batch_export_dialog(ctx);
-
-        // After choosing Picker / Pick whitepoint, override label I-beams
-        // until the preview job has landed.
-        if self.wb_picker_wait_cursor {
-            let pending = self.preview_receiver.is_some()
-                || self
-                    .selected_index
-                    .map(|idx| self.preview_options_dirty(idx))
-                    .unwrap_or(false);
-            if pending {
-                ctx.set_cursor_icon(egui::CursorIcon::Wait);
-            } else {
-                self.wb_picker_wait_cursor = false;
-            }
-        }
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let screen = ctx.screen_rect();
