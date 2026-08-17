@@ -244,6 +244,101 @@ pub fn step_5_calibration_gpu(
     step_5_calibration(image, options, lut3d);
 }
 
+fn step5_profile_matrix(options: &PipelineOptions) -> [[f32; 3]; 3] {
+    if options.apply_color_profile {
+        options.density_matrix
+    } else {
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    }
+}
+
+fn step5_matrix_is_identity(m: [[f32; 3]; 3]) -> bool {
+    (m[0][0] - 1.0).abs() < 1e-6
+        && m[0][1].abs() < 1e-6
+        && m[0][2].abs() < 1e-6
+        && m[1][0].abs() < 1e-6
+        && (m[1][1] - 1.0).abs() < 1e-6
+        && m[1][2].abs() < 1e-6
+        && m[2][0].abs() < 1e-6
+        && m[2][1].abs() < 1e-6
+        && (m[2][2] - 1.0).abs() < 1e-6
+}
+
+/// Matrix/LUT + clamp + highlight-spread for one density pixel. Same order as CPU step 5.
+pub(crate) fn step5_prep_pixel(
+    dr: f32,
+    dg: f32,
+    db: f32,
+    options: &PipelineOptions,
+    lut3d: Option<&lut3d::Lut3d>,
+) -> [f32; 3] {
+    let [r, g, b] = if let Some(lut) = lut3d {
+        lut.sample_density(dr, dg, db)
+    } else {
+        let m = step5_profile_matrix(options);
+        if step5_matrix_is_identity(m) {
+            [dr, dg, db]
+        } else {
+            [
+                m[0][0] * dr + m[0][1] * dg + m[0][2] * db,
+                m[1][0] * dr + m[1][1] * dg + m[1][2] * db,
+                m[2][0] * dr + m[2][1] * dg + m[2][2] * db,
+            ]
+        }
+    };
+    crate::density_ops::limit_highlight_density_spread_pixel(r.max(0.0), g.max(0.0), b.max(0.0))
+}
+
+/// Zone percentiles as CPU step 5 measures them: after matrix/LUT and highlight spread.
+///
+/// `from_transmittance` is for unified GPU start-at-step-4 (image is still T).
+/// Pinned zones are used as-is.
+pub(crate) fn zone_range_for_gpu_step5(
+    image: &Array3<f32>,
+    options: &PipelineOptions,
+    lut3d: Option<&lut3d::Lut3d>,
+    from_transmittance: bool,
+) -> crate::density_ops::ZonePercentiles {
+    if options.pinned_zone.is_some() {
+        return crate::density_ops::zone_range_for_options(image, options);
+    }
+    if from_transmittance {
+        let mut density = image.clone();
+        step_4_t_to_d_wb(&mut density, options);
+        return zone_range_after_step5_prep(&density, options, lut3d);
+    }
+    zone_range_after_step5_prep(image, options, lut3d)
+}
+
+fn zone_range_after_step5_prep(
+    image: &Array3<f32>,
+    options: &PipelineOptions,
+    lut3d: Option<&lut3d::Lut3d>,
+) -> crate::density_ops::ZonePercentiles {
+    let (h, w, _) = image.dim();
+    let n = h * w;
+    if n == 0 {
+        return crate::density_ops::zone_percentiles_from_samples(Vec::new());
+    }
+    let step = (n / 4096).max(1);
+    let d_effs: Vec<f32> = (0..n)
+        .step_by(step)
+        .map(|i| {
+            let y = i / w;
+            let x = i % w;
+            let [r, g, b] = step5_prep_pixel(
+                image[[y, x, 0]],
+                image[[y, x, 1]],
+                image[[y, x, 2]],
+                options,
+                lut3d,
+            );
+            (r + g + b) / 3.0 + options.curve_offset
+        })
+        .collect();
+    crate::density_ops::zone_percentiles_from_samples(d_effs)
+}
+
 /// Step 5: Density matrix / 3D LUT, limit highlight spread, saturation, zone adjustments.
 pub fn step_5_calibration(
     image: &mut Array3<f32>,
@@ -253,11 +348,7 @@ pub fn step_5_calibration(
     if options.debug_pipeline_step < 5 {
         return;
     }
-    let m = if options.apply_color_profile {
-        options.density_matrix
-    } else {
-        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    };
+    let m = step5_profile_matrix(options);
 
     if let Some(lut) = lut3d {
         let (h, w, _) = image.dim();
@@ -272,27 +363,16 @@ pub fn step_5_calibration(
                 image[[y, x, 2]] = ob;
             }
         }
-    } else {
-        let is_identity = (m[0][0] - 1.0).abs() < 1e-6
-            && m[0][1].abs() < 1e-6
-            && m[0][2].abs() < 1e-6
-            && m[1][0].abs() < 1e-6
-            && (m[1][1] - 1.0).abs() < 1e-6
-            && m[1][2].abs() < 1e-6
-            && m[2][0].abs() < 1e-6
-            && m[2][1].abs() < 1e-6
-            && (m[2][2] - 1.0).abs() < 1e-6;
-        if !is_identity {
-            let (h, w, _) = image.dim();
-            for y in 0..h {
-                for x in 0..w {
-                    let dr = image[[y, x, 0]];
-                    let dg = image[[y, x, 1]];
-                    let db = image[[y, x, 2]];
-                    image[[y, x, 0]] = m[0][0] * dr + m[0][1] * dg + m[0][2] * db;
-                    image[[y, x, 1]] = m[1][0] * dr + m[1][1] * dg + m[1][2] * db;
-                    image[[y, x, 2]] = m[2][0] * dr + m[2][1] * dg + m[2][2] * db;
-                }
+    } else if !step5_matrix_is_identity(m) {
+        let (h, w, _) = image.dim();
+        for y in 0..h {
+            for x in 0..w {
+                let dr = image[[y, x, 0]];
+                let dg = image[[y, x, 1]];
+                let db = image[[y, x, 2]];
+                image[[y, x, 0]] = m[0][0] * dr + m[0][1] * dg + m[0][2] * db;
+                image[[y, x, 1]] = m[1][0] * dr + m[1][1] * dg + m[1][2] * db;
+                image[[y, x, 2]] = m[2][0] * dr + m[2][1] * dg + m[2][2] * db;
             }
         }
     }

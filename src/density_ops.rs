@@ -19,45 +19,53 @@ pub(crate) const SHADOW_CAST_THRESHOLD: f32 = 1.2;
 /// saturated colors have channels that are roughly evenly spaced (e.g.
 /// 0.3, 0.5, 0.7) and are left untouched.  Speckles have a skewed
 /// distribution (e.g. 1.0, 1.0, 2.5) and get pulled toward the mean.
+pub(crate) fn limit_highlight_density_spread_pixel(r: f32, g: f32, b: f32) -> [f32; 3] {
+    let mut lo = r;
+    let mut mid = g;
+    let mut hi = b;
+    if lo > mid {
+        std::mem::swap(&mut lo, &mut mid);
+    }
+    if mid > hi {
+        std::mem::swap(&mut mid, &mut hi);
+    }
+    if lo > mid {
+        std::mem::swap(&mut lo, &mut mid);
+    }
+
+    let range = hi - lo;
+    if range < 0.02 {
+        return [r, g, b];
+    }
+
+    let mid_pos = (mid - lo) / range;
+    let outlier = (0.5 - mid_pos).abs() * 2.0;
+    if outlier < 0.5 {
+        return [r, g, b];
+    }
+
+    let excess = (outlier - 0.5) / 0.5;
+    let blend = excess * 0.85;
+    let mean = (r + g + b) * (1.0 / 3.0);
+    [
+        r + (mean - r) * blend,
+        g + (mean - g) * blend,
+        b + (mean - b) * blend,
+    ]
+}
+
 pub(crate) fn limit_highlight_density_spread(image: &mut Array3<f32>) {
     let (h, w, _) = image.dim();
     for y in 0..h {
         for x in 0..w {
-            let r = image[[y, x, 0]];
-            let g = image[[y, x, 1]];
-            let b = image[[y, x, 2]];
-
-            let mut lo = r;
-            let mut mid = g;
-            let mut hi = b;
-            if lo > mid {
-                std::mem::swap(&mut lo, &mut mid);
-            }
-            if mid > hi {
-                std::mem::swap(&mut mid, &mut hi);
-            }
-            if lo > mid {
-                std::mem::swap(&mut lo, &mut mid);
-            }
-
-            let range = hi - lo;
-            if range < 0.02 {
-                continue;
-            }
-
-            let mid_pos = (mid - lo) / range;
-            let outlier = (0.5 - mid_pos).abs() * 2.0;
-            if outlier < 0.5 {
-                continue;
-            }
-
-            let excess = (outlier - 0.5) / 0.5;
-            let blend = excess * 0.85;
-            let mean = (r + g + b) * (1.0 / 3.0);
-
-            image[[y, x, 0]] = r + (mean - r) * blend;
-            image[[y, x, 1]] = g + (mean - g) * blend;
-            image[[y, x, 2]] = b + (mean - b) * blend;
+            let [r, g, b] = limit_highlight_density_spread_pixel(
+                image[[y, x, 0]],
+                image[[y, x, 1]],
+                image[[y, x, 2]],
+            );
+            image[[y, x, 0]] = r;
+            image[[y, x, 1]] = g;
+            image[[y, x, 2]] = b;
         }
     }
 }
@@ -265,7 +273,7 @@ pub(crate) fn zone_density_range(image: &Array3<f32>, curve_offset: f32) -> Zone
         };
     }
     let step = (n / 4096).max(1);
-    let mut d_effs: Vec<f32> = (0..n)
+    let d_effs: Vec<f32> = (0..n)
         .step_by(step)
         .map(|i| {
             let y = i / w;
@@ -274,6 +282,18 @@ pub(crate) fn zone_density_range(image: &Array3<f32>, curve_offset: f32) -> Zone
             d_mean + curve_offset
         })
         .collect();
+    zone_percentiles_from_samples(d_effs)
+}
+
+pub(crate) fn zone_percentiles_from_samples(mut d_effs: Vec<f32>) -> ZonePercentiles {
+    if d_effs.is_empty() {
+        return ZonePercentiles {
+            d_min: 0.0,
+            d_p33: 0.33,
+            d_p66: 0.66,
+            d_max: 1.0,
+        };
+    }
     d_effs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let ns = d_effs.len();
     let lo = d_effs[(ns * 2 / 100).clamp(0, ns - 1)];
@@ -303,53 +323,6 @@ pub(crate) fn zone_range_for_options(
         }
     } else {
         zone_density_range(image, options.curve_offset)
-    }
-}
-
-/// Estimate zone percentiles from a transmittance image (step-4 input).
-/// Approximates density as −log10(T) × inv_gamma, ignoring per-channel WB.
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-pub(crate) fn zone_density_range_from_transmittance(
-    image: &Array3<f32>,
-    options: &crate::PipelineOptions,
-) -> ZonePercentiles {
-    let (h, w, _) = image.dim();
-    let n = h * w;
-    if n == 0 {
-        return ZonePercentiles {
-            d_min: 0.0,
-            d_p33: 0.33,
-            d_p66: 0.66,
-            d_max: 1.0,
-        };
-    }
-    let inv_gamma = 1.0 / options.film_gamma.max(0.1);
-    let step = (n / 4096).max(1);
-    let mut d_effs: Vec<f32> = (0..n)
-        .step_by(step)
-        .map(|i| {
-            let y = i / w;
-            let x = i % w;
-            let tr = image[[y, x, 0]].max(1e-10);
-            let tg = image[[y, x, 1]].max(1e-10);
-            let tb = image[[y, x, 2]].max(1e-10);
-            let d_mean = ((-tr.log10()).max(0.0) + (-tg.log10()).max(0.0) + (-tb.log10()).max(0.0))
-                / 3.0
-                * inv_gamma;
-            d_mean + options.curve_offset
-        })
-        .collect();
-    d_effs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let ns = d_effs.len();
-    let lo = d_effs[(ns * 2 / 100).clamp(0, ns - 1)];
-    let p33 = d_effs[(ns * 33 / 100).clamp(0, ns - 1)];
-    let p66 = d_effs[(ns * 66 / 100).clamp(0, ns - 1)];
-    let hi = d_effs[(ns * 98 / 100).clamp(0, ns - 1)];
-    ZonePercentiles {
-        d_min: lo,
-        d_p33: p33.max(lo + 0.02),
-        d_p66: p66.max(p33 + 0.02),
-        d_max: hi.max(p66 + 0.02),
     }
 }
 

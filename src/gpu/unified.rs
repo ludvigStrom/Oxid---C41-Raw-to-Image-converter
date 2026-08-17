@@ -158,16 +158,10 @@ impl GpuPipeline {
 
         // ── Step 5 ──
         if start_step <= 5 && options.debug_pipeline_step >= 5 {
-            // Compute zone density range from input image. When start_step == 4 the
-            // image is still transmittance; we approximate density as -log10(T)*inv_gamma
-            // (ignoring WB, which is fine for a range estimate).
-            let zp = if options.pinned_zone.is_some() {
-                crate::density_ops::zone_range_for_options(image, options)
-            } else if start_step >= 5 {
-                crate::density_ops::zone_density_range(image, options.curve_offset)
-            } else {
-                crate::density_ops::zone_density_range_from_transmittance(image, options)
-            };
+            // Same order as CPU step 5: matrix/LUT + highlight spread, then percentiles.
+            // From step 4 the buffer is still transmittance, so run CPU step 4 first.
+            let zp =
+                crate::pipeline::zone_range_for_gpu_step5(image, options, lut3d, start_step < 5);
             let (step5_params_buf, step5_lut_buf) =
                 self.build_step5_buffers(device, options, lut3d, width, height, &zp);
             let step5_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

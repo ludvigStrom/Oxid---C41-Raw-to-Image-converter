@@ -179,7 +179,7 @@ impl Step5Pipeline {
             None => (0u32, 1u32, 1.0f32),
         };
 
-        let zp = crate::density_ops::zone_range_for_options(image, options);
+        let zp = crate::pipeline::zone_range_for_gpu_step5(image, options, lut3d, false);
 
         let params = Step5Params {
             width: width as u32,
