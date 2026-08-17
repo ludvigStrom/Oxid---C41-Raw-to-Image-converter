@@ -223,6 +223,38 @@ struct VisibleTileGrid {
     core_n: usize,
 }
 
+/// Tiles that intersect sensor-pixel range `[px0, px1] × [py0, py1]`.
+/// `px1`/`py1` are exclusive-ish (egui UV max). `ceil-1` still includes a
+/// tile that is only a sliver on-screen; `floor(end - eps)` used to miss it.
+fn tile_range_intersecting(
+    px0: f32,
+    py0: f32,
+    px1: f32,
+    py1: f32,
+    tile: f32,
+    tiles_x: i32,
+    tiles_y: i32,
+) -> (i32, i32, i32, i32) {
+    let last_x = tiles_x.saturating_sub(1);
+    let last_y = tiles_y.saturating_sub(1);
+    if tile <= 0.0 || last_x < 0 || last_y < 0 {
+        return (0, 0, 0, 0);
+    }
+    let x0 = px0.min(px1);
+    let x1 = px0.max(px1);
+    let y0 = py0.min(py1);
+    let y1 = py0.max(py1);
+    let ix0 = (x0 / tile).floor() as i32;
+    let iy0 = (y0 / tile).floor() as i32;
+    let ix1 = (x1 / tile).ceil() as i32 - 1;
+    let iy1 = (y1 / tile).ceil() as i32 - 1;
+    let ix0 = ix0.clamp(0, last_x);
+    let iy0 = iy0.clamp(0, last_y);
+    let ix1 = ix1.clamp(ix0, last_x);
+    let iy1 = iy1.clamp(iy0, last_y);
+    (ix0, iy0, ix1, iy1)
+}
+
 impl VisibleTileGrid {
     fn contains(&self, ix: i32, iy: i32) -> bool {
         ix >= self.ix0 && ix <= self.ix1 && iy >= self.iy0 && iy <= self.iy1
@@ -2413,22 +2445,30 @@ impl C41Gui {
         let entry = self.images.get(idx)?;
         let (tex_w, tex_h, _) = entry.preview_full_rgb.as_ref()?;
         let (canvas_w, canvas_h) = self.preview_canvas_size?;
-        let (ow, oh) = if let Some([w, h]) = entry.raw_source_size {
-            (w, h)
-        } else if let Some(s) = entry.cached_sensor.as_ref() {
+        // Same oriented frame the tile crop uses, so indices match request_tile_for.
+        let (ow, oh) = if let Some(s) = entry.cached_sensor.as_ref() {
             oriented_sensor_size(
                 s.dimensions().0,
                 s.dimensions().1,
                 entry.options.rotation_degrees,
             )
+        } else if let Some([w, h]) = entry.raw_source_size {
+            (w, h)
         } else {
             return None;
         };
-        if ow == 0 || oh == 0 {
+        if ow == 0 || oh == 0 || canvas_w <= 0.0 || canvas_h <= 0.0 {
             return None;
         }
-        let full_w_f = (*tex_w as f32).max(1.0);
-        let full_h_f = (*tex_h as f32).max(1.0);
+        // Same display size as the draw path (swap when a 90° view rotation is pending).
+        let view_rot = preview_view_rotation(entry);
+        let (full_w, full_h) = if view_rot == 90 || view_rot == 270 {
+            (*tex_h, *tex_w)
+        } else {
+            (*tex_w, *tex_h)
+        };
+        let full_w_f = (full_w as f32).max(1.0);
+        let full_h_f = (full_h as f32).max(1.0);
         let zoom = entry.preview_zoom.max(1.0);
         let base_scale = (canvas_w / full_w_f).min(canvas_h / full_h_f);
         let img_w = (full_w_f * base_scale * zoom).max(1.0);
@@ -2449,23 +2489,25 @@ impl C41Gui {
         let uv_t = ((vis_top - vir_top) / img_h).clamp(0.0, 1.0);
         let uv_r = ((vis_right - vir_left) / img_w).clamp(0.0, 1.0);
         let uv_b = ((vis_bottom - vir_top) / img_h).clamp(0.0, 1.0);
+        // 2 screen pixels in UV so a sliver after zoom-out still counts.
+        // Not a full tile — that used to inflate past PREVIEW_TILE_MAX.
+        let pad_u = 2.0 / img_w;
+        let pad_v = 2.0 / img_h;
+        let uv_l = (uv_l - pad_u).clamp(0.0, 1.0);
+        let uv_t = (uv_t - pad_v).clamp(0.0, 1.0);
+        let uv_r = (uv_r + pad_u).clamp(0.0, 1.0);
+        let uv_b = (uv_b + pad_v).clamp(0.0, 1.0);
         let tiles_x = ((ow + PREVIEW_TILE_SIZE - 1) / PREVIEW_TILE_SIZE) as i32;
         let tiles_y = ((oh + PREVIEW_TILE_SIZE - 1) / PREVIEW_TILE_SIZE) as i32;
-        let tile = PREVIEW_TILE_SIZE as f32;
-        let px0 = uv_l * ow as f32;
-        let py0 = uv_t * oh as f32;
-        // uv max is exclusive (egui rect). ceil-1 includes a tile that is only
-        // a few pixels on-screen after zoom-out; floor(px-eps) used to miss it.
-        let px1 = (uv_r * ow as f32).max(px0);
-        let py1 = (uv_b * oh as f32).max(py0);
-        let ix0 = (px0 / tile).floor() as i32;
-        let iy0 = (py0 / tile).floor() as i32;
-        let ix1 = (px1 / tile).ceil() as i32 - 1;
-        let iy1 = (py1 / tile).ceil() as i32 - 1;
-        let ix0 = ix0.clamp(0, tiles_x.saturating_sub(1));
-        let iy0 = iy0.clamp(0, tiles_y.saturating_sub(1));
-        let ix1 = ix1.clamp(ix0, tiles_x.saturating_sub(1));
-        let iy1 = iy1.clamp(iy0, tiles_y.saturating_sub(1));
+        let (ix0, iy0, ix1, iy1) = tile_range_intersecting(
+            uv_l * ow as f32,
+            uv_t * oh as f32,
+            uv_r * ow as f32,
+            uv_b * oh as f32,
+            PREVIEW_TILE_SIZE as f32,
+            tiles_x,
+            tiles_y,
+        );
         let nx = (ix1 - ix0 + 1) as usize;
         let ny = (iy1 - iy0 + 1) as usize;
         let core_n = nx.saturating_mul(ny);
@@ -5775,15 +5817,11 @@ impl eframe::App for C41Gui {
                             + BOTTOM_PADDING
                             + HISTOGRAM_HEIGHT
                             + BOTTOM_PADDING;
-                        let canvas_h = (available.height() - reserved_bottom).max(60.0);
+                        // TOP_PADDING is allocated above the canvas; reserve it or the
+                        // stored size is taller than the drawn rect and edge tiles miss.
+                        let canvas_h =
+                            (available.height() - reserved_bottom - TOP_PADDING).max(60.0);
                         let canvas_w = available.width();
-                        let canvas_changed = self.preview_canvas_size.map(|(ow, oh)| {
-                            (ow - canvas_w).abs() > 1.0 || (oh - canvas_h).abs() > 1.0
-                        });
-                        self.preview_canvas_size = Some((canvas_w, canvas_h));
-                        if canvas_changed == Some(true) {
-                            self.mark_preview_view_changed();
-                        }
 
                         // Extract image dims with fallback so the layout is stable before
                         // the first preview arrives (no jump when data loads in).
@@ -5834,6 +5872,15 @@ impl eframe::App for C41Gui {
                             egui::vec2(canvas_w, canvas_h),
                             egui::Sense::click_and_drag(),
                         );
+                        let canvas_w = canvas_rect.width();
+                        let canvas_h = canvas_rect.height();
+                        let canvas_changed = self.preview_canvas_size.map(|(ow, oh)| {
+                            (ow - canvas_w).abs() > 1.0 || (oh - canvas_h).abs() > 1.0
+                        });
+                        self.preview_canvas_size = Some((canvas_w, canvas_h));
+                        if canvas_changed == Some(true) {
+                            self.mark_preview_view_changed();
+                        }
                         let canvas_painter = ui.painter_at(canvas_rect);
                         canvas_painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_gray(30));
 
@@ -5893,14 +5940,12 @@ impl eframe::App for C41Gui {
                                 || canvas_resp.dragged();
                             if zoom > 1.0 && !hide_tiles {
                                 let opt_hash = self.images[idx].preview_options_hash;
-                                let grid = self.visible_tile_grid(idx);
                                 for tile in &self.images[idx].tile_cache {
                                     if tile.options_hash != opt_hash {
                                         continue;
                                     }
-                                    if grid.as_ref().is_some_and(|g| !g.contains(tile.ix, tile.iy)) {
-                                        continue;
-                                    }
+                                    // Draw by screen intersection, not grid.contains —
+                                    // a tight grid used to hide real edge tiles after zoom.
                                     let tile_rect = egui::Rect::from_min_max(
                                         egui::pos2(
                                             vir_rect.left() + tile.uv.min.x * img_w,
@@ -7030,5 +7075,37 @@ impl eframe::App for C41Gui {
                 egui::Color32::from_gray(240),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tile_grid_tests {
+    use super::{tile_range_intersecting, PREVIEW_TILE_SIZE};
+
+    #[test]
+    fn exclusive_end_on_tile_boundary_does_not_drop_previous_tile() {
+        let t = PREVIEW_TILE_SIZE as f32;
+        let (ix0, _, ix1, _) = tile_range_intersecting(0.0, 0.0, t, t, t, 16, 16);
+        assert_eq!((ix0, ix1), (0, 0));
+    }
+
+    #[test]
+    fn sliver_past_tile_boundary_includes_new_edge_tile() {
+        let t = PREVIEW_TILE_SIZE as f32;
+        // Zoom-out exposes 0.1 sensor px of the next column — used to miss with floor(px-eps).
+        let (ix0, _, ix1, _) = tile_range_intersecting(10.0, 0.0, t + 0.1, t, t, 16, 16);
+        assert_eq!(ix0, 0);
+        assert_eq!(ix1, 1);
+    }
+
+    #[test]
+    fn floor_minus_eps_regression_still_covers_new_column() {
+        let t = PREVIEW_TILE_SIZE as f32;
+        // Exclusive UV just past a boundary, then minus 1e-3, used to snap back a tile.
+        let px1 = t + 0.0005;
+        let old_ix1 = ((px1 - 1e-3) / t).floor() as i32;
+        assert_eq!(old_ix1, 0, "documents the old miss");
+        let (_, _, ix1, _) = tile_range_intersecting(0.0, 0.0, px1, t, t, 16, 16);
+        assert_eq!(ix1, 1);
     }
 }
