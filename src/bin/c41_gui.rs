@@ -1153,26 +1153,26 @@ fn compute_histogram_from_rgb(
 
 /// Shared linear Y-scale for the RGB overlay histogram.
 ///
-/// Full height is the tallest interior bin across R/G/B. End bins (0–1, 254–255)
-/// are allowed to clip — those are usually film base, rebate, or hard clips and
-/// would squash the rest of the plot if they set the scale. One scale for all
-/// three channels so relative channel height still reads as colour balance.
+/// Full height is the 98th percentile of non-zero bin counts across R/G/B.
+/// Outlier spikes (film base, rebate, hard clip, a single giant mode) sit
+/// above that and clip. One scale for all three channels so relative channel
+/// height still reads as colour balance. Falls back to the absolute max if
+/// the histogram is empty or degenerate.
 fn histogram_y_scale(r: &[u32; 256], g: &[u32; 256], b: &[u32; 256]) -> f32 {
-    let mut peak = 0u32;
+    let mut heights = Vec::with_capacity(256 * 3);
     for hist in [r, g, b] {
-        for &count in &hist[2..254] {
-            peak = peak.max(count);
+        for &count in hist {
+            if count > 0 {
+                heights.push(count);
+            }
         }
     }
-    if peak == 0 {
-        peak = r
-            .iter()
-            .chain(g.iter())
-            .chain(b.iter())
-            .copied()
-            .max()
-            .unwrap_or(1);
+    if heights.is_empty() {
+        return 1.0;
     }
+    heights.sort_unstable();
+    let idx = ((heights.len() as f32 - 1.0) * 0.98).round() as usize;
+    let peak = heights[idx.min(heights.len() - 1)];
     peak.max(1) as f32
 }
 
@@ -7080,11 +7080,14 @@ impl eframe::App for C41Gui {
                                  fill_color: egui::Color32,
                                  painter: &egui::Painter| {
                                     let mut curve_points = Vec::with_capacity(256);
+                                    let mut clipped = [false; 256];
                                     let w = draw_rect.width().max(1.0);
                                     for i in 0..256 {
                                         let x = draw_rect.left()
                                             + (i as f32 / 255.0) * w;
-                                        let h_norm = (hist[i] as f32 / scale_at_full).min(1.0);
+                                        let raw = hist[i] as f32 / scale_at_full;
+                                        clipped[i] = raw > 1.0;
+                                        let h_norm = raw.min(1.0);
                                         let y = (draw_rect.bottom()
                                             - draw_rect.height() * h_norm)
                                             .clamp(draw_rect.top(), draw_rect.bottom());
@@ -7113,6 +7116,24 @@ impl eframe::App for C41Gui {
                                         curve_points,
                                         egui::Stroke::new(1.0, line_color),
                                     ));
+
+                                    // 1px cap on clipped bins so overflow is not a silent flat ceiling.
+                                    let cap_y = draw_rect.top();
+                                    let bin_w = (w / 255.0).max(1.0);
+                                    let cap_stroke = egui::Stroke::new(1.0, line_color);
+                                    for i in 0..256 {
+                                        if !clipped[i] {
+                                            continue;
+                                        }
+                                        let x = draw_rect.left() + (i as f32 / 255.0) * w;
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(x - bin_w * 0.5, cap_y),
+                                                egui::pos2(x + bin_w * 0.5, cap_y),
+                                            ],
+                                            cap_stroke,
+                                        );
+                                    }
                                 };
 
                             draw_channel(
