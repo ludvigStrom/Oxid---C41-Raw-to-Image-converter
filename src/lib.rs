@@ -71,7 +71,7 @@ pub use sensor::{
 pub use tiff_export::TiffFormat;
 pub use undo::{UndoManager, UNDO_LIMIT};
 
-use crate::demosaic::CfaPattern;
+use crate::demosaic::{BayerPattern, CfaPattern};
 
 /// Scale D-min rect from reference size to current image size. If reference is None or matches current size, returns rect as-is.
 pub(crate) fn scale_dmin_rect(
@@ -255,6 +255,68 @@ fn downsample_cfa_box(bayer: &Array3<f32>, max_width: u32, period: usize) -> Arr
 /// RGGB pattern so demosaic can produce real color.
 fn downsample_bayer_for_preview(bayer: &Array3<f32>, max_width: u32) -> Array3<f32> {
     downsample_cfa_box(bayer, max_width, 2)
+}
+
+/// Pack each 2×2 Bayer tile into one RGB pixel (native R, mean G, native B).
+///
+/// Used for the GUI backdrop instead of CFA-bin-then-demosaic, which invents
+/// chroma that C-41 inversion turns into a blue/cyan cast.
+fn pack_bayer_2x2_to_rgb(bayer: &Array3<f32>, pattern: BayerPattern) -> Array3<f32> {
+    let (h, w, c) = bayer.dim();
+    assert_eq!(c, 1, "Expected single-channel CFA");
+    let out_h = h / 2;
+    let out_w = w / 2;
+    let mut out = Array3::<f32>::zeros((out_h, out_w, 3));
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let y0 = y * 2;
+            let x0 = x * 2;
+            let a = bayer[(y0, x0, 0)];
+            let b = bayer[(y0, x0 + 1, 0)];
+            let c = bayer[(y0 + 1, x0, 0)];
+            let d = bayer[(y0 + 1, x0 + 1, 0)];
+            let (r, g, bl) = match pattern {
+                BayerPattern::Rggb => (a, 0.5 * (b + c), d),
+                BayerPattern::Grbg => (b, 0.5 * (a + d), c),
+                BayerPattern::Gbrg => (c, 0.5 * (a + d), b),
+                BayerPattern::Bggr => (d, 0.5 * (b + c), a),
+            };
+            out[(y, x, 0)] = r;
+            out[(y, x, 1)] = g;
+            out[(y, x, 2)] = bl;
+        }
+    }
+    out
+}
+
+/// RAW → working RGB for a preview job. Tiles / full-res demosaic natively.
+/// Bayer backdrops pack 2×2 → RGB then downsample (no interpolated chroma).
+fn preview_rgb_from_mosaic(
+    bayer: &Array3<f32>,
+    pattern: CfaPattern,
+    max_width: u32,
+    max_height: u32,
+    simple_debayer: bool,
+) -> anyhow::Result<Array3<f32>> {
+    let full_res = max_width == u32::MAX && max_height == u32::MAX;
+    if !full_res {
+        if let CfaPattern::Bayer(p) = pattern {
+            let packed = pack_bayer_2x2_to_rgb(bayer, p);
+            return Ok(downsample_rgb_for_preview(&packed, max_width, max_height));
+        }
+    }
+    let working = if full_res {
+        bayer.clone()
+    } else {
+        downsample_raw_for_preview(bayer, pattern, preview_mosaic_working_width(max_width))
+    };
+    let mut img = if simple_debayer {
+        demosaic::demosaic_bilinear(&working, pattern)?
+    } else {
+        demosaic::demosaic_quality(&working, pattern)?
+    };
+    img.mapv_inplace(|v| v.max(0.0));
+    Ok(finish_preview_rgb(img, max_width, max_height))
 }
 
 /// Mosaic working width. Full-res / 1:1 tiles pass `u32::MAX`.
@@ -937,6 +999,65 @@ mod live_preview_tests {
     }
 }
 
+#[cfg(test)]
+mod pack_bayer_tests {
+    use super::*;
+    use ndarray::Array3;
+
+    fn mosaic_2x2(a: f32, b: f32, c: f32, d: f32) -> Array3<f32> {
+        let mut m = Array3::<f32>::zeros((2, 2, 1));
+        m[(0, 0, 0)] = a;
+        m[(0, 1, 0)] = b;
+        m[(1, 0, 0)] = c;
+        m[(1, 1, 0)] = d;
+        m
+    }
+
+    #[test]
+    fn rggb_pack_uses_native_r_mean_g_native_b() {
+        let rgb = pack_bayer_2x2_to_rgb(&mosaic_2x2(1.0, 0.4, 0.6, 0.2), BayerPattern::Rggb);
+        assert_eq!(rgb.dim(), (1, 1, 3));
+        assert!((rgb[(0, 0, 0)] - 1.0).abs() < 1e-6);
+        assert!((rgb[(0, 0, 1)] - 0.5).abs() < 1e-6);
+        assert!((rgb[(0, 0, 2)] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bggr_pack_swaps_r_and_b() {
+        let rgb = pack_bayer_2x2_to_rgb(&mosaic_2x2(0.2, 0.4, 0.6, 1.0), BayerPattern::Bggr);
+        assert!((rgb[(0, 0, 0)] - 1.0).abs() < 1e-6);
+        assert!((rgb[(0, 0, 1)] - 0.5).abs() < 1e-6);
+        assert!((rgb[(0, 0, 2)] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn preview_mosaic_packs_bayer_instead_of_demosaic() {
+        let mut bayer = Array3::<f32>::zeros((4, 4, 1));
+        for y in 0..4 {
+            for x in 0..4 {
+                let rggb = match (y % 2, x % 2) {
+                    (0, 0) => 1.0,
+                    (1, 1) => 0.25,
+                    _ => 0.5,
+                };
+                bayer[(y, x, 0)] = rggb;
+            }
+        }
+        let rgb = preview_rgb_from_mosaic(
+            &bayer,
+            CfaPattern::Bayer(BayerPattern::Rggb),
+            2,
+            2,
+            false,
+        )
+        .expect("pack");
+        assert_eq!(rgb.dim(), (2, 2, 3));
+        assert!((rgb[(0, 0, 0)] - 1.0).abs() < 1e-5);
+        assert!((rgb[(0, 0, 1)] - 0.5).abs() < 1e-5);
+        assert!((rgb[(0, 0, 2)] - 0.25).abs() < 1e-5);
+    }
+}
+
 /// Process a single image for GUI preview. Pipeline order matches `process_files`: load → demosaic →
 /// D-min/flat-field → WB → curve or no-curve.
 ///
@@ -963,18 +1084,13 @@ pub fn process_one_to_preview(
             let (bh, bw, _) = bayer.dim();
             true_src_w = bw as u32;
             true_src_h = bh as u32;
-            let small_bayer = downsample_raw_for_preview(
+            preview_rgb_from_mosaic(
                 &bayer,
                 pattern,
-                preview_mosaic_working_width(max_width),
-            );
-            let mut img = if options.debug_preview_simple_debayer {
-                demosaic::demosaic_bilinear(&small_bayer, pattern)?
-            } else {
-                demosaic::demosaic_quality(&small_bayer, pattern)?
-            };
-            img.mapv_inplace(|v| v.max(0.0));
-            finish_preview_rgb(img, max_width, max_height)
+                max_width,
+                max_height,
+                options.debug_preview_simple_debayer,
+            )?
         }
         "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
             let mut img = png_reader::load_png_as_ndarray(path)?;
@@ -2030,14 +2146,26 @@ fn load_preview_from_sensor<D: DemosaicBackend>(
     match sensor {
         CachedSensor::Bayer { data, pattern } => {
             let (bh, bw, _) = data.dim();
-            let small_bayer =
-                downsample_raw_for_preview(data, *pattern, preview_mosaic_working_width(max_width));
-            let img = demosaic_backend.demosaic(&small_bayer, *pattern)?;
-            Ok((
-                finish_preview_rgb(img, max_width, max_height),
-                bw as u32,
-                bh as u32,
-            ))
+            let full_res = max_width == u32::MAX && max_height == u32::MAX;
+            let img = if !full_res {
+                if let CfaPattern::Bayer(p) = *pattern {
+                    downsample_rgb_for_preview(
+                        &pack_bayer_2x2_to_rgb(data, p),
+                        max_width,
+                        max_height,
+                    )
+                } else {
+                    let small = downsample_raw_for_preview(
+                        data,
+                        *pattern,
+                        preview_mosaic_working_width(max_width),
+                    );
+                    finish_preview_rgb(demosaic_backend.demosaic(&small, *pattern)?, max_width, max_height)
+                }
+            } else {
+                demosaic_backend.demosaic(data, *pattern)?
+            };
+            Ok((img, bw as u32, bh as u32))
         }
         CachedSensor::Rgb(img) => {
             let mut img = img.clone();
@@ -2076,13 +2204,13 @@ fn load_and_demosaic_preview<D: DemosaicBackend>(
             let (bh, bw, _) = bayer.dim();
             true_src_w = bw as u32;
             true_src_h = bh as u32;
-            let small_bayer = downsample_raw_for_preview(
+            preview_rgb_from_mosaic(
                 &bayer,
                 pattern,
-                preview_mosaic_working_width(max_width),
-            );
-            let img = demosaic_backend.demosaic(&small_bayer, pattern)?;
-            finish_preview_rgb(img, max_width, max_height)
+                max_width,
+                max_height,
+                options.debug_preview_simple_debayer,
+            )?
         }
         "png" | "jpeg" | "jpg" | "tiff" | "tif" => {
             let mut img = png_reader::load_png_as_ndarray(path)?;

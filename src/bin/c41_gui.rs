@@ -213,6 +213,8 @@ struct PreviewTile {
     uv: egui::Rect,
     /// Corresponding region of `texture` (0–1), halo excluded.
     tex_uv: egui::Rect,
+    /// Live slider apply retags tiles so they keep drawing; fetch replaces them.
+    stale: bool,
 }
 
 /// Visible 1:1 tile grid for the current canvas / pan / zoom.
@@ -586,6 +588,8 @@ struct C41Gui {
     rect_dragging: bool,
     /// True while the preview is being panned (left/middle drag).
     preview_view_dragging: bool,
+    /// True while the pointer is down on the preview canvas (not a slider).
+    preview_canvas_pointer: bool,
     /// Last pan/zoom; tiles wait until this has settled.
     preview_view_changed_at: Option<Instant>,
     /// Debounce state for preview refreshes: (image index, options hash) currently waiting to settle.
@@ -658,6 +662,7 @@ impl Default for C41Gui {
             ui_icons: UiIcons::default(),
             rect_dragging: false,
             preview_view_dragging: false,
+            preview_canvas_pointer: false,
             preview_view_changed_at: None,
             pending_preview_key: None,
             pending_preview_since: None,
@@ -2349,6 +2354,7 @@ impl C41Gui {
         self.preview_job_hash = Some(options_hash);
         self.preview_job_live = true;
         let gen = self.preview_gen;
+        let lod = self.images[index].preview_lod;
         #[cfg(feature = "gpu")]
         let gpu_arc = self.gpu_pipeline.clone();
         let (tx, rx) = mpsc::channel();
@@ -2369,7 +2375,7 @@ impl C41Gui {
             let res = match applied {
                 Some((input_w, input_h, w, h, rgb, new_cache)) => Ok(PreviewJobResult {
                     gen,
-                    lod: PreviewLod::Draft,
+                    lod,
                     index,
                     options_hash,
                     input_w,
@@ -2600,14 +2606,8 @@ impl C41Gui {
     }
 
     fn drop_tiles_outside_view(&mut self, idx: usize) {
-        let Some(grid) = self.visible_tile_grid(idx) else {
-            return;
-        };
-        // Drop off-screen tiles, and when over cap drop the farthest so
-        // newly visible center-adjacent edges can be fetched.
-        self.images[idx]
-            .tile_cache
-            .retain(|t| t.options_hash != grid.opt_hash || grid.is_priority(t.ix, t.iy));
+        // Evict off-screen tiles only when over the cap so pan/zoom keeps the cache.
+        self.evict_tile_cache(idx);
     }
 
     fn evict_tile_cache(&mut self, idx: usize) {
@@ -2663,10 +2663,12 @@ impl C41Gui {
                 {
                     continue;
                 }
-                let have = entry
-                    .tile_cache
-                    .iter()
-                    .any(|t| t.ix == ix && t.iy == iy && t.options_hash == grid.opt_hash);
+                let have = entry.tile_cache.iter().any(|t| {
+                    t.ix == ix
+                        && t.iy == iy
+                        && t.options_hash == grid.opt_hash
+                        && !t.stale
+                });
                 if have {
                     continue;
                 }
@@ -2680,10 +2682,8 @@ impl C41Gui {
     }
 
     fn mark_preview_view_changed(&mut self) {
-        if !self.preview_view_dragging {
-            self.tile_gen = self.tile_gen.wrapping_add(1);
-            self.tile_inflight = None;
-        }
+        // Pan/zoom only changes which tiles are visible. Do not bump tile_gen —
+        // in-flight tiles stay valid and the cache is not thrown away.
         self.preview_view_dragging = true;
         self.preview_view_changed_at = Some(Instant::now());
     }
@@ -3917,6 +3917,7 @@ impl eframe::App for C41Gui {
         }
 
         self.rect_dragging = false;
+        self.preview_canvas_pointer = false;
 
         if self.ui_icons.logo.is_none() {
             self.ui_icons.logo = load_icon_texture(ctx, "ui_icon_logo", ICON_LOGO_PATH);
@@ -3977,6 +3978,7 @@ impl eframe::App for C41Gui {
         if let Some(rx) = self.preview_receiver.as_ref() {
             match rx.try_recv() {
                 Ok(Ok(job)) => {
+                    let was_live = self.preview_job_live;
                     self.preview_receiver = None;
                     self.preview_started_at = None;
                     self.preview_job_live = false;
@@ -4056,12 +4058,20 @@ impl eframe::App for C41Gui {
                         if job.captured_debug {
                             self.images[idx].pipeline_debug_log = Some(job.dbg_log);
                         }
-                        // Old 1:1 tiles belong to the previous options; drop them
-                        // with the new proxy so we don't flash stale seams.
-                        self.images[idx].tile_cache.clear();
-                        self.tile_gen = self.tile_gen.wrapping_add(1);
-                        self.tile_inflight = None;
-                        self.tile_failed.clear();
+                        // Backdrop is hole-fill. Live apply retags tiles so they
+                        // keep drawing (one slider tick stale) until replacements
+                        // arrive. A remosaic drops only mismatched hashes — a
+                        // same-hash screen refine must not wipe the cache.
+                        if was_live {
+                            for tile in &mut self.images[idx].tile_cache {
+                                tile.options_hash = job.options_hash;
+                                tile.stale = true;
+                            }
+                        } else {
+                            self.images[idx]
+                                .tile_cache
+                                .retain(|t| t.options_hash == job.options_hash);
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -4102,6 +4112,7 @@ impl eframe::App for C41Gui {
                             texture: tex,
                             uv: job.uv,
                             tex_uv: job.tex_uv,
+                            stale: false,
                         };
                         let cache = &mut self.images[idx].tile_cache;
                         cache.retain(|t| !(t.ix == tile.ix && t.iy == tile.iy));
@@ -6187,19 +6198,15 @@ impl eframe::App for C41Gui {
                                 );
                             }
 
-                            // 1:1 tiles over the proxy when the view is settled.
-                            // Slider drag and pan/zoom show the proxy only.
-                            let pointer_down = ui.input(|i| i.pointer.any_down());
+                            // 1:1 tiles stay up during click / pan / zoom (UVs follow the view).
+                            // Hide only when develop options or rotate/flip are stale.
+                            self.preview_canvas_pointer = canvas_resp.is_pointer_button_down_on()
+                                || canvas_resp.dragged();
                             let grid_now = self.visible_tile_grid(idx);
                             let proxy_soft = grid_now.as_ref().map(|g| g.proxy_soft).unwrap_or(false);
-                            // Keep drawing cached tiles while the view settles so a
-                            // zoom-out does not flash back to the proxy. Fetch waits.
                             let hide_tiles = !proxy_soft
                                 || self.preview_options_dirty(idx)
-                                || geometry_pending
-                                || pointer_down
-                                || self.preview_view_dragging
-                                || canvas_resp.dragged();
+                                || geometry_pending;
                             if !hide_tiles {
                                 let opt_hash = self.images[idx].preview_options_hash;
                                 for tile in &self.images[idx].tile_cache {
@@ -7218,12 +7225,16 @@ impl eframe::App for C41Gui {
                     // which blocked 1:1 tiles. Skip refine when tiles can cover the view;
                     // still refine the proxy when the visible grid exceeds PREVIEW_TILE_MAX.
                     let pointer_down = ctx.input(|i| i.pointer.any_down());
-                    let slider_dragging =
-                        pointer_down && !self.rect_dragging && !self.preview_view_dragging;
+                    // Canvas press is not a slider. Live 50 ms debounce is only
+                    // for develop widgets (and crop/d-min rects use rect_dragging).
+                    let slider_dragging = pointer_down
+                        && !self.rect_dragging
+                        && !self.preview_view_dragging
+                        && !self.preview_canvas_pointer;
                     let need_screen = have_current
                         && !self.full_res_preview_active
                         && !tiles_fit
-                        && !pointer_down
+                        && !slider_dragging
                         && (lod == PreviewLod::Draft
                             || (lod == PreviewLod::Screen
                                 && (req_sw + 64 < screen_w || req_sh + 64 < screen_h)));
@@ -7234,8 +7245,8 @@ impl eframe::App for C41Gui {
                         if self.pending_preview_key != Some(key) {
                             self.pending_preview_key = Some(key);
                             self.pending_preview_since = Some(now);
-                            // Keep an in-flight draft so the proxy can update while dragging.
-                            // Tiles wait until the pointer is released.
+                            // Cancel in-flight tiles for the old options. Cached
+                            // tiles stay until the new hash is applied.
                             self.tile_gen = self.tile_gen.wrapping_add(1);
                             self.tile_inflight = None;
                             self.tile_failed.clear();
@@ -7321,7 +7332,8 @@ impl eframe::App for C41Gui {
                         self.preview_view_dragging = false;
                     }
                     let view_settling = self.preview_view_settling();
-                    // 1:1 tiles: after pan/zoom/slider release, at every zoom including fit.
+                    // 1:1 tiles: after pan/zoom settle, at every zoom including fit.
+                    // A canvas click must not pause fetch. Slider drag is need_options.
                     // Over-cap views still fetch a center-first window of PREVIEW_TILE_MAX.
                     if proxy_soft
                         && self.preview_receiver.is_none()
@@ -7332,7 +7344,6 @@ impl eframe::App for C41Gui {
                         && !self.preview_view_dragging
                         && !view_settling
                         && !need_options
-                        && !pointer_down
                     {
                         self.drop_tiles_outside_view(idx);
                         if let Some(missing) = self.visible_tile_to_request(idx) {
