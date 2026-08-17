@@ -126,7 +126,7 @@ pub enum OutputLutEncoding {
 }
 
 /// All pipeline options (CLI flags / GUI state).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PipelineOptions {
     /// Which D-min method to use (Off / Fixed / SampleRegion / AutoPercentile).

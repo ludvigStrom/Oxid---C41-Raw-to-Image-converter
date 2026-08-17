@@ -25,7 +25,7 @@ use c41_raw_tool::{
     AutoCropResult, AutoTuneResult, CachedSensor, CropConfidence, DminMode, ExportCancelled,
     ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions,
     PreviewSceneStats, PreviewStepCache, ProjectExportFormat, ProjectImage, Rect, TiffFormat,
-    WbMode,
+    UndoManager, WbMode, UNDO_LIMIT,
 };
 use eframe::egui;
 
@@ -54,6 +54,20 @@ const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
 /// Left inset so the Archive menu clears macOS traffic lights (hidden title bar).
 const MENU_BAR_MACOS_INSET: f32 = 78.0;
+const PROJECT_SAVE_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+const PROJECT_SAVE_AS_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+    egui::Key::S,
+);
+const PROJECT_LOAD_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+const UNDO_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+const REDO_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+    egui::Key::Z,
+);
 const ICON_CLOSE_PATH: &str = "X.png";
 const ICON_ROTATE_RIGHT_PATH: &str = "rotate_right.png";
 const ICON_ROTATE_LEFT_PATH: &str = "rotate_left.png";
@@ -121,6 +135,8 @@ fn main() -> eframe::Result<()> {
 }
 
 struct ImageEntry {
+    /// Stable identity for the session undo stack (not persisted).
+    id: u64,
     path: PathBuf,
     options: PipelineOptions,
     /// Preview texture uploaded when RGB arrives; filter updated only when zoom crosses 1×.
@@ -280,6 +296,13 @@ struct TileJobResult {
     rgb: Vec<u8>,
     uv: egui::Rect,
     tex_uv: egui::Rect,
+}
+
+/// User-facing per-image edit state captured by the undo stack.
+#[derive(Clone, PartialEq)]
+struct EditSnapshot {
+    options: PipelineOptions,
+    export_format: ExportFormat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -554,6 +577,9 @@ struct C41Gui {
     wb_picker_armed: bool,
     /// While set and in the future, preview debounce uses [`GEOMETRY_COALESCE_MS`].
     geometry_coalesce_until: Option<Instant>,
+    /// Session-wide chronological undo/redo of per-image edits.
+    history: UndoManager<u64, EditSnapshot>,
+    next_image_id: u64,
     #[cfg(feature = "gpu")]
     gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
 }
@@ -604,6 +630,8 @@ impl Default for C41Gui {
             batch_export_dialog: None,
             wb_picker_armed: false,
             geometry_coalesce_until: None,
+            history: UndoManager::new(UNDO_LIMIT),
+            next_image_id: 1,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
                 .map(std::sync::Arc::new),
@@ -1683,8 +1711,14 @@ fn crop_histogram_hash(opts: &PipelineOptions) -> u64 {
     h.finish()
 }
 
-fn image_entry(path: PathBuf, options: PipelineOptions, export_format: ExportFormat) -> ImageEntry {
+fn image_entry(
+    id: u64,
+    path: PathBuf,
+    options: PipelineOptions,
+    export_format: ExportFormat,
+) -> ImageEntry {
     ImageEntry {
+        id,
         path,
         options,
         preview_texture: None,
@@ -1759,13 +1793,61 @@ fn apply_runtime_gui_defaults(opts: &mut PipelineOptions) {
     opts.flat_field_path = None;
 }
 
+fn normalize_runtime_options(opts: &mut PipelineOptions) {
+    opts.use_gpu = false;
+    opts.debug_pipeline_step = 6;
+    opts.debug_preview_simple_debayer = false;
+    opts.verbose_debug = false;
+    opts.pinned_zone = None;
+    opts.flat_field_path = None;
+}
+
+fn edit_snapshot(entry: &ImageEntry) -> EditSnapshot {
+    let mut options = entry.options.clone();
+    normalize_runtime_options(&mut options);
+    EditSnapshot {
+        options,
+        export_format: entry.export_format,
+    }
+}
+
+fn restore_edit_snapshot(entry: &mut ImageEntry, snap: &EditSnapshot) {
+    let use_gpu = entry.options.use_gpu;
+    let debug_pipeline_step = entry.options.debug_pipeline_step;
+    let debug_preview_simple_debayer = entry.options.debug_preview_simple_debayer;
+    let verbose_debug = entry.options.verbose_debug;
+    let pinned_zone = entry.options.pinned_zone;
+    let flat_field_path = entry.options.flat_field_path.clone();
+    entry.options = snap.options.clone();
+    entry.options.use_gpu = use_gpu;
+    entry.options.debug_pipeline_step = debug_pipeline_step;
+    entry.options.debug_preview_simple_debayer = debug_preview_simple_debayer;
+    entry.options.verbose_debug = verbose_debug;
+    entry.options.pinned_zone = pinned_zone;
+    entry.options.flat_field_path = flat_field_path;
+    entry.export_format = snap.export_format;
+}
+
 impl C41Gui {
+    fn make_image_entry(
+        &mut self,
+        path: PathBuf,
+        options: PipelineOptions,
+        export_format: ExportFormat,
+    ) -> ImageEntry {
+        let id = self.next_image_id;
+        self.next_image_id = self.next_image_id.wrapping_add(1);
+        let entry = image_entry(id, path, options, export_format);
+        self.history.track(id, edit_snapshot(&entry));
+        entry
+    }
+
     fn add_image_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> usize {
         let mut added = 0usize;
         for p in collect_importable_paths(paths) {
             if !self.images.iter().any(|e| e.path == p) {
-                self.images
-                    .push(image_entry(p, default_options(), ExportFormat::Tiff16));
+                let entry = self.make_image_entry(p, default_options(), ExportFormat::Tiff16);
+                self.images.push(entry);
                 if self.selected_index.is_none() {
                     self.selected_index = Some(self.images.len() - 1);
                     self.full_res_preview_active = false;
@@ -1777,6 +1859,56 @@ impl C41Gui {
             self.status = format!("{} file(s)", self.images.len());
         }
         added
+    }
+
+    fn undo_edits(&mut self) {
+        if let Some(states) = self.history.undo() {
+            self.apply_history_restore(states);
+            self.status = "Undo".to_string();
+        }
+    }
+
+    fn redo_edits(&mut self) {
+        if let Some(states) = self.history.redo() {
+            self.apply_history_restore(states);
+            self.status = "Redo".to_string();
+        }
+    }
+
+    fn apply_history_restore(&mut self, states: Vec<(u64, EditSnapshot)>) {
+        let mut first_idx = None;
+        for (id, snap) in states {
+            if let Some(idx) = self.images.iter().position(|e| e.id == id) {
+                restore_edit_snapshot(&mut self.images[idx], &snap);
+                if first_idx.is_none() {
+                    first_idx = Some(idx);
+                }
+            }
+        }
+        if let Some(idx) = first_idx {
+            self.selected_index = Some(idx);
+            self.full_res_preview_active = false;
+        }
+    }
+
+    fn commit_edit_history(&mut self, ctx: &egui::Context) {
+        if self.auto_job.as_ref().is_some_and(|j| j.batch) {
+            return;
+        }
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+        let interacting = pointer_down || self.rect_dragging;
+        let skip_id = if interacting {
+            self.selected_index
+                .and_then(|i| self.images.get(i).map(|e| e.id))
+        } else {
+            None
+        };
+        let current: Vec<(u64, EditSnapshot)> = self
+            .images
+            .iter()
+            .map(|e| (e.id, edit_snapshot(e)))
+            .collect();
+        self.history.commit_settled(&current, skip_id.as_ref());
     }
 
     fn request_project_save(&mut self, save_as: bool) {
@@ -1869,19 +2001,18 @@ impl C41Gui {
 
         let missing_count = loaded.missing.len();
         let total = loaded.images.len() + missing_count;
-        self.images = loaded
-            .images
-            .into_iter()
-            .map(|img| {
-                let mut opts = img.options;
-                apply_runtime_gui_defaults(&mut opts);
-                image_entry(
-                    img.path,
-                    opts,
-                    ExportFormat::from_project(img.export_format),
-                )
-            })
-            .collect();
+        self.history.clear();
+        self.images.clear();
+        for img in loaded.images {
+            let mut opts = img.options;
+            apply_runtime_gui_defaults(&mut opts);
+            let entry = self.make_image_entry(
+                img.path,
+                opts,
+                ExportFormat::from_project(img.export_format),
+            );
+            self.images.push(entry);
+        }
         self.selected_index = if self.images.is_empty() {
             None
         } else {
@@ -3464,21 +3595,18 @@ impl eframe::App for C41Gui {
             };
         }
 
-        let (save_shortcut, save_as_shortcut, load_shortcut) = ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            (
-                cmd && !i.modifiers.shift && i.key_pressed(egui::Key::S),
-                cmd && i.modifiers.shift && i.key_pressed(egui::Key::S),
-                cmd && !i.modifiers.shift && i.key_pressed(egui::Key::O),
-            )
-        });
-        if save_as_shortcut {
+        if ctx.input_mut(|i| i.consume_shortcut(&PROJECT_SAVE_AS_SHORTCUT)) {
             self.request_project_save(true);
-        } else if save_shortcut {
+        } else if ctx.input_mut(|i| i.consume_shortcut(&PROJECT_SAVE_SHORTCUT)) {
             self.request_project_save(false);
         }
-        if load_shortcut {
+        if ctx.input_mut(|i| i.consume_shortcut(&PROJECT_LOAD_SHORTCUT)) {
             self.pending_project_load = true;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&REDO_SHORTCUT)) {
+            self.redo_edits();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&UNDO_SHORTCUT)) {
+            self.undo_edits();
         }
 
         self.rect_dragging = false;
@@ -3765,15 +3893,36 @@ impl eframe::App for C41Gui {
                 }
                 ui.menu_button("Archive", |ui| {
                     ui.menu_button("Project", |ui| {
-                        if ui.button("Save").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new("Save").shortcut_text(
+                                    ui.ctx().format_shortcut(&PROJECT_SAVE_SHORTCUT),
+                                ),
+                            )
+                            .clicked()
+                        {
                             self.request_project_save(false);
                             ui.close_menu();
                         }
-                        if ui.button("Save As...").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new("Save As...").shortcut_text(
+                                    ui.ctx().format_shortcut(&PROJECT_SAVE_AS_SHORTCUT),
+                                ),
+                            )
+                            .clicked()
+                        {
                             self.request_project_save(true);
                             ui.close_menu();
                         }
-                        if ui.button("Load").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new("Load").shortcut_text(
+                                    ui.ctx().format_shortcut(&PROJECT_LOAD_SHORTCUT),
+                                ),
+                            )
+                            .clicked()
+                        {
                             self.pending_project_load = true;
                             ui.close_menu();
                         }
@@ -3813,6 +3962,32 @@ impl eframe::App for C41Gui {
                             ui.close_menu();
                         }
                     });
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui
+                        .add_enabled(
+                            self.history.can_undo(),
+                            egui::Button::new("Undo").shortcut_text(
+                                ui.ctx().format_shortcut(&UNDO_SHORTCUT),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.undo_edits();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.history.can_redo(),
+                            egui::Button::new("Redo").shortcut_text(
+                                ui.ctx().format_shortcut(&REDO_SHORTCUT),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.redo_edits();
+                        ui.close_menu();
+                    }
                 });
             });
         });
@@ -4002,6 +4177,9 @@ impl eframe::App for C41Gui {
                         }
                     }
                     for i in to_remove.into_iter().rev() {
+                        if let Some(id) = self.images.get(i).map(|e| e.id) {
+                            self.history.forget(&id);
+                        }
                         self.images.remove(i);
                         if self.selected_index == Some(i) {
                             self.selected_index = None;
@@ -6776,6 +6954,7 @@ impl eframe::App for C41Gui {
         self.show_export_progress(ctx);
         self.show_auto_progress(ctx);
         self.show_batch_export_dialog(ctx);
+        self.commit_edit_history(ctx);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let screen = ctx.screen_rect();

@@ -43,6 +43,7 @@ pub mod raw_reader;
 pub mod sensor;
 pub mod stats;
 pub mod tiff_export;
+pub mod undo;
 
 pub use auto::{auto_tune, AutoTuneResult, AUTO_PROXY_MAX_SIDE};
 pub use auto_crop::{
@@ -68,6 +69,7 @@ pub use sensor::{
     PreviewSceneStats, SensorTileCrop,
 };
 pub use tiff_export::TiffFormat;
+pub use undo::{UndoManager, UNDO_LIMIT};
 
 use crate::demosaic::CfaPattern;
 
