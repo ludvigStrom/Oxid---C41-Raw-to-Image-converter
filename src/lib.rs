@@ -1254,6 +1254,29 @@ pub fn process_one_to_preview_with_cache(
     capture_debug: bool,
     sensor: Option<&CachedSensor>,
 ) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>, String, PreviewStepCache)> {
+    process_one_to_preview_with_cache_on_progress(
+        path,
+        options,
+        max_width,
+        max_height,
+        cache,
+        capture_debug,
+        sensor,
+        &mut |_, _| {},
+    )
+}
+
+/// Same as [`process_one_to_preview_with_cache`], with 97–100% stage callbacks.
+pub fn process_one_to_preview_with_cache_on_progress(
+    path: &Path,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    cache: Option<&PreviewStepCache>,
+    capture_debug: bool,
+    sensor: Option<&CachedSensor>,
+    on_progress: &mut dyn FnMut(&str, f32),
+) -> anyhow::Result<(u32, u32, u32, u32, Vec<u8>, String, PreviewStepCache)> {
     use pipeline_cache::{hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5};
 
     // Simple-debayer path: no cache; delegate to full pipeline.
@@ -1328,6 +1351,7 @@ pub fn process_one_to_preview_with_cache(
     }
 
     if start_step == 1 {
+        on_progress("Demosaicing…", 0.97);
         let (mut img, tw, th) =
             load_and_demosaic_preview(path, options, max_width, max_height, CpuDemosaic, sensor)?;
         true_src_w = tw;
@@ -1379,18 +1403,22 @@ pub fn process_one_to_preview_with_cache(
         .and_then(|p| lut3d::read_cube(p).ok());
 
     if start_step <= 3 {
+        on_progress("D-min…", 0.98);
         pipeline::step_3_dmin(&mut image, options, flat_map_preview.as_ref())?;
         new_cache.after_step3 = Some((h3, image.clone()));
     }
     if start_step <= 4 {
+        on_progress("Tone and white balance…", 0.98);
         pipeline::step_4_t_to_d_wb(&mut image, options);
         new_cache.after_step4 = Some((h4, image.clone()));
     }
     if start_step <= 5 {
+        on_progress("Color…", 0.99);
         pipeline::step_5_calibration(&mut image, options, lut3d_preview.as_ref());
         new_cache.after_step5 = Some((h5, image.clone()));
     }
 
+    on_progress("Print curve…", 0.99);
     let (orig_h, orig_w, _) = image.dim();
     let orig_w = orig_w as u32;
     let orig_h = orig_h as u32;
@@ -1398,6 +1426,7 @@ pub fn process_one_to_preview_with_cache(
         pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
     pipeline::apply_bujack(&mut display, options);
     let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    on_progress("Preview ready", 1.0);
 
     let _ = writeln!(dbg, "=== end pipeline debug ===");
     let img = RgbImage::from_raw(orig_w, orig_h, rgb_u8)
@@ -1418,7 +1447,19 @@ pub fn apply_preview_from_cache(
     max_height: u32,
     cache: &PreviewStepCache,
 ) -> Option<(u32, u32, u32, u32, Vec<u8>, PreviewStepCache)> {
-    apply_preview_from_cache_cpu(path, options, max_width, max_height, cache)
+    apply_preview_from_cache_on_progress(path, options, max_width, max_height, cache, &mut |_, _| {})
+}
+
+/// Live preview from cache, reporting 97–100% as steps 4–6 finish.
+pub fn apply_preview_from_cache_on_progress(
+    path: &Path,
+    options: &PipelineOptions,
+    max_width: u32,
+    max_height: u32,
+    cache: &PreviewStepCache,
+    on_progress: &mut dyn FnMut(&str, f32),
+) -> Option<(u32, u32, u32, u32, Vec<u8>, PreviewStepCache)> {
+    apply_preview_from_cache_cpu(path, options, max_width, max_height, cache, on_progress)
 }
 
 fn apply_preview_from_cache_cpu(
@@ -1427,6 +1468,7 @@ fn apply_preview_from_cache_cpu(
     max_width: u32,
     max_height: u32,
     cache: &PreviewStepCache,
+    on_progress: &mut dyn FnMut(&str, f32),
 ) -> Option<(u32, u32, u32, u32, Vec<u8>, PreviewStepCache)> {
     use pipeline_cache::{hash_after_step4, hash_after_step5};
 
@@ -1455,18 +1497,23 @@ fn apply_preview_from_cache_cpu(
         pivot: options.curve_pivot,
     };
 
+    on_progress("Applying settings…", 0.97);
     if start_step <= 4 {
+        on_progress("Tone and white balance…", 0.98);
         pipeline::step_4_t_to_d_wb(&mut image, options);
         new_cache.after_step4 = Some((h4, image.clone()));
     }
     if start_step <= 5 {
+        on_progress("Color…", 0.99);
         pipeline::step_5_calibration(&mut image, options, lut3d.as_ref());
         new_cache.after_step5 = Some((h5, image.clone()));
     }
 
+    on_progress("Print curve…", 0.99);
     let (orig_h, orig_w, _) = image.dim();
     let display = pipeline::step_6_render(&image, options, &ra4_params, output_lut.as_ref());
     let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    on_progress("Preview ready", 1.0);
     Some((
         true_src_w,
         true_src_h,
@@ -1491,7 +1538,14 @@ pub fn apply_preview_from_cache_gpu(
 
     let use_gpu = gpu.is_some() && options.use_gpu;
     if !use_gpu {
-        return apply_preview_from_cache_cpu(path, options, max_width, max_height, cache);
+        return apply_preview_from_cache_cpu(
+            path,
+            options,
+            max_width,
+            max_height,
+            cache,
+            &mut |_, _| {},
+        );
     }
     let gpu = gpu.unwrap();
 
