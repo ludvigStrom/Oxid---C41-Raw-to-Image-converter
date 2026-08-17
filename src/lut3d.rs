@@ -172,10 +172,10 @@ impl Lut3d {
     }
 }
 
-/// Return the .cube file content as a string (for embedding in .c41 zip).
+/// Return the .cube file content as a string (for embedding in .oxid zip).
 pub fn cube_to_string(lut: &Lut3d) -> String {
     let mut out = String::new();
-    out.push_str("# C-41 RAW Tool 3D LUT (density domain, normalized 0..1)\n");
+    out.push_str("# Oxid 3D LUT (density domain, normalized 0..1)\n");
     out.push_str(&format!("LUT_3D_SIZE {}\n", lut.size));
     for tri in &lut.data {
         out.push_str(&format!("{} {} {}\n", tri[0], tri[1], tri[2]));

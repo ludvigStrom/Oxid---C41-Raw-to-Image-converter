@@ -12,6 +12,10 @@ use crate::options::PipelineOptions;
 /// Current project schema version. Bump when the JSON shape changes in a way
 /// that needs a migration in [`load_project`].
 pub const PROJECT_VERSION: u32 = 1;
+/// On-disk project extension (without the dot).
+pub const PROJECT_EXTENSION: &str = "oxidProj";
+/// Previous project extension; still accepted when opening files.
+pub const PROJECT_EXTENSION_LEGACY: &str = "c41proj";
 
 /// Export format stored per image in a project file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -233,7 +237,7 @@ mod tests {
         opts.use_gpu = true;
         opts.pinned_zone = Some((0.1, 0.2, 0.3, 0.4));
 
-        let project_path = dir.join("roll.c41proj");
+        let project_path = dir.join("roll.oxidProj");
         save_project(
             &[ProjectImage {
                 path: img_path.clone(),
@@ -280,7 +284,7 @@ mod tests {
         let mut opts = PipelineOptions::default();
         opts.output_lut_cube = Some(lut_path.clone());
 
-        let project_path = dir.join("job.c41proj");
+        let project_path = dir.join("job.oxidProj");
         save_project(
             &[ProjectImage {
                 path: img_path,
@@ -314,7 +318,7 @@ mod tests {
         let dir = temp_dir();
         let img_path = dir.join("a.arw");
         std::fs::write(&img_path, b"raw").unwrap();
-        let project_path = dir.join("partial.c41proj");
+        let project_path = dir.join("partial.oxidProj");
         std::fs::write(
             &project_path,
             r#"{"version":1,"images":[{"path":"a.arw"}]}"#,
@@ -334,7 +338,7 @@ mod tests {
     #[test]
     fn missing_image_is_reported() {
         let dir = temp_dir();
-        let project_path = dir.join("gone.c41proj");
+        let project_path = dir.join("gone.oxidProj");
         std::fs::write(
             &project_path,
             r#"{"version":1,"images":[{"path":"missing.arw"}]}"#,

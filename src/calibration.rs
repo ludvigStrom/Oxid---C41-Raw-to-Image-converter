@@ -4,7 +4,7 @@
 //! ColorChecker Classic, converted to linear RGB at runtime before going to
 //! density.
 //!
-//! `.c41` profile format: a zip file containing `profile.json` (CalibrationProfile)
+//! `.oxid` profile format: a zip file containing `profile.json` (CalibrationProfile)
 //! and `lut.cube` (3D LUT generated from the matrix) for use in Process mode.
 
 use std::fs::File;
@@ -19,6 +19,15 @@ use zip::ZipWriter;
 
 use crate::curve;
 use crate::lut3d;
+
+/// On-disk color profile extension (without the dot).
+pub const PROFILE_EXTENSION: &str = "oxid";
+/// Previous profile extension; still accepted when opening files.
+pub const PROFILE_EXTENSION_LEGACY: &str = "c41";
+
+fn is_profile_zip_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case(PROFILE_EXTENSION) || ext.eq_ignore_ascii_case(PROFILE_EXTENSION_LEGACY)
+}
 
 /// Manufacturer sRGB patch colors for ColorChecker Classic (24 patches).
 ///
@@ -166,7 +175,7 @@ pub fn save_profile_to_path(
     Ok(())
 }
 
-/// Save a calibration profile as a `.c41` zip (profile.json + lut.cube).
+/// Save a calibration profile as a `.oxid` zip (profile.json + lut.cube).
 /// LUT is generated from the profile matrix (17³, d_max 4.0).
 pub fn save_c41_profile(profile: &CalibrationProfile, path: &Path) -> anyhow::Result<()> {
     let lut = lut3d::Lut3d::generate_from_matrix(&profile.matrix, 17, 4.0);
@@ -185,8 +194,9 @@ pub fn save_c41_profile(profile: &CalibrationProfile, path: &Path) -> anyhow::Re
     Ok(())
 }
 
-/// Load a `.c41` zip profile. Extracts to `parent_of_path/.cache/<stem>/` and returns
-/// the profile plus the path to the extracted `lut.cube` for use as `lut3d_path`.
+/// Load a `.oxid` (or legacy `.c41`) zip profile. Extracts to
+/// `parent_of_path/.cache/<stem>/` and returns the profile plus the path to the
+/// extracted `lut.cube` for use as `lut3d_path`.
 pub fn load_c41_profile(path: &Path) -> anyhow::Result<(CalibrationProfile, std::path::PathBuf)> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -204,19 +214,19 @@ pub fn load_c41_profile(path: &Path) -> anyhow::Result<(CalibrationProfile, std:
     let profile_path = cache_dir.join("profile.json");
     let lut_path = cache_dir.join("lut.cube");
     let json_content = std::fs::read_to_string(&profile_path)
-        .map_err(|e| anyhow::anyhow!("Missing or unreadable profile.json in .c41: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Missing or unreadable profile.json in .oxid: {}", e))?;
     if !lut_path.exists() {
-        anyhow::bail!("Missing lut.cube in .c41");
+        anyhow::bail!("Missing lut.cube in .oxid");
     }
     let profile: CalibrationProfile = serde_json::from_str(&json_content)
-        .map_err(|e| anyhow::anyhow!("Invalid profile.json in .c41: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Invalid profile.json in .oxid: {}", e))?;
     Ok((profile, lut_path))
 }
 
-/// Load all `.json` and `.c41` calibration profiles from a directory.
+/// Load all `.json` and `.oxid` (or legacy `.c41`) calibration profiles from a directory.
 ///
 /// Returns a vector of `(path, profile, optional_lut_path)`.
-/// For .json the third element is None; for .c41 it is the path to the extracted lut.cube.
+/// For .json the third element is None; for .oxid/.c41 it is the path to the extracted lut.cube.
 pub fn load_profiles_from_dir(
     dir: &std::path::Path,
 ) -> anyhow::Result<
@@ -248,7 +258,7 @@ pub fn load_profiles_from_dir(
             if let Ok(profile) = serde_json::from_str::<CalibrationProfile>(&text) {
                 out.push((path, profile, None));
             }
-        } else if ext == Some("c41") {
+        } else if ext.is_some_and(is_profile_zip_ext) {
             if let Ok((profile, lut_path)) = load_c41_profile(&path) {
                 out.push((path, profile, Some(lut_path)));
             }

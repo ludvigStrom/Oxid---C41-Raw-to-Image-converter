@@ -1,10 +1,19 @@
-# c41-raw-tool
+# Oxid
 
-A GPU-accelerated GUI Application for **C-41 color-negative film** written in Rust. It takes RAW camera captures and turns them into photographs by working in optical density, the space the dyes occupy, so color is treated as the film intended, not flipped as an RGB negative. White balance and film gamma are applied there; an RA-4 paper curve (Michaelis-Menten) forms the image. No hidden tone curves or auto-adjustments run unless you enable them.
+**Oxid** is a GPU-accelerated GUI for **C-41 color-negative film**, written in Rust. It takes RAW camera captures and turns them into photographs by working in optical density, the space the dyes occupy, so color is treated as the film intended, not flipped as an RGB negative. White balance and film gamma are applied there; an RA-4 paper curve (Michaelis-Menten) forms the image. No hidden tone curves or auto-adjustments run unless you enable them.
 
 **Supported cameras:** any `rawloader`-supported Bayer RAW (Sony `.arw`, Nikon `.nef`/`.nrw`, Canon `.cr2`/`.cr3`/`.crw`, Adobe `.dng`, Fujifilm `.raf`, Olympus `.orf`, Panasonic `.rw2`). PNG, JPEG (`.jpg`/`.jpeg`), and TIFF (`.tiff`/`.tif`) input are also accepted and run the same D-min / curve / export pipeline (skips raw decode and demosaic).
 
-Allthough supported in theory its only tested with SOny and Fujifilm cameras as this is a hobby project with limited resources.
+Although supported in theory, it is only tested with Sony and Fujifilm cameras — this is a hobby project with limited resources.
+
+**File types**
+
+| Extension | What it is |
+|-----------|------------|
+| `.oxidProj` | Multi-image project (image list + per-image develop settings) |
+| `.oxid` | Color profile (ZIP of `profile.json` + `lut.cube`) |
+
+Older `.c41proj` / `.c41` files still open. New saves use the Oxid extensions.
 
 ---
 
@@ -32,13 +41,13 @@ This is the exact function in [`src/curve.rs`](src/curve.rs), computed once into
 
 ## Build and run
 
-Launch the GPU-accelerated GUI:
+Launch Oxid (GPU-accelerated GUI):
 
 ```bash
 cargo guigpu
 ```
 
-This is an alias for `cargo run --release --bin c41-gui --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)).
+This is an alias for `cargo run --release --bin c41-gui --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)). On macOS you can also build a signed installer with `scripts/release_pkg_notarize.sh` (see `.env.example`).
 
 **CLI (convert subcommand):**
 
@@ -78,7 +87,7 @@ Prints rawloader metadata and sample pixel values without running the full pipel
 cargo run --release --bin c41-gui --features gui
 ```
 
-Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Prefer `cargo guigpu` for the GPU build. The GUI has three tabs: **Process** (main development with per-step checkboxes), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).
+Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Prefer `cargo guigpu` for the GPU build. Oxid has three tabs: **Process** (main development with per-step checkboxes), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).
 
 **GPU-accelerated build:**
 
@@ -244,7 +253,7 @@ Output filenames are derived from the input stem: `frame_001.arw` → `frame_001
 
 ### Color calibration (density matrix)
 
-Solve a 3×3 matrix from a scan of a **ColorChecker Classic** (24 patches, reference values baked into `src/calibration.rs` as manufacturer sRGB values). OLS is solved via `nalgebra`. The result is stored in a `.c41` profile (a ZIP containing `profile.json` + `lut.cube`):
+Solve a 3×3 matrix from a scan of a **ColorChecker Classic** (24 patches, reference values baked into `src/calibration.rs` as manufacturer sRGB values). OLS is solved via `nalgebra`. The result is stored in a `.oxid` profile (a ZIP containing `profile.json` + `lut.cube`):
 
 ```json
 {
@@ -271,6 +280,8 @@ The blurred map can be saved as a 32f TIFF and reloaded to skip re-blurring. Whe
 ---
 
 ## CLI reference
+
+Oxid’s command-line tool (crate binary `c41-raw-tool`):
 
 ```
 c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
@@ -304,13 +315,13 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 |------|------|
 | `src/lib.rs` | `PipelineOptions`, `process_files`, `process_one_to_preview`. Shared by CLI and GUI. Contains all pipeline logic. |
 | `src/main.rs` | CLI (`clap`): `convert` and `debug-raw` subcommands. |
-| `src/bin/c41_gui.rs` | GUI (`eframe`/`egui`): Process / Color calibration / Luminance calibration tabs. Requires `--features gui`. |
+| `src/bin/c41_gui.rs` | Oxid GUI (`eframe`/`egui`): Process / Color calibration / Luminance calibration tabs. Requires `--features gui`. |
 | `src/raw_reader.rs` | `rawloader` wrapper → single-channel CFA `Array3<f32>` + `CfaPattern`. |
 | `src/png_reader.rs` | `image` crate PNG loader → linear RGB `Array3<f32>`. |
 | `src/demosaic.rs` | Bayer and X-Trans demosaic: bilinear (fallback), edge-aware green, and quality (color-difference R/B). |
 | `src/dmin.rs` | D-min: rect sampling, fixed medians, auto-percentile, flat-field division. |
 | `src/curve.rs` | RA-4 Michaelis-Menten curve: 65 536-entry LUT generation, rayon-parallel apply, Film Print variant with per-channel curves and color bleed. |
-| `src/calibration.rs` | ColorChecker reference data, OLS 3×3 solver via `nalgebra`, `.c41` profile load/save (zip). |
+| `src/calibration.rs` | ColorChecker reference data, OLS 3×3 solver via `nalgebra`, `.oxid` profile load/save (zip). |
 | `src/lut3d.rs` | Density-domain 3D LUT: generate from 3×3 matrix, `.cube` file I/O, tetrahedral interpolation. |
 | `src/aces.rs` | ACEScg IDT and `linear_acescg_to_aces2065_1` matrix. |
 | `src/tiff_export.rs` | Uncompressed TIFF writer: `write_tiff_u16` (u16), `write_tiff` (f32 or u16). |
@@ -349,7 +360,7 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `exr` | 1.74 | OpenEXR output |
 | `nalgebra` | 0.34 | OLS solver for 3×3 calibration matrix |
 | `serde` / `serde_json` | 1.0 | Calibration profile JSON |
-| `zip` | 2.2 | `.c41` profile format (zip of JSON + LUT) |
+| `zip` | 2.2 | `.oxid` profile format (zip of JSON + LUT) |
 | `eframe` | 0.29 | GUI (optional, `--features gui`) |
 | `rfd` | 0.15 | Native file dialogs (optional) |
 | `arboard` | 3 | Clipboard (optional) |
@@ -365,7 +376,7 @@ This program is free software: you can redistribute it and/or modify it under th
 
 ## Credits
 
-This project is a port of, and is heavily inspired by:
+Oxid is a port of, and is heavily inspired by:
 
 - **[Negadoctor](https://github.com/darktable-org/darktable/blob/master/src/iop/negadoctor.c)** — darktable’s film-negative inversion module, © darktable developers, GPL-3.0-or-later.
 - **[NegPy](https://github.com/marcinz606/NegPy)** by Marcin Zawalski, GPL-3.0.

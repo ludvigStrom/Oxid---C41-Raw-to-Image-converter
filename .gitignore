@@ -1,5 +1,6 @@
 # Build
 /target/
+/Build/
 Cargo.lock
 /vendor/
 /test files/
@@ -34,6 +35,9 @@ Cargo.lock
 *.rwz
 *.rw2
 *.rw1
+
+# Local Apple / release IDs (see .env.example)
+.env
 
 # macOS
 .DS_Store

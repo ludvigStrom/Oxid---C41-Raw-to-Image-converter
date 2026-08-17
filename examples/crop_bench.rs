@@ -1,7 +1,7 @@
-//! Score auto-crop against a hand-corrected `.c41proj`.
+//! Score auto-crop against a hand-corrected `.oxidProj`.
 //!
 //! ```text
-//! cargo run --release --example crop_bench -- "/path/to/cropped.c41proj"
+//! cargo run --release --example crop_bench -- "/path/to/cropped.oxidProj"
 //! ```
 
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ fn main() {
         args.iter()
             .find(|a| !a.starts_with("--"))
             .cloned()
-            .expect("usage: crop_bench [--probe] <project.c41proj>"),
+            .expect("usage: crop_bench [--probe] <project.oxidProj>"),
     );
     let loaded = load_project(&project).expect("load project");
     if !loaded.missing.is_empty() {

@@ -61,7 +61,7 @@ pub use pipeline_cache::{
 pub use preset::{load_develop_preset, save_develop_preset, DevelopPreset, PRESET_VERSION};
 pub use project::{
     load_project, save_project, LoadedProject, ProjectExportFormat, ProjectFile, ProjectImage,
-    PROJECT_VERSION,
+    PROJECT_EXTENSION, PROJECT_EXTENSION_LEGACY, PROJECT_VERSION,
 };
 pub use sensor::{
     compute_dmin_from_sensor, compute_preview_scene_stats, crop_sensor_for_oriented_rect,

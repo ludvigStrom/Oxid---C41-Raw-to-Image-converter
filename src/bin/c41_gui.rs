@@ -1,4 +1,4 @@
-//! C-41 RAW Tool GUI: three-panel layout — center preview, right per-image settings, bottom image strip + global output/convert.
+//! Oxid GUI: three-panel layout — center preview, right per-image settings, bottom image strip + global output/convert.
 
 // On Windows, use GUI subsystem so closing the window exits with code 0 instead of 0xC000013A (STATUS_CONTROL_C_EXIT).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
@@ -27,7 +27,7 @@ use c41_raw_tool::{
     AutoCropResult, AutoTuneResult, CachedSensor, CropConfidence, DminMode, ExportCancelled,
     ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions,
     PreviewSceneStats, PreviewStepCache, ProjectExportFormat, ProjectImage, Rect, TiffFormat,
-    UndoManager, WbMode, UNDO_LIMIT,
+    UndoManager, WbMode, PROJECT_EXTENSION, PROJECT_EXTENSION_LEGACY, UNDO_LIMIT,
 };
 use eframe::egui;
 
@@ -124,7 +124,7 @@ fn main() -> eframe::Result<()> {
         native_options.viewport = native_options.viewport.clone().with_icon(Arc::new(icon));
     }
     eframe::run_native(
-        "C-41 RAW Tool",
+        "Oxid",
         native_options,
         Box::new(|cc| {
             theme::install_fonts(&cc.egui_ctx);
@@ -213,8 +213,6 @@ struct PreviewTile {
     uv: egui::Rect,
     /// Corresponding region of `texture` (0–1), halo excluded.
     tex_uv: egui::Rect,
-    /// Live slider apply retags tiles so they keep drawing; fetch replaces them.
-    stale: bool,
 }
 
 /// Visible 1:1 tile grid for the current canvas / pan / zoom.
@@ -575,7 +573,7 @@ struct C41Gui {
     calibration_result: Option<([[f32; 3]; 3], f32)>, // (matrix, mse)
     calibration_profile_name: String,
     calibration_light_source: String,
-    /// (path, profile, LUT path for .c41 or None for .json)
+    /// (path, profile, LUT path for .oxid or None for .json)
     #[allow(dead_code)]
     calibration_profiles: Vec<(PathBuf, calibration::CalibrationProfile, Option<PathBuf>)>,
     #[allow(dead_code)]
@@ -2037,7 +2035,7 @@ impl C41Gui {
 
     fn run_project_save_as_dialog(&mut self) {
         let mut dialog = rfd::FileDialog::new()
-            .add_filter("C-41 Project", &["c41proj"])
+            .add_filter("Oxid Project", &[PROJECT_EXTENSION])
             .add_filter("JSON", &["json"]);
         if let Some(ref existing) = self.project_path {
             if let Some(parent) = existing.parent() {
@@ -2053,14 +2051,17 @@ impl C41Gui {
         }
         if let Some(mut path) = dialog.save_file() {
             if path.extension().is_none() {
-                path.set_extension("c41proj");
+                path.set_extension(PROJECT_EXTENSION);
             }
             self.write_project_to_path(&path);
         }
     }
 
     fn run_project_load_dialog(&mut self) {
-        let mut dialog = rfd::FileDialog::new().add_filter("C-41 Project", &["c41proj", "json"]);
+        let mut dialog = rfd::FileDialog::new().add_filter(
+            "Oxid Project",
+            &[PROJECT_EXTENSION, PROJECT_EXTENSION_LEGACY, "json"],
+        );
         if let Some(ref existing) = self.project_path {
             if let Some(parent) = existing.parent() {
                 dialog = dialog.set_directory(parent);
@@ -2663,12 +2664,10 @@ impl C41Gui {
                 {
                     continue;
                 }
-                let have = entry.tile_cache.iter().any(|t| {
-                    t.ix == ix
-                        && t.iy == iy
-                        && t.options_hash == grid.opt_hash
-                        && !t.stale
-                });
+                let have = entry
+                    .tile_cache
+                    .iter()
+                    .any(|t| t.ix == ix && t.iy == iy && t.options_hash == grid.opt_hash);
                 if have {
                     continue;
                 }
@@ -4058,15 +4057,15 @@ impl eframe::App for C41Gui {
                         if job.captured_debug {
                             self.images[idx].pipeline_debug_log = Some(job.dbg_log);
                         }
-                        // Backdrop is hole-fill. Live apply retags tiles so they
-                        // keep drawing (one slider tick stale) until replacements
-                        // arrive. A remosaic drops only mismatched hashes — a
-                        // same-hash screen refine must not wipe the cache.
+                        // Live apply already wrote the new backdrop + step cache.
+                        // Drop pre-slider tiles so they cannot cover that result;
+                        // tiling starts from the updated cache. A remosaic keeps
+                        // same-hash tiles (screen refine must not wipe the cache).
                         if was_live {
-                            for tile in &mut self.images[idx].tile_cache {
-                                tile.options_hash = job.options_hash;
-                                tile.stale = true;
-                            }
+                            self.images[idx].tile_cache.clear();
+                            self.tile_gen = self.tile_gen.wrapping_add(1);
+                            self.tile_inflight = None;
+                            self.tile_failed.clear();
                         } else {
                             self.images[idx]
                                 .tile_cache
@@ -4112,7 +4111,6 @@ impl eframe::App for C41Gui {
                             texture: tex,
                             uv: job.uv,
                             tex_uv: job.tex_uv,
-                            stale: false,
                         };
                         let cache = &mut self.images[idx].tile_cache;
                         cache.retain(|t| !(t.ix == tile.ix && t.iy == tile.iy));
@@ -5744,7 +5742,7 @@ impl eframe::App for C41Gui {
                         }
                     }
                     ui.label("Profile name / film stock")
-                        .on_hover_text("Set the profile name / film stock and notes, then create the color profile in one step (matrix + 3D LUT saved as .c41).");
+                        .on_hover_text("Set the profile name / film stock and notes, then create the color profile in one step (matrix + 3D LUT saved as .oxid).");
                     ui.text_edit_singleline(&mut self.calibration_profile_name);
                     ui.label("Notes (e.g. light source)");
                     ui.text_edit_singleline(&mut self.calibration_light_source);
@@ -5788,20 +5786,20 @@ impl eframe::App for C41Gui {
                                         let _ = std::fs::create_dir_all(&base_dir);
                                         if let Some(save_path) = rfd::FileDialog::new()
                                             .set_directory(&base_dir)
-                                            .add_filter("C-41 profile", &["c41"])
-                                            .set_file_name(&(name.clone() + ".c41"))
+                                            .add_filter("Oxid profile", &[calibration::PROFILE_EXTENSION])
+                                            .set_file_name(&(name.clone() + "." + calibration::PROFILE_EXTENSION))
                                             .save_file()
                                         {
                                             match calibration::save_c41_profile(&profile, &save_path) {
                                                 Ok(()) => {
                                                     self.status = format!(
-                                                        "Created .c41 profile (MSE {:.6}): {}",
+                                                        "Created .oxid profile (MSE {:.6}): {}",
                                                         mse,
                                                         save_path.display()
                                                     );
                                                 }
                                                 Err(e) => {
-                                                    self.status = format!("Failed to save .c41 profile: {}", e);
+                                                    self.status = format!("Failed to save .oxid profile: {}", e);
                                                 }
                                             }
                                         } else {
@@ -7245,8 +7243,10 @@ impl eframe::App for C41Gui {
                         if self.pending_preview_key != Some(key) {
                             self.pending_preview_key = Some(key);
                             self.pending_preview_since = Some(now);
-                            // Cancel in-flight tiles for the old options. Cached
-                            // tiles stay until the new hash is applied.
+                            // Slider/options changed: drop the old tile cache now
+                            // so release cannot flash pre-slider tiles over the
+                            // live backdrop. New tiles start after the cache apply.
+                            self.images[idx].tile_cache.clear();
                             self.tile_gen = self.tile_gen.wrapping_add(1);
                             self.tile_inflight = None;
                             self.tile_failed.clear();
@@ -7333,7 +7333,7 @@ impl eframe::App for C41Gui {
                     }
                     let view_settling = self.preview_view_settling();
                     // 1:1 tiles: after pan/zoom settle, at every zoom including fit.
-                    // A canvas click must not pause fetch. Slider drag is need_options.
+                    // Wait for slider release so the live backdrop is committed first.
                     // Over-cap views still fetch a center-first window of PREVIEW_TILE_MAX.
                     if proxy_soft
                         && self.preview_receiver.is_none()
@@ -7344,6 +7344,7 @@ impl eframe::App for C41Gui {
                         && !self.preview_view_dragging
                         && !view_settling
                         && !need_options
+                        && !slider_dragging
                     {
                         self.drop_tiles_outside_view(idx);
                         if let Some(missing) = self.visible_tile_to_request(idx) {
