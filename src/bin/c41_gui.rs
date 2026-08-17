@@ -58,6 +58,9 @@ const BOTTOM_PANEL_HEIGHT: f32 = 150.0;
 const RIGHT_PANEL_WIDTH: f32 = 330.0;
 const RIGHT_PANEL_MIN_WIDTH: f32 = 240.0;
 const RIGHT_PANEL_MAX_WIDTH: f32 = 560.0;
+const HISTOGRAM_HEIGHT: f32 = 72.0;
+const HISTOGRAM_MIN_HEIGHT: f32 = 40.0;
+const HISTOGRAM_MAX_HEIGHT: f32 = 320.0;
 /// Left inset so the Archive menu clears macOS traffic lights (hidden title bar).
 const MENU_BAR_MACOS_INSET: f32 = 78.0;
 const PROJECT_SAVE_SHORTCUT: egui::KeyboardShortcut =
@@ -618,6 +621,10 @@ struct C41Gui {
     /// Session-wide chronological undo/redo of per-image edits.
     history: UndoManager<u64, EditSnapshot>,
     next_image_id: u64,
+    /// Preview histogram height in points; drag the top edge to resize.
+    histogram_height: f32,
+    /// Right settings panel width in points; drag the inner edge to resize.
+    right_panel_width: f32,
     #[cfg(feature = "gpu")]
     gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
 }
@@ -670,6 +677,8 @@ impl Default for C41Gui {
             geometry_coalesce_until: None,
             history: UndoManager::new(UNDO_LIMIT),
             next_image_id: 1,
+            histogram_height: HISTOGRAM_HEIGHT,
+            right_panel_width: RIGHT_PANEL_WIDTH,
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
                 .map(std::sync::Arc::new),
@@ -4489,10 +4498,26 @@ impl eframe::App for C41Gui {
         let mut arm_wb_picker = false;
         let mut disarm_wb_picker = false;
         let wb_picker_armed = self.wb_picker_armed;
+        let available = ctx.available_rect();
+        let panel_max_w = available
+            .width()
+            .min(RIGHT_PANEL_MAX_WIDTH)
+            .max(RIGHT_PANEL_MIN_WIDTH);
+        self.right_panel_width = self
+            .right_panel_width
+            .clamp(RIGHT_PANEL_MIN_WIDTH, panel_max_w);
+        let resize_id = egui::Id::new("settings_panel").with("__resize");
+        if let Some(resp) = ctx.read_response(resize_id) {
+            if resp.dragged() {
+                if let Some(pointer) = resp.interact_pointer_pos() {
+                    self.right_panel_width = (available.right() - pointer.x)
+                        .clamp(RIGHT_PANEL_MIN_WIDTH, panel_max_w);
+                }
+            }
+        }
         egui::SidePanel::right("settings_panel")
             .resizable(true)
-            .default_width(RIGHT_PANEL_WIDTH)
-            .width_range(RIGHT_PANEL_MIN_WIDTH..=RIGHT_PANEL_MAX_WIDTH)
+            .exact_width(self.right_panel_width)
             .show(ctx, |ui| {
                 // SidePanel persists the content min-rect. Lock to the allocated
                 // width so sliders/paths/combos cannot snap the panel to max.
@@ -6004,17 +6029,29 @@ impl eframe::App for C41Gui {
                     {
                         let available = ui.available_rect_before_wrap();
                         const CONTROL_ROW_HEIGHT: f32 = 28.0;
-                        const HISTOGRAM_HEIGHT: f32 = 72.0;
                         const BOTTOM_PADDING: f32 = 8.0;
                         const IMAGE_PREVIEW_BOTTOM_PADDING: f32 = 16.0;
                         const TOP_PADDING: f32 = 17.0;
                         const INFO_ROW_HEIGHT: f32 = 18.0;
 
+                        let other_reserved = IMAGE_PREVIEW_BOTTOM_PADDING
+                            + INFO_ROW_HEIGHT
+                            + CONTROL_ROW_HEIGHT
+                            + BOTTOM_PADDING
+                            + BOTTOM_PADDING
+                            + TOP_PADDING;
+                        let hist_max = (available.height() - other_reserved - 60.0)
+                            .clamp(HISTOGRAM_MIN_HEIGHT, HISTOGRAM_MAX_HEIGHT);
+                        self.histogram_height = self
+                            .histogram_height
+                            .clamp(HISTOGRAM_MIN_HEIGHT, hist_max);
+                        let hist_h = self.histogram_height;
+
                         let reserved_bottom = IMAGE_PREVIEW_BOTTOM_PADDING
                             + INFO_ROW_HEIGHT
                             + CONTROL_ROW_HEIGHT
                             + BOTTOM_PADDING
-                            + HISTOGRAM_HEIGHT
+                            + hist_h
                             + BOTTOM_PADDING;
                         // TOP_PADDING is allocated above the canvas; reserve it or the
                         // stored size is taller than the drawn rect and edge tiles miss.
@@ -6956,11 +6993,41 @@ impl eframe::App for C41Gui {
                             });
                         });
                         ui.add_space(BOTTOM_PADDING);
-                        if let Some((r_hist, g_hist, b_hist)) = &self.images[idx].histogram {
-                            const H_HIST: f32 = 72.0;
+                        if let Some((r_hist, g_hist, b_hist)) = self.images[idx].histogram {
                             let (hist_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), H_HIST),
+                                egui::vec2(ui.available_width(), hist_h),
                                 egui::Sense::hover(),
+                            );
+                            let resize_rect = egui::Rect::from_x_y_ranges(
+                                hist_rect.x_range(),
+                                (hist_rect.top() - 5.0)..=(hist_rect.top() + 5.0),
+                            );
+                            let resize_resp = ui.interact(
+                                resize_rect,
+                                ui.id().with("histogram_resize"),
+                                egui::Sense::drag(),
+                            );
+                            if resize_resp.hovered() || resize_resp.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                            }
+                            if resize_resp.dragged() {
+                                self.histogram_height = (self.histogram_height
+                                    - resize_resp.drag_delta().y)
+                                    .clamp(HISTOGRAM_MIN_HEIGHT, hist_max);
+                            }
+                            let grip_color = if resize_resp.dragged() {
+                                egui::Color32::from_rgb(110, 140, 170)
+                            } else if resize_resp.hovered() {
+                                egui::Color32::from_gray(160)
+                            } else {
+                                egui::Color32::from_gray(80)
+                            };
+                            let grip_w = 28.0;
+                            ui.painter().hline(
+                                (hist_rect.center().x - grip_w * 0.5)
+                                    ..=(hist_rect.center().x + grip_w * 0.5),
+                                hist_rect.top() + 2.0,
+                                egui::Stroke::new(2.0, grip_color),
                             );
                             let painter = ui.painter_at(hist_rect);
                             let rect = hist_rect;
@@ -7029,19 +7096,19 @@ impl eframe::App for C41Gui {
                                 };
 
                             draw_channel(
-                                r_hist,
+                                &r_hist,
                                 egui::Color32::from_rgba_unmultiplied(220, 70, 70, 140),
                                 egui::Color32::from_rgba_unmultiplied(200, 0, 0, 18),
                                 &painter,
                             );
                             draw_channel(
-                                g_hist,
+                                &g_hist,
                                 egui::Color32::from_rgba_unmultiplied(80, 200, 80, 140),
                                 egui::Color32::from_rgba_unmultiplied(0, 200, 0, 18),
                                 &painter,
                             );
                             draw_channel(
-                                b_hist,
+                                &b_hist,
                                 egui::Color32::from_rgba_unmultiplied(80, 130, 240, 140),
                                 egui::Color32::from_rgba_unmultiplied(0, 80, 220, 18),
                                 &painter,
