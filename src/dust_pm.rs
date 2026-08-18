@@ -38,11 +38,12 @@ fn search_radius(loosen: f32) -> i32 {
     (10.0 + 8.0 * loosen.clamp(1.0, 4.0)).round() as i32
 }
 
-/// PatchMatch fill on `tight`, then alpha composite. Grain is unused.
+/// PatchMatch fill on `dilated`, sampling only outside `tight`, then alpha composite.
+/// Grain is unused (copied film).
 pub(crate) fn heal_patchmatch(
     image: &mut Array3<f32>,
     tight: &[bool],
-    _dilated: &[bool],
+    dilated: &[bool],
     alpha: &[f32],
     match_loosen: f32,
     w: usize,
@@ -51,7 +52,7 @@ pub(crate) fn heal_patchmatch(
     let loosen = match_loosen.clamp(1.0, 4.0);
     let n_pix = w * h;
     let mut fill = vec![None; n_pix];
-    let components = connected_components(tight, w, h);
+    let components = connected_components(dilated, w, h);
     let results: Vec<(Vec<usize>, Vec<(f32, f32, f32)>)> = components
         .par_iter()
         .map(|component| {
@@ -99,7 +100,7 @@ fn fill_component(
     let (rim_mean, _gate, sources) = collect_sources(image, tight, &hole, loosen, w, h);
     if sources.is_empty() {
         for (k, &i) in component.iter().enumerate() {
-            colors[k] = structure_hv(image, tight, i % w, i / w, w, h)
+            colors[k] = structure_hv(image, &hole, i % w, i / w, w, h)
                 .unwrap_or(rim_mean);
         }
         return colors;
@@ -150,7 +151,7 @@ fn fill_component(
         let x = (i % w) - x0;
         let y = (i / w) - y0;
         colors[k] = vote(fine, x, y).unwrap_or_else(|| {
-            structure_hv(image, tight, i % w, i / w, w, h).unwrap_or(rim_mean)
+            structure_hv(image, &hole, i % w, i / w, w, h).unwrap_or(rim_mean)
         });
     }
     colors
@@ -170,7 +171,7 @@ fn collect_sources(
     let mut n = 0.0f32;
     let mut colors = Vec::new();
     for i in 0..w * h {
-        if !rim[i] || tight[i] {
+        if !rim[i] || tight[i] || hole[i] {
             continue;
         }
         let c = rgb_at(image, i % w, i / w);
@@ -193,7 +194,7 @@ fn collect_sources(
     let gate = scale.max(1.0e-4) * loosen;
     let mut sources = Vec::new();
     for i in 0..w * h {
-        if !search[i] || tight[i] {
+        if !search[i] || tight[i] || hole[i] {
             continue;
         }
         let c = rgb_at(image, i % w, i / w);
@@ -725,6 +726,57 @@ mod tests {
         assert!(
             (hole_mean - collar_mean).abs() < 0.08,
             "hole mean must stay near the collar (hole={hole_mean}, collar={collar_mean})"
+        );
+    }
+
+    #[test]
+    fn feather_ring_blends_and_leaves_outside() {
+        let mut img = Array3::<f32>::from_elem((48, 48, 3), 0.25);
+        let tight = hole_square(48, 22, 22, 5);
+        let dilated = dilate(&tight, 48, 48, 3);
+        let mut ring_i = None;
+        let mut outside_i = None;
+        for i in 0..48 * 48 {
+            if dilated[i] && !tight[i] && ring_i.is_none() {
+                ring_i = Some(i);
+            }
+            if !dilated[i] && outside_i.is_none() {
+                outside_i = Some(i);
+            }
+        }
+        let ring_i = ring_i.expect("feather ring");
+        let outside_i = outside_i.expect("outside dilated");
+        img[(ring_i / 48, ring_i % 48, 0)] = 0.95;
+        img[(ring_i / 48, ring_i % 48, 1)] = 0.95;
+        img[(ring_i / 48, ring_i % 48, 2)] = 0.95;
+        img[(outside_i / 48, outside_i % 48, 0)] = 0.95;
+        img[(outside_i / 48, outside_i % 48, 1)] = 0.95;
+        img[(outside_i / 48, outside_i % 48, 2)] = 0.95;
+
+        let mut alpha = vec![0.0f32; 48 * 48];
+        for i in 0..48 * 48 {
+            if tight[i] {
+                alpha[i] = 1.0;
+            } else if dilated[i] {
+                alpha[i] = 0.5;
+            }
+        }
+        let mut out = img.clone();
+        heal_patchmatch(&mut out, &tight, &dilated, &alpha, 2.0, 48, 48);
+
+        let ring = out[(ring_i / 48, ring_i % 48, 0)];
+        assert!(
+            ring < 0.85,
+            "feather ring must blend toward the fill (got {ring})"
+        );
+        assert!(
+            (out[(outside_i / 48, outside_i % 48, 0)] - 0.95).abs() < 1e-5,
+            "pixels outside dilated must stay"
+        );
+        let core = out[(24, 24, 0)];
+        assert!(
+            core < 0.50,
+            "tight hole must still be replaced (got {core})"
         );
     }
 }
