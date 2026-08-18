@@ -237,7 +237,7 @@ pub fn crop_mask_uv(
 }
 
 const MASK_ON: u8 = 16;
-const MIN_SPECK_AREA: usize = 4;
+const MIN_SPECK_AREA: usize = 2;
 
 /// Detection strength, rim fade, and grain for [`apply_dust_removal_with`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -287,8 +287,8 @@ pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
     apply_dust_removal_with(image, mask, DustHealParams::default());
 }
 
-/// Replace dust inside the painted ROI: tighten to the speck, copy grain,
-/// match surrounding color, fade only outside the tight core.
+/// Replace dust in the painted stroke (detect may add pixels). Structure from
+/// punched Telea / H+V; grain from known film only.
 pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     if mask.is_empty() {
         return;
@@ -319,7 +319,19 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
         return;
     }
 
-    let tight = refine_speck_mask(image, &roi, w, h, params.detect);
+    let detected = refine_speck_mask(image, &roi, w, h, params.detect);
+    let mut interior = erode(&roi, w, h, 1);
+    if !interior.iter().any(|&v| v) {
+        interior = roi.clone();
+    }
+    // Trust the stroke: heal the brush interior even when detect misses.
+    // Detect can only add pixels, not take the paint away.
+    let mut tight = interior;
+    for i in 0..n {
+        if detected[i] {
+            tight[i] = true;
+        }
+    }
     if !tight.iter().any(|&v| v) {
         return;
     }
@@ -365,40 +377,63 @@ fn refine_speck_mask(
     detect: f32,
 ) -> Vec<bool> {
     let detect = detect.clamp(0.35, 2.5);
-    let dog_thresh = (0.032 / detect).max(0.006);
-    let mad_k = 3.0 / detect;
+    let dog_thresh = (0.022 / detect).max(0.005);
+    let mad_k = 2.4 / detect;
     let clip_lo = 0.025;
     let clip_hi = 0.975;
 
     let n = w * h;
+    let mut pr = vec![0.0f32; n];
+    let mut pg = vec![0.0f32; n];
+    let mut pb = vec![0.0f32; n];
     let mut lum = vec![0.0f32; n];
     for y in 0..h {
         for x in 0..w {
+            let i = y * w + x;
             let r = image[(y, x, 0)];
             let g = image[(y, x, 1)];
             let b = image[(y, x, 2)];
-            lum[y * w + x] = r.max(g).max(b);
+            pr[i] = r;
+            pg[i] = g;
+            pb[i] = b;
+            lum[i] = 0.3 * r + 0.6 * g + 0.1 * b;
         }
     }
-    let blur_s = blur_plane(&lum, w, h, 0.8);
-    let blur_l = blur_plane(&lum, w, h, 2.4);
+    let blur_s = blur_plane(&lum, w, h, 0.7);
+    let blur_l = blur_plane(&lum, w, h, 2.2);
 
-    let mut residuals = Vec::new();
     let mut residual_at = vec![0.0f32; n];
+    let mut ring_res = Vec::new();
+    let mut all_res = Vec::new();
     for i in 0..n {
         if !roi[i] {
             continue;
         }
-        let med = local_median(&lum, w, h, i % w, i / w, 3);
-        let r = (lum[i] - med).abs();
+        let x = i % w;
+        let y = i / w;
+        let mr = local_median(&pr, w, h, x, y, 3);
+        let mg = local_median(&pg, w, h, x, y, 3);
+        let mb = local_median(&pb, w, h, x, y, 3);
+        let ml = local_median(&lum, w, h, x, y, 3);
+        let chan = (pr[i] - mr).abs().max((pg[i] - mg).abs()).max((pb[i] - mb).abs());
+        let chroma = (pr[i] - mr).abs() + (pg[i] - mg).abs() + (pb[i] - mb).abs();
+        let r = (lum[i] - ml).abs().max(chan).max(chroma * 0.45);
         residual_at[i] = r;
-        residuals.push(r);
+        all_res.push(r);
+        if roi_is_ring(roi, w, h, x, y) {
+            ring_res.push(r);
+        }
     }
+    let mad_src = if ring_res.len() >= 8 {
+        ring_res
+    } else {
+        robust_interior(&all_res)
+    };
     let mad = {
-        let mut m = residuals.clone();
+        let mut m = mad_src.clone();
         let med = median_f32(&mut m);
-        let mut dev: Vec<f32> = residuals.iter().map(|v| (v - med).abs()).collect();
-        median_f32(&mut dev).max(0.006)
+        let mut dev: Vec<f32> = mad_src.iter().map(|v| (v - med).abs()).collect();
+        median_f32(&mut dev).max(0.005)
     };
 
     let mut tight = vec![false; n];
@@ -407,17 +442,22 @@ fn refine_speck_mask(
             continue;
         }
         let dog = (blur_s[i] - blur_l[i]).abs();
-        let clip = lum[i] <= clip_lo || lum[i] >= clip_hi;
+        let clip = lum[i] <= clip_lo || lum[i] >= clip_hi || pr[i].max(pg[i]).max(pb[i]) >= clip_hi;
         if dog >= dog_thresh || residual_at[i] >= mad_k * mad || clip {
             tight[i] = true;
         }
     }
 
+    // Close 1px gaps so a soft core stays one speck.
+    let tight = erode(&dilate(&tight, w, h, 1), w, h, 1);
+
     let mut kept = vec![false; n];
     for comp in connected_components(&tight, w, h) {
         if comp.len() >= MIN_SPECK_AREA {
             for i in comp {
-                kept[i] = true;
+                if roi[i] {
+                    kept[i] = true;
+                }
             }
         }
     }
@@ -430,6 +470,32 @@ fn refine_speck_mask(
     } else {
         erode(roi, w, h, 1)
     }
+}
+
+fn roi_is_ring(roi: &[bool], w: usize, h: usize, x: usize, y: usize) -> bool {
+    let x = x as i32;
+    let y = y as i32;
+    for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+            return true;
+        }
+        if !roi[ny as usize * w + nx as usize] {
+            return true;
+        }
+    }
+    false
+}
+
+/// Drop the brightest residuals so a tight brush on the speck does not inflate MAD.
+fn robust_interior(residuals: &[f32]) -> Vec<f32> {
+    if residuals.len() < 12 {
+        return residuals.to_vec();
+    }
+    let mut s = residuals.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let keep = (s.len() * 4 / 5).max(8);
+    s.truncate(keep);
+    s
 }
 
 fn local_median(lum: &[f32], w: usize, h: usize, x: usize, y: usize, radius: i32) -> f32 {
@@ -1248,9 +1314,9 @@ mod tests {
     }
 
     #[test]
-    fn tight_mask_leaves_far_roi_pixels() {
+    fn heal_stays_inside_painted_and_feather() {
         let mut img = gradient_image(48, 48);
-        let before = img[(24, 11, 0)];
+        let before = img[(24, 4, 0)];
         img[(24, 24, 0)] = 1.0;
         img[(24, 24, 1)] = 1.0;
         img[(24, 24, 2)] = 1.0;
@@ -1259,14 +1325,51 @@ mod tests {
         img[(25, 25, 0)] = 1.0;
 
         let mut mask = DustMask::new(48, 48);
-        stamp_disc(&mut mask, 24.0, 24.0, 16.0, DustTool::Pen);
-        apply_dust_removal(&mut img, &mask);
+        stamp_disc(&mut mask, 24.0, 24.0, 8.0, DustTool::Pen);
+        apply_dust_removal_with(
+            &mut img,
+            &mask,
+            DustHealParams {
+                detect: 1.0,
+                feather: 2.0,
+                grain: 0.0,
+                grain_sigma: 0.8,
+            },
+        );
 
         assert!(
-            (img[(24, 11, 0)] - before).abs() < 1e-5,
-            "pixels far from the speck inside the brush must stay"
+            (img[(24, 4, 0)] - before).abs() < 1e-5,
+            "pixels outside the painted stroke must stay"
         );
         assert!(img[(24, 24, 0)] < 0.85, "the white speck must be healed");
+    }
+
+    #[test]
+    fn painted_interior_heals_faint_speck() {
+        let mut img = Array3::<f32>::from_elem((36, 36, 3), 0.35);
+        img[(18, 18, 0)] = 0.39;
+        img[(18, 18, 1)] = 0.39;
+        img[(18, 18, 2)] = 0.39;
+        img[(18, 19, 0)] = 0.39;
+        img[(19, 18, 0)] = 0.39;
+
+        let mut mask = DustMask::new(36, 36);
+        stamp_disc(&mut mask, 18.0, 18.0, 4.0, DustTool::Pen);
+        apply_dust_removal_with(
+            &mut img,
+            &mask,
+            DustHealParams {
+                detect: 0.5,
+                feather: 1.0,
+                grain: 0.0,
+                grain_sigma: 0.8,
+            },
+        );
+        assert!(
+            (img[(18, 18, 0)] - 0.35).abs() < 0.025,
+            "painted interior must be punched even when detect is weak (got {})",
+            img[(18, 18, 0)]
+        );
     }
 
     #[test]
@@ -1349,6 +1452,35 @@ mod tests {
         );
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn detect_picks_faint_colored_two_pixel_speck() {
+        let mut img = gradient_image(40, 40);
+        let before = [img[(20, 20, 0)], img[(20, 20, 1)], img[(20, 20, 2)]];
+        // Same max-channel-ish luma, but a cyan tint — old max(R,G,B) detect missed this.
+        img[(20, 20, 1)] = (before[1] + 0.11).min(1.0);
+        img[(20, 20, 2)] = (before[2] + 0.11).min(1.0);
+        img[(20, 21, 1)] = (img[(20, 21, 1)] + 0.11).min(1.0);
+        img[(20, 21, 2)] = (img[(20, 21, 2)] + 0.11).min(1.0);
+
+        let mut mask = DustMask::new(40, 40);
+        stamp_disc(&mut mask, 20.0, 20.0, 8.0, DustTool::Pen);
+        apply_dust_removal_with(
+            &mut img,
+            &mask,
+            DustHealParams {
+                detect: 1.0,
+                feather: 2.0,
+                grain: 0.0,
+                grain_sigma: 0.8,
+            },
+        );
+        assert!(
+            (img[(20, 20, 1)] - before[1]).abs() < 0.08,
+            "faint colored speck should be detected and replaced (g={})",
+            img[(20, 20, 1)]
+        );
     }
 
     #[test]
