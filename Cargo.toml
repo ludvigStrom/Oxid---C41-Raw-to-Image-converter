@@ -3,6 +3,7 @@ name = "c41_raw_tool"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
+autobins = false
 
 [dependencies]
 # Pure-Rust RAW decoding (replaces LibRaw)

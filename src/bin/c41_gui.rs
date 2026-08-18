@@ -7953,8 +7953,8 @@ impl eframe::App for C41Gui {
                         ctx.pixels_per_point(),
                         self.full_res_preview_active,
                     );
+                    let apply = self.dust_should_apply(&self.images[idx]);
                     {
-                        let apply = self.dust_should_apply(&self.images[idx]);
                         let entry = &mut self.images[idx];
                         entry.options.dust_heal = entry_dust_heal(entry);
                         entry.options.dust_mask_hash = if apply {
@@ -7980,6 +7980,8 @@ impl eframe::App for C41Gui {
                     let grid_now = self.visible_tile_grid(idx);
                     let proxy_soft = grid_now.as_ref().map(|g| g.proxy_soft).unwrap_or(false);
                     let tiles_fit = grid_now.as_ref().map(|g| g.tiles_fit).unwrap_or(false);
+                    let wfc_dust = apply
+                        && self.images[idx].dust_infill == DustInfill::WaveFunction;
                     let (req_sw, req_sh) = self.images[idx].preview_screen_requested_wh;
                     // Do not compare CFA output size to the request cap — downsample often
                     // comes in smaller and that used to restart screen refine forever,
@@ -7995,7 +7997,7 @@ impl eframe::App for C41Gui {
                         && !self.preview_canvas_pointer;
                     let need_screen = have_current
                         && !self.full_res_preview_active
-                        && !tiles_fit
+                        && (!tiles_fit || wfc_dust)
                         && !slider_dragging
                         && (lod == PreviewLod::Draft
                             || (lod == PreviewLod::Screen
@@ -8111,6 +8113,7 @@ impl eframe::App for C41Gui {
                         && !view_settling
                         && !need_options
                         && !slider_dragging
+                        && !(wfc_dust && lod == PreviewLod::Draft)
                     {
                         self.drop_tiles_outside_view(idx);
                         if let Some(missing) = self.visible_tile_to_request(idx) {

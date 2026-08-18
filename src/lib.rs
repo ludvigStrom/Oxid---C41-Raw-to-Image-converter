@@ -26,7 +26,7 @@ pub mod demosaic;
 pub mod density_ops;
 pub mod dmin;
 pub mod dust;
-mod dust_wfc;
+pub(crate) mod dust_wfc;
 pub mod exr_export;
 pub mod flat_field;
 pub mod inversion;
@@ -87,6 +87,26 @@ fn apply_optional_dust(image: &mut Array3<f32>, options: &PipelineOptions) {
     if let Some(mask) = options.dust_mask.as_ref() {
         dust::apply_dust_removal_with(image, mask, options.dust_heal);
     }
+}
+
+#[cfg(feature = "gpu")]
+fn apply_optional_dust_gpu(
+    image: &mut Array3<f32>,
+    options: &PipelineOptions,
+    gpu: &crate::gpu::unified::GpuPipeline,
+) {
+    if options.dust_mask_hash == 0 {
+        return;
+    }
+    let Some(mask) = options.dust_mask.as_ref() else {
+        return;
+    };
+    if options.dust_heal.infill == dust::DustInfill::WaveFunction
+        && gpu.dust_wfc.run(image, mask, options.dust_heal).is_ok()
+    {
+        return;
+    }
+    dust::apply_dust_removal_with(image, mask, options.dust_heal);
 }
 
 /// Scale D-min rect from reference size to current image size. If reference is None or matches current size, returns rect as-is.
@@ -2073,7 +2093,7 @@ pub fn process_one_to_preview_with_cache_gpu(
 
     // Step 3: flat-field divide and D-min divide on GPU; rect/percentile on CPU
     if start_step <= 3 {
-        apply_optional_dust(&mut image, options);
+        apply_optional_dust_gpu(&mut image, options, gpu);
         let flat_map_preview = options
             .flat_field_path
             .as_ref()

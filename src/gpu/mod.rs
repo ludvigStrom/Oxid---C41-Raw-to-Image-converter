@@ -1,9 +1,11 @@
 //! Optional GPU pipeline acceleration via wgpu.
 //!
-//! Enabled with the `gpu` Cargo feature. Provides demosaic (RGGB quality), steps 4–6
-//! (T→D, calibration, render) on the GPU, with the same math as the CPU reference.
+//! Enabled with the `gpu` Cargo feature. Provides demosaic (RGGB quality),
+//! Wave-function dust heal, and steps 4–6 (T→D, calibration, render) on the GPU,
+//! with the same math as the CPU reference.
 
 pub mod demosaic;
+pub mod dust_wfc;
 pub mod flat_field;
 pub mod step3_dmin;
 pub mod step4;

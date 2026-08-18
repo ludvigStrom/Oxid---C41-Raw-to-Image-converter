@@ -10,6 +10,7 @@ use ndarray::Array3;
 use wgpu::util::DeviceExt;
 
 use super::demosaic::DemosaicPipeline;
+use super::dust_wfc::DustWfcPipeline;
 use super::flat_field::FlatFieldPipeline;
 use super::step3_dmin::Step3DminPipeline;
 use super::step4::Step4Pipeline;
@@ -35,6 +36,7 @@ pub struct Step3Gpu {
 pub struct GpuPipeline {
     pub ctx: Arc<GpuContext>,
     pub demosaic: DemosaicPipeline,
+    pub dust_wfc: DustWfcPipeline,
     pub step3: Step3Gpu,
     step4: Step4Pipeline,
     step5: Step5Pipeline,
@@ -46,6 +48,7 @@ impl GpuPipeline {
     pub fn try_new() -> Option<Self> {
         let ctx = Arc::new(GpuContext::try_new()?);
         let demosaic = DemosaicPipeline::new(&ctx);
+        let dust_wfc = DustWfcPipeline::new(&ctx);
         let step3 = Step3Gpu {
             flat_field: FlatFieldPipeline::new(&ctx),
             step3_dmin: Step3DminPipeline::new(&ctx),
@@ -56,6 +59,7 @@ impl GpuPipeline {
         Some(Self {
             ctx,
             demosaic,
+            dust_wfc,
             step3,
             step4,
             step5,

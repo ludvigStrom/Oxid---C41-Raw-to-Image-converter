@@ -336,28 +336,50 @@ pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params:
     heal_spots(image, mask, params);
 }
 
-fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
-    let (h, w, _) = image.dim();
+pub(crate) struct DustHealPrep {
+    pub tight: Vec<bool>,
+    pub dilated: Vec<bool>,
+    pub alpha: Vec<f32>,
+    pub grain: f32,
+    pub tile: u8,
+    pub loosen: f32,
+    pub w: usize,
+    pub h: usize,
+}
+
+pub(crate) fn prepare_dust_heal(
+    image: &Array3<f32>,
+    mask: &DustMask,
+    params: DustHealParams,
+) -> Option<DustHealPrep> {
+    if mask.is_empty() {
+        return None;
+    }
+    let (h, w, c) = image.dim();
+    if c < 3 || w == 0 || h == 0 {
+        return None;
+    }
+    let scaled = if mask.width == w as u32 && mask.height == h as u32 {
+        None
+    } else {
+        Some(scale_mask(mask, w as u32, h as u32))
+    };
+    let mask = scaled.as_ref().unwrap_or(mask);
     let n = w * h;
-    let mut roi = vec![false; n];
+    let mut tight = vec![false; n];
     for (i, &c) in mask.data.iter().enumerate() {
         if c >= MASK_ON {
-            roi[i] = true;
+            tight[i] = true;
         }
     }
-    if !roi.iter().any(|&v| v) {
-        return;
+    if !tight.iter().any(|&v| v) {
+        return None;
     }
-
     let _ = params.detect;
     let _ = params.grain_sigma;
-    // The painted stroke is the hole. Detect is not a gate.
-    let tight = roi;
-
     let feather = params.feather.clamp(0.0, 16.0);
-    let grain_amount = params.grain.clamp(0.0, 3.0);
-    let dilate_r = feather.ceil() as i32;
-    let dilated = dilate(&tight, w, h, dilate_r);
+    let grain = params.grain.clamp(0.0, 3.0);
+    let dilated = dilate(&tight, w, h, feather.ceil() as i32);
     let not_tight: Vec<bool> = tight.iter().map(|&t| !t).collect();
     let dist_from_tight = dist_inside(&not_tight, w, h);
     let mut alpha = vec![0.0f32; n];
@@ -368,6 +390,32 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
             alpha[i] = 1.0 - smoothstep(0.0, feather, dist_from_tight[i]);
         }
     }
+    Some(DustHealPrep {
+        tight,
+        dilated,
+        alpha,
+        grain,
+        tile: params.tile,
+        loosen: params.match_loosen.clamp(1.0, 4.0),
+        w,
+        h,
+    })
+}
+
+fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
+    let Some(prep) = prepare_dust_heal(image, mask, params) else {
+        return;
+    };
+    let DustHealPrep {
+        tight,
+        dilated,
+        alpha,
+        grain: grain_amount,
+        tile: _,
+        loosen: _,
+        w,
+        h,
+    } = prep;
 
     if params.infill == DustInfill::WaveFunction {
         crate::dust_wfc::heal_wfc(
