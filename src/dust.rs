@@ -534,6 +534,7 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
             &dilated,
             &alpha,
             params.match_loosen,
+            grain_amount,
             w,
             h,
         );

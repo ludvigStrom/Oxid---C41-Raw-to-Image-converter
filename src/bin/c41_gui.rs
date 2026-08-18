@@ -6554,7 +6554,8 @@ impl eframe::App for C41Gui {
                         DustInfill::PatchMatch => {
                             theme::slider_row(ui, "Match", &mut entry.dust_match, 1.0..=4.0, 1);
                             ui.small("Match is how far and how loosely PatchMatch may search nearby film.");
-                            ui.small("Copies a 7×7-matched patch from a color-gated collar. Grain is unused.");
+                            ui.small("Copies a 7×7-matched patch from a color-gated collar.");
+                            ui.small("Grain adds statistical film grain on the hole and feather (NLF + clump spectrum). 1.0 matches measured σ.");
                             ui.small("Feather fades the copied patch into film next to the stroke.");
                         }
                     }

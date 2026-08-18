@@ -1,13 +1,14 @@
 //! PatchMatch infill for dust holes.
 //!
 //! Local, color-gated Barnes NN-field: 7×7 SSD, propagate + random search,
-//! coarse-to-fine pyramid, weighted vote. Grain is the copied film.
+//! coarse-to-fine pyramid, patch splat. Grain is WFC statistical (hole + feather).
 
 use image::{imageops, Rgb, Rgb32FImage};
 use ndarray::Array3;
 use rayon::prelude::*;
 
 use crate::dust::{connected_components, dilate, pixel_hash, rgb_at, structure_hv};
+use crate::dust_grain::{apply_statistical_grain, component_bbox, nlm_bbox, MARGIN};
 
 const PATCH: i32 = 3;
 const ITERS: u32 = 5;
@@ -45,10 +46,12 @@ pub(crate) fn heal_patchmatch(
     dilated: &[bool],
     alpha: &[f32],
     match_loosen: f32,
+    grain_amount: f32,
     w: usize,
     h: usize,
 ) {
     let loosen = match_loosen.clamp(1.0, 4.0);
+    let grain = grain_amount.clamp(0.0, 3.0);
     let n_pix = w * h;
     let mut fill = vec![None; n_pix];
     let components = connected_components(dilated, w, h);
@@ -63,6 +66,9 @@ pub(crate) fn heal_patchmatch(
         for (&i, c) in component.iter().zip(colors) {
             fill[i] = Some(c);
         }
+    }
+    if grain > 1.0e-5 {
+        grain_fill(image, tight, dilated, &components, &mut fill, grain, loosen, w, h);
     }
     for i in 0..n_pix {
         let a = alpha[i];
@@ -169,6 +175,38 @@ fn fill_component(
         colors[k] = color_at[i].unwrap_or(rim_mean);
     }
     colors
+}
+
+/// WFC statistical grain on the painted hole and feather ring.
+fn grain_fill(
+    image: &Array3<f32>,
+    tight: &[bool],
+    dilated: &[bool],
+    components: &[Vec<usize>],
+    fill: &mut [Option<(f32, f32, f32)>],
+    grain: f32,
+    loosen: f32,
+    w: usize,
+    h: usize,
+) {
+    let mut den = image.clone();
+    for component in components {
+        if component.is_empty() {
+            continue;
+        }
+        let mut hole = vec![false; w * h];
+        for &i in component {
+            if tight[i] {
+                hole[i] = true;
+            }
+        }
+        let (rim_mean, gate, _) = collect_sources(image, tight, &hole, loosen, w, h);
+        let (x0, y0, x1, y1) = component_bbox(component, w, h, MARGIN);
+        nlm_bbox(&mut den, image, tight, x0, y0, x1, y1, w, h);
+        apply_statistical_grain(
+            image, &den, dilated, component, fill, grain, rim_mean, gate, loosen, w, h,
+        );
+    }
 }
 
 /// Copy each matched source patch onto the dilated component (hole + overlap).
@@ -765,7 +803,7 @@ mod tests {
     fn run_fill(img: &Array3<f32>, tight: &[bool], loosen: f32, w: usize, h: usize) -> Array3<f32> {
         let mut out = img.clone();
         let alpha: Vec<f32> = tight.iter().map(|&t| if t { 1.0 } else { 0.0 }).collect();
-        heal_patchmatch(&mut out, tight, tight, &alpha, loosen, w, h);
+        heal_patchmatch(&mut out, tight, tight, &alpha, loosen, 0.0, w, h);
         out
     }
 
@@ -792,7 +830,7 @@ mod tests {
         let mut img = Array3::<f32>::from_elem((8, 8, 3), 0.4);
         let tight = vec![false; 64];
         let alpha = vec![0.0f32; 64];
-        heal_patchmatch(&mut img, &tight, &tight, &alpha, 2.0, 8, 8);
+        heal_patchmatch(&mut img, &tight, &tight, &alpha, 2.0, 0.0, 8, 8);
     }
 
     #[test]
@@ -891,7 +929,7 @@ mod tests {
             }
         }
         let mut out = img.clone();
-        heal_patchmatch(&mut out, &tight, &dilated, &alpha, 2.0, 48, 48);
+        heal_patchmatch(&mut out, &tight, &dilated, &alpha, 2.0, 0.0, 48, 48);
 
         let ring = out[(ring_i / 48, ring_i % 48, 0)];
         assert!(
@@ -950,7 +988,7 @@ mod tests {
             }
         }
         let mut out = img.clone();
-        heal_patchmatch(&mut out, &tight, &dilated, &alpha, 2.0, 48, 48);
+        heal_patchmatch(&mut out, &tight, &dilated, &alpha, 2.0, 0.0, 48, 48);
 
         let ring = out[(ring_i / 48, ring_i % 48, 0)];
         assert!(
@@ -1010,7 +1048,7 @@ mod tests {
             }
         }
         let mut out = img.clone();
-        heal_patchmatch(&mut out, &tight, &dilated, &alpha, 2.0, w, h);
+        heal_patchmatch(&mut out, &tight, &dilated, &alpha, 2.0, 0.0, w, h);
 
         let ring_r = out[(ring_i / w, ring_i % w, 0)];
         assert!(
@@ -1020,6 +1058,59 @@ mod tests {
         assert!(
             (out[(outside_i / w, outside_i % w, 0)] - orig_out).abs() < 1e-5,
             "pixels outside dilated must stay"
+        );
+    }
+
+    #[test]
+    fn pm_ring_grain_raises_spread() {
+        let w = 48usize;
+        let h = 48usize;
+        let img = grainy_field(w, h);
+        let tight = hole_square(w, 16, 16, 5);
+        let dilated = dilate(&tight, w, h, 3);
+        let ring: Vec<bool> = dilated
+            .iter()
+            .zip(tight.iter())
+            .map(|(&d, &t)| d && !t)
+            .collect();
+        let mut alpha = vec![0.0f32; w * h];
+        for i in 0..w * h {
+            if tight[i] {
+                alpha[i] = 1.0;
+            } else if dilated[i] {
+                alpha[i] = 0.5;
+            }
+        }
+        let mut none = img.clone();
+        heal_patchmatch(&mut none, &tight, &dilated, &alpha, 2.0, 0.0, w, h);
+        let mut grained = img.clone();
+        heal_patchmatch(&mut grained, &tight, &dilated, &alpha, 2.0, 1.5, w, h);
+
+        let (_, ring_none) = luma_stats(&none, &ring, w);
+        let (_, ring_grain) = luma_stats(&grained, &ring, w);
+        assert!(
+            ring_grain > ring_none + 0.002,
+            "feather grain must raise ring spread (none={ring_none}, grain={ring_grain})"
+        );
+
+        let (_, core_none) = luma_stats(&none, &tight, w);
+        let (_, core_grain) = luma_stats(&grained, &tight, w);
+        assert!(
+            core_grain > core_none + 0.002,
+            "core grain must raise hole spread (none={core_none}, grain={core_grain})"
+        );
+        let mut core_diff = 0.0f32;
+        for i in 0..w * h {
+            if !tight[i] {
+                continue;
+            }
+            let y = i / w;
+            let x = i % w;
+            core_diff += (grained[(y, x, 0)] - none[(y, x, 0)]).abs();
+        }
+        assert!(
+            core_diff > 0.02,
+            "tight pixels must receive statistical grain (diff={core_diff})"
         );
     }
 
