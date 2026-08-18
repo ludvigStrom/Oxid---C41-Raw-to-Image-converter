@@ -38,8 +38,7 @@ fn search_radius(loosen: f32) -> i32 {
     (10.0 + 8.0 * loosen.clamp(1.0, 4.0)).round() as i32
 }
 
-/// PatchMatch on `tight` (seam can see film), smooth fill of the feather ring,
-/// then alpha composite. Grain is unused (copied film).
+/// PatchMatch on `tight` using only nearby film, then alpha composite.
 pub(crate) fn heal_patchmatch(
     image: &mut Array3<f32>,
     tight: &[bool],
@@ -142,7 +141,7 @@ fn fill_component(
             }
         }
 
-        let mut levels = build_pyramid(rgb, hole_c, src_c, bw, bh);
+        let mut levels = build_pyramid(rgb, hole_c, src_c, bw, bh, search_radius(loosen));
         let last = levels.len() - 1;
         init_nn(&mut levels[last]);
         for _ in 0..ITERS {
@@ -291,6 +290,13 @@ struct Level {
     hole: Vec<bool>,
     source: Vec<bool>,
     nn: Vec<Option<(u16, u16)>>,
+    src_rad: i32,
+}
+
+fn source_near(x: usize, y: usize, sx: usize, sy: usize, rad: i32) -> bool {
+    let dx = sx as i32 - x as i32;
+    let dy = sy as i32 - y as i32;
+    dx * dx + dy * dy <= rad * rad
 }
 
 fn build_pyramid(
@@ -299,7 +305,9 @@ fn build_pyramid(
     source: Vec<bool>,
     w: usize,
     h: usize,
+    src_rad: i32,
 ) -> Vec<Level> {
+    let mut rad = src_rad.max(2);
     let mut levels = vec![Level {
         w,
         h,
@@ -307,6 +315,7 @@ fn build_pyramid(
         hole,
         source,
         nn: vec![None; w * h],
+        src_rad: rad,
     }];
     while levels.len() < MAX_LEVELS {
         let prev = levels.last().unwrap();
@@ -328,6 +337,7 @@ fn build_pyramid(
         if !source.iter().any(|&s| s) {
             break;
         }
+        rad = (rad / 2).max(2);
         let n = nw * nh;
         levels.push(Level {
             w: nw,
@@ -336,6 +346,7 @@ fn build_pyramid(
             hole,
             source,
             nn: vec![None; n],
+            src_rad: rad,
         });
     }
     levels
@@ -405,14 +416,21 @@ fn init_nn(level: &mut Level) {
     if srcs.is_empty() {
         return;
     }
+    let rad = level.src_rad;
     for y in 0..level.h {
         for x in 0..level.w {
             let i = y * level.w + x;
             if !level.hole[i] {
                 continue;
             }
+            let local: Vec<(u16, u16)> = srcs
+                .iter()
+                .copied()
+                .filter(|&(sx, sy)| source_near(x, y, sx as usize, sy as usize, rad))
+                .collect();
+            let pick = if local.is_empty() { &srcs } else { &local };
             let hsh = pixel_hash(x, y) as usize;
-            level.nn[i] = Some(srcs[hsh % srcs.len()]);
+            level.nn[i] = Some(pick[hsh % pick.len()]);
         }
     }
 }
@@ -430,17 +448,27 @@ fn upsample_nn(coarse: &Level, fine: &mut Level) {
             if let Some((sx, sy)) = coarse.nn[cy * coarse.w + cx] {
                 let fx = ((sx as usize) * 2 + x % 2).min(fine.w.saturating_sub(1));
                 let fy = ((sy as usize) * 2 + y % 2).min(fine.h.saturating_sub(1));
-                if fine.source[fy * fine.w + fx] {
+                if fine.source[fy * fine.w + fx]
+                    && source_near(x, y, fx, fy, fine.src_rad)
+                {
                     fine.nn[i] = Some((fx as u16, fy as u16));
                     continue;
                 }
                 if let Some(near) = nearest_source(fine, fx, fy) {
-                    fine.nn[i] = Some(near);
-                    continue;
+                    if source_near(x, y, near.0 as usize, near.1 as usize, fine.src_rad) {
+                        fine.nn[i] = Some(near);
+                        continue;
+                    }
                 }
             }
-            if !srcs.is_empty() {
-                fine.nn[i] = Some(srcs[pixel_hash(x, y) as usize % srcs.len()]);
+            let local: Vec<(u16, u16)> = srcs
+                .iter()
+                .copied()
+                .filter(|&(sx, sy)| source_near(x, y, sx as usize, sy as usize, fine.src_rad))
+                .collect();
+            let pick = if local.is_empty() { &srcs } else { &local };
+            if !pick.is_empty() {
+                fine.nn[i] = Some(pick[pixel_hash(x, y) as usize % pick.len()]);
             }
         }
     }
@@ -518,6 +546,9 @@ fn try_assign(level: &mut Level, x: usize, y: usize, sx: i32, sy: i32, best: &mu
     let sx = sx as usize;
     let sy = sy as usize;
     if !level.source[sy * level.w + sx] {
+        return;
+    }
+    if !source_near(x, y, sx, sy, level.src_rad) {
         return;
     }
     let cost = patch_ssd(level, x, y, sx, sy, *best);
@@ -907,6 +938,36 @@ mod tests {
         assert!(
             (out[(outside_i / 48, outside_i % 48, 0)] - orig_out).abs() < 1e-5,
             "pixels outside dilated must stay"
+        );
+    }
+
+    #[test]
+    fn long_stroke_does_not_carry_dark_along_sky() {
+        let mut img = Array3::<f32>::from_elem((24, 64, 3), 0.78);
+        for y in 0..24 {
+            for x in 0..14 {
+                img[(y, x, 0)] = 0.06;
+                img[(y, x, 1)] = 0.06;
+                img[(y, x, 2)] = 0.06;
+            }
+        }
+        let mut tight = vec![false; 64 * 24];
+        for x in 8..52 {
+            tight[11 * 64 + x] = true;
+            tight[12 * 64 + x] = true;
+            tight[13 * 64 + x] = true;
+        }
+        let filled = run_fill(&img, &tight, 2.0, 64, 24);
+        let mut sky = 0.0;
+        let mut n = 0.0;
+        for x in 32..48 {
+            sky += luma(rgb_at(&filled, x, 12));
+            n += 1.0;
+        }
+        sky /= n;
+        assert!(
+            sky > 0.55,
+            "sky part of a long stroke must not copy the dark end (luma={sky})"
         );
     }
 }

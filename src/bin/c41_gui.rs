@@ -6586,7 +6586,7 @@ impl eframe::App for C41Gui {
                             theme::slider_row(ui, "Match", &mut entry.dust_match, 1.0..=4.0, 1);
                             ui.small("Match is how far and how loosely PatchMatch may search nearby film.");
                             ui.small("Copies a 7×7-matched patch from a color-gated collar. Grain is unused.");
-                            ui.small("Feather blends the copied patch into the rim, same as Telea.");
+                            ui.small("Feather fades the copied patch into film next to the stroke.");
                         }
                     }
                     ui.small("The pen is the hole. Size the brush to the speck; feather fades the rim.");
