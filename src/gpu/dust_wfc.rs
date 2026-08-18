@@ -11,7 +11,7 @@ use crate::dust::{
     connected_components, prepare_dust_heal, DustHealParams, DustHealPrep, DustMask,
 };
 use crate::dust_wfc::{
-    build_candidates, composite_and_grain, exemplar_fill, hole_pass_count,
+    blend_offset_seams, build_candidates, composite_and_grain, exemplar_fill, hole_pass_count,
 };
 
 #[repr(C)]
@@ -154,14 +154,19 @@ impl DustWfcPipeline {
             }
             let (cands, color_gate, rim) = build_candidates(image, tight, &hole, *loosen, w, h);
             if cands.is_empty() {
-                let (colors, _) =
+                let (mut colors, srcs) =
                     exemplar_fill(image, tight, &component, &[], color_gate, rim, n, w, h);
+                blend_offset_seams(
+                    image, tight, &component, &mut colors, &srcs, color_gate, rim, w, h,
+                );
                 for (&i, c) in component.iter().zip(colors) {
                     fill[i] = Some(c);
                 }
                 continue;
             }
             self.fill_component(
+                image,
+                tight,
                 &image_buf,
                 &tight_buf,
                 &component,
@@ -182,6 +187,8 @@ impl DustWfcPipeline {
 
     fn fill_component(
         &self,
+        image: &Array3<f32>,
+        tight: &[bool],
         image_buf: &wgpu::Buffer,
         tight_buf: &wgpu::Buffer,
         component: &[usize],
@@ -247,15 +254,16 @@ impl DustWfcPipeline {
             contents: bytemuck::cast_slice(&fill_zeros),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
+        let src_bytes = (src_zeros.len() * std::mem::size_of::<u32>()) as u64;
         let src_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("dust_wfc_src_a"),
             contents: bytemuck::cast_slice(&src_zeros),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
         let src_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("dust_wfc_src_b"),
             contents: bytemuck::cast_slice(&src_zeros),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
         let bg_ab = self.bind(
@@ -286,36 +294,75 @@ impl DustWfcPipeline {
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
-        let last = if passes % 2 == 1 { &fill_b } else { &fill_a };
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dust_wfc_staging"),
+        let last_fill = if passes % 2 == 1 { &fill_b } else { &fill_a };
+        let last_src = if passes % 2 == 1 { &src_b } else { &src_a };
+        let fill_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dust_wfc_fill_staging"),
             size: fill_bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        encoder.copy_buffer_to_buffer(last, 0, &staging, 0, fill_bytes);
+        let src_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dust_wfc_src_staging"),
+            size: src_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(last_fill, 0, &fill_staging, 0, fill_bytes);
+        encoder.copy_buffer_to_buffer(last_src, 0, &src_staging, 0, src_bytes);
         queue.submit(std::iter::once(encoder.finish()));
 
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
+        let fill_slice = fill_staging.slice(..);
+        let src_slice = src_staging.slice(..);
+        let (tx_f, rx_f) = std::sync::mpsc::channel();
+        let (tx_s, rx_s) = std::sync::mpsc::channel();
+        fill_slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx_f.send(r);
+        });
+        src_slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx_s.send(r);
         });
         device.poll(wgpu::Maintain::Wait);
-        rx.recv()
+        rx_f.recv()
+            .map_err(|_| anyhow::anyhow!("GPU map channel disconnected"))?
+            .map_err(|e| anyhow::anyhow!("GPU buffer map failed: {:?}", e))?;
+        rx_s.recv()
             .map_err(|_| anyhow::anyhow!("GPU map channel disconnected"))?
             .map_err(|e| anyhow::anyhow!("GPU buffer map failed: {:?}", e))?;
 
-        let data = slice.get_mapped_range();
-        let result: &[f32] = bytemuck::cast_slice(&data);
-        for &i in component {
+        let fill_data = fill_slice.get_mapped_range();
+        let src_data = src_slice.get_mapped_range();
+        let result: &[f32] = bytemuck::cast_slice(&fill_data);
+        let packed: &[u32] = bytemuck::cast_slice(&src_data);
+        let mut colors = vec![(0.0f32, 0.0f32, 0.0f32); component.len()];
+        let mut srcs = vec![None; component.len()];
+        let mut placed = vec![false; component.len()];
+        for (k, &i) in component.iter().enumerate() {
             let b = i * 4;
             if result[b + 3] > 0.5 {
-                fill[i] = Some((result[b], result[b + 1], result[b + 2]));
+                colors[k] = (result[b], result[b + 1], result[b + 2]);
+                placed[k] = true;
+            }
+            let p = packed[i];
+            if p != 0 {
+                let sx = ((p >> 16) - 1) as u16;
+                let sy = ((p & 0xFFFF) - 1) as u16;
+                srcs[k] = Some((sx, sy));
             }
         }
-        drop(data);
-        staging.unmap();
+        drop(fill_data);
+        drop(src_data);
+        fill_staging.unmap();
+        src_staging.unmap();
+
+        blend_offset_seams(
+            image, tight, component, &mut colors, &srcs, color_gate, rim, w, h,
+        );
+        for (k, &i) in component.iter().enumerate() {
+            if placed[k] {
+                fill[i] = Some(colors[k]);
+            }
+        }
         Ok(())
     }
 

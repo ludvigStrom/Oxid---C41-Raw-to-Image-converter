@@ -140,7 +140,7 @@ fn fill_component(
     }
     let (candidates, color_gate, rim_mean) =
         build_candidates(image, tight, &hole, loosen, w, h);
-    let (colors, _) = exemplar_fill(
+    let (mut colors, srcs) = exemplar_fill(
         image,
         tight,
         component,
@@ -148,6 +148,17 @@ fn fill_component(
         color_gate,
         rim_mean,
         n,
+        w,
+        h,
+    );
+    blend_offset_seams(
+        image,
+        tight,
+        component,
+        &mut colors,
+        &srcs,
+        color_gate,
+        rim_mean,
         w,
         h,
     );
@@ -533,6 +544,123 @@ pub(crate) fn exemplar_fill(
     (colors, srcs)
 }
 
+fn source_offset(i: usize, src: Option<(u16, u16)>, w: usize) -> Option<(i32, i32)> {
+    let (sx, sy) = src?;
+    Some((sx as i32 - (i % w) as i32, sy as i32 - (i / w) as i32))
+}
+
+fn offset_chebyshev(a: (i32, i32), b: (i32, i32)) -> u32 {
+    a.0.abs_diff(b.0).max(a.1.abs_diff(b.1))
+}
+
+/// Cross-dissolve where neighboring hole pixels copied from disagreeing offsets.
+/// Skips when every source agrees (one rigid patch, no X).
+pub(crate) fn blend_offset_seams(
+    image: &Array3<f32>,
+    tight: &[bool],
+    component: &[usize],
+    colors: &mut [(f32, f32, f32)],
+    srcs: &[Option<(u16, u16)>],
+    color_gate: f32,
+    rim_mean: (f32, f32, f32),
+    w: usize,
+    h: usize,
+) {
+    if component.is_empty() || srcs.iter().all(Option::is_none) {
+        return;
+    }
+
+    let mut index_of = vec![usize::MAX; w * h];
+    let mut hole = vec![false; w * h];
+    for (k, &i) in component.iter().enumerate() {
+        index_of[i] = k;
+        hole[i] = true;
+    }
+
+    let mut marked = vec![false; w * h];
+    let mut any = false;
+    for (k, &i) in component.iter().enumerate() {
+        let Some(off_p) = source_offset(i, srcs[k], w) else {
+            continue;
+        };
+        let x = (i % w) as i32;
+        let y = (i / w) as i32;
+        for (dx, dy) in DIRS {
+            let nx = x + dx;
+            let ny = y + dy;
+            if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                continue;
+            }
+            let ni = ny as usize * w + nx as usize;
+            if !hole[ni] {
+                continue;
+            }
+            let nk = index_of[ni];
+            let disagree = match source_offset(ni, srcs[nk], w) {
+                None => true,
+                Some(off_n) => offset_chebyshev(off_p, off_n) > 1,
+            };
+            if disagree {
+                marked[i] = true;
+                any = true;
+                break;
+            }
+        }
+    }
+    if !any {
+        return;
+    }
+
+    let dilated = dilate(&marked, w, h, 1);
+    for (k, &i) in component.iter().enumerate() {
+        if !dilated[i] {
+            continue;
+        }
+        let x = (i % w) as i32;
+        let y = (i / w) as i32;
+        let mut acc = (0.0f32, 0.0f32, 0.0f32);
+        let mut n = 0.0f32;
+        let mut seen = [(i32::MAX, i32::MAX); 5];
+        let mut seen_n = 0usize;
+        let mut consider = |off: (i32, i32)| {
+            if seen[..seen_n].contains(&off) {
+                return;
+            }
+            seen[seen_n] = off;
+            seen_n += 1;
+            let Some(src) = source_ok(image, tight, x + off.0, y + off.1, w, h, rim_mean, color_gate)
+            else {
+                return;
+            };
+            let c = rgb_at(image, src.0 as usize, src.1 as usize);
+            acc.0 += c.0;
+            acc.1 += c.1;
+            acc.2 += c.2;
+            n += 1.0;
+        };
+        if let Some(off) = source_offset(i, srcs[k], w) {
+            consider(off);
+        }
+        for (dx, dy) in DIRS {
+            let nx = x + dx;
+            let ny = y + dy;
+            if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                continue;
+            }
+            let ni = ny as usize * w + nx as usize;
+            if !hole[ni] {
+                continue;
+            }
+            if let Some(off) = source_offset(ni, srcs[index_of[ni]], w) {
+                consider(off);
+            }
+        }
+        if n > 0.0 {
+            colors[k] = (acc.0 / n, acc.1 / n, acc.2 / n);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,7 +730,40 @@ mod tests {
             hole[i] = true;
         }
         let (cands, gate, rim) = build_candidates(img, tight, &hole, loosen, w, h);
-        exemplar_fill(img, tight, component, &cands, gate, rim, n, w, h)
+        let (mut colors, srcs) = exemplar_fill(img, tight, component, &cands, gate, rim, n, w, h);
+        blend_offset_seams(img, tight, component, &mut colors, &srcs, gate, rim, w, h);
+        (colors, srcs)
+    }
+
+    fn max_hole_luma_jump(
+        colors: &[(f32, f32, f32)],
+        component: &[usize],
+        w: usize,
+    ) -> f32 {
+        let mut index_of = vec![usize::MAX; w * w];
+        for (k, &i) in component.iter().enumerate() {
+            index_of[i] = k;
+        }
+        let mut max_j = 0.0f32;
+        for (k, &i) in component.iter().enumerate() {
+            let y0 = luma(colors[k]);
+            let x = (i % w) as i32;
+            let y = (i / w) as i32;
+            for (dx, dy) in DIRS {
+                let nx = x + dx;
+                let ny = y + dy;
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= w as i32 {
+                    continue;
+                }
+                let ni = ny as usize * w + nx as usize;
+                let nk = index_of[ni];
+                if nk == usize::MAX {
+                    continue;
+                }
+                max_j = max_j.max((y0 - luma(colors[nk])).abs());
+            }
+        }
+        max_j
     }
 
     #[test]
@@ -735,6 +896,66 @@ mod tests {
         assert!(
             hi - lo > 0.02,
             "coherent copy must still have grain (spread={})",
+            hi - lo
+        );
+    }
+
+    #[test]
+    fn seam_blend_softens_offset_jump() {
+        let mut img = Array3::<f32>::from_elem((24, 24, 3), 0.0);
+        for y in 0..24 {
+            for x in 0..24 {
+                let v = if x < 12 { 0.18 } else { 0.82 };
+                img[(y, x, 0)] = v;
+                img[(y, x, 1)] = v;
+                img[(y, x, 2)] = v;
+            }
+        }
+        let (tight, component) = hole_square(24, 8, 8, 8);
+        let mut colors = vec![(0.0, 0.0, 0.0); component.len()];
+        let mut srcs = vec![None; component.len()];
+        for (k, &i) in component.iter().enumerate() {
+            let x = i % 24;
+            let y = i / 24;
+            let (sx, sy, v) = if x < 12 {
+                (2u16, y as u16, 0.18)
+            } else {
+                (20u16, y as u16, 0.82)
+            };
+            srcs[k] = Some((sx, sy));
+            colors[k] = (v, v, v);
+        }
+        let before = max_hole_luma_jump(&colors, &component, 24);
+        assert!(
+            before > 0.50,
+            "fixture must have a hard mid-hole jump (got {before})"
+        );
+        blend_offset_seams(
+            &img,
+            &tight,
+            &component,
+            &mut colors,
+            &srcs,
+            1.0,
+            (0.5, 0.5, 0.5),
+            24,
+            24,
+        );
+        let after = max_hole_luma_jump(&colors, &component, 24);
+        assert!(
+            after < before * 0.75,
+            "seam blend must cut the offset jump (before={before}, after={after})"
+        );
+        let mut lo = 1.0f32;
+        let mut hi = 0.0f32;
+        for c in &colors {
+            let y = luma(*c);
+            lo = lo.min(y);
+            hi = hi.max(y);
+        }
+        assert!(
+            hi - lo > 0.20,
+            "blend must not flatten the hole to one slab (spread={})",
             hi - lo
         );
     }
