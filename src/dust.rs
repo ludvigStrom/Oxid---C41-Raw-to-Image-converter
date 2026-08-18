@@ -1,4 +1,4 @@
-//! User-painted dust mask and nearby-patch dust healing on linear transmittance.
+//! User-painted dust mask and punched-hole Telea + grain healing.
 
 use std::hash::{Hash, Hasher};
 
@@ -340,11 +340,13 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
         }
     }
 
-    let low = blur_rgb(image, grain_sigma);
+    let structure = fill_structure_telea(image, &dilated, w, h);
+    let low = blur_rgb_masked(image, &dilated, grain_sigma);
     for component in connected_components(&dilated, w, h) {
         heal_component(
             image,
             &low,
+            &structure,
             &component,
             &dilated,
             &alpha,
@@ -476,7 +478,49 @@ fn blur_plane(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     out
 }
 
-fn blur_rgb(image: &Array3<f32>, sigma: f32) -> Array3<f32> {
+/// Separable Gaussian that never reads `hole` pixels (renormalize the kernel).
+fn blur_plane_masked(src: &[f32], hole: &[bool], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    if sigma <= 0.0 || w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let kernel = gauss_kernel(sigma);
+    let half = kernel.len() / 2;
+    let mut temp = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            let mut wsum = 0.0;
+            for (i, &k) in kernel.iter().enumerate() {
+                let xi = (x as i32 + i as i32 - half as i32).clamp(0, w as i32 - 1) as usize;
+                if hole[y * w + xi] {
+                    continue;
+                }
+                acc += src[y * w + xi] * k;
+                wsum += k;
+            }
+            temp[y * w + x] = if wsum > 1.0e-8 { acc / wsum } else { src[y * w + x] };
+        }
+    }
+    let mut out = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            let mut wsum = 0.0;
+            for (i, &k) in kernel.iter().enumerate() {
+                let yi = (y as i32 + i as i32 - half as i32).clamp(0, h as i32 - 1) as usize;
+                if hole[yi * w + x] {
+                    continue;
+                }
+                acc += temp[yi * w + x] * k;
+                wsum += k;
+            }
+            out[y * w + x] = if wsum > 1.0e-8 { acc / wsum } else { temp[y * w + x] };
+        }
+    }
+    out
+}
+
+fn blur_rgb_masked(image: &Array3<f32>, hole: &[bool], sigma: f32) -> Array3<f32> {
     let (h, w, _) = image.dim();
     let mut planes = [
         vec![0.0f32; w * h],
@@ -491,9 +535,9 @@ fn blur_rgb(image: &Array3<f32>, sigma: f32) -> Array3<f32> {
             planes[2][i] = image[(y, x, 2)];
         }
     }
-    let br = blur_plane(&planes[0], w, h, sigma);
-    let bg = blur_plane(&planes[1], w, h, sigma);
-    let bb = blur_plane(&planes[2], w, h, sigma);
+    let br = blur_plane_masked(&planes[0], hole, w, h, sigma);
+    let bg = blur_plane_masked(&planes[1], hole, w, h, sigma);
+    let bb = blur_plane_masked(&planes[2], hole, w, h, sigma);
     let mut out = Array3::<f32>::zeros((h, w, 3));
     for y in 0..h {
         for x in 0..w {
@@ -685,6 +729,7 @@ fn connected_components(on: &[bool], w: usize, h: usize) -> Vec<Vec<usize>> {
 fn heal_component(
     image: &mut Array3<f32>,
     low: &Array3<f32>,
+    structure: &Array3<f32>,
     component: &[usize],
     forbidden: &[bool],
     alpha: &[f32],
@@ -710,7 +755,6 @@ fn heal_component(
     let span = (x1 - x0 + 1).max(y1 - y0 + 1).max(6) as i32;
 
     let ring = component_ring(component, forbidden, w, h);
-    let fallback = ring_median(low, &ring);
     let offset = best_patch_offset(image, &ring, forbidden, w, h, span);
     let residuals = ring_residuals(image, low, &ring);
 
@@ -718,7 +762,7 @@ fn heal_component(
     for (k, &i) in component.iter().enumerate() {
         let x = i % w;
         let y = i / w;
-        let color = structure_hv(low, forbidden, x, y, w, h).unwrap_or(fallback);
+        let color = rgb_at(structure, x, y);
         let x = x as i32;
         let y = y as i32;
         let grain = if let Some((dx, dy)) = offset {
@@ -857,7 +901,117 @@ fn interp_axis(
     }
 }
 
-/// Weighted H+V lerp of `low` across the hole. Shorter span wins.
+const TELEA_RADIUS: i32 = 4;
+
+/// Telea-style weights over **original** known film only. Filled pixels are
+/// never sampled again (that was the inward smear). No gradient term — that
+/// continued any leftover halo into the hole. Interior pixels fall back to H+V.
+fn fill_structure_telea(image: &Array3<f32>, hole: &[bool], w: usize, h: usize) -> Array3<f32> {
+    let n = w * h;
+    let mut out = image.clone();
+    let mut original = vec![false; n];
+    let mut pixels = Vec::new();
+    for i in 0..n {
+        if hole[i] {
+            pixels.push(i);
+        } else {
+            original[i] = true;
+        }
+    }
+    if pixels.is_empty() {
+        return out;
+    }
+    let t = dist_inside(hole, w, h);
+    pixels.sort_by(|&a, &b| t[a].partial_cmp(&t[b]).unwrap_or(std::cmp::Ordering::Equal));
+    for i in pixels {
+        let x = i % w;
+        let y = i / w;
+        let color = telea_estimate(image, &original, &t, x, y, w, h)
+            .or_else(|| structure_hv(image, hole, x, y, w, h))
+            .unwrap_or((0.0, 0.0, 0.0));
+        out[(y, x, 0)] = color.0;
+        out[(y, x, 1)] = color.1;
+        out[(y, x, 2)] = color.2;
+    }
+    out
+}
+
+fn telea_estimate(
+    img: &Array3<f32>,
+    original: &[bool],
+    t: &[f32],
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> Option<(f32, f32, f32)> {
+    let (nx, ny) = normal_t(t, x, y, w, h);
+    let tp = t[y * w + x];
+    let mut acc = (0.0f32, 0.0f32, 0.0f32);
+    let mut wsum = 0.0f32;
+    for dy in -TELEA_RADIUS..=TELEA_RADIUS {
+        for dx in -TELEA_RADIUS..=TELEA_RADIUS {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            if dx * dx + dy * dy > TELEA_RADIUS * TELEA_RADIUS {
+                continue;
+            }
+            let qx = x as i32 + dx;
+            let qy = y as i32 + dy;
+            if qx < 0 || qy < 0 || qx >= w as i32 || qy >= h as i32 {
+                continue;
+            }
+            let qx = qx as usize;
+            let qy = qy as usize;
+            if !original[qy * w + qx] {
+                continue;
+            }
+            let ddx = x as f32 - qx as f32;
+            let ddy = y as f32 - qy as f32;
+            let len2 = ddx * ddx + ddy * ddy;
+            if len2 < 1.0e-8 {
+                continue;
+            }
+            let len = len2.sqrt();
+            let dir = (ddx / len * nx + ddy / len * ny).max(0.0);
+            let dst = 1.0 / len2;
+            let lev = 1.0 / (1.0 + (tp - t[qy * w + qx]).abs());
+            let wgt = dir * dst * lev;
+            if wgt <= 1.0e-12 {
+                continue;
+            }
+            let iq = rgb_at(img, qx, qy);
+            acc.0 += wgt * iq.0;
+            acc.1 += wgt * iq.1;
+            acc.2 += wgt * iq.2;
+            wsum += wgt;
+        }
+    }
+    if wsum > 1.0e-8 {
+        Some((acc.0 / wsum, acc.1 / wsum, acc.2 / wsum))
+    } else {
+        None
+    }
+}
+
+fn normal_t(t: &[f32], x: usize, y: usize, w: usize, h: usize) -> (f32, f32) {
+    let i = y * w + x;
+    let xm = if x > 0 { t[i - 1] } else { t[i] };
+    let xp = if x + 1 < w { t[i + 1] } else { t[i] };
+    let ym = if y > 0 { t[i - w] } else { t[i] };
+    let yp = if y + 1 < h { t[i + w] } else { t[i] };
+    let gx = (xp - xm) * 0.5;
+    let gy = (yp - ym) * 0.5;
+    let len = (gx * gx + gy * gy).sqrt();
+    if len < 1.0e-6 {
+        (0.0, 0.0)
+    } else {
+        (gx / len, gy / len)
+    }
+}
+
+/// Weighted H+V lerp of known endpoints. Shorter span wins.
 fn structure_hv(
     low: &Array3<f32>,
     hole: &[bool],
@@ -916,28 +1070,6 @@ fn component_ring(component: &[usize], forbidden: &[bool], w: usize, h: usize) -
         }
     }
     ring
-}
-
-fn ring_median(image: &Array3<f32>, ring: &[usize]) -> (f32, f32, f32) {
-    if ring.is_empty() {
-        return (0.0, 0.0, 0.0);
-    }
-    let w = image.dim().1;
-    let mut rs = Vec::with_capacity(ring.len());
-    let mut gs = Vec::with_capacity(ring.len());
-    let mut bs = Vec::with_capacity(ring.len());
-    for &i in ring {
-        let x = i % w;
-        let y = i / w;
-        rs.push(image[(y, x, 0)]);
-        gs.push(image[(y, x, 1)]);
-        bs.push(image[(y, x, 2)]);
-    }
-    (
-        median_f32(&mut rs),
-        median_f32(&mut gs),
-        median_f32(&mut bs),
-    )
 }
 
 fn median_f32(v: &mut [f32]) -> f32 {
@@ -1367,6 +1499,68 @@ mod tests {
         assert!(
             healed < 0.72 && healed > 0.35,
             "heal should follow the step, not the 0.8 ring (got {healed})"
+        );
+    }
+
+    #[test]
+    fn telea_does_not_smear_speck_inward() {
+        let mut img = Array3::<f32>::from_elem((32, 32, 3), 0.4);
+        img[(16, 16, 0)] = 1.0;
+        img[(16, 16, 1)] = 1.0;
+        img[(16, 16, 2)] = 1.0;
+        img[(16, 17, 0)] = 1.0;
+        img[(17, 16, 0)] = 1.0;
+        img[(17, 17, 0)] = 1.0;
+
+        let mut mask = DustMask::new(32, 32);
+        stamp_disc(&mut mask, 16.0, 16.0, 4.0, DustTool::Pen);
+        apply_dust_removal_with(
+            &mut img,
+            &mask,
+            DustHealParams {
+                detect: 1.0,
+                feather: 2.0,
+                grain: 0.0,
+                grain_sigma: 0.8,
+            },
+        );
+        let v = img[(16, 16, 0)];
+        assert!(
+            (v - 0.4).abs() < 0.12,
+            "punched Telea must reconstruct the surround, not the speck (got {v})"
+        );
+        assert!(v < 0.65, "must not smear the white speck inward (got {v})");
+    }
+
+    #[test]
+    fn telea_ignores_hole_values_on_diagonal() {
+        let mut img = Array3::<f32>::zeros((40, 40, 3));
+        for y in 0..40 {
+            for x in 0..40 {
+                let v = if y < x { 0.2 } else { 0.8 };
+                img[(y, x, 0)] = v;
+                img[(y, x, 1)] = v;
+                img[(y, x, 2)] = v;
+            }
+        }
+        let mut hole = vec![false; 40 * 40];
+        for y in 18..=22 {
+            for x in 18..=22 {
+                hole[y * 40 + x] = true;
+                img[(y, x, 0)] = 1.0;
+                img[(y, x, 1)] = 1.0;
+                img[(y, x, 2)] = 1.0;
+            }
+        }
+        let s = fill_structure_telea(&img, &hole, 40, 40);
+        let v = s[(20, 18, 0)];
+        assert!(
+            v < 0.85,
+            "must not read the punched 1.0 hole (got {v})"
+        );
+        assert!(
+            (v - 0.2).abs() < 0.15 || (v - 0.8).abs() < 0.15,
+            "Telea should stay on one side of the diagonal (got {v})"
         );
     }
 }
