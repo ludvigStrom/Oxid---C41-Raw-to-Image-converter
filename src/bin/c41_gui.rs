@@ -224,8 +224,22 @@ struct UiIcons {
     logo: Option<egui::TextureHandle>,
 }
 
+fn startup_project_from_args() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::args_os().nth(1)?);
+    let ext = path.extension()?.to_string_lossy();
+    let ext_lc = ext.to_ascii_lowercase();
+    if ext_lc == PROJECT_EXTENSION.to_ascii_lowercase()
+        || ext_lc == PROJECT_EXTENSION_LEGACY.to_ascii_lowercase()
+    {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let start_size = startup_window_size();
+    let startup_project = startup_project_from_args();
     let mut native_options = if cfg!(target_os = "macos") {
         let mut o = eframe::NativeOptions::default();
         o.viewport = o
@@ -261,10 +275,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_NAME,
         native_options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(C41Gui::default()))
+            let mut app = C41Gui::default();
+            if let Some(path) = startup_project {
+                app.pending_recent_load = Some(path);
+            }
+            Ok(Box::new(app))
         }),
     )
 }

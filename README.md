@@ -51,7 +51,17 @@ Launch Oxid (GPU-accelerated GUI):
 cargo guigpu
 ```
 
-This is an alias for `cargo run --release --bin Oxid --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)). On macOS you can also build a signed installer with `scripts/release_pkg_notarize.sh` (see `.env.example`).
+This is an alias for `cargo run --release --bin Oxid --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)).
+
+**Windows installer** (requires [Inno Setup 6](https://jrsoftware.org/isinfo.php); uses the MSVC Rust toolchain so the package does not need MinGW DLLs):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/release_windows_installer.ps1
+```
+
+The setup exe is written to `build/dist/Oxid-<version>-setup.exe`. It installs Oxid, adds a Start Menu shortcut, optionally associates `.oxidProj` files, and can create a desktop icon.
+
+On macOS you can also build a signed installer with `scripts/release_pkg_notarize.sh` (see `.env.example`).
 
 **CLI (convert subcommand):**
 
@@ -444,7 +454,9 @@ This program is free software: you can redistribute it and/or modify it under th
 
 ## Credits
 
-Oxid is a port of, and is heavily inspired by:
+Oxid borrows some parts from:
 
 - **[Negadoctor](https://github.com/darktable-org/darktable/blob/master/src/iop/negadoctor.c)**: darktable’s film-negative inversion module, © darktable developers, GPL-3.0-or-later.
+
+The auto crop function is heavily inspired by:
 - **[NegPy](https://github.com/marcinz606/NegPy)** by Marcin Zawalski, GPL-3.0.
