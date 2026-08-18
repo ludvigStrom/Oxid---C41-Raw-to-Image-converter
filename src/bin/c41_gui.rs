@@ -270,6 +270,8 @@ struct ImageEntry {
     dust_grain: f32,
     dust_grain_size: f32,
     dust_infill: DustInfill,
+    dust_tile: u8,
+    dust_match: f32,
     dust_overlay_texture: Option<egui::TextureHandle>,
     dust_overlay_dirty: bool,
 }
@@ -1117,6 +1119,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.dust_heal.grain.to_bits().hash(&mut h);
     opts.dust_heal.grain_sigma.to_bits().hash(&mut h);
     opts.dust_heal.infill.hash(&mut h);
+    opts.dust_heal.tile.hash(&mut h);
+    opts.dust_heal.match_loosen.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -1956,6 +1960,8 @@ fn image_entry(
         dust_grain: 1.5,
         dust_grain_size: 2.0,
         dust_infill: DustInfill::Telea,
+        dust_tile: 3,
+        dust_match: 2.5,
         dust_overlay_texture: None,
         dust_overlay_dirty: true,
     }
@@ -2132,6 +2138,8 @@ fn entry_dust_heal(entry: &ImageEntry) -> DustHealParams {
         grain: entry.dust_grain,
         grain_sigma: 2.0,
         infill: entry.dust_infill,
+        tile: entry.dust_tile,
+        match_loosen: entry.dust_match,
     }
 }
 
@@ -6421,6 +6429,11 @@ impl eframe::App for C41Gui {
                             ui.small("Grain is the high-pass of film next to the stroke. 1.0 is a 1:1 copy.");
                         }
                         DustInfill::WaveFunction => {
+                            let mut tile = entry.dust_tile as f32;
+                            theme::slider_row(ui, "Tile", &mut tile, 2.0..=5.0, 0);
+                            entry.dust_tile = tile.round().clamp(2.0, 5.0) as u8;
+                            theme::slider_row(ui, "Match", &mut entry.dust_match, 1.0..=4.0, 1);
+                            ui.small("Tile is patch size. Match is how far a neighbor may jump versus the film around the stroke.");
                             ui.small("Wave function copies nearby tiles into the hole. Grain is synthetic noise on top.");
                         }
                     }

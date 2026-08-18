@@ -89,6 +89,8 @@ pub fn hash_after_step3(
     opts.dust_heal.grain.to_bits().hash(&mut h);
     opts.dust_heal.grain_sigma.to_bits().hash(&mut h);
     opts.dust_heal.infill.hash(&mut h);
+    opts.dust_heal.tile.hash(&mut h);
+    opts.dust_heal.match_loosen.to_bits().hash(&mut h);
     h.finish()
 }
 

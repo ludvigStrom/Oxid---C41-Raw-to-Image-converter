@@ -270,6 +270,10 @@ pub struct DustHealParams {
     pub grain_sigma: f32,
     /// Infill algorithm.
     pub infill: DustInfill,
+    /// WFC tile edge length in pixels (2–5). Ignored by Telea.
+    pub tile: u8,
+    /// Multiplier on harvest neighbor SSD (1–4). Ignored by Telea.
+    pub match_loosen: f32,
 }
 
 impl Default for DustHealParams {
@@ -280,6 +284,8 @@ impl Default for DustHealParams {
             grain: 1.5,
             grain_sigma: 2.0,
             infill: DustInfill::Telea,
+            tile: 3,
+            match_loosen: 2.5,
         }
     }
 }
@@ -292,6 +298,8 @@ impl DustHealParams {
         self.grain.to_bits().hash(&mut h);
         self.grain_sigma.to_bits().hash(&mut h);
         self.infill.hash(&mut h);
+        self.tile.hash(&mut h);
+        self.match_loosen.to_bits().hash(&mut h);
         h.finish()
     }
 }
@@ -362,7 +370,17 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
     }
 
     if params.infill == DustInfill::WaveFunction {
-        crate::dust_wfc::heal_wfc(image, &tight, &dilated, &alpha, grain_amount, w, h);
+        crate::dust_wfc::heal_wfc(
+            image,
+            &tight,
+            &dilated,
+            &alpha,
+            grain_amount,
+            params.tile,
+            params.match_loosen,
+            w,
+            h,
+        );
         return;
     }
 
@@ -1492,6 +1510,7 @@ mod tests {
                 grain: 0.0,
                 grain_sigma: 0.8,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
 
@@ -1528,6 +1547,7 @@ mod tests {
                 grain: 0.0,
                 grain_sigma: 0.8,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
         assert!(
@@ -1611,6 +1631,7 @@ mod tests {
                 grain: 1.5,
                 grain_sigma: 0.8,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
         let c = hash_dust(
@@ -1627,9 +1648,25 @@ mod tests {
                 ..DustHealParams::default()
             },
         );
+        let e = hash_dust(
+            &strokes,
+            DustHealParams {
+                tile: 4,
+                ..DustHealParams::default()
+            },
+        );
+        let f = hash_dust(
+            &strokes,
+            DustHealParams {
+                match_loosen: 3.5,
+                ..DustHealParams::default()
+            },
+        );
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);
+        assert_ne!(a, e);
+        assert_ne!(a, f);
     }
 
     #[test]
@@ -1653,6 +1690,7 @@ mod tests {
                 grain: 0.0,
                 grain_sigma: 0.8,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
         assert!(
@@ -1684,6 +1722,7 @@ mod tests {
                 grain: 0.0,
                 grain_sigma: 0.8,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
 
@@ -1740,6 +1779,7 @@ mod tests {
                 grain: 0.0,
                 grain_sigma: 0.8,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
         let mut heavy = base.clone();
@@ -1752,6 +1792,7 @@ mod tests {
                 grain: 3.0,
                 grain_sigma: 0.8,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
 
@@ -1840,6 +1881,7 @@ mod tests {
                 grain: 0.0,
                 grain_sigma: 0.6,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
         let healed = img[(20, 21, 0)];
@@ -1870,6 +1912,7 @@ mod tests {
                 grain: 0.0,
                 grain_sigma: 0.8,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
         let v = img[(16, 16, 0)];
@@ -1954,6 +1997,7 @@ mod tests {
                 grain: 0.0,
                 grain_sigma: 2.0,
                 infill: DustInfill::Telea,
+                ..DustHealParams::default()
             },
         );
         let hole = plane_spread(&img, 17, 17, 19, 19);
