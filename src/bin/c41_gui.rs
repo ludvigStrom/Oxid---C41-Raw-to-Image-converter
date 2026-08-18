@@ -359,6 +359,12 @@ impl VisibleTileGrid {
         if self.tiles_fit {
             return true;
         }
+        // Fit views that exceed the cap still keep the first/last visible
+        // rows. Those were dropped first (farthest from center) and the CFA
+        // proxy showed through as a more-saturated strip.
+        if iy == self.iy0 || iy == self.iy1 {
+            return true;
+        }
         let cx = (self.ix0 + self.ix1) as f32 * 0.5;
         let cy = (self.iy0 + self.iy1) as f32 * 0.5;
         let d = (ix as f32 - cx).hypot(iy as f32 - cy);
@@ -1681,6 +1687,35 @@ fn rgb_u8_to_color_image(w: u32, h: u32, rgb: &[u8]) -> egui::ColorImage {
         .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
         .collect();
     egui::ColorImage { size, pixels }
+}
+
+/// Crop RGB to `uv` (0–1 of the buffer) so mipmaps do not average in the halo.
+/// Halo pixels sit at the crop edge and C-41-invert into a saturated strip.
+fn crop_rgb_u8_to_uv(w: u32, h: u32, rgb: &[u8], uv: egui::Rect) -> (u32, u32, Vec<u8>, egui::Rect) {
+    let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    if w == 0 || h == 0 || rgb.len() < w as usize * h as usize * 3 {
+        return (w, h, rgb.to_vec(), uv);
+    }
+    let x0 = (uv.min.x * w as f32)
+        .round()
+        .clamp(0.0, w.saturating_sub(1) as f32) as u32;
+    let y0 = (uv.min.y * h as f32)
+        .round()
+        .clamp(0.0, h.saturating_sub(1) as f32) as u32;
+    let x1 = (uv.max.x * w as f32).round().clamp((x0 + 1) as f32, w as f32) as u32;
+    let y1 = (uv.max.y * h as f32).round().clamp((y0 + 1) as f32, h as f32) as u32;
+    if x0 == 0 && y0 == 0 && x1 == w && y1 == h {
+        return (w, h, rgb.to_vec(), full);
+    }
+    let nw = x1 - x0;
+    let nh = y1 - y0;
+    let mut out = Vec::with_capacity(nw as usize * nh as usize * 3);
+    let stride = w as usize * 3;
+    for y in y0..y1 {
+        let s = y as usize * stride + x0 as usize * 3;
+        out.extend_from_slice(&rgb[s..s + nw as usize * 3]);
+    }
+    (nw, nh, out, full)
 }
 
 /// Pipeline geometry: rotate, then flip H, then flip V.
@@ -4609,7 +4644,9 @@ impl eframe::App for C41Gui {
                     self.tile_inflight = None;
                     if job.gen == self.tile_gen && job.index < self.images.len() {
                         let idx = job.index;
-                        let image = rgb_u8_to_color_image(job.w, job.h, &job.rgb);
+                        let (tw, th, rgb, tex_uv) =
+                            crop_rgb_u8_to_uv(job.w, job.h, &job.rgb, job.tex_uv);
+                        let image = rgb_u8_to_color_image(tw, th, &rgb);
                         let tex = ctx.load_texture(
                             format!("preview_tile_{}_{}_{}", idx, job.ix, job.iy),
                             image,
@@ -4621,7 +4658,7 @@ impl eframe::App for C41Gui {
                             options_hash: job.options_hash,
                             texture: tex,
                             uv: job.uv,
-                            tex_uv: job.tex_uv,
+                            tex_uv,
                         };
                         let cache = &mut self.images[idx].tile_cache;
                         cache.retain(|t| !(t.ix == tile.ix && t.iy == tile.iy));
@@ -8412,8 +8449,9 @@ impl eframe::App for C41Gui {
 #[cfg(test)]
 mod tile_grid_tests {
     use super::{
-        egui, preview_minify_texture_options, preview_pixel_scale, proxy_is_soft,
-        tile_range_intersecting, tile_texture_options, want_nearest_filter, PREVIEW_TILE_SIZE,
+        egui,         crop_rgb_u8_to_uv, preview_minify_texture_options, preview_pixel_scale, proxy_is_soft,
+        tile_range_intersecting, tile_texture_options, want_nearest_filter, VisibleTileGrid,
+        PREVIEW_TILE_MAX, PREVIEW_TILE_SIZE,
     };
 
     #[test]
@@ -8458,6 +8496,41 @@ mod tile_grid_tests {
         assert!(!want_nearest_filter(0.5));
         assert!(!want_nearest_filter(1.0));
         assert!(want_nearest_filter(1.1));
+    }
+
+    #[test]
+    fn crop_rgb_drops_halo_and_uses_full_tex_uv() {
+        let w = 4u32;
+        let h = 3u32;
+        let mut rgb = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                rgb.extend_from_slice(&[x as u8, y as u8, 9]);
+            }
+        }
+        let uv = egui::Rect::from_min_max(egui::pos2(0.25, 1.0 / 3.0), egui::pos2(0.75, 2.0 / 3.0));
+        let (cw, ch, out, tex_uv) = crop_rgb_u8_to_uv(w, h, &rgb, uv);
+        assert_eq!((cw, ch), (2, 1));
+        assert_eq!(out, vec![1, 1, 9, 2, 1, 9]);
+        assert_eq!(tex_uv.min, egui::pos2(0.0, 0.0));
+        assert_eq!(tex_uv.max, egui::pos2(1.0, 1.0));
+    }
+
+    #[test]
+    fn over_cap_grid_keeps_visible_top_and_bottom_rows() {
+        let g = VisibleTileGrid {
+            ix0: 0,
+            iy0: 0,
+            ix1: 20,
+            iy1: 12,
+            opt_hash: 0,
+            proxy_soft: true,
+            tiles_fit: false,
+            core_n: PREVIEW_TILE_MAX + 40,
+        };
+        assert!(g.is_priority(10, 0), "top row must stay");
+        assert!(g.is_priority(10, 12), "bottom row must stay");
+        assert!(g.is_priority(10, 6), "center stays");
     }
 
     #[test]
