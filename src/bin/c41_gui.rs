@@ -1886,6 +1886,23 @@ fn want_nearest_filter(pixel_scale: f32) -> bool {
     pixel_scale > 1.0
 }
 
+/// LINEAR + mipmaps so minifying a grainy buffer averages like a downscaled export.
+/// Without mipmaps, bilinear picks isolated grain peaks and the grain looks bigger.
+fn preview_minify_texture_options() -> egui::TextureOptions {
+    egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear))
+}
+
+/// Full-res tiles: NEAREST when magnified (true 1:1), LINEAR + mipmaps when
+/// minified so fit / zoom-out does not alias film grain into sparkle.
+fn tile_texture_options() -> egui::TextureOptions {
+    egui::TextureOptions {
+        magnification: egui::TextureFilter::Nearest,
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+    }
+}
+
 /// Working preview size: canvas × DPI, floored at 640 and capped at 1920×1200.
 /// Zoom does not change this; full-res mode requests the export pipeline size.
 fn preview_working_limits(canvas: Option<(f32, f32)>, ppp: f32, full_res: bool) -> (u32, u32) {
@@ -4477,12 +4494,12 @@ impl eframe::App for C41Gui {
                     self.preview_job_live = false;
                     if job.gen == self.preview_gen && job.index < self.images.len() {
                         let idx = job.index;
-                        // Fit / first frame: LINEAR. Draw path recreates if pixel scale needs NEAREST.
+                        // Fit / first frame: LINEAR + mipmaps. Draw path recreates if pixel scale needs NEAREST.
                         let image = rgb_u8_to_color_image(job.w, job.h, &job.rgb);
                         let tex = ctx.load_texture(
                             format!("preview_full_{}", idx),
                             image,
-                            egui::TextureOptions::LINEAR,
+                            preview_minify_texture_options(),
                         );
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_texture_nearest = false;
@@ -4596,7 +4613,7 @@ impl eframe::App for C41Gui {
                         let tex = ctx.load_texture(
                             format!("preview_tile_{}_{}_{}", idx, job.ix, job.iy),
                             image,
-                            egui::TextureOptions::NEAREST,
+                            tile_texture_options(),
                         );
                         let tile = PreviewTile {
                             ix: job.ix,
@@ -6877,7 +6894,7 @@ impl eframe::App for C41Gui {
                                 let tex_opts = if want_nearest {
                                     egui::TextureOptions::NEAREST
                                 } else {
-                                    egui::TextureOptions::LINEAR
+                                    preview_minify_texture_options()
                                 };
                                 let tex = ui.ctx().load_texture(
                                     format!("preview_full_{}", idx),
@@ -8395,8 +8412,8 @@ impl eframe::App for C41Gui {
 #[cfg(test)]
 mod tile_grid_tests {
     use super::{
-        preview_pixel_scale, proxy_is_soft, tile_range_intersecting, want_nearest_filter,
-        PREVIEW_TILE_SIZE,
+        egui, preview_minify_texture_options, preview_pixel_scale, proxy_is_soft,
+        tile_range_intersecting, tile_texture_options, want_nearest_filter, PREVIEW_TILE_SIZE,
     };
 
     #[test]
@@ -8441,5 +8458,16 @@ mod tile_grid_tests {
         assert!(!want_nearest_filter(0.5));
         assert!(!want_nearest_filter(1.0));
         assert!(want_nearest_filter(1.1));
+    }
+
+    #[test]
+    fn minify_preview_and_tiles_use_mipmaps() {
+        let preview = preview_minify_texture_options();
+        assert_eq!(preview.minification, egui::TextureFilter::Linear);
+        assert_eq!(preview.mipmap_mode, Some(egui::TextureFilter::Linear));
+        let tile = tile_texture_options();
+        assert_eq!(tile.magnification, egui::TextureFilter::Nearest);
+        assert_eq!(tile.minification, egui::TextureFilter::Linear);
+        assert_eq!(tile.mipmap_mode, Some(egui::TextureFilter::Linear));
     }
 }
