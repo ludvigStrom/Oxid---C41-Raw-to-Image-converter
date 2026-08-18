@@ -47,7 +47,7 @@ Launch Oxid (GPU-accelerated GUI):
 cargo guigpu
 ```
 
-This is an alias for `cargo run --release --bin c41-gui --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)). On macOS you can also build a signed installer with `scripts/release_pkg_notarize.sh` (see `.env.example`).
+This is an alias for `cargo run --release --bin Oxid --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)). On macOS you can also build a signed installer with `scripts/release_pkg_notarize.sh` (see `.env.example`).
 
 **CLI (convert subcommand):**
 
@@ -84,7 +84,7 @@ Prints rawloader metadata and sample pixel values without running the full pipel
 **GUI (CPU only):**
 
 ```bash
-cargo run --release --bin c41-gui --features gui
+cargo run --release --bin Oxid --features gui
 ```
 
 Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Prefer `cargo guigpu` for the GPU build. Oxid has three tabs: **Process** (main development with per-step checkboxes), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).

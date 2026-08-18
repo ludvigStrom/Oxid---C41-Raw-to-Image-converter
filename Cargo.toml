@@ -59,7 +59,7 @@ gui = ["eframe", "rfd", "arboard"]
 gpu = ["wgpu", "pollster", "bytemuck"]
 
 [[bin]]
-name = "c41-gui"
+name = "Oxid"
 path = "src/bin/c41_gui.rs"
 required-features = ["gui"]
 

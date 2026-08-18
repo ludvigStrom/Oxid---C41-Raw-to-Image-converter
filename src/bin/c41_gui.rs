@@ -88,6 +88,10 @@ const DUST_EDIT_SHORTCUT: egui::KeyboardShortcut =
 const DUST_DISABLE_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::D);
 const DUST_BRUSH_RADIUS_MAX: f32 = 150.0;
+const APP_NAME: &str = "Oxid";
+/// First launch fills most of the display; width scales with the screen.
+const START_WINDOW_SCREEN_FRACTION: f32 = 0.80;
+const START_WINDOW_MIN: [f32; 2] = [960.0, 640.0];
 const ICON_LOGO_PATH: &str = "logo.png";
 /// Extensions accepted by Add image… and drag-and-drop.
 const IMPORT_EXTENSIONS: &[&str] = &[
@@ -162,12 +166,66 @@ fn app_icon_data() -> Option<egui::IconData> {
     })
 }
 
+fn primary_screen_size() -> Option<(f32, f32)> {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct CgPoint {
+            x: f64,
+            y: f64,
+        }
+        #[repr(C)]
+        struct CgSize {
+            width: f64,
+            height: f64,
+        }
+        #[repr(C)]
+        struct CgRect {
+            origin: CgPoint,
+            size: CgSize,
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayBounds(display: u32) -> CgRect;
+        }
+        let bounds = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+        let w = bounds.size.width as f32;
+        let h = bounds.size.height as f32;
+        return (w > 1.0 && h > 1.0).then_some((w, h));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        extern "C" {
+            fn GetSystemMetrics(index: i32) -> i32;
+        }
+        const SM_CXSCREEN: i32 = 0;
+        const SM_CYSCREEN: i32 = 1;
+        let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        return (w > 1 && h > 1).then_some((w as f32, h as f32));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+fn startup_window_size() -> [f32; 2] {
+    let (screen_w, screen_h) = primary_screen_size().unwrap_or((1440.0, 900.0));
+    let width = (screen_w * START_WINDOW_SCREEN_FRACTION).max(START_WINDOW_MIN[0]);
+    let height = (screen_h * START_WINDOW_SCREEN_FRACTION).max(START_WINDOW_MIN[1]);
+    [width.min(screen_w), height.min(screen_h)]
+}
+
 #[derive(Default)]
 struct UiIcons {
     logo: Option<egui::TextureHandle>,
 }
 
 fn main() -> eframe::Result<()> {
+    let start_size = startup_window_size();
     let mut native_options = if cfg!(target_os = "macos") {
         let mut o = eframe::NativeOptions::default();
         o.viewport = o
@@ -187,11 +245,21 @@ fn main() -> eframe::Result<()> {
         o.viewport = o.viewport.clone().with_drag_and_drop(true);
         o
     };
+    native_options.centered = true;
+    // Always use the large default; a persisted tiny window would otherwise win.
+    native_options.persist_window = false;
+    native_options.viewport = native_options
+        .viewport
+        .clone()
+        .with_title(APP_NAME)
+        .with_app_id(APP_NAME)
+        .with_inner_size(start_size)
+        .with_min_inner_size(START_WINDOW_MIN);
     if let Some(icon) = app_icon_data() {
         native_options.viewport = native_options.viewport.clone().with_icon(Arc::new(icon));
     }
     eframe::run_native(
-        "Oxid",
+        APP_NAME,
         native_options,
         Box::new(|cc| {
             theme::install_fonts(&cc.egui_ctx);
@@ -345,6 +413,76 @@ fn tile_range_intersecting(
     (ix0, iy0, ix1, iy1)
 }
 
+/// If the visible UV includes an image edge, that sensor tile row/column
+/// must be in the grid. Preview-UV × sensor-size can start at iy=1.
+fn include_image_edge_tiles(
+    uv_l: f32,
+    uv_t: f32,
+    uv_r: f32,
+    uv_b: f32,
+    tiles_x: i32,
+    tiles_y: i32,
+    ix0: i32,
+    iy0: i32,
+    ix1: i32,
+    iy1: i32,
+) -> (i32, i32, i32, i32) {
+    let last_x = tiles_x.saturating_sub(1);
+    let last_y = tiles_y.saturating_sub(1);
+    let ix0 = if uv_l <= 0.05 { 0 } else { ix0 }.clamp(0, last_x);
+    let iy0 = if uv_t <= 0.05 { 0 } else { iy0 }.clamp(0, last_y);
+    let ix1 = if uv_r >= 0.95 { last_x } else { ix1 }.clamp(ix0, last_x);
+    let iy1 = if uv_b >= 0.95 { last_y } else { iy1 }.clamp(iy0, last_y);
+    (ix0, iy0, ix1, iy1)
+}
+
+/// Active crop in `current_w × current_h` pixels, or `None` when crop is off.
+fn scaled_crop_px(
+    entry: &ImageEntry,
+    current_w: u32,
+    current_h: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if !entry.options.apply_crop || current_w == 0 || current_h == 0 {
+        return None;
+    }
+    let rect = entry.options.crop_rect?;
+    let s = scale_rect_to_size(rect, entry.options.crop_rect_reference_size, current_w, current_h);
+    Some((s.x, s.y, s.width.max(1), s.height.max(1)))
+}
+
+/// Tile grid origin and size in oriented-sensor pixels.
+/// When crop is on, (0,0) is the crop origin so the first row is the frame,
+/// not the rebate above it.
+fn tile_space(entry: &ImageEntry, ow: u32, oh: u32) -> (u32, u32, u32, u32) {
+    scaled_crop_px(entry, ow, oh).unwrap_or((0, 0, ow, oh))
+}
+
+/// Preview layout size: crop size when crop is on, else the full buffer.
+fn preview_display_wh(entry: &ImageEntry, tex_w: u32, tex_h: u32) -> (u32, u32) {
+    let view_rot = preview_view_rotation(entry);
+    let (fw, fh) = if view_rot == 90 || view_rot == 270 {
+        (tex_h, tex_w)
+    } else {
+        (tex_w, tex_h)
+    };
+    if let Some((_, _, cw, ch)) = scaled_crop_px(entry, fw, fh) {
+        (cw.max(1), ch.max(1))
+    } else {
+        (fw, fh)
+    }
+}
+
+/// Crop in 0–1 of the preview texture, or `None` when crop is off.
+fn preview_crop_uv(entry: &ImageEntry, tex_w: u32, tex_h: u32) -> Option<egui::Rect> {
+    let (x, y, w, h) = scaled_crop_px(entry, tex_w, tex_h)?;
+    let tw = (tex_w as f32).max(1.0);
+    let th = (tex_h as f32).max(1.0);
+    Some(egui::Rect::from_min_max(
+        egui::pos2(x as f32 / tw, y as f32 / th),
+        egui::pos2((x + w) as f32 / tw, (y + h) as f32 / th),
+    ))
+}
+
 impl VisibleTileGrid {
     fn contains(&self, ix: i32, iy: i32) -> bool {
         ix >= self.ix0 && ix <= self.ix1 && iy >= self.iy0 && iy <= self.iy1
@@ -359,10 +497,10 @@ impl VisibleTileGrid {
         if self.tiles_fit {
             return true;
         }
-        // Fit views that exceed the cap still keep the first/last visible
-        // rows. Those were dropped first (farthest from center) and the CFA
-        // proxy showed through as a more-saturated strip.
-        if iy == self.iy0 || iy == self.iy1 {
+        // Fit views that exceed the cap still keep the visible silhouette.
+        // Those tiles are farthest from center and were dropped first, so
+        // the CFA proxy showed through as a more-saturated L-shaped band.
+        if iy == self.iy0 || iy == self.iy1 || ix == self.ix0 || ix == self.ix1 {
             return true;
         }
         let cx = (self.ix0 + self.ix1) as f32 * 0.5;
@@ -1696,14 +1834,19 @@ fn crop_rgb_u8_to_uv(w: u32, h: u32, rgb: &[u8], uv: egui::Rect) -> (u32, u32, V
     if w == 0 || h == 0 || rgb.len() < w as usize * h as usize * 3 {
         return (w, h, rgb.to_vec(), uv);
     }
+    // Ceil/floor so a rounded halo texel cannot leak into the uploaded crop.
     let x0 = (uv.min.x * w as f32)
-        .round()
+        .ceil()
         .clamp(0.0, w.saturating_sub(1) as f32) as u32;
     let y0 = (uv.min.y * h as f32)
-        .round()
+        .ceil()
         .clamp(0.0, h.saturating_sub(1) as f32) as u32;
-    let x1 = (uv.max.x * w as f32).round().clamp((x0 + 1) as f32, w as f32) as u32;
-    let y1 = (uv.max.y * h as f32).round().clamp((y0 + 1) as f32, h as f32) as u32;
+    let x1 = (uv.max.x * w as f32)
+        .floor()
+        .clamp((x0 + 1) as f32, w as f32) as u32;
+    let y1 = (uv.max.y * h as f32)
+        .floor()
+        .clamp((y0 + 1) as f32, h as f32) as u32;
     if x0 == 0 && y0 == 0 && x1 == w && y1 == h {
         return (w, h, rgb.to_vec(), full);
     }
@@ -1936,6 +2079,56 @@ fn tile_texture_options() -> egui::TextureOptions {
         wrap_mode: egui::TextureWrapMode::ClampToEdge,
         mipmap_mode: Some(egui::TextureFilter::Linear),
     }
+}
+
+/// Place a tile on the virtual image, then expand / snap so a 1 px proxy
+/// sliver cannot show on the top or right after pixel snapping.
+fn tile_draw_rect(vir_rect: egui::Rect, uv: egui::Rect, img_w: f32, img_h: f32) -> egui::Rect {
+    let mut r = egui::Rect::from_min_max(
+        egui::pos2(
+            vir_rect.left() + uv.min.x * img_w,
+            vir_rect.top() + uv.min.y * img_h,
+        ),
+        egui::pos2(
+            vir_rect.left() + uv.max.x * img_w,
+            vir_rect.top() + uv.max.y * img_h,
+        ),
+    );
+    r = r.expand(2.0);
+    if uv.min.x <= 1e-5 {
+        r.min.x = vir_rect.left();
+    }
+    if uv.min.y <= 1e-5 {
+        r.min.y = vir_rect.top();
+    }
+    if uv.max.x >= 1.0 - 1e-5 {
+        r.max.x = vir_rect.right();
+    }
+    if uv.max.y >= 1.0 - 1e-5 {
+        r.max.y = vir_rect.bottom();
+    }
+    r
+}
+
+fn visible_priority_tiles_ready(
+    tiles: &[PreviewTile],
+    grid: &VisibleTileGrid,
+    opt_hash: u64,
+) -> bool {
+    for iy in grid.iy0..=grid.iy1 {
+        for ix in grid.ix0..=grid.ix1 {
+            if !grid.is_priority(ix, iy) {
+                continue;
+            }
+            if !tiles
+                .iter()
+                .any(|t| t.ix == ix && t.iy == iy && t.options_hash == opt_hash)
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Working preview size: canvas × DPI, floored at 640 and capped at 1920×1200.
@@ -2895,13 +3088,14 @@ impl C41Gui {
         if ow == 0 || oh == 0 {
             return;
         }
-        let x = (ix as u32).saturating_mul(PREVIEW_TILE_SIZE);
-        let y = (iy as u32).saturating_mul(PREVIEW_TILE_SIZE);
-        if x >= ow || y >= oh {
+        let (origin_x, origin_y, grid_w, grid_h) = tile_space(entry, ow, oh);
+        let x = origin_x.saturating_add((ix as u32).saturating_mul(PREVIEW_TILE_SIZE));
+        let y = origin_y.saturating_add((iy as u32).saturating_mul(PREVIEW_TILE_SIZE));
+        if x >= ow || y >= oh || x >= origin_x + grid_w || y >= origin_y + grid_h {
             return;
         }
-        let tw = PREVIEW_TILE_SIZE.min(ow - x);
-        let th = PREVIEW_TILE_SIZE.min(oh - y);
+        let tw = PREVIEW_TILE_SIZE.min(ow - x).min(origin_x + grid_w - x);
+        let th = PREVIEW_TILE_SIZE.min(oh - y).min(origin_y + grid_h - y);
         let halo = if entry.options.bujack_enabled {
             PREVIEW_TILE_HALO.max(entry.options.bujack_radius.ceil() as u32 + 8)
         } else {
@@ -2927,25 +3121,36 @@ impl C41Gui {
         };
         // Place the requested 512² (plus 1 px overlap), not the halo crop.
         // Drawing the halo showed C-41 edge fringes as red seams.
+        // Display UV is in tile-space (crop when active, else full sensor).
         let owf = ow as f32;
         let ohf = oh as f32;
+        let gwf = (grid_w as f32).max(1.0);
+        let ghf = (grid_h as f32).max(1.0);
         let overlap = 1.0;
-        let inner_l = (x as f32 - overlap).max(0.0) / owf;
-        let inner_t = (y as f32 - overlap).max(0.0) / ohf;
-        let inner_r = ((x + tw) as f32 + overlap).min(owf) / owf;
-        let inner_b = ((y + th) as f32 + overlap).min(ohf) / ohf;
+        let sensor_l = (x as f32 - overlap).max(0.0);
+        let sensor_t = (y as f32 - overlap).max(0.0);
+        let sensor_r = ((x + tw) as f32 + overlap).min(owf);
+        let sensor_b = ((y + th) as f32 + overlap).min(ohf);
+        let inner_l = ((sensor_l - origin_x as f32) / gwf).clamp(0.0, 1.0);
+        let inner_t = ((sensor_t - origin_y as f32) / ghf).clamp(0.0, 1.0);
+        let inner_r = ((sensor_r - origin_x as f32) / gwf).clamp(0.0, 1.0);
+        let inner_b = ((sensor_b - origin_y as f32) / ghf).clamp(0.0, 1.0);
         let uv =
             egui::Rect::from_min_max(egui::pos2(inner_l, inner_t), egui::pos2(inner_r, inner_b));
+        let sensor_uv_l = sensor_l / owf;
+        let sensor_uv_t = sensor_t / ohf;
+        let sensor_uv_r = sensor_r / owf;
+        let sensor_uv_b = sensor_b / ohf;
         let crop_uw = (crop.uv_right - crop.uv_left).max(1e-6);
         let crop_uh = (crop.uv_bottom - crop.uv_top).max(1e-6);
         let tex_uv = egui::Rect::from_min_max(
             egui::pos2(
-                ((inner_l - crop.uv_left) / crop_uw).clamp(0.0, 1.0),
-                ((inner_t - crop.uv_top) / crop_uh).clamp(0.0, 1.0),
+                ((sensor_uv_l - crop.uv_left) / crop_uw).clamp(0.0, 1.0),
+                ((sensor_uv_t - crop.uv_top) / crop_uh).clamp(0.0, 1.0),
             ),
             egui::pos2(
-                ((inner_r - crop.uv_left) / crop_uw).clamp(0.0, 1.0),
-                ((inner_b - crop.uv_top) / crop_uh).clamp(0.0, 1.0),
+                ((sensor_uv_r - crop.uv_left) / crop_uw).clamp(0.0, 1.0),
+                ((sensor_uv_b - crop.uv_top) / crop_uh).clamp(0.0, 1.0),
             ),
         );
         let mut options = self.bake_preview_options(entry);
@@ -3020,19 +3225,15 @@ impl C41Gui {
         if ow == 0 || oh == 0 || canvas_w <= 0.0 || canvas_h <= 0.0 {
             return None;
         }
-        // Same display size as the draw path (swap when a 90° view rotation is pending).
-        let view_rot = preview_view_rotation(entry);
-        let (full_w, full_h) = if view_rot == 90 || view_rot == 270 {
-            (*tex_h, *tex_w)
-        } else {
-            (*tex_w, *tex_h)
-        };
+        // Same display size as the draw path (crop when active).
+        let (full_w, full_h) = preview_display_wh(entry, *tex_w, *tex_h);
         let full_w_f = (full_w as f32).max(1.0);
         let full_h_f = (full_h as f32).max(1.0);
         let zoom = entry.preview_zoom.max(1.0);
         let base_scale = (canvas_w / full_w_f).min(canvas_h / full_h_f);
         let img_w = (full_w_f * base_scale * zoom).max(1.0);
         let img_h = (full_h_f * base_scale * zoom).max(1.0);
+        let (_, _, grid_w, grid_h) = tile_space(entry, ow, oh);
         // Same canvas ∩ virtual-image UV as the draw path.
         let pan_x = entry.preview_pan.x.clamp(0.0, 1.0);
         let pan_y = entry.preview_pan.y.clamp(0.0, 1.0);
@@ -3057,16 +3258,19 @@ impl C41Gui {
         let uv_t = (uv_t - pad_v).clamp(0.0, 1.0);
         let uv_r = (uv_r + pad_u).clamp(0.0, 1.0);
         let uv_b = (uv_b + pad_v).clamp(0.0, 1.0);
-        let tiles_x = ((ow + PREVIEW_TILE_SIZE - 1) / PREVIEW_TILE_SIZE) as i32;
-        let tiles_y = ((oh + PREVIEW_TILE_SIZE - 1) / PREVIEW_TILE_SIZE) as i32;
-        let (ix0, iy0, ix1, iy1) = tile_range_intersecting(
-            uv_l * ow as f32,
-            uv_t * oh as f32,
-            uv_r * ow as f32,
-            uv_b * oh as f32,
+        let tiles_x = ((grid_w + PREVIEW_TILE_SIZE - 1) / PREVIEW_TILE_SIZE) as i32;
+        let tiles_y = ((grid_h + PREVIEW_TILE_SIZE - 1) / PREVIEW_TILE_SIZE) as i32;
+        let (raw_ix0, raw_iy0, raw_ix1, raw_iy1) = tile_range_intersecting(
+            uv_l * grid_w as f32,
+            uv_t * grid_h as f32,
+            uv_r * grid_w as f32,
+            uv_b * grid_h as f32,
             PREVIEW_TILE_SIZE as f32,
             tiles_x,
             tiles_y,
+        );
+        let (ix0, iy0, ix1, iy1) = include_image_edge_tiles(
+            uv_l, uv_t, uv_r, uv_b, tiles_x, tiles_y, raw_ix0, raw_iy0, raw_ix1, raw_iy1,
         );
         let nx = (ix1 - ix0 + 1) as usize;
         let ny = (iy1 - iy0 + 1) as usize;
@@ -3143,10 +3347,15 @@ impl C41Gui {
                 if self.tile_inflight == Some((idx, ix, iy)) {
                     continue;
                 }
-                if self
-                    .tile_failed
-                    .iter()
-                    .any(|&(g, fx, fy)| g == self.tile_gen && fx == ix && fy == iy)
+                // Silhouette tiles are retried — a single failed top-row crop
+                // used to blacklist the whole row for the rest of the gen.
+                let on_silhouette =
+                    iy == 0 || iy == grid.iy0 || iy == grid.iy1 || ix == grid.ix0 || ix == grid.ix1;
+                if !on_silhouette
+                    && self
+                        .tile_failed
+                        .iter()
+                        .any(|&(g, fx, fy)| g == self.tile_gen && fx == ix && fy == iy)
                 {
                     continue;
                 }
@@ -3157,7 +3366,14 @@ impl C41Gui {
                 if have {
                     continue;
                 }
-                let d = (ix as f32 - cx).hypot(iy as f32 - cy);
+                let mut d = (ix as f32 - cx).hypot(iy as f32 - cy);
+                // Top sensor row first. Center-first left it last, and a
+                // wrong iy0=1 meant it was never in the set at all.
+                if iy == 0 || iy == grid.iy0 {
+                    d -= 1.0e6;
+                } else if iy == grid.iy1 || ix == grid.ix0 || ix == grid.ix1 {
+                    d -= 1.0e5;
+                }
                 if best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
                     best = Some((ix, iy, d));
                 }
@@ -6877,16 +7093,12 @@ impl eframe::App for C41Gui {
 
                         // Extract image dims with fallback so the layout is stable before
                         // the first preview arrives (no jump when data loads in).
-                        let view_rot = preview_view_rotation(&self.images[idx]);
+                        let _view_rot = preview_view_rotation(&self.images[idx]);
                         let desired_orient = preview_desired_orient(&self.images[idx]);
                         let baked_orient = preview_baked_orient(&self.images[idx]);
                         let geometry_pending = preview_view_geometry_pending(&self.images[idx]);
                         let (full_w, full_h) = if let Some((w, h, _)) = &self.images[idx].preview_full_rgb {
-                            if view_rot == 90 || view_rot == 270 {
-                                (*h, *w)
-                            } else {
-                                (*w, *h)
-                            }
+                            preview_display_wh(&self.images[idx], *w, *h)
                         } else {
                             self.images[idx].preview_input_size
                                 .map(|s| (s[0], s[1]))
@@ -6959,15 +7171,50 @@ impl eframe::App for C41Gui {
                         // Draw image only when texture is ready.
                         if let Some(tex) = &tex_opt {
                             let vis_rect = vir_rect.intersect(canvas_rect);
-                            if vis_rect.width() > 0.0 && vis_rect.height() > 0.0 {
+                            self.preview_canvas_pointer = canvas_resp.is_pointer_button_down_on()
+                                || canvas_resp.dragged();
+                            let grid_now = self.visible_tile_grid(idx);
+                            let proxy_soft = grid_now.as_ref().map(|g| g.proxy_soft).unwrap_or(false);
+                            let hide_tiles = !proxy_soft
+                                || self.preview_options_dirty(idx)
+                                || geometry_pending;
+                            let opt_hash = self.images[idx].preview_options_hash;
+                            let tiles_complete = !hide_tiles
+                                && grid_now.as_ref().is_some_and(|g| {
+                                    visible_priority_tiles_ready(
+                                        &self.images[idx].tile_cache,
+                                        g,
+                                        opt_hash,
+                                    )
+                                });
+                            // Once 1:1 tiles cover the view, skip the CFA proxy.
+                            // It is more saturated; a 1 px gap on the top/right
+                            // used to read as a chroma band after tiles finished.
+                            if vis_rect.width() > 0.0 && vis_rect.height() > 0.0 && !tiles_complete {
                                 let uv_l = (vis_rect.left()   - vir_rect.left()) / img_w;
                                 let uv_t = (vis_rect.top()    - vir_rect.top())  / img_h;
                                 let uv_r = (vis_rect.right()  - vir_rect.left()) / img_w;
                                 let uv_b = (vis_rect.bottom() - vir_rect.top())  / img_h;
-                                let uv = egui::Rect::from_min_max(
+                                let display_uv = egui::Rect::from_min_max(
                                     egui::pos2(uv_l, uv_t),
                                     egui::pos2(uv_r, uv_b),
                                 );
+                                let uv = if let Some((tw, th, _)) = self.images[idx].preview_full_rgb {
+                                    preview_crop_uv(&self.images[idx], tw, th).map(|c| {
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(
+                                                c.min.x + display_uv.min.x * (c.max.x - c.min.x),
+                                                c.min.y + display_uv.min.y * (c.max.y - c.min.y),
+                                            ),
+                                            egui::pos2(
+                                                c.min.x + display_uv.max.x * (c.max.x - c.min.x),
+                                                c.min.y + display_uv.max.y * (c.max.y - c.min.y),
+                                            ),
+                                        )
+                                    }).unwrap_or(display_uv)
+                                } else {
+                                    display_uv
+                                };
                                 paint_preview_image(
                                     &canvas_painter,
                                     tex.id(),
@@ -6980,13 +7227,6 @@ impl eframe::App for C41Gui {
 
                             // 1:1 tiles stay up during click / pan / zoom (UVs follow the view).
                             // Hide only when develop options or rotate/flip are stale.
-                            self.preview_canvas_pointer = canvas_resp.is_pointer_button_down_on()
-                                || canvas_resp.dragged();
-                            let grid_now = self.visible_tile_grid(idx);
-                            let proxy_soft = grid_now.as_ref().map(|g| g.proxy_soft).unwrap_or(false);
-                            let hide_tiles = !proxy_soft
-                                || self.preview_options_dirty(idx)
-                                || geometry_pending;
                             if !hide_tiles {
                                 let opt_hash = self.images[idx].preview_options_hash;
                                 for tile in &self.images[idx].tile_cache {
@@ -6995,16 +7235,7 @@ impl eframe::App for C41Gui {
                                     }
                                     // Draw by screen intersection, not grid.contains —
                                     // a tight grid used to hide real edge tiles after zoom.
-                                    let tile_rect = egui::Rect::from_min_max(
-                                        egui::pos2(
-                                            vir_rect.left() + tile.uv.min.x * img_w,
-                                            vir_rect.top() + tile.uv.min.y * img_h,
-                                        ),
-                                        egui::pos2(
-                                            vir_rect.left() + tile.uv.max.x * img_w,
-                                            vir_rect.top() + tile.uv.max.y * img_h,
-                                        ),
-                                    );
+                                    let tile_rect = tile_draw_rect(vir_rect, tile.uv, img_w, img_h);
                                     let tvis = tile_rect.intersect(canvas_rect);
                                     if tvis.width() <= 0.0 || tvis.height() <= 0.0 {
                                         continue;
@@ -7684,8 +7915,10 @@ impl eframe::App for C41Gui {
                         }
 
                         // Crop overlay: project image-space crop rect through camera.
-                        // Always draw the mask; only draw interactive handles in the Input tab.
-                        if self.mode == UIMode::Process {
+                        // Skip when apply_crop — the view is already the crop.
+                        if self.mode == UIMode::Process
+                            && !self.images.get(idx).is_some_and(|e| e.options.apply_crop)
+                        {
                             if let Some(entry) = self.images.get_mut(idx) {
                                 let opts = &mut entry.options;
                                 if opts.apply_crop {
@@ -8449,9 +8682,10 @@ impl eframe::App for C41Gui {
 #[cfg(test)]
 mod tile_grid_tests {
     use super::{
-        egui,         crop_rgb_u8_to_uv, preview_minify_texture_options, preview_pixel_scale, proxy_is_soft,
-        tile_range_intersecting, tile_texture_options, want_nearest_filter, VisibleTileGrid,
-        PREVIEW_TILE_MAX, PREVIEW_TILE_SIZE,
+        crop_rgb_u8_to_uv, egui, include_image_edge_tiles, preview_minify_texture_options,
+        preview_pixel_scale, proxy_is_soft, tile_draw_rect, tile_range_intersecting,
+        tile_texture_options, want_nearest_filter, VisibleTileGrid, PREVIEW_TILE_MAX,
+        PREVIEW_TILE_SIZE,
     };
 
     #[test]
@@ -8517,7 +8751,7 @@ mod tile_grid_tests {
     }
 
     #[test]
-    fn over_cap_grid_keeps_visible_top_and_bottom_rows() {
+    fn over_cap_grid_keeps_visible_silhouette() {
         let g = VisibleTileGrid {
             ix0: 0,
             iy0: 0,
@@ -8530,7 +8764,27 @@ mod tile_grid_tests {
         };
         assert!(g.is_priority(10, 0), "top row must stay");
         assert!(g.is_priority(10, 12), "bottom row must stay");
+        assert!(g.is_priority(0, 6), "left column must stay");
+        assert!(g.is_priority(20, 6), "right column must stay");
         assert!(g.is_priority(10, 6), "center stays");
+    }
+
+    #[test]
+    fn fit_view_always_includes_top_sensor_row() {
+        // Simulates preview-UV mapping that skipped row 0 (iy0=1).
+        let (ix0, iy0, ix1, iy1) =
+            include_image_edge_tiles(0.0, 0.0, 1.0, 1.0, 12, 8, 0, 1, 11, 7);
+        assert_eq!(iy0, 0, "image top must request sensor row 0");
+        assert_eq!((ix0, ix1, iy1), (0, 11, 7));
+    }
+
+    #[test]
+    fn tile_draw_rect_snaps_to_virtual_image_edges() {
+        let vir = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 80.0));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let r = tile_draw_rect(vir, uv, 100.0, 60.0);
+        assert_eq!(r.min, vir.min);
+        assert_eq!(r.max, vir.max);
     }
 
     #[test]
