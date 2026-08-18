@@ -87,6 +87,7 @@ const DUST_EDIT_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::E);
 const DUST_DISABLE_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::D);
+const DUST_BRUSH_RADIUS_MAX: f32 = 150.0;
 const ICON_LOGO_PATH: &str = "logo.png";
 /// Extensions accepted by Add image… and drag-and-drop.
 const IMPORT_EXTENSIONS: &[&str] = &[
@@ -684,8 +685,8 @@ struct C41Gui {
     rect_dragging: bool,
     /// True while painting or erasing on the Dust tab.
     dust_painting: bool,
-    /// Ctrl+drag brush resize: (radius at press, pointer at press).
-    dust_brush_resize: Option<(f32, egui::Pos2)>,
+    /// Ctrl+drag brush resize: (radius at press, locked pointer, accumulated delta).
+    dust_brush_resize: Option<(f32, egui::Pos2, f32)>,
     /// True while the preview is being panned (left/middle drag).
     preview_view_dragging: bool,
     /// True while the pointer is down on the preview canvas (not a slider).
@@ -2565,6 +2566,20 @@ impl C41Gui {
             };
         }
         true
+    }
+
+    fn begin_dust_brush_resize(&mut self, ctx: &egui::Context, radius: f32, pos: egui::Pos2) {
+        self.dust_brush_resize = Some((radius, pos, 0.0));
+        self.dust_painting = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+    }
+
+    fn end_dust_brush_resize(&mut self, ctx: &egui::Context) {
+        if self.dust_brush_resize.take().is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        }
     }
 
     fn ensure_sensor_and_scene_stats(&mut self, index: usize) -> bool {
@@ -6502,7 +6517,7 @@ impl eframe::App for C41Gui {
                             ui,
                             "Size",
                             &mut entry.dust_brush_radius,
-                            1.0..=80.0,
+                            1.0..=DUST_BRUSH_RADIUS_MAX,
                             0,
                         );
                     });
@@ -6511,23 +6526,42 @@ impl eframe::App for C41Gui {
                         entry.dust_brush_radius = (entry.dust_brush_radius - 1.0).max(1.0);
                     }
                     if ui.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
-                        entry.dust_brush_radius = (entry.dust_brush_radius + 1.0).min(80.0);
+                        entry.dust_brush_radius =
+                            (entry.dust_brush_radius + 1.0).min(DUST_BRUSH_RADIUS_MAX);
                     }
                     if !ui.ctx().wants_keyboard_input() {
                         if ui.input_mut(|i| i.consume_shortcut(&DUST_DISABLE_SHORTCUT)) {
                             entry.dust_view = DustView::Disable;
                             self.dust_painting = false;
-                            self.dust_brush_resize = None;
+                            if self.dust_brush_resize.take().is_some() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                                    egui::CursorGrab::None,
+                                ));
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                            }
                         }
                         if ui.input_mut(|i| i.consume_shortcut(&DUST_PROCESS_SHORTCUT)) {
                             entry.dust_view = DustView::Process;
                             self.dust_painting = false;
-                            self.dust_brush_resize = None;
+                            if self.dust_brush_resize.take().is_some() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                                    egui::CursorGrab::None,
+                                ));
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                            }
                         }
                         if ui.input_mut(|i| i.consume_shortcut(&DUST_EDIT_SHORTCUT)) {
                             entry.dust_view = DustView::Edit;
                             self.dust_painting = false;
-                            self.dust_brush_resize = None;
+                            if self.dust_brush_resize.take().is_some() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                                    egui::CursorGrab::None,
+                                ));
+                                ui.ctx()
+                                    .send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                            }
                         }
                         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
                         {
@@ -6983,18 +7017,31 @@ impl eframe::App for C41Gui {
                                 && !space_down;
                             if dust_tool.is_some() && primary_down && ctrl_down {
                                 if let Some(pos) = canvas_resp.interact_pointer_pos() {
-                                    if let Some((start_r, start_pos)) = self.dust_brush_resize {
-                                        let delta = (pos.x - start_pos.x) - (pos.y - start_pos.y);
-                                        self.images[idx].dust_brush_radius =
-                                            (start_r + delta * 0.15).clamp(1.0, 80.0);
+                                    if let Some((start_r, _, accum)) = self.dust_brush_resize {
+                                        let d = ui.input(|i| i.pointer.delta());
+                                        let accum = accum + d.x - d.y;
+                                        if let Some((_, _, acc)) = self.dust_brush_resize.as_mut() {
+                                            *acc = accum;
+                                        }
+                                        self.images[idx].dust_brush_radius = (start_r
+                                            + accum * 0.15)
+                                            .clamp(1.0, DUST_BRUSH_RADIUS_MAX);
+                                        ui.ctx().send_viewport_cmd(
+                                            egui::ViewportCommand::CursorGrab(
+                                                egui::CursorGrab::Locked,
+                                            ),
+                                        );
+                                        ui.ctx().request_repaint();
                                     } else {
-                                        self.dust_brush_resize =
-                                            Some((self.images[idx].dust_brush_radius, pos));
-                                        self.dust_painting = false;
+                                        self.begin_dust_brush_resize(
+                                            ui.ctx(),
+                                            self.images[idx].dust_brush_radius,
+                                            pos,
+                                        );
                                     }
                                 }
                             } else if self.dust_brush_resize.is_some() && !primary_down {
-                                self.dust_brush_resize = None;
+                                self.end_dust_brush_resize(ui.ctx());
                             }
                             let pointer_down = dust_tool.is_some()
                                 && primary_down
@@ -7133,8 +7180,8 @@ impl eframe::App for C41Gui {
 
                             let hovering_canvas = canvas_resp.hovered();
                             let tool_armed = dust_tool.is_some();
-                            if hovering_canvas {
-                                if space_down {
+                            if hovering_canvas || self.dust_brush_resize.is_some() {
+                                if space_down && self.dust_brush_resize.is_none() {
                                     let grabbing = ui.input(|i| i.pointer.primary_down())
                                         || ui.input(|i| i.pointer.middle_down());
                                     ui.ctx().set_cursor_icon(if grabbing {
@@ -7147,9 +7194,15 @@ impl eframe::App for C41Gui {
                                 }
                             }
                             if !space_down && tool_armed {
-                                if let Some(pos) = canvas_resp.hover_pos().filter(|p| {
-                                    vir_rect.contains(*p) && canvas_rect.contains(*p)
-                                }) {
+                                let pos = self
+                                    .dust_brush_resize
+                                    .map(|(_, lock, _)| lock)
+                                    .or_else(|| {
+                                        canvas_resp.hover_pos().filter(|p| {
+                                            vir_rect.contains(*p) && canvas_rect.contains(*p)
+                                        })
+                                    });
+                                if let Some(pos) = pos {
                                     let (src_w, _) =
                                         dust_source_wh(&self.images[idx], full_w, full_h);
                                     let radius_screen = self.images[idx].dust_brush_radius
@@ -7177,7 +7230,7 @@ impl eframe::App for C41Gui {
                             }
                         } else if self.dust_painting || self.dust_brush_resize.is_some() {
                             self.dust_painting = false;
-                            self.dust_brush_resize = None;
+                            self.end_dust_brush_resize(ui.ctx());
                         }
 
                         ui.add_space(IMAGE_PREVIEW_BOTTOM_PADDING);
