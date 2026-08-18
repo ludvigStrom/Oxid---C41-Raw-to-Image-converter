@@ -239,6 +239,24 @@ pub fn crop_mask_uv(
 const MASK_ON: u8 = 16;
 const MIN_SPECK_AREA: usize = 2;
 
+/// How the punched hole is filled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DustInfill {
+    #[default]
+    Telea,
+    WaveFunction,
+}
+
+impl DustInfill {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Telea => "Telea",
+            Self::WaveFunction => "Wave function",
+        }
+    }
+}
+
 /// Rim fade and grain for [`apply_dust_removal_with`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DustHealParams {
@@ -246,10 +264,12 @@ pub struct DustHealParams {
     pub detect: f32,
     /// Fade width in pixels *outside* the painted hole (0 = core only).
     pub feather: f32,
-    /// Scale on nearby high-pass grain (0 = structure only, 1 = 1:1 copy).
+    /// Telea: scale on nearby high-pass. WFC: synthetic grain amplitude.
     pub grain: f32,
     /// Unused by heal (σ is estimated from nearby film). Kept for cache-hash compatibility.
     pub grain_sigma: f32,
+    /// Infill algorithm.
+    pub infill: DustInfill,
 }
 
 impl Default for DustHealParams {
@@ -259,6 +279,7 @@ impl Default for DustHealParams {
             feather: 6.0,
             grain: 1.5,
             grain_sigma: 2.0,
+            infill: DustInfill::Telea,
         }
     }
 }
@@ -270,6 +291,7 @@ impl DustHealParams {
         self.feather.to_bits().hash(&mut h);
         self.grain.to_bits().hash(&mut h);
         self.grain_sigma.to_bits().hash(&mut h);
+        self.infill.hash(&mut h);
         h.finish()
     }
 }
@@ -287,8 +309,8 @@ pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
     apply_dust_removal_with(image, mask, DustHealParams::default());
 }
 
-/// Replace dust in the painted stroke. Punched Telea / H+V on a masked
-/// low-pass; grain is the high-pass of nearby film.
+/// Replace dust in the painted stroke. Telea or wave-function infill,
+/// then a soft-alpha composite.
 pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     if mask.is_empty() {
         return;
@@ -337,6 +359,11 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
         } else if dilated[i] {
             alpha[i] = 1.0 - smoothstep(0.0, feather, dist_from_tight[i]);
         }
+    }
+
+    if params.infill == DustInfill::WaveFunction {
+        crate::dust_wfc::heal_wfc(image, &tight, &dilated, &alpha, grain_amount, w, h);
+        return;
     }
 
     let grain_sigma = estimate_grain_sigma(image, &dilated, w, h);
@@ -825,7 +852,7 @@ fn erode(on: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
     out
 }
 
-fn dilate(on: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
+pub(crate) fn dilate(on: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
     let mut out = on.to_vec();
     if radius <= 0 {
         return out;
@@ -854,7 +881,7 @@ fn dilate(on: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
     out
 }
 
-fn connected_components(on: &[bool], w: usize, h: usize) -> Vec<Vec<usize>> {
+pub(crate) fn connected_components(on: &[bool], w: usize, h: usize) -> Vec<Vec<usize>> {
     let mut seen = vec![false; w * h];
     let mut out = Vec::new();
     for start in 0..w * h {
@@ -952,7 +979,7 @@ fn heal_component(
     }
 }
 
-fn pixel_hash(x: usize, y: usize) -> u32 {
+pub(crate) fn pixel_hash(x: usize, y: usize) -> u32 {
     let mut n = (x as u32)
         .wrapping_mul(0x9E37_79B9)
         ^ (y as u32).wrapping_mul(0x85EB_CA6B);
@@ -987,7 +1014,7 @@ fn residual_at(
     ))
 }
 
-fn rgb_at(img: &Array3<f32>, x: usize, y: usize) -> (f32, f32, f32) {
+pub(crate) fn rgb_at(img: &Array3<f32>, x: usize, y: usize) -> (f32, f32, f32) {
     (img[(y, x, 0)], img[(y, x, 1)], img[(y, x, 2)])
 }
 
@@ -1188,7 +1215,7 @@ fn normal_t(t: &[f32], x: usize, y: usize, w: usize, h: usize) -> (f32, f32) {
 }
 
 /// Weighted H+V lerp of known endpoints. Shorter span wins.
-fn structure_hv(
+pub(crate) fn structure_hv(
     low: &Array3<f32>,
     hole: &[bool],
     x: usize,
@@ -1464,6 +1491,7 @@ mod tests {
                 feather: 2.0,
                 grain: 0.0,
                 grain_sigma: 0.8,
+                infill: DustInfill::Telea,
             },
         );
 
@@ -1499,6 +1527,7 @@ mod tests {
                 feather: 1.0,
                 grain: 0.0,
                 grain_sigma: 0.8,
+                infill: DustInfill::Telea,
             },
         );
         assert!(
@@ -1581,6 +1610,7 @@ mod tests {
                 feather: 4.0,
                 grain: 1.5,
                 grain_sigma: 0.8,
+                infill: DustInfill::Telea,
             },
         );
         let c = hash_dust(
@@ -1590,8 +1620,16 @@ mod tests {
                 ..DustHealParams::default()
             },
         );
+        let d = hash_dust(
+            &strokes,
+            DustHealParams {
+                infill: DustInfill::WaveFunction,
+                ..DustHealParams::default()
+            },
+        );
         assert_ne!(a, b);
         assert_ne!(a, c);
+        assert_ne!(a, d);
     }
 
     #[test]
@@ -1614,6 +1652,7 @@ mod tests {
                 feather: 2.0,
                 grain: 0.0,
                 grain_sigma: 0.8,
+                infill: DustInfill::Telea,
             },
         );
         assert!(
@@ -1644,6 +1683,7 @@ mod tests {
                 feather: 12.0,
                 grain: 0.0,
                 grain_sigma: 0.8,
+                infill: DustInfill::Telea,
             },
         );
 
@@ -1699,6 +1739,7 @@ mod tests {
                 feather: 2.0,
                 grain: 0.0,
                 grain_sigma: 0.8,
+                infill: DustInfill::Telea,
             },
         );
         let mut heavy = base.clone();
@@ -1710,6 +1751,7 @@ mod tests {
                 feather: 2.0,
                 grain: 3.0,
                 grain_sigma: 0.8,
+                infill: DustInfill::Telea,
             },
         );
 
@@ -1797,6 +1839,7 @@ mod tests {
                 feather: 0.0,
                 grain: 0.0,
                 grain_sigma: 0.6,
+                infill: DustInfill::Telea,
             },
         );
         let healed = img[(20, 21, 0)];
@@ -1826,6 +1869,7 @@ mod tests {
                 feather: 2.0,
                 grain: 0.0,
                 grain_sigma: 0.8,
+                infill: DustInfill::Telea,
             },
         );
         let v = img[(16, 16, 0)];
@@ -1909,12 +1953,89 @@ mod tests {
                 feather: 2.0,
                 grain: 0.0,
                 grain_sigma: 2.0,
+                infill: DustInfill::Telea,
             },
         );
         let hole = plane_spread(&img, 17, 17, 19, 19);
         assert!(
             hole < surround * 0.55,
             "grain=0 should leave a smooth hole, not dragged edge grains (hole={hole}, surround={surround})"
+        );
+    }
+
+    fn wfc_params(feather: f32, grain: f32) -> DustHealParams {
+        DustHealParams {
+            infill: DustInfill::WaveFunction,
+            feather,
+            grain,
+            ..DustHealParams::default()
+        }
+    }
+
+    #[test]
+    fn wfc_replaces_white_speck() {
+        let mut img = gradient_image(40, 40);
+        img[(20, 20, 0)] = 1.0;
+        img[(20, 20, 1)] = 1.0;
+        img[(20, 20, 2)] = 1.0;
+        img[(20, 21, 0)] = 1.0;
+        img[(21, 20, 0)] = 1.0;
+
+        let mut mask = DustMask::new(40, 40);
+        stamp_disc(&mut mask, 20.0, 20.0, 5.0, DustTool::Pen);
+        apply_dust_removal_with(&mut img, &mask, wfc_params(2.0, 0.0));
+        assert!(
+            img[(20, 20, 0)] < 0.85,
+            "WFC (or H+V fallback) must replace the speck (got {})",
+            img[(20, 20, 0)]
+        );
+    }
+
+    #[test]
+    fn wfc_leaves_outside_paint() {
+        let mut img = gradient_image(48, 48);
+        let outside = img[(24, 5, 0)];
+        img[(24, 24, 0)] = 1.0;
+        img[(24, 24, 1)] = 1.0;
+        img[(24, 24, 2)] = 1.0;
+
+        let mut mask = DustMask::new(48, 48);
+        stamp_disc(&mut mask, 24.0, 24.0, 8.0, DustTool::Pen);
+        apply_dust_removal_with(&mut img, &mask, wfc_params(2.0, 0.0));
+        assert!(
+            (img[(24, 5, 0)] - outside).abs() < 1e-5,
+            "pixels outside the paint must stay"
+        );
+    }
+
+    #[test]
+    fn wfc_grain_raises_core_spread() {
+        let mut base = gradient_image(40, 40);
+        for y in 0..40 {
+            for x in 0..40 {
+                let n = ((x * 17 + y * 31) % 7) as f32 * 0.01 - 0.03;
+                base[(y, x, 0)] = (base[(y, x, 0)] + n).clamp(0.0, 1.0);
+                base[(y, x, 1)] = (base[(y, x, 1)] + n).clamp(0.0, 1.0);
+                base[(y, x, 2)] = (base[(y, x, 2)] + n).clamp(0.0, 1.0);
+            }
+        }
+        base[(20, 20, 0)] = 1.0;
+        base[(20, 20, 1)] = 1.0;
+        base[(20, 20, 2)] = 1.0;
+
+        let mut mask = DustMask::new(40, 40);
+        stamp_disc(&mut mask, 20.0, 20.0, 5.0, DustTool::Pen);
+
+        let mut none = base.clone();
+        apply_dust_removal_with(&mut none, &mask, wfc_params(2.0, 0.0));
+        let mut heavy = base.clone();
+        apply_dust_removal_with(&mut heavy, &mask, wfc_params(2.0, 3.0));
+
+        let spread_none = heal_core_spread(&none, 20, 20);
+        let spread_heavy = heal_core_spread(&heavy, 20, 20);
+        assert!(
+            spread_heavy > spread_none + 0.004,
+            "synthetic grain should raise core spread (none={spread_none}, heavy={spread_heavy})"
         );
     }
 }

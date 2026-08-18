@@ -24,7 +24,8 @@ use c41_raw_tool::{
     process_one_to_preview_with_cache_on_progress, rasterize_strokes, raw_reader,
     reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path, save_develop_preset,
     save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export, AutoCropResult, AutoTuneResult,
-    CachedSensor, CropConfidence, DminMode, DustHealParams, DustMask, DustStroke, DustTool,
+    CachedSensor, CropConfidence, DminMode, DustHealParams, DustInfill, DustMask, DustStroke,
+    DustTool,
     ExportCancelled, ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage,
     PipelineOptions, PreviewSceneStats, PreviewStepCache, ProjectDust, ProjectExportFormat,
     ProjectImage, Rect, TiffFormat, UndoManager, WbMode, PROJECT_EXTENSION,
@@ -268,6 +269,7 @@ struct ImageEntry {
     dust_feather: f32,
     dust_grain: f32,
     dust_grain_size: f32,
+    dust_infill: DustInfill,
     dust_overlay_texture: Option<egui::TextureHandle>,
     dust_overlay_dirty: bool,
 }
@@ -1114,6 +1116,7 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.dust_heal.feather.to_bits().hash(&mut h);
     opts.dust_heal.grain.to_bits().hash(&mut h);
     opts.dust_heal.grain_sigma.to_bits().hash(&mut h);
+    opts.dust_heal.infill.hash(&mut h);
     h.finish()
 }
 
@@ -1952,6 +1955,7 @@ fn image_entry(
         dust_feather: 6.0,
         dust_grain: 1.5,
         dust_grain_size: 2.0,
+        dust_infill: DustInfill::Telea,
         dust_overlay_texture: None,
         dust_overlay_dirty: true,
     }
@@ -2127,6 +2131,7 @@ fn entry_dust_heal(entry: &ImageEntry) -> DustHealParams {
         feather: entry.dust_feather,
         grain: entry.dust_grain,
         grain_sigma: 2.0,
+        infill: entry.dust_infill,
     }
 }
 
@@ -6398,9 +6403,27 @@ impl eframe::App for C41Gui {
 
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("Heal").strong());
+                    egui::ComboBox::from_label("Infill")
+                        .selected_text(entry.dust_infill.label())
+                        .show_ui(ui, |ui| {
+                            for value in [DustInfill::Telea, DustInfill::WaveFunction] {
+                                ui.selectable_value(
+                                    &mut entry.dust_infill,
+                                    value,
+                                    value.label(),
+                                );
+                            }
+                        });
                     theme::slider_row(ui, "Feather", &mut entry.dust_feather, 0.0..=12.0, 0);
                     theme::slider_row(ui, "Grain", &mut entry.dust_grain, 0.0..=3.0, 1);
-                    ui.small("Grain is the high-pass of film next to the stroke. 1.0 is a 1:1 copy; raise it if the hole looks too smooth.");
+                    match entry.dust_infill {
+                        DustInfill::Telea => {
+                            ui.small("Grain is the high-pass of film next to the stroke. 1.0 is a 1:1 copy.");
+                        }
+                        DustInfill::WaveFunction => {
+                            ui.small("Wave function copies nearby tiles into the hole. Grain is synthetic noise on top.");
+                        }
+                    }
                     ui.small("The pen is the hole. Size the brush to the speck; feather fades the rim.");
                     ui.add_space(8.0);
                     let has_mask = !entry.dust_strokes.is_empty();

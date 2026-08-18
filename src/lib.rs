@@ -26,6 +26,7 @@ pub mod demosaic;
 pub mod density_ops;
 pub mod dmin;
 pub mod dust;
+mod dust_wfc;
 pub mod exr_export;
 pub mod flat_field;
 pub mod inversion;
@@ -52,7 +53,8 @@ pub use auto_crop::{
 };
 pub use dust::{
     apply_dust_removal, apply_dust_removal_with, crop_mask_uv, hash_dust, hash_strokes,
-    rasterize_strokes, stamp_disc, DustHealParams, DustMask, DustStroke, DustTool, ProjectDust,
+    rasterize_strokes, stamp_disc, DustHealParams, DustInfill, DustMask, DustStroke, DustTool,
+    ProjectDust,
 };
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{
