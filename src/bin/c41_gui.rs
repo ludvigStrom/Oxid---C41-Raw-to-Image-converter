@@ -21,7 +21,7 @@ use c41_raw_tool::{
     demosaic, detect_crop, dmin, hash_dust, load_develop_preset, load_flat_field_linear,
     load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
     process_export_jobs,     process_one_to_preview, process_one_to_preview_with_cache,
-    process_one_to_preview_with_cache_on_progress, rasterize_strokes,
+    process_one_to_preview_with_cache_on_progress, rasterize_strokes, rasterize_strokes_uv,
     raw_reader,
     reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path, save_develop_preset,
     save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export, AutoCropResult, AutoTuneResult,
@@ -346,6 +346,9 @@ struct ImageEntry {
     dust_match: f32,
     dust_overlay_texture: Option<egui::TextureHandle>,
     dust_overlay_dirty: bool,
+    /// Develop crop (reference pixels) the working mask was rasterized for.
+    /// `None` = full frame. Rebuild when this diverges from the current crop.
+    dust_mask_crop: Option<(u32, u32, u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,7 +377,7 @@ struct VisibleTileGrid {
     ix1: i32,
     iy1: i32,
     opt_hash: u64,
-    /// True when 1:1 tiles should run (always: the proxy is CFA-downsampled).
+    /// True when 1:1 tiles should run (view is at least 100%).
     proxy_soft: bool,
     /// True when the core view fits in `PREVIEW_TILE_MAX` (we can cover it).
     tiles_fit: bool,
@@ -2056,10 +2059,11 @@ fn preview_pixel_scale(base_scale: f32, zoom: f32) -> f32 {
     base_scale * zoom
 }
 
-/// Tiles run at every zoom, including fit / zoom-out. The screen proxy is
-/// always softer than full-res tiles (CFA box-downsample before demosaic).
-fn proxy_is_soft(_pixel_scale: f32) -> bool {
-    true
+/// Tiles only when the view is at least 1 preview pixel per screen pixel.
+/// Fit / zoom-out uses the mipmapped proxy. Drawing minified 1:1 tiles with
+/// their own mip chains made each tile pop in as a soft, off-color square.
+fn proxy_is_soft(pixel_scale: f32) -> bool {
+    pixel_scale >= 1.0
 }
 
 /// NEAREST only when magnifying the proxy; LINEAR for fit / minification.
@@ -2073,14 +2077,14 @@ fn preview_minify_texture_options() -> egui::TextureOptions {
     egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear))
 }
 
-/// Full-res tiles: NEAREST when magnified (true 1:1), LINEAR + mipmaps when
-/// minified so fit / zoom-out does not alias film grain into sparkle.
+/// Full-res tiles are shown at 1:1 and closer. No mipmaps: a per-tile mip
+/// chain averages each 512² independently and the patch pops when it lands.
 fn tile_texture_options() -> egui::TextureOptions {
     egui::TextureOptions {
         magnification: egui::TextureFilter::Nearest,
         minification: egui::TextureFilter::Linear,
         wrap_mode: egui::TextureWrapMode::ClampToEdge,
-        mipmap_mode: Some(egui::TextureFilter::Linear),
+        mipmap_mode: None,
     }
 }
 
@@ -2238,6 +2242,7 @@ fn image_entry(
         dust_match: 2.0,
         dust_overlay_texture: None,
         dust_overlay_dirty: true,
+        dust_mask_crop: None,
     }
 }
 
@@ -2371,6 +2376,7 @@ fn rebuild_dust_raster(entry: &mut ImageEntry) {
     if w == 0 || h == 0 {
         entry.dust_mask.clear();
         entry.dust_mask_size = (0, 0);
+        entry.dust_mask_crop = None;
         entry.dust_overlay_dirty = true;
         return;
     }
@@ -2382,6 +2388,7 @@ fn rebuild_dust_raster(entry: &mut ImageEntry) {
     );
     entry.dust_mask = mask.data;
     entry.dust_mask_size = (w, h);
+    entry.dust_mask_crop = None;
     entry.dust_overlay_dirty = true;
 }
 
@@ -2390,6 +2397,72 @@ fn dust_source_wh(entry: &ImageEntry, preview_w: u32, preview_h: u32) -> (f32, f
         .raw_source_size
         .map(|[w, h]| (w as f32, h as f32))
         .unwrap_or((preview_w.max(1) as f32, preview_h.max(1) as f32))
+}
+
+/// Map a crop-relative display pixel into dust reference (full-sensor) space.
+fn display_to_dust_ref(
+    ix: f32,
+    iy: f32,
+    disp_w: f32,
+    disp_h: f32,
+    rw: u32,
+    rh: u32,
+    crop: Option<(u32, u32, u32, u32)>,
+) -> (f32, f32) {
+    let dw = disp_w.max(1.0);
+    let dh = disp_h.max(1.0);
+    if let Some((cx, cy, cw, ch)) = crop {
+        (
+            cx as f32 + ix * cw as f32 / dw,
+            cy as f32 + iy * ch as f32 / dh,
+        )
+    } else {
+        (ix * rw as f32 / dw, iy * rh as f32 / dh)
+    }
+}
+
+/// Inverse of [`display_to_dust_ref`].
+fn dust_ref_to_display(
+    px: f32,
+    py: f32,
+    disp_w: f32,
+    disp_h: f32,
+    rw: u32,
+    rh: u32,
+    crop: Option<(u32, u32, u32, u32)>,
+) -> (f32, f32) {
+    let dw = disp_w.max(1.0);
+    let dh = disp_h.max(1.0);
+    if let Some((cx, cy, cw, ch)) = crop {
+        (
+            (px - cx as f32) * dw / (cw as f32).max(1.0),
+            (py - cy as f32) * dh / (ch as f32).max(1.0),
+        )
+    } else {
+        (
+            px * dw / (rw as f32).max(1.0),
+            py * dh / (rh as f32).max(1.0),
+        )
+    }
+}
+
+/// Brush radius in display (working-mask) pixels.
+fn dust_stamp_radius_display(
+    brush: f32,
+    src_w: f32,
+    src_h: f32,
+    rw: u32,
+    rh: u32,
+    disp_w: f32,
+    crop: Option<(u32, u32, u32, u32)>,
+) -> f32 {
+    let radius_ref =
+        brush * ((rw as f32 / src_w.max(1.0)) + (rh as f32 / src_h.max(1.0))) * 0.5;
+    let span = crop
+        .map(|(_, _, cw, _)| cw as f32)
+        .unwrap_or(rw as f32)
+        .max(1.0);
+    radius_ref * disp_w.max(1.0) / span
 }
 
 fn ensure_dust_working_mask(entry: &mut ImageEntry, w: u32, h: u32) {
@@ -2406,17 +2479,33 @@ fn ensure_dust_working_mask(entry: &mut ImageEntry, w: u32, h: u32) {
     if entry.dust_reference_size.is_none() {
         entry.dust_reference_size = Some((w, h));
     }
-    if entry.dust_mask_size == (w, h) && entry.dust_mask.len() == w as usize * h as usize {
+    let ref_size = entry.dust_reference_size.unwrap_or((w, h));
+    let want_crop = scaled_crop_px(entry, ref_size.0, ref_size.1);
+    if entry.dust_mask_size == (w, h)
+        && entry.dust_mask.len() == w as usize * h as usize
+        && entry.dust_mask_crop == want_crop
+    {
         return;
     }
-    let mask = rasterize_strokes(
-        &entry.dust_strokes,
-        w,
-        h,
-        entry.dust_reference_size.unwrap_or((w, h)),
-    );
+    let mask = if let Some((cx, cy, cw, ch)) = want_crop {
+        let wf = (ref_size.0 as f32).max(1.0);
+        let hf = (ref_size.1 as f32).max(1.0);
+        rasterize_strokes_uv(
+            &entry.dust_strokes,
+            ref_size,
+            cx as f32 / wf,
+            cy as f32 / hf,
+            (cx + cw) as f32 / wf,
+            (cy + ch) as f32 / hf,
+            w,
+            h,
+        )
+    } else {
+        rasterize_strokes(&entry.dust_strokes, w, h, ref_size)
+    };
     entry.dust_mask = mask.data;
     entry.dust_mask_size = (w, h);
+    entry.dust_mask_crop = want_crop;
     entry.dust_overlay_dirty = true;
 }
 
@@ -7377,9 +7466,10 @@ impl eframe::App for C41Gui {
                                         let (rw, rh) = entry
                                             .dust_reference_size
                                             .unwrap_or((src_w as u32, src_h as u32));
-                                        let sx = rw as f32 / full_w_f;
-                                        let sy = rh as f32 / full_h_f;
-                                        let pt = (ix * sx, iy * sy);
+                                        let crop = scaled_crop_px(entry, rw, rh);
+                                        let pt = display_to_dust_ref(
+                                            ix, iy, full_w_f, full_h_f, rw, rh, crop,
+                                        );
                                         let radius_ref = entry.dust_brush_radius
                                             * ((rw as f32 / src_w) + (rh as f32 / src_h))
                                             * 0.5;
@@ -7388,7 +7478,9 @@ impl eframe::App for C41Gui {
                                         } else {
                                             entry.dust_strokes.last().and_then(|s| {
                                                 s.points.last().copied().map(|(px, py)| {
-                                                    (px / sx, py / sy)
+                                                    dust_ref_to_display(
+                                                        px, py, full_w_f, full_h_f, rw, rh, crop,
+                                                    )
                                                 })
                                             })
                                         };
@@ -7416,9 +7508,15 @@ impl eframe::App for C41Gui {
                                             height: entry.dust_mask_size.1,
                                             data: std::mem::take(&mut entry.dust_mask),
                                         };
-                                        let (src_w, _) = dust_source_wh(entry, full_w, full_h);
-                                        let radius = entry.dust_brush_radius
-                                            * (full_w_f / src_w.max(1.0));
+                                        let radius = dust_stamp_radius_display(
+                                            entry.dust_brush_radius,
+                                            src_w,
+                                            src_h,
+                                            rw,
+                                            rh,
+                                            full_w_f,
+                                            crop,
+                                        );
                                         if let Some((ox, oy)) = prev_img {
                                             let dx = ix - ox;
                                             let dy = iy - oy;
@@ -7523,10 +7621,21 @@ impl eframe::App for C41Gui {
                                         })
                                     });
                                 if let Some(pos) = pos {
-                                    let (src_w, _) =
-                                        dust_source_wh(&self.images[idx], full_w, full_h);
-                                    let radius_screen = self.images[idx].dust_brush_radius
-                                        * (img_w / src_w.max(1.0));
+                                    let entry = &self.images[idx];
+                                    let (src_w, src_h) = dust_source_wh(entry, full_w, full_h);
+                                    let (rw, rh) = entry
+                                        .dust_reference_size
+                                        .unwrap_or((src_w as u32, src_h as u32));
+                                    let radius_display = dust_stamp_radius_display(
+                                        entry.dust_brush_radius,
+                                        src_w,
+                                        src_h,
+                                        rw,
+                                        rh,
+                                        full_w_f,
+                                        scaled_crop_px(entry, rw, rh),
+                                    );
+                                    let radius_screen = radius_display * (img_w / full_w_f);
                                     let eraser = dust_tool == Some(DustTool::Eraser);
                                     let color = if eraser {
                                         DUST_ERASER_RED
@@ -8717,10 +8826,10 @@ impl eframe::App for C41Gui {
 #[cfg(test)]
 mod tile_grid_tests {
     use super::{
-        crop_rgb_u8_to_uv, egui, include_image_edge_tiles, preview_minify_texture_options,
-        preview_pixel_scale, proxy_is_soft, tile_draw_rect, tile_range_intersecting,
-        tile_texture_options, want_nearest_filter, VisibleTileGrid, PREVIEW_TILE_MAX,
-        PREVIEW_TILE_SIZE,
+        crop_rgb_u8_to_uv, display_to_dust_ref, dust_ref_to_display, dust_stamp_radius_display,
+        egui, include_image_edge_tiles, preview_minify_texture_options, preview_pixel_scale,
+        proxy_is_soft, tile_draw_rect, tile_range_intersecting, tile_texture_options,
+        want_nearest_filter, VisibleTileGrid, PREVIEW_TILE_MAX, PREVIEW_TILE_SIZE,
     };
 
     #[test]
@@ -8751,12 +8860,12 @@ mod tile_grid_tests {
     }
 
     #[test]
-    fn tiles_on_at_fit_and_100_and_110_percent() {
-        assert!(proxy_is_soft(0.25), "fit / zoom-out must request 1:1 tiles");
-        assert!(proxy_is_soft(0.99));
+    fn tiles_off_when_minified_on_at_100_and_110_percent() {
+        assert!(!proxy_is_soft(0.25), "fit / zoom-out uses the mipmapped proxy");
+        assert!(!proxy_is_soft(0.99));
         assert!(proxy_is_soft(1.0), "100% must request 1:1 tiles");
         assert!(proxy_is_soft(1.1), "110% must request 1:1 tiles");
-        assert!(proxy_is_soft(preview_pixel_scale(0.25, 1.0)));
+        assert!(!proxy_is_soft(preview_pixel_scale(0.25, 1.0)));
         assert!(proxy_is_soft(preview_pixel_scale(0.5, 2.0)));
     }
 
@@ -8814,6 +8923,24 @@ mod tile_grid_tests {
     }
 
     #[test]
+    fn dust_display_maps_through_crop_origin() {
+        // Display is the crop; strokes stay in full-sensor space.
+        let crop = Some((100, 400, 800, 600));
+        let (px, py) = display_to_dust_ref(0.0, 0.0, 800.0, 600.0, 2000, 2000, crop);
+        assert_eq!((px, py), (100.0, 400.0));
+        let (px, py) = display_to_dust_ref(400.0, 300.0, 800.0, 600.0, 2000, 2000, crop);
+        assert_eq!((px, py), (500.0, 700.0));
+        let back = dust_ref_to_display(500.0, 700.0, 800.0, 600.0, 2000, 2000, crop);
+        assert_eq!(back, (400.0, 300.0));
+        let full = display_to_dust_ref(400.0, 300.0, 800.0, 600.0, 2000, 2000, None);
+        assert_eq!(full, (1000.0, 1000.0));
+        let r_full = dust_stamp_radius_display(8.0, 2000.0, 2000.0, 2000, 2000, 800.0, None);
+        let r_crop = dust_stamp_radius_display(8.0, 2000.0, 2000.0, 2000, 2000, 800.0, crop);
+        assert!((r_full - 8.0 * 800.0 / 2000.0).abs() < 1e-4);
+        assert!((r_crop - 8.0).abs() < 1e-4, "crop view: 1 display px = 1 crop px");
+    }
+
+    #[test]
     fn tile_draw_rect_snaps_to_virtual_image_edges() {
         let vir = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 80.0));
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -8823,13 +8950,13 @@ mod tile_grid_tests {
     }
 
     #[test]
-    fn minify_preview_and_tiles_use_mipmaps() {
+    fn minify_preview_uses_mipmaps_tiles_do_not() {
         let preview = preview_minify_texture_options();
         assert_eq!(preview.minification, egui::TextureFilter::Linear);
         assert_eq!(preview.mipmap_mode, Some(egui::TextureFilter::Linear));
         let tile = tile_texture_options();
         assert_eq!(tile.magnification, egui::TextureFilter::Nearest);
         assert_eq!(tile.minification, egui::TextureFilter::Linear);
-        assert_eq!(tile.mipmap_mode, Some(egui::TextureFilter::Linear));
+        assert_eq!(tile.mipmap_mode, None);
     }
 }
