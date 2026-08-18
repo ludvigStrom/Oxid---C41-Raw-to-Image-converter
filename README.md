@@ -123,7 +123,7 @@ This runs 25 tests across 4 test suites (`gpu_step4`, `gpu_step5`, `gpu_step6`, 
 
 ## Shortcuts
 
-⌘ is Command on macOS and Ctrl on Windows/Linux. **Ctrl+Shift+D** always uses the Control key, including on macOS.
+⌘ is Command on macOS and Ctrl on Windows/Linux. **Ctrl+Shift+D** and **Ctrl+drag** always use the Control key, including on macOS.
 
 ### Project and edit
 
@@ -155,8 +155,10 @@ Only while **Process → Dust** is open.
 | E | Eraser |
 | Esc | Deselect pen and eraser |
 | [ / ] | Smaller / larger brush |
-| ⌘P | Process view (healed preview) |
+| Ctrl+drag | Change pen / eraser size |
+| ⌘D | Disable view (no heal) |
 | ⌘E | Edit view (mask overlay) |
+| ⌘P | Process view (healed preview) |
 | Space | Pan (hand cursor; does not paint) |
 
 ---
