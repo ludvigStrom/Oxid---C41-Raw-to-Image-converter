@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::dust::{DustHealParams, DustMask};
+use crate::dust::{DustHealParams, DustMask, DustStroke};
 use crate::tiff_export::TiffFormat;
 
 /// Rectangle for D-min sampling (pixel coordinates).
@@ -339,6 +339,15 @@ pub struct PipelineOptions {
     /// Working dust mask applied after load when `dust_mask_hash != 0`.
     #[serde(skip)]
     pub dust_mask: Option<Arc<DustMask>>,
+    /// Strokes replayed at the current buffer size so mask pixels match image pixels.
+    #[serde(skip)]
+    pub dust_strokes: Vec<DustStroke>,
+    /// Image size the stroke coordinates were painted in.
+    #[serde(skip)]
+    pub dust_reference_size: Option<(u32, u32)>,
+    /// Tile / crop UV (oriented full frame) when the buffer is a sub-rect.
+    #[serde(skip)]
+    pub dust_uv: Option<(f32, f32, f32, f32)>,
     /// Detect / feather / grain used when applying `dust_mask`.
     #[serde(skip)]
     pub dust_heal: DustHealParams,
@@ -444,6 +453,9 @@ impl Default for PipelineOptions {
             pinned_zone: None,
             dust_mask_hash: 0,
             dust_mask: None,
+            dust_strokes: Vec::new(),
+            dust_reference_size: None,
+            dust_uv: None,
             dust_heal: DustHealParams::default(),
         }
     }

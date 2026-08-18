@@ -21,7 +21,7 @@ use c41_raw_tool::{
     demosaic, detect_crop, dmin, hash_dust, load_develop_preset, load_flat_field_linear,
     load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
     process_export_jobs,     process_one_to_preview, process_one_to_preview_with_cache,
-    process_one_to_preview_with_cache_on_progress, rasterize_strokes, rasterize_strokes_uv,
+    process_one_to_preview_with_cache_on_progress, rasterize_strokes,
     raw_reader,
     reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path, save_develop_preset,
     save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export, AutoCropResult, AutoTuneResult,
@@ -1011,6 +1011,9 @@ fn default_options() -> PipelineOptions {
         pinned_zone: None,
         dust_mask_hash: 0,
         dust_mask: None,
+        dust_strokes: Vec::new(),
+        dust_reference_size: None,
+        dust_uv: None,
         dust_heal: DustHealParams::default(),
     }
 }
@@ -2123,29 +2126,6 @@ fn ensure_dust_working_mask(entry: &mut ImageEntry, w: u32, h: u32) {
     entry.dust_overlay_dirty = true;
 }
 
-fn dust_mask_from_entry(entry: &ImageEntry) -> Option<Arc<DustMask>> {
-    if entry.dust_strokes.is_empty() {
-        return None;
-    }
-    let (w, h) = entry
-        .dust_reference_size
-        .or(Some(entry.dust_mask_size))
-        .filter(|(w, h)| *w > 0 && *h > 0)?;
-    if entry.dust_mask_size == (w, h) && entry.dust_mask.len() == w as usize * h as usize {
-        return Some(Arc::new(DustMask {
-            width: w,
-            height: h,
-            data: entry.dust_mask.clone(),
-        }));
-    }
-    Some(Arc::new(rasterize_strokes(
-        &entry.dust_strokes,
-        w,
-        h,
-        entry.dust_reference_size.unwrap_or((w, h)),
-    )))
-}
-
 fn apply_project_dust(entry: &mut ImageEntry, dust: ProjectDust) {
     entry.dust_detect = dust.heal.detect;
     entry.dust_feather = dust.heal.feather;
@@ -2220,24 +2200,20 @@ fn attach_export_dust(opts: &mut PipelineOptions, entry: &ImageEntry) {
     if entry.dust_strokes.is_empty() {
         opts.dust_mask_hash = 0;
         opts.dust_mask = None;
-        return;
-    }
-    let (fw, fh) = oriented_export_size(entry)
-        .or(entry.dust_reference_size)
-        .unwrap_or((0, 0));
-    if fw == 0 || fh == 0 {
-        opts.dust_mask_hash = 0;
-        opts.dust_mask = None;
+        opts.dust_strokes.clear();
+        opts.dust_reference_size = None;
+        opts.dust_uv = None;
         return;
     }
     opts.dust_heal = entry_dust_heal(entry);
     opts.dust_mask_hash = hash_dust(&entry.dust_strokes, opts.dust_heal);
-    opts.dust_mask = Some(Arc::new(rasterize_strokes(
-        &entry.dust_strokes,
-        fw,
-        fh,
-        entry.dust_reference_size.unwrap_or((fw, fh)),
-    )));
+    opts.dust_strokes = entry.dust_strokes.clone();
+    opts.dust_reference_size = entry
+        .dust_reference_size
+        .or(oriented_export_size(entry))
+        .filter(|(w, h)| *w > 0 && *h > 0);
+    opts.dust_mask = None;
+    opts.dust_uv = None;
 }
 
 impl C41Gui {
@@ -2554,10 +2530,19 @@ impl C41Gui {
         options.dust_heal = entry_dust_heal(entry);
         if self.dust_should_apply(entry) {
             options.dust_mask_hash = hash_dust(&entry.dust_strokes, options.dust_heal);
-            options.dust_mask = dust_mask_from_entry(entry);
+            options.dust_strokes = entry.dust_strokes.clone();
+            options.dust_reference_size = entry
+                .dust_reference_size
+                .or(Some(entry.dust_mask_size))
+                .filter(|(w, h)| *w > 0 && *h > 0);
+            options.dust_mask = None;
+            options.dust_uv = None;
         } else {
             options.dust_mask_hash = 0;
             options.dust_mask = None;
+            options.dust_strokes.clear();
+            options.dust_reference_size = None;
+            options.dust_uv = None;
         }
         options
     }
@@ -2892,23 +2877,7 @@ impl C41Gui {
         let mut options = self.bake_preview_options(entry);
         options.verbose_debug = false;
         if self.dust_should_apply(entry) && !entry.dust_strokes.is_empty() {
-            let (fw, fh) = oriented_export_size(entry)
-                .or(entry.dust_reference_size)
-                .unwrap_or((ow, oh));
-            let pw = (((crop.uv_right - crop.uv_left) * fw as f32).round() as u32).max(1);
-            let ph = (((crop.uv_bottom - crop.uv_top) * fh as f32).round() as u32).max(1);
-            options.dust_heal = entry_dust_heal(entry);
-            options.dust_mask_hash = hash_dust(&entry.dust_strokes, options.dust_heal);
-            options.dust_mask = Some(Arc::new(rasterize_strokes_uv(
-                &entry.dust_strokes,
-                entry.dust_reference_size.unwrap_or((fw, fh)),
-                crop.uv_left,
-                crop.uv_top,
-                crop.uv_right,
-                crop.uv_bottom,
-                pw,
-                ph,
-            )));
+            options.dust_uv = Some((crop.uv_left, crop.uv_top, crop.uv_right, crop.uv_bottom));
         }
         // Same hash the cache lookup uses, so a finished tile is never "missing".
         let options_hash = entry.preview_options_hash;

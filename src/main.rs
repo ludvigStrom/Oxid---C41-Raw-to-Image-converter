@@ -367,6 +367,9 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         pinned_zone: None,
         dust_mask_hash: 0,
         dust_mask: None,
+        dust_strokes: Vec::new(),
+        dust_reference_size: None,
+        dust_uv: None,
         dust_heal: DustHealParams::default(),
     };
 

@@ -398,6 +398,21 @@ pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
     apply_dust_removal_with(image, mask, DustHealParams::default());
 }
 
+/// Build a mask at `width` × `height` from strokes so one mask pixel is one image pixel.
+pub fn mask_at_image_size(
+    strokes: &[DustStroke],
+    reference_size: (u32, u32),
+    uv: Option<(f32, f32, f32, f32)>,
+    width: u32,
+    height: u32,
+) -> DustMask {
+    if let Some((u0, v0, u1, v1)) = uv {
+        rasterize_strokes_uv(strokes, reference_size, u0, v0, u1, v1, width, height)
+    } else {
+        rasterize_strokes(strokes, width, height, reference_size)
+    }
+}
+
 /// Replace dust in the painted stroke. Telea, wave-function, or PatchMatch,
 /// then a soft-alpha composite.
 pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
@@ -1572,6 +1587,28 @@ mod tests {
         assert!(
             replay.data.iter().any(|&v| (16..250).contains(&v)),
             "replay at a higher res must stamp a soft rim, not a nearest block"
+        );
+    }
+
+    #[test]
+    fn mask_at_image_size_replays_soft_disc() {
+        let strokes = vec![DustStroke {
+            tool: DustTool::Pen,
+            radius: 2.0,
+            points: vec![(8.0, 8.0)],
+        }];
+        let mask = mask_at_image_size(&strokes, (16, 16), None, 32, 32);
+        assert_eq!(mask.width, 32);
+        assert_eq!(mask.height, 32);
+        assert!(mask.data[16 * 32 + 16] > 200);
+        assert!(
+            mask.data.iter().any(|&v| (16..250).contains(&v)),
+            "16×16 strokes on a 32×32 buffer must stamp a soft disc, not a nearest 2×2 block"
+        );
+        let nearest = scale_mask(&rasterize_strokes(&strokes, 16, 16, (16, 16)), 32, 32);
+        assert_ne!(
+            mask.data, nearest.data,
+            "live heal must not nearest-scale a reference-sized bitmap"
         );
     }
 

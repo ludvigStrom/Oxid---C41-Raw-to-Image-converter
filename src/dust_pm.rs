@@ -94,13 +94,10 @@ fn fill_component(
     }
     let mut hole = vec![false; w * h];
     let mut tight_in = Vec::new();
-    let mut ring = Vec::new();
     for &i in component {
         if tight[i] {
             hole[i] = true;
             tight_in.push(i);
-        } else {
-            ring.push(i);
         }
     }
     let (rim_mean, _gate, sources) = collect_sources(image, tight, &hole, loosen, w, h);
@@ -156,7 +153,11 @@ fn fill_component(
         }
 
         let fine = &levels[0];
+        splat_patches(fine, &tight_in, component, x0, y0, w, h, &mut color_at);
         for &i in &tight_in {
+            if color_at[i].is_some() {
+                continue;
+            }
             let x = (i % w) - x0;
             let y = (i / w) - y0;
             color_at[i] = Some(vote(fine, x, y).unwrap_or_else(|| {
@@ -164,58 +165,83 @@ fn fill_component(
             }));
         }
     }
-    fill_ring_idw(&mut color_at, &ring, w, h, RIM_R, rim_mean);
     for (k, &i) in component.iter().enumerate() {
         colors[k] = color_at[i].unwrap_or(rim_mean);
     }
     colors
 }
 
-/// Inverse-distance blend of nearby tight fills into the feather ring.
-fn fill_ring_idw(
-    color_at: &mut [Option<(f32, f32, f32)>],
-    ring: &[usize],
+/// Copy each matched source patch onto the dilated component (hole + overlap).
+fn splat_patches(
+    fine: &Level,
+    tight_in: &[usize],
+    component: &[usize],
+    x0: usize,
+    y0: usize,
     w: usize,
     h: usize,
-    radius: i32,
-    fallback: (f32, f32, f32),
+    color_at: &mut [Option<(f32, f32, f32)>],
 ) {
-    let r2 = radius * radius;
-    let mut filled = Vec::with_capacity(ring.len());
-    for &i in ring {
-        let x = (i % w) as i32;
-        let y = (i / w) as i32;
-        let mut acc = (0.0f32, 0.0f32, 0.0f32);
-        let mut wt = 0.0f32;
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
+    let n = w * h;
+    let mut in_comp = vec![false; n];
+    for &i in component {
+        in_comp[i] = true;
+    }
+    let mut acc = vec![(0.0f32, 0.0f32, 0.0f32); n];
+    let mut wt = vec![0.0f32; n];
+    let r = RIM_R;
+    let r2 = r * r;
+    for &i in tight_in {
+        let x = (i % w).saturating_sub(x0);
+        let y = (i / w).saturating_sub(y0);
+        if x >= fine.w || y >= fine.h {
+            continue;
+        }
+        let Some((sx, sy)) = fine.nn[y * fine.w + x] else {
+            continue;
+        };
+        let gx = (i % w) as i32;
+        let gy = (i / w) as i32;
+        let sx = sx as i32;
+        let sy = sy as i32;
+        for dy in -r..=r {
+            for dx in -r..=r {
                 let d2 = dx * dx + dy * dy;
-                if d2 == 0 || d2 > r2 {
+                if d2 > r2 {
                     continue;
                 }
-                let nx = x + dx;
-                let ny = y + dy;
-                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                let dx_dest = gx + dx;
+                let dy_dest = gy + dy;
+                if dx_dest < 0 || dy_dest < 0 || dx_dest >= w as i32 || dy_dest >= h as i32 {
                     continue;
                 }
-                let Some(c) = color_at[ny as usize * w + nx as usize] else {
+                let di = dy_dest as usize * w + dx_dest as usize;
+                if !in_comp[di] {
                     continue;
-                };
-                let wgt = 1.0 / d2 as f32;
-                acc.0 += c.0 * wgt;
-                acc.1 += c.1 * wgt;
-                acc.2 += c.2 * wgt;
-                wt += wgt;
+                }
+                let qx = sx + dx;
+                let qy = sy + dy;
+                if qx < 0 || qy < 0 || qx >= fine.w as i32 || qy >= fine.h as i32 {
+                    continue;
+                }
+                let qi = qy as usize * fine.w + qx as usize;
+                if fine.hole[qi] {
+                    continue;
+                }
+                let c = rgb_at_level(fine, qx as usize, qy as usize);
+                let dist = (d2 as f32).sqrt();
+                let wgt = (r as f32 + 1.0 - dist).max(0.0);
+                acc[di].0 += c.0 * wgt;
+                acc[di].1 += c.1 * wgt;
+                acc[di].2 += c.2 * wgt;
+                wt[di] += wgt;
             }
         }
-        filled.push(if wt > 1.0e-8 {
-            (acc.0 / wt, acc.1 / wt, acc.2 / wt)
-        } else {
-            fallback
-        });
     }
-    for (&i, c) in ring.iter().zip(filled) {
-        color_at[i] = Some(c);
+    for &i in component {
+        if wt[i] > 1.0e-8 {
+            color_at[i] = Some((acc[i].0 / wt[i], acc[i].1 / wt[i], acc[i].2 / wt[i]));
+        }
     }
 }
 
@@ -937,6 +963,62 @@ mod tests {
         );
         assert!(
             (out[(outside_i / 48, outside_i % 48, 0)] - orig_out).abs() < 1e-5,
+            "pixels outside dilated must stay"
+        );
+    }
+
+    #[test]
+    fn patch_overlap_fills_ring_from_splat() {
+        let w = 32usize;
+        let h = 32usize;
+        let mut img = Array3::<f32>::from_elem((h, w, 3), 0.20);
+        for y in 10..22 {
+            for x in 6..12 {
+                img[(y, x, 0)] = 0.90;
+                img[(y, x, 1)] = 0.15;
+                img[(y, x, 2)] = 0.15;
+            }
+        }
+        let tight = hole_square(w, 12, 12, 5);
+        let dilated = dilate(&tight, w, h, 3);
+        let mut ring_left = None;
+        let mut outside_i = None;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if dilated[i] && !tight[i] && x < 12 && ring_left.is_none() {
+                    ring_left = Some(i);
+                }
+                if !dilated[i] && x > 26 && outside_i.is_none() {
+                    outside_i = Some(i);
+                }
+            }
+        }
+        let ring_i = ring_left.expect("left feather ring");
+        let outside_i = outside_i.expect("outside dilated");
+        let orig_out = img[(outside_i / w, outside_i % w, 0)];
+        img[(ring_i / w, ring_i % w, 0)] = 0.0;
+        img[(ring_i / w, ring_i % w, 1)] = 0.0;
+        img[(ring_i / w, ring_i % w, 2)] = 0.0;
+
+        let mut alpha = vec![0.0f32; w * h];
+        for i in 0..w * h {
+            if tight[i] {
+                alpha[i] = 1.0;
+            } else if dilated[i] {
+                alpha[i] = 1.0;
+            }
+        }
+        let mut out = img.clone();
+        heal_patchmatch(&mut out, &tight, &dilated, &alpha, 2.0, w, h);
+
+        let ring_r = out[(ring_i / w, ring_i % w, 0)];
+        assert!(
+            ring_r > 0.05,
+            "dilated ring must receive splat fill, not stay the marker (got {ring_r})"
+        );
+        assert!(
+            (out[(outside_i / w, outside_i % w, 0)] - orig_out).abs() < 1e-5,
             "pixels outside dilated must stay"
         );
     }

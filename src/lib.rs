@@ -55,8 +55,8 @@ pub use auto_crop::{
 };
 pub use dust::{
     apply_dust_removal, apply_dust_removal_with, crop_mask_uv, hash_dust, hash_strokes,
-    rasterize_strokes, rasterize_strokes_uv, stamp_disc, DustHealParams, DustInfill, DustMask,
-    DustStroke, DustTool,
+    mask_at_image_size, rasterize_strokes, rasterize_strokes_uv, stamp_disc, DustHealParams,
+    DustInfill, DustMask, DustStroke, DustTool,
     ProjectDust,
 };
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
@@ -87,6 +87,21 @@ fn apply_optional_dust(image: &mut Array3<f32>, options: &PipelineOptions) {
     if options.dust_mask_hash == 0 {
         return;
     }
+    let (h, w, _) = image.dim();
+    if !options.dust_strokes.is_empty() {
+        let reference = options
+            .dust_reference_size
+            .unwrap_or((w as u32, h as u32));
+        let mask = dust::mask_at_image_size(
+            &options.dust_strokes,
+            reference,
+            options.dust_uv,
+            w as u32,
+            h as u32,
+        );
+        dust::apply_dust_removal_with(image, &mask, options.dust_heal);
+        return;
+    }
     if let Some(mask) = options.dust_mask.as_ref() {
         dust::apply_dust_removal_with(image, mask, options.dust_heal);
     }
@@ -101,7 +116,22 @@ fn apply_optional_dust_gpu(
     if options.dust_mask_hash == 0 {
         return;
     }
-    let Some(mask) = options.dust_mask.as_ref() else {
+    let (h, w, _) = image.dim();
+    let owned = if !options.dust_strokes.is_empty() {
+        let reference = options
+            .dust_reference_size
+            .unwrap_or((w as u32, h as u32));
+        Some(dust::mask_at_image_size(
+            &options.dust_strokes,
+            reference,
+            options.dust_uv,
+            w as u32,
+            h as u32,
+        ))
+    } else {
+        None
+    };
+    let Some(mask) = owned.as_ref().or(options.dust_mask.as_deref()) else {
         return;
     };
     if options.dust_heal.infill == dust::DustInfill::WaveFunction
