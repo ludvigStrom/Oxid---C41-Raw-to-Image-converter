@@ -205,6 +205,8 @@ struct ImageEntry {
     dust_brush_radius: f32,
     dust_detect: f32,
     dust_feather: f32,
+    dust_grain: f32,
+    dust_grain_size: f32,
     dust_overlay_texture: Option<egui::TextureHandle>,
     dust_overlay_dirty: bool,
 }
@@ -1043,6 +1045,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.dust_mask_hash.hash(&mut h);
     opts.dust_heal.detect.to_bits().hash(&mut h);
     opts.dust_heal.feather.to_bits().hash(&mut h);
+    opts.dust_heal.grain.to_bits().hash(&mut h);
+    opts.dust_heal.grain_sigma.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -1879,6 +1883,8 @@ fn image_entry(
         dust_brush_radius: 8.0,
         dust_detect: 1.0,
         dust_feather: 4.0,
+        dust_grain: 1.5,
+        dust_grain_size: 0.8,
         dust_overlay_texture: None,
         dust_overlay_dirty: true,
     }
@@ -2037,6 +2043,8 @@ fn entry_dust_heal(entry: &ImageEntry) -> DustHealParams {
     DustHealParams {
         detect: entry.dust_detect,
         feather: entry.dust_feather,
+        grain: entry.dust_grain,
+        grain_sigma: entry.dust_grain_size,
     }
 }
 
@@ -6173,7 +6181,9 @@ impl eframe::App for C41Gui {
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("Heal").strong());
                     theme::slider_row(ui, "Detect", &mut entry.dust_detect, 0.5..=2.5, 1);
-                    theme::slider_row(ui, "Feather", &mut entry.dust_feather, 1.0..=12.0, 0);
+                    theme::slider_row(ui, "Feather", &mut entry.dust_feather, 0.0..=12.0, 0);
+                    theme::slider_row(ui, "Grain", &mut entry.dust_grain, 0.0..=3.0, 1);
+                    theme::slider_row(ui, "Grain size", &mut entry.dust_grain_size, 0.6..=4.0, 1);
                     ui.small("The pen marks where to look. Process heals the speck inside it.");
                     ui.add_space(8.0);
                     let has_mask = !entry.dust_strokes.is_empty();

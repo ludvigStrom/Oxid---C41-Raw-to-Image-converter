@@ -239,13 +239,17 @@ pub fn crop_mask_uv(
 const MASK_ON: u8 = 16;
 const MIN_SPECK_AREA: usize = 4;
 
-/// Detection strength and edge fade for [`apply_dust_removal_with`].
+/// Detection strength, rim fade, and grain for [`apply_dust_removal_with`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DustHealParams {
     /// Higher = pick up fainter specks inside the brush (0.5–2.5).
     pub detect: f32,
-    /// Fade width in pixels from the tight mask edge.
+    /// Fade width in pixels *outside* the tight speck (0 = core only).
     pub feather: f32,
+    /// Scale on the high-pass residual (0 = color only, 1 = match surround).
+    pub grain: f32,
+    /// Blur σ that splits low/high for grain (lower keeps finer texture).
+    pub grain_sigma: f32,
 }
 
 impl Default for DustHealParams {
@@ -253,6 +257,8 @@ impl Default for DustHealParams {
         Self {
             detect: 1.0,
             feather: 4.0,
+            grain: 1.5,
+            grain_sigma: 0.8,
         }
     }
 }
@@ -262,6 +268,8 @@ impl DustHealParams {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.detect.to_bits().hash(&mut h);
         self.feather.to_bits().hash(&mut h);
+        self.grain.to_bits().hash(&mut h);
+        self.grain_sigma.to_bits().hash(&mut h);
         h.finish()
     }
 }
@@ -274,13 +282,13 @@ pub fn hash_dust(strokes: &[DustStroke], params: DustHealParams) -> u64 {
     h.finish()
 }
 
-/// Heal using default detect/feather.
+/// Heal using default detect/feather/grain.
 pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
     apply_dust_removal_with(image, mask, DustHealParams::default());
 }
 
 /// Replace dust inside the painted ROI: tighten to the speck, copy grain,
-/// match surrounding color, feather the edge.
+/// match surrounding color, fade only outside the tight core.
 pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     if mask.is_empty() {
         return;
@@ -316,20 +324,34 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
         return;
     }
 
-    let feather = params.feather.clamp(1.0, 16.0);
+    let feather = params.feather.clamp(0.0, 16.0);
+    let grain_amount = params.grain.clamp(0.0, 3.0);
+    let grain_sigma = params.grain_sigma.clamp(0.6, 4.0);
     let dilate_r = feather.ceil() as i32;
     let dilated = dilate(&tight, w, h, dilate_r);
-    let dist = dist_inside(&dilated, w, h);
+    let not_tight: Vec<bool> = tight.iter().map(|&t| !t).collect();
+    let dist_from_tight = dist_inside(&not_tight, w, h);
     let mut alpha = vec![0.0f32; n];
     for i in 0..n {
-        if dilated[i] {
-            alpha[i] = smoothstep(0.0, feather, dist[i]);
+        if tight[i] {
+            alpha[i] = 1.0;
+        } else if dilated[i] {
+            alpha[i] = 1.0 - smoothstep(0.0, feather, dist_from_tight[i]);
         }
     }
 
-    let low = blur_rgb(image, 1.2);
+    let low = blur_rgb(image, grain_sigma);
     for component in connected_components(&dilated, w, h) {
-        heal_component(image, &low, &component, &dilated, &alpha, w, h);
+        heal_component(
+            image,
+            &low,
+            &component,
+            &dilated,
+            &alpha,
+            grain_amount,
+            w,
+            h,
+        );
     }
 }
 
@@ -666,6 +688,7 @@ fn heal_component(
     component: &[usize],
     forbidden: &[bool],
     alpha: &[f32],
+    grain_amount: f32,
     w: usize,
     h: usize,
 ) {
@@ -722,7 +745,11 @@ fn heal_component(
                 residuals[k % residuals.len()]
             }
         });
-        fills.push((color.0 + gr, color.1 + gg, color.2 + gb));
+        fills.push((
+            color.0 + grain_amount * gr,
+            color.1 + grain_amount * gg,
+            color.2 + grain_amount * gb,
+        ));
     }
     for (&i, (r, g, b)) in component.iter().zip(fills) {
         let a = alpha[i];
@@ -1058,8 +1085,116 @@ mod tests {
             DustHealParams {
                 detect: 1.4,
                 feather: 4.0,
+                grain: 1.5,
+                grain_sigma: 0.8,
+            },
+        );
+        let c = hash_dust(
+            &strokes,
+            DustHealParams {
+                grain: 2.5,
+                ..DustHealParams::default()
             },
         );
         assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn large_feather_fully_replaces_speck_core() {
+        let mut img = gradient_image(48, 48);
+        let local = [img[(24, 24, 0)], img[(24, 24, 1)], img[(24, 24, 2)]];
+        img[(24, 24, 0)] = 1.0;
+        img[(24, 24, 1)] = 1.0;
+        img[(24, 24, 2)] = 1.0;
+        img[(24, 25, 0)] = 1.0;
+        img[(25, 24, 0)] = 1.0;
+        img[(25, 25, 0)] = 1.0;
+
+        let mut mask = DustMask::new(48, 48);
+        stamp_disc(&mut mask, 24.0, 24.0, 6.0, DustTool::Pen);
+        apply_dust_removal_with(
+            &mut img,
+            &mask,
+            DustHealParams {
+                detect: 1.0,
+                feather: 12.0,
+                grain: 0.0,
+                grain_sigma: 0.8,
+            },
+        );
+
+        assert!(
+            (img[(24, 24, 0)] - local[0]).abs() < 0.12,
+            "core must be fully replaced even with a wide feather (got {})",
+            img[(24, 24, 0)]
+        );
+        assert!(
+            img[(24, 24, 0)] < 0.75,
+            "must not leak the white speck through the core (got {})",
+            img[(24, 24, 0)]
+        );
+    }
+
+    fn heal_core_spread(img: &Array3<f32>, cx: usize, cy: usize) -> f32 {
+        let mut vals = Vec::new();
+        for y in cy.saturating_sub(1)..=cy + 1 {
+            for x in cx.saturating_sub(1)..=cx + 1 {
+                vals.push(img[(y, x, 0)]);
+            }
+        }
+        vals.iter().copied().fold(0.0f32, f32::max)
+            - vals.iter().copied().fold(1.0f32, f32::min)
+    }
+
+    #[test]
+    fn grain_amount_scales_residual() {
+        let mut base = gradient_image(40, 40);
+        for y in 0..40 {
+            for x in 0..40 {
+                let n = ((x * 17 + y * 31) % 7) as f32 * 0.02 - 0.06;
+                base[(y, x, 0)] = (base[(y, x, 0)] + n).clamp(0.0, 1.0);
+                base[(y, x, 1)] = (base[(y, x, 1)] + n * 0.8).clamp(0.0, 1.0);
+                base[(y, x, 2)] = (base[(y, x, 2)] + n * 0.6).clamp(0.0, 1.0);
+            }
+        }
+        base[(20, 20, 0)] = 1.0;
+        base[(20, 20, 1)] = 1.0;
+        base[(20, 20, 2)] = 1.0;
+        base[(20, 21, 0)] = 1.0;
+        base[(21, 20, 0)] = 1.0;
+
+        let mut mask = DustMask::new(40, 40);
+        stamp_disc(&mut mask, 20.0, 20.0, 5.0, DustTool::Pen);
+
+        let mut none = base.clone();
+        apply_dust_removal_with(
+            &mut none,
+            &mask,
+            DustHealParams {
+                detect: 1.0,
+                feather: 2.0,
+                grain: 0.0,
+                grain_sigma: 0.8,
+            },
+        );
+        let mut heavy = base.clone();
+        apply_dust_removal_with(
+            &mut heavy,
+            &mask,
+            DustHealParams {
+                detect: 1.0,
+                feather: 2.0,
+                grain: 3.0,
+                grain_sigma: 0.8,
+            },
+        );
+
+        let spread_none = heal_core_spread(&none, 20, 20);
+        let spread_heavy = heal_core_spread(&heavy, 20, 20);
+        assert!(
+            spread_heavy > spread_none + 0.008,
+            "grain amount should scale residual (none={spread_none}, heavy={spread_heavy})"
+        );
     }
 }

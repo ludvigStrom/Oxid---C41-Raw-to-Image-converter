@@ -339,7 +339,7 @@ pub struct PipelineOptions {
     /// Working dust mask applied after load when `dust_mask_hash != 0`.
     #[serde(skip)]
     pub dust_mask: Option<Arc<DustMask>>,
-    /// Detect / feather used when applying `dust_mask`.
+    /// Detect / feather / grain used when applying `dust_mask`.
     #[serde(skip)]
     pub dust_heal: DustHealParams,
 }
