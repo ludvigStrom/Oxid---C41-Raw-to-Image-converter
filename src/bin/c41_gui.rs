@@ -453,14 +453,26 @@ fn scaled_crop_px(
     Some((s.x, s.y, s.width.max(1), s.height.max(1)))
 }
 
-/// Tile grid origin and size in oriented-sensor pixels.
-/// When crop is on, (0,0) is the crop origin so the first row is the frame,
-/// not the rebate above it.
-fn tile_space(entry: &ImageEntry, ow: u32, oh: u32) -> (u32, u32, u32, u32) {
-    scaled_crop_px(entry, ow, oh).unwrap_or((0, 0, ow, oh))
+/// True when the preview is cropped to the frame (Develop / Dust / Export).
+/// Input keeps the full frame so crop handles stay editable.
+fn preview_uses_crop_viewport(entry: &ImageEntry) -> bool {
+    entry.process_tab != ProcessTab::Input
+        && entry.options.apply_crop
+        && entry.options.crop_rect.is_some()
 }
 
-/// Preview layout size: crop size when crop is on, else the full buffer.
+/// Tile grid origin and size in oriented-sensor pixels.
+/// When the viewport is cropped, (0,0) is the crop origin so the first row is
+/// the frame, not the rebate above it. Input uses the full frame.
+fn tile_space(entry: &ImageEntry, ow: u32, oh: u32) -> (u32, u32, u32, u32) {
+    if preview_uses_crop_viewport(entry) {
+        scaled_crop_px(entry, ow, oh).unwrap_or((0, 0, ow, oh))
+    } else {
+        (0, 0, ow, oh)
+    }
+}
+
+/// Preview layout size: crop size when the viewport is cropped, else the full buffer.
 fn preview_display_wh(entry: &ImageEntry, tex_w: u32, tex_h: u32) -> (u32, u32) {
     let view_rot = preview_view_rotation(entry);
     let (fw, fh) = if view_rot == 90 || view_rot == 270 {
@@ -468,15 +480,19 @@ fn preview_display_wh(entry: &ImageEntry, tex_w: u32, tex_h: u32) -> (u32, u32) 
     } else {
         (tex_w, tex_h)
     };
-    if let Some((_, _, cw, ch)) = scaled_crop_px(entry, fw, fh) {
-        (cw.max(1), ch.max(1))
-    } else {
-        (fw, fh)
+    if preview_uses_crop_viewport(entry) {
+        if let Some((_, _, cw, ch)) = scaled_crop_px(entry, fw, fh) {
+            return (cw.max(1), ch.max(1));
+        }
     }
+    (fw, fh)
 }
 
-/// Crop in 0–1 of the preview texture, or `None` when crop is off.
+/// Crop in 0–1 of the preview texture, or `None` when the viewport is the full frame.
 fn preview_crop_uv(entry: &ImageEntry, tex_w: u32, tex_h: u32) -> Option<egui::Rect> {
+    if !preview_uses_crop_viewport(entry) {
+        return None;
+    }
     let (x, y, w, h) = scaled_crop_px(entry, tex_w, tex_h)?;
     let tw = (tex_w as f32).max(1.0);
     let th = (tex_h as f32).max(1.0);
@@ -8057,9 +8073,9 @@ impl eframe::App for C41Gui {
                         }
 
                         // Crop overlay: project image-space crop rect through camera.
-                        // Skip when apply_crop — the view is already the crop.
+                        // Skip when the view is already the crop (Develop / Dust / Export).
                         if self.mode == UIMode::Process
-                            && !self.images.get(idx).is_some_and(|e| e.options.apply_crop)
+                            && self.images.get(idx).is_some_and(|e| !preview_uses_crop_viewport(e))
                         {
                             if let Some(entry) = self.images.get_mut(idx) {
                                 let opts = &mut entry.options;
