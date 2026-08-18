@@ -2088,8 +2088,8 @@ fn tile_texture_options() -> egui::TextureOptions {
     }
 }
 
-/// Place a tile on the virtual image, then expand / snap so a 1 px proxy
-/// sliver cannot show on the top or right after pixel snapping.
+/// Place a tile on the virtual image. Snap edges that already meet 0/1 UV
+/// so float error cannot leave a 1 px gap at the frame.
 fn tile_draw_rect(vir_rect: egui::Rect, uv: egui::Rect, img_w: f32, img_h: f32) -> egui::Rect {
     let mut r = egui::Rect::from_min_max(
         egui::pos2(
@@ -2101,7 +2101,6 @@ fn tile_draw_rect(vir_rect: egui::Rect, uv: egui::Rect, img_w: f32, img_h: f32) 
             vir_rect.top() + uv.max.y * img_h,
         ),
     );
-    r = r.expand(2.0);
     if uv.min.x <= 1e-5 {
         r.min.x = vir_rect.left();
     }
@@ -3243,18 +3242,17 @@ impl C41Gui {
                 return;
             }
         };
-        // Place the requested 512² (plus 1 px overlap), not the halo crop.
+        // Place the requested 512², not the halo crop.
         // Drawing the halo showed C-41 edge fringes as red seams.
         // Display UV is in tile-space (crop when active, else full sensor).
         let owf = ow as f32;
         let ohf = oh as f32;
         let gwf = (grid_w as f32).max(1.0);
         let ghf = (grid_h as f32).max(1.0);
-        let overlap = 1.0;
-        let sensor_l = (x as f32 - overlap).max(0.0);
-        let sensor_t = (y as f32 - overlap).max(0.0);
-        let sensor_r = ((x + tw) as f32 + overlap).min(owf);
-        let sensor_b = ((y + th) as f32 + overlap).min(ohf);
+        let sensor_l = x as f32;
+        let sensor_t = y as f32;
+        let sensor_r = (x + tw) as f32;
+        let sensor_b = (y + th) as f32;
         let inner_l = ((sensor_l - origin_x as f32) / gwf).clamp(0.0, 1.0);
         let inner_t = ((sensor_t - origin_y as f32) / ghf).clamp(0.0, 1.0);
         let inner_r = ((sensor_r - origin_x as f32) / gwf).clamp(0.0, 1.0);
@@ -8946,6 +8944,15 @@ mod tile_grid_tests {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let r = tile_draw_rect(vir, uv, 100.0, 60.0);
         assert_eq!(r.min, vir.min);
+        assert_eq!(r.max, vir.max);
+    }
+
+    #[test]
+    fn tile_draw_rect_does_not_inflate_interior_tiles() {
+        let vir = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1024.0, 1024.0));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.5, 0.5), egui::pos2(1.0, 1.0));
+        let r = tile_draw_rect(vir, uv, 1024.0, 1024.0);
+        assert_eq!(r.min, egui::pos2(512.0, 512.0));
         assert_eq!(r.max, vir.max);
     }
 
