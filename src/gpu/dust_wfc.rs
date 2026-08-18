@@ -1,5 +1,5 @@
-//! GPU Jacobi tile pick for Wave-function dust heal.
-//! Harvest stays on the CPU; per-pixel score/pick matches `dust_wfc`.
+//! GPU coherent exemplar copy for Wave-function dust heal.
+//! Candidate list stays on the CPU; per-pixel propagate/search matches `dust_wfc`.
 
 use std::sync::Arc;
 
@@ -11,8 +11,7 @@ use crate::dust::{
     connected_components, prepare_dust_heal, DustHealParams, DustHealPrep, DustMask,
 };
 use crate::dust_wfc::{
-    build_library, composite_and_grain, flatten_tiles, hole_pass_count, parallel_fill, MEAN_W,
-    SCORE_BAND, TAU_PENALTY,
+    build_candidates, composite_and_grain, exemplar_fill, hole_pass_count,
 };
 
 #[repr(C)]
@@ -21,11 +20,11 @@ struct Params {
     width: u32,
     height: u32,
     n: u32,
-    n_tiles: u32,
-    tau: f32,
-    mean_w: f32,
-    tau_penalty: f32,
-    score_band: f32,
+    n_cand: u32,
+    color_gate: f32,
+    rim_r: f32,
+    rim_g: f32,
+    rim_b: f32,
 }
 
 pub struct DustWfcPipeline {
@@ -56,6 +55,8 @@ impl DustWfcPipeline {
                     bind_storage(4, true),
                     bind_storage(5, false),
                     bind_storage(6, true),
+                    bind_storage(7, false),
+                    bind_storage(8, true),
                 ],
             });
 
@@ -85,7 +86,6 @@ impl DustWfcPipeline {
         }
     }
 
-    /// Fill holes with the same tile pick as the CPU path. Falls back via `Err`.
     pub fn run(
         &self,
         image: &mut Array3<f32>,
@@ -132,7 +132,6 @@ impl DustWfcPipeline {
         let tight_u: Vec<u32> = tight.iter().map(|&t| u32::from(t)).collect();
 
         let device = &self.ctx.device;
-
         let image_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("dust_wfc_image"),
             contents: bytemuck::cast_slice(&img_flat),
@@ -153,10 +152,10 @@ impl DustWfcPipeline {
             for &i in &component {
                 hole[i] = true;
             }
-            let (tiles, tau_base) = build_library(image, tight, &hole, n, w, h);
-            let tau = (tau_base * loosen).max(1.0e-6);
-            if tiles.is_empty() {
-                let (colors, _) = parallel_fill(image, tight, &component, &[], tau, n, w, h);
+            let (cands, color_gate, rim) = build_candidates(image, tight, &hole, *loosen, w, h);
+            if cands.is_empty() {
+                let (colors, _) =
+                    exemplar_fill(image, tight, &component, &[], color_gate, rim, n, w, h);
                 for (&i, c) in component.iter().zip(colors) {
                     fill[i] = Some(c);
                 }
@@ -166,8 +165,9 @@ impl DustWfcPipeline {
                 &image_buf,
                 &tight_buf,
                 &component,
-                &tiles,
-                tau,
+                &cands,
+                color_gate,
+                rim,
                 n,
                 w,
                 h,
@@ -185,8 +185,9 @@ impl DustWfcPipeline {
         image_buf: &wgpu::Buffer,
         tight_buf: &wgpu::Buffer,
         component: &[usize],
-        tiles: &[crate::dust_wfc::Tile],
-        tau: f32,
+        cands: &[(u16, u16)],
+        color_gate: f32,
+        rim: (f32, f32, f32),
         n: usize,
         w: usize,
         h: usize,
@@ -196,22 +197,25 @@ impl DustWfcPipeline {
         let device = &self.ctx.device;
         let queue = &self.ctx.queue;
 
-        let mut active = vec![0u32; n_pix];
+        let mut hole_mask = vec![0u32; n_pix];
         for &i in component {
-            active[i] = 1;
+            hole_mask[i] = 1;
         }
-        let tile_flat = flatten_tiles(tiles);
-        anyhow::ensure!(!tile_flat.is_empty(), "empty tile buffer");
+        let mut cand_flat = Vec::with_capacity(cands.len() * 2);
+        for &(x, y) in cands {
+            cand_flat.push(x as u32);
+            cand_flat.push(y as u32);
+        }
 
         let params = Params {
             width: w as u32,
             height: h as u32,
             n: n as u32,
-            n_tiles: tiles.len() as u32,
-            tau,
-            mean_w: MEAN_W,
-            tau_penalty: TAU_PENALTY,
-            score_band: SCORE_BAND,
+            n_cand: cands.len() as u32,
+            color_gate,
+            rim_r: rim.0,
+            rim_g: rim.1,
+            rim_b: rim.2,
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -219,18 +223,19 @@ impl DustWfcPipeline {
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let active_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("dust_wfc_active"),
-            contents: bytemuck::cast_slice(&active),
+        let hole_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dust_wfc_hole"),
+            contents: bytemuck::cast_slice(&hole_mask),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let tiles_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("dust_wfc_tiles"),
-            contents: bytemuck::cast_slice(&tile_flat),
+        let cand_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dust_wfc_cands"),
+            contents: bytemuck::cast_slice(&cand_flat),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
         let fill_zeros = vec![0.0f32; n_pix * 4];
+        let src_zeros = vec![0u32; n_pix];
         let fill_bytes = (fill_zeros.len() * std::mem::size_of::<f32>()) as u64;
         let fill_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("dust_wfc_fill_a"),
@@ -242,9 +247,25 @@ impl DustWfcPipeline {
             contents: bytemuck::cast_slice(&fill_zeros),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
+        let src_a = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dust_wfc_src_a"),
+            contents: bytemuck::cast_slice(&src_zeros),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let src_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dust_wfc_src_b"),
+            contents: bytemuck::cast_slice(&src_zeros),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
 
-        let bg_ab = self.bind(device, &params_buf, image_buf, tight_buf, &active_buf, &fill_a, &fill_b, &tiles_buf);
-        let bg_ba = self.bind(device, &params_buf, image_buf, tight_buf, &active_buf, &fill_b, &fill_a, &tiles_buf);
+        let bg_ab = self.bind(
+            device, &params_buf, image_buf, tight_buf, &hole_buf, &fill_a, &fill_b, &src_a,
+            &src_b, &cand_buf,
+        );
+        let bg_ba = self.bind(
+            device, &params_buf, image_buf, tight_buf, &hole_buf, &fill_b, &fill_a, &src_b,
+            &src_a, &cand_buf,
+        );
 
         const MAX_WG: u32 = 65535;
         let total_wg = (n_pix as u32 + 255) / 256;
@@ -295,7 +316,6 @@ impl DustWfcPipeline {
         }
         drop(data);
         staging.unmap();
-        let _ = (w, h);
         Ok(())
     }
 
@@ -305,10 +325,12 @@ impl DustWfcPipeline {
         params: &wgpu::Buffer,
         image: &wgpu::Buffer,
         tight: &wgpu::Buffer,
-        active: &wgpu::Buffer,
-        prev: &wgpu::Buffer,
-        next: &wgpu::Buffer,
-        tiles: &wgpu::Buffer,
+        hole: &wgpu::Buffer,
+        prev_fill: &wgpu::Buffer,
+        next_fill: &wgpu::Buffer,
+        prev_src: &wgpu::Buffer,
+        next_src: &wgpu::Buffer,
+        cands: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("dust_wfc_bg"),
@@ -328,19 +350,27 @@ impl DustWfcPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: active.as_entire_binding(),
+                    resource: hole.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: prev.as_entire_binding(),
+                    resource: prev_fill.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: next.as_entire_binding(),
+                    resource: next_fill.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: tiles.as_entire_binding(),
+                    resource: prev_src.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: next_src.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: cands.as_entire_binding(),
                 },
             ],
         })
