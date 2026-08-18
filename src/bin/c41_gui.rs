@@ -6433,8 +6433,8 @@ impl eframe::App for C41Gui {
                             theme::slider_row(ui, "Tile", &mut tile, 2.0..=5.0, 0);
                             entry.dust_tile = tile.round().clamp(2.0, 5.0) as u8;
                             theme::slider_row(ui, "Match", &mut entry.dust_match, 1.0..=4.0, 1);
-                            ui.small("Tile is the overlap window. Match is how far and how loose the copy may search.");
-                            ui.small("Copies nearby film into the hole. Grain is optional synthetic noise on top.");
+                            ui.small("Tile is the residual tap along the local direction. Match is how strongly that direction is used.");
+                            ui.small("Bridges the low-pass, then copies film grain (high-pass). Grain 1.0 is a 1:1 residual.");
                         }
                     }
                     ui.small("The pen is the hole. Size the brush to the speck; feather fades the rim.");

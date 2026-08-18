@@ -264,7 +264,7 @@ pub struct DustHealParams {
     pub detect: f32,
     /// Fade width in pixels *outside* the painted hole (0 = core only).
     pub feather: f32,
-    /// Telea: scale on nearby high-pass. WFC: synthetic grain amplitude.
+    /// Telea and Wave-function: scale on nearby high-pass residual.
     pub grain: f32,
     /// Unused by heal (σ is estimated from nearby film). Kept for cache-hash compatibility.
     pub grain_sigma: f32,
@@ -451,7 +451,7 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
 }
 
 /// Split frequency from film next to the hole: finer grain → smaller σ.
-fn estimate_grain_sigma(image: &Array3<f32>, hole: &[bool], w: usize, h: usize) -> f32 {
+pub(crate) fn estimate_grain_sigma(image: &Array3<f32>, hole: &[bool], w: usize, h: usize) -> f32 {
     let outer = dilate(hole, w, h, 10);
     let mut x0 = w;
     let mut y0 = h;
@@ -771,7 +771,7 @@ fn blur_plane_masked(src: &[f32], hole: &[bool], w: usize, h: usize, sigma: f32)
     out
 }
 
-fn blur_rgb_masked(image: &Array3<f32>, hole: &[bool], sigma: f32) -> Array3<f32> {
+pub(crate) fn blur_rgb_masked(image: &Array3<f32>, hole: &[bool], sigma: f32) -> Array3<f32> {
     let (h, w, _) = image.dim();
     let mut planes = [
         vec![0.0f32; w * h],
@@ -2127,7 +2127,7 @@ mod tests {
         let spread_heavy = heal_core_spread(&heavy, 20, 20);
         assert!(
             spread_heavy > spread_none + 0.004,
-            "synthetic grain should raise core spread (none={spread_none}, heavy={spread_heavy})"
+            "extracted residual should raise core spread (none={spread_none}, heavy={spread_heavy})"
         );
     }
 }
