@@ -636,6 +636,12 @@ impl Default for CalibrationOverlay {
     }
 }
 
+enum PendingLeaveAction {
+    LoadDialog,
+    LoadRecent(PathBuf),
+    Quit,
+}
+
 struct C41Gui {
     images: Vec<ImageEntry>,
     selected_index: Option<usize>,
@@ -692,6 +698,12 @@ struct C41Gui {
     pending_project_load: bool,
     /// Deferred load from Archive → Recent (outside the menu render loop).
     pending_recent_load: Option<PathBuf>,
+    /// Confirm save before Load, Recent, or Quit when the project is not empty.
+    save_before_leave: Option<PendingLeaveAction>,
+    /// After Yes with no project path: proceed only if deferred Save As succeeds.
+    pending_save_then_leave: Option<PendingLeaveAction>,
+    /// True after Yes/No on Quit so the follow-up close is not intercepted again.
+    close_confirmed: bool,
     /// Last successfully loaded or saved projects, newest first.
     recent_projects: Vec<PathBuf>,
     /// When true, preview uses full resolution (export pipeline). Deactivates on option change or image switch.
@@ -764,6 +776,9 @@ impl Default for C41Gui {
             pending_project_save_as: false,
             pending_project_load: false,
             pending_recent_load: None,
+            save_before_leave: None,
+            pending_save_then_leave: None,
+            close_confirmed: false,
             recent_projects: load_recent_projects(),
             full_res_preview_active: false,
             full_res_preview_button_clicked: false,
@@ -2294,14 +2309,52 @@ impl C41Gui {
     fn request_project_save(&mut self, save_as: bool) {
         if !save_as {
             if let Some(path) = self.project_path.clone() {
-                self.write_project_to_path(&path);
+                let _ = self.write_project_to_path(&path);
                 return;
             }
         }
         self.pending_project_save_as = true;
     }
 
-    fn write_project_to_path(&mut self, path: &Path) {
+    fn request_leave_current_project(
+        &mut self,
+        ctx: &egui::Context,
+        action: PendingLeaveAction,
+    ) {
+        if self.images.is_empty() {
+            self.dispatch_leave_action(ctx, action);
+            return;
+        }
+        self.save_before_leave = Some(action);
+    }
+
+    fn dispatch_leave_action(&mut self, ctx: &egui::Context, action: PendingLeaveAction) {
+        match action {
+            PendingLeaveAction::LoadDialog => {
+                self.pending_project_load = true;
+            }
+            PendingLeaveAction::LoadRecent(path) => {
+                self.pending_recent_load = Some(path);
+            }
+            PendingLeaveAction::Quit => {
+                self.close_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn confirm_save_then_leave(&mut self, ctx: &egui::Context, action: PendingLeaveAction) {
+        if let Some(path) = self.project_path.clone() {
+            if self.write_project_to_path(&path) {
+                self.dispatch_leave_action(ctx, action);
+            }
+            return;
+        }
+        self.pending_save_then_leave = Some(action);
+        self.pending_project_save_as = true;
+    }
+
+    fn write_project_to_path(&mut self, path: &Path) -> bool {
         let images: Vec<ProjectImage> = self
             .images
             .iter()
@@ -2324,14 +2377,16 @@ impl C41Gui {
                 self.project_path = Some(path.to_path_buf());
                 self.remember_recent_project(path);
                 self.status = format!("Saved project: {}", path.display());
+                true
             }
             Err(e) => {
                 self.status = format!("Failed to save project: {e}");
+                false
             }
         }
     }
 
-    fn run_project_save_as_dialog(&mut self) {
+    fn run_project_save_as_dialog(&mut self) -> bool {
         let mut dialog = rfd::FileDialog::new()
             .add_filter("Oxid Project", &[PROJECT_EXTENSION])
             .add_filter("JSON", &["json"]);
@@ -2351,8 +2406,9 @@ impl C41Gui {
             if path.extension().is_none() {
                 path.set_extension(PROJECT_EXTENSION);
             }
-            self.write_project_to_path(&path);
+            return self.write_project_to_path(&path);
         }
+        false
     }
 
     fn run_project_load_dialog(&mut self) {
@@ -3470,6 +3526,47 @@ impl C41Gui {
         }
     }
 
+    fn show_save_before_leave_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.save_before_leave.take() else {
+            return;
+        };
+        let mut keep = true;
+        let mut yes = false;
+        let mut no = false;
+        egui::Window::new("Save project")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.add_space(4.0);
+                ui.label("Do you wish to save your project before closing it?");
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Yes").clicked() {
+                            yes = true;
+                            keep = false;
+                        }
+                        if ui.button("No").clicked() {
+                            no = true;
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                });
+            });
+        if yes {
+            self.confirm_save_then_leave(ctx, action);
+        } else if no {
+            self.dispatch_leave_action(ctx, action);
+        } else if keep {
+            self.save_before_leave = Some(action);
+        }
+    }
+
     fn start_auto(&mut self, ctx: &egui::Context) {
         if self.heavy_job_running() || self.auto_job.is_some() {
             return;
@@ -4255,6 +4352,15 @@ impl eframe::App for C41Gui {
         // Re-apply each frame so backends that reset visuals stay on the lab theme.
         theme::apply(ctx);
 
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed {
+            if !self.images.is_empty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if self.pending_save_then_leave.is_none() {
+                    self.request_leave_current_project(ctx, PendingLeaveAction::Quit);
+                }
+            }
+        }
+
         // Global shortcut: Ctrl+Shift+D toggles Debug mode visibility.
         let debug_shortcut =
             ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::D));
@@ -4272,7 +4378,7 @@ impl eframe::App for C41Gui {
             self.request_project_save(false);
         }
         if ctx.input_mut(|i| i.consume_shortcut(&PROJECT_LOAD_SHORTCUT)) {
-            self.pending_project_load = true;
+            self.request_leave_current_project(ctx, PendingLeaveAction::LoadDialog);
         }
         if ctx.input_mut(|i| i.consume_shortcut(&REDO_SHORTCUT)) {
             self.redo_edits();
@@ -4291,7 +4397,12 @@ impl eframe::App for C41Gui {
         // to avoid macOS NSOpenPanel re-entrance crashes on repeated opens).
         if self.pending_project_save_as {
             self.pending_project_save_as = false;
-            self.run_project_save_as_dialog();
+            let saved = self.run_project_save_as_dialog();
+            if let Some(action) = self.pending_save_then_leave.take() {
+                if saved {
+                    self.dispatch_leave_action(ctx, action);
+                }
+            }
         }
         if self.pending_project_load {
             self.pending_project_load = false;
@@ -4611,7 +4722,10 @@ impl eframe::App for C41Gui {
                             )
                             .clicked()
                         {
-                            self.pending_project_load = true;
+                            self.request_leave_current_project(
+                                ui.ctx(),
+                                PendingLeaveAction::LoadDialog,
+                            );
                             ui.close_menu();
                         }
                     });
@@ -4627,7 +4741,10 @@ impl eframe::App for C41Gui {
                                     .on_hover_text(path.display().to_string())
                                     .clicked()
                                 {
-                                    self.pending_recent_load = Some(path);
+                                    self.request_leave_current_project(
+                                        ui.ctx(),
+                                        PendingLeaveAction::LoadRecent(path),
+                                    );
                                     ui.close_menu();
                                 }
                             }
@@ -4942,6 +5059,7 @@ impl eframe::App for C41Gui {
                 // SidePanel persists the content min-rect. Lock to the allocated
                 // width so sliders/paths/combos cannot snap the panel to max.
                 ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing = egui::vec2(5.0, 8.0);
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -8149,6 +8267,7 @@ impl eframe::App for C41Gui {
         self.show_export_progress(ctx);
         self.show_auto_progress(ctx);
         self.show_batch_export_dialog(ctx);
+        self.show_save_before_leave_dialog(ctx);
         self.commit_edit_history(ctx);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
