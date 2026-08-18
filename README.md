@@ -2,9 +2,13 @@
 
 **Oxid** is a GPU-accelerated GUI for **C-41 color-negative film**, written in Rust. It takes RAW camera captures and turns them into photographs by working in optical density, the space the dyes occupy, so color is treated as the film intended, not flipped as an RGB negative. White balance and film gamma are applied there; an RA-4 paper curve (Michaelis-Menten) forms the image. No hidden tone curves or auto-adjustments run unless you enable them.
 
+[![Oxid: import, develop, dust removal, and export of a 42 MB Sony ARW C-41 scan](https://img.youtube.com/vi/zQfDPatA1Rs/maxresdefault.jpg)](https://youtu.be/zQfDPatA1Rs)
+
+Import, develop, dust removal, and export of a 42 MB Sony ARW scan of a C-41 negative. [Watch on YouTube](https://youtu.be/zQfDPatA1Rs).
+
 **Supported cameras:** any `rawloader`-supported Bayer RAW (Sony `.arw`, Nikon `.nef`/`.nrw`, Canon `.cr2`/`.cr3`/`.crw`, Adobe `.dng`, Fujifilm `.raf`, Olympus `.orf`, Panasonic `.rw2`). PNG, JPEG (`.jpg`/`.jpeg`), and TIFF (`.tiff`/`.tif`) input are also accepted and run the same D-min / curve / export pipeline (skips raw decode and demosaic).
 
-Although supported in theory, it is only tested with Sony and Fujifilm cameras — this is a hobby project with limited resources.
+Although supported in theory, it is only tested with Sony and Fujifilm cameras. This is a side project with limited resources.
 
 **File types**
 
@@ -34,7 +38,7 @@ This is the exact function in [`src/curve.rs`](src/curve.rs), computed once into
 
 ## Prerequisites
 
-- **Rust** 2021 edition — install via [rustup](https://rustup.rs/).
+- **Rust** 2021 edition. Install via [rustup](https://rustup.rs/).
 - No system libraries; `rawloader` is pure Rust.
 
 ---
@@ -87,7 +91,7 @@ Prints rawloader metadata and sample pixel values without running the full pipel
 cargo run --release --bin Oxid --features gui
 ```
 
-Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Prefer `cargo guigpu` for the GPU build. Oxid has three tabs: **Process** (main development with per-step checkboxes), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).
+Requires the `gui` feature (adds `eframe`, `rfd`, `arboard`). Prefer `cargo guigpu` for the GPU build. Oxid has three tabs: **Process** (main development with per-step checkboxes, plus **Dust** heal), **Color calibration** (solve a 3×3 density matrix from a ColorChecker), and **Luminance calibration** (load/save flat-field reference frames).
 
 **GPU-accelerated build:**
 
@@ -96,20 +100,20 @@ cargo run --release --features gpu -- convert \
   --input-dir /path/to/scans --output-dir /path/to/output
 ```
 
-The `gpu` feature adds `wgpu`, `pollster`, and `bytemuck`. When enabled, pipeline steps 4–6 (T→D / WB / shadow cast, density matrix / 3D LUT / saturation / zones, and the full output stage with post-curve ops) run on the GPU via WGSL compute shaders. A unified pipeline uploads the image once, runs all three steps as consecutive compute dispatches in a single command encoder submission, and reads back the final result once — minimizing PCIe/bus overhead.
+The `gpu` feature adds `wgpu`, `pollster`, and `bytemuck`. When enabled, pipeline steps 4-6 (T→D / WB / shadow cast, density matrix / 3D LUT / saturation / zones, and the full output stage with post-curve ops) run on the GPU via WGSL compute shaders. A unified pipeline uploads the image once, runs all three steps as consecutive compute dispatches in a single command encoder submission, and reads back the final result once, minimizing PCIe/bus overhead.
 
 The GPU path produces results virtually identical to the CPU reference:
 
 | Step | Max diff (f32) | Max diff (u16) | Notes |
 |------|---------------|----------------|-------|
-| Step 4 (T→D, WB, shadow cast) | 2.4×10⁻⁷ | — | Hardware `log2` vs software `log10` |
-| Step 5 (matrix, LUT, saturation) | 1.2×10⁻⁶ | — | |
-| Step 6 (RA-4, FilmPrint, Lut2383) | <1×10⁻⁶ | 0–1 LSB (no Lab) | With Lab: ≤10 LSB due to `pow` precision |
-| Unified 4→5→6 end-to-end | — | ≤7 LSB | Compound precision; 0.01% |
+| Step 4 (T→D, WB, shadow cast) | 2.4×10⁻⁷ | - | Hardware `log2` vs software `log10` |
+| Step 5 (matrix, LUT, saturation) | 1.2×10⁻⁶ | - | |
+| Step 6 (RA-4, FilmPrint, Lut2383) | <1×10⁻⁶ | 0-1 LSB (no Lab) | With Lab: ≤10 LSB due to `pow` precision |
+| Unified 4→5→6 end-to-end | - | ≤7 LSB | Compound precision; 0.01% |
 
 If no GPU adapter is available, the pipeline falls back to CPU automatically.
 
-`cargo guigpu` initializes the GPU at startup and adds a **GPU acceleration** checkbox in the Debug tab. Toggling it switches between GPU and CPU paths instantly. The step cache (steps 1–3) remains valid across GPU/CPU switches.
+`cargo guigpu` initializes the GPU at startup and adds a **GPU acceleration** checkbox in the Debug tab. Toggling it switches between GPU and CPU paths instantly. The step cache (steps 1-3) remains valid across GPU/CPU switches.
 
 To run the CPU-vs-GPU comparison tests:
 
@@ -140,7 +144,7 @@ This runs 25 tests across 4 test suites (`gpu_step4`, `gpu_step5`, `gpu_step6`, 
 
 | Shortcut | Action |
 |----------|--------|
-| Scroll | Zoom toward the pointer (1×–16×) |
+| Scroll | Zoom toward the pointer (1×-16×) |
 | Left-drag | Pan (not while painting dust, or dragging a crop / D-min handle) |
 | Middle-drag | Pan |
 | Space + left-drag | Pan |
@@ -167,12 +171,12 @@ Only while **Process → Dust** is open.
 
 The steps below match the literal execution order in `process_files` and `process_one_to_preview` in `src/lib.rs`. `debug_pipeline_step` (default 6) can stop the pipeline early at any step for inspection.
 
-### Step 1 — Load and demosaic
+### Step 1: Load and demosaic
 
 RAW files: `rawloader` decodes the file → single-channel Bayer or X-Trans CFA `Array3<f32>` → `demosaic_quality` → linear RGB.
 
 `demosaic_quality` (in `src/demosaic.rs`) uses:
-1. Edge-aware green interpolation (Hamilton–Adams gradient).
+1. Edge-aware green interpolation (Hamilton-Adams gradient).
 2. R and B recovered via **color-difference** (R−G, B−G) interpolation. Interpolating differences rather than raw channel values eliminates false color at edges.
 
 Bayer preview downsampling preserves 2×2 super-pixels so the pattern stays intact after subsampling. X-Trans downsampling uses 6×6 super-pixels for the same reason.
@@ -181,7 +185,23 @@ PNG files: loaded as linear RGB, bypassing raw decode and demosaic.
 
 Optional rotation (0°, 90°, 180°, 270°) is applied immediately after demosaic.
 
-### Step 3 — D-min / flat-field normalization
+### Dust removal (after step 1)
+
+Optional. Runs after load, demosaic, rotation, and IDT, before D-min. Paint on **Process → Dust**; the pen is the hole. Size the brush to the speck. Feather (default 6 px) fades the heal outside the stroke so the rim does not look cut out. Grain (default 1.0) puts film texture back so the fill does not look airbrushed.
+
+Three infill algorithms (`DustInfill` in [`src/dust.rs`](src/dust.rs)). **PatchMatch with statistical grain is the default and the best result.**
+
+| Infill | What it does |
+|--------|--------------|
+| `PatchMatch` (default) | Barnes nearest-neighbour field: 7×7 SSD, colour-gated search of nearby film, propagate + random search, coarse-to-fine pyramid, then patch splat. Grain is synthesized (NLF × clump PSD) on the hole and the feather. Match (1-4) is how far and how loosely it may search. |
+| `WaveFunction` | Structure-tensor flow: smears the low-pass along the collar direction (or H+V when isotropic). Grain is the same statistical model, hole only. Match controls how strongly local direction is used. GPU path available. |
+| `Telea` | Fast-marching Telea on a blurred low-pass, then a high-pass copy of grain from film next to the stroke. Faster, less structure-aware. Grain 1.0 is a 1:1 residual copy. |
+
+Statistical grain ([`src/dust_grain.rs`](src/dust_grain.rs)): edge-preserving NLM on nearby flat, on-colour film → residual → noise-level function (σ vs luma) and a 16×16 power spectrum. Shaped noise is synthesized into the hole. Grain 1.0 matches the measured σ.
+
+Views: **Disable** (no heal), **Edit** (mask overlay), **Process** (healed preview). Implementation: [`src/dust.rs`](src/dust.rs) (Telea + prep), [`src/dust_pm.rs`](src/dust_pm.rs), [`src/dust_wfc.rs`](src/dust_wfc.rs).
+
+### Step 3: D-min / flat-field normalization
 
 Four modes (`DminMode` in `src/lib.rs`):
 
@@ -196,7 +216,7 @@ When `neutral_only = true`, all three channels are divided by the geometric mean
 
 Flat-field override: if `--flat-field` is provided, D-min is replaced by pixel-by-pixel division against a blurred reference frame. RAW flat-field inputs are demosaiced then blurred with a separable f32 Gaussian (σ = 60 px) to remove grain and dust, leaving only low-frequency illumination falloff. Pre-blurred 32f TIFFs are used directly.
 
-### Step 4 — T → D → WB → film gamma
+### Step 4: T → D → WB → film gamma
 
 All in one pass per pixel after D-min:
 
@@ -207,13 +227,13 @@ All in one pass per pixel after D-min:
 4d:  film γ:    D *= 1 / film_gamma         (default γ = 0.65 for C-41)
 ```
 
-Auto WB is multiplicative in density space (not additive), so it preserves `D = 0` as the black point in all channels — no black-point shift occurs. Manual WB and film gamma are folded into the same per-channel scalar for a single pass over the data.
+Auto WB is multiplicative in density space (not additive), so it preserves `D = 0` as the black point in all channels. No black-point shift occurs. Manual WB and film gamma are folded into the same per-channel scalar for a single pass over the data.
 
 Optional colour temperature (`--temp-k`, in Kelvin): a Kelvin-to-RGB model converts the temperature to additive density offsets that are added per channel.
 
 Optional shadow cast correction (`shadow_cast_strength`): detects per-channel colour imbalance in pixels with mean density below 1.2 and applies a correction weighted by `t^1.5` (strongest at D = 0, zero by threshold).
 
-### Step 5 — Density calibration
+### Step 5: Density calibration
 
 Either a 3×3 matrix or a `.cube` 3D LUT is applied in the density domain. Both live at the same pipeline slot (after T→D, before the output stage). If the matrix is identity, the pixel loop is skipped.
 
@@ -234,9 +254,9 @@ D_mean  = (D_r + D_g + D_b) / 3
 D'_ch   = D_mean + saturation * (D_ch - D_mean)
 ```
 
-Optional Gaussian-masked zone adjustments: shadow (`zone_shadows`) and highlight (`zone_highlights`) density offsets. The shadow mask is a Gaussian centred at D = 0.4 (σ² = 0.25); the highlight mask at D = 2.2 (σ² = 0.50). They are additive and channel-neutral — all three channels shift by the same amount.
+Optional Gaussian-masked zone adjustments: shadow (`zone_shadows`) and highlight (`zone_highlights`) density offsets. The shadow mask is a Gaussian centred at D = 0.4 (σ² = 0.25); the highlight mask at D = 2.2 (σ² = 0.50). They are additive and channel-neutral: all three channels shift by the same amount.
 
-### Step 6 — Output stage
+### Step 6: Output stage
 
 Four output stages selectable via `output_stage`:
 
@@ -247,18 +267,18 @@ Four output stages selectable via `output_stage`:
 | `Lut2383` | Density → code value with selectable encoding (Cineon log D/2.046, Rec.709, or linear D/2.5) → user-supplied `.cube` 3D LUT → display-space output. |
 | `None` | Direct density display: `D / 2.5` clamped to [0, 1]. |
 
-Post-curve operations applied after `Ra4` and `FilmPrint` (all operate on the u16 output): 
+Post-curve operations applied after `Ra4` and `FilmPrint` (all operate on the u16 output):
 
-- **Toe/shoulder shaping** — smoothstep-masked additive offset; toe mask centered on [0.07, 0.60], shoulder mask on [0.45, 0.95].
-- **Soft clip** — exponential highlight roll-off: `v + (1 - exp(-(v-s)/(1-s))) * (1-s)` above knee `s` (default 0.93).
-- **Lab separation** — converts sRGB → XYZ → Lab, scales the a/b chroma deviation by a bell-shaped function `1 + strength * c_norm * (1 - c_norm) * 2`. Near-neutral pixels (chroma < 1e-4) are not touched.
-- **Highlight warmth** — Noritsu/Frontier-style golden tint on neutral highlights: `+0.035 R, +0.015 G, −0.055 B`, weighted by `smoothstep(0.35, 0.85, luma) * (1 − smoothstep(0.04, 0.18, chroma))`. Saturated colors receive no warmth.
+- **Toe/shoulder shaping**: smoothstep-masked additive offset; toe mask centered on [0.07, 0.60], shoulder mask on [0.45, 0.95].
+- **Soft clip**: exponential highlight roll-off: `v + (1 - exp(-(v-s)/(1-s))) * (1-s)` above knee `s` (default 0.93).
+- **Lab separation**: converts sRGB → XYZ → Lab, scales the a/b chroma deviation by a bell-shaped function `1 + strength * c_norm * (1 - c_norm) * 2`. Near-neutral pixels (chroma < 1e-4) are not touched.
+- **Highlight warmth**: Noritsu/Frontier-style golden tint on neutral highlights: `+0.035 R, +0.015 G, −0.055 B`, weighted by `smoothstep(0.35, 0.85, luma) * (1 − smoothstep(0.04, 0.18, chroma))`. Saturated colors receive no warmth.
 
 ### De-Bujack (after step 6)
 
 Optional, **off by default**. Runs after the output transform and display-space looks, before grain / sharpen / encode. Skipped when the pipeline stopped before step 6, or when the buffer is still density (`output_stage = None`).
 
-Bujack et al. showed that perceived color difference is not a Riemannian metric: large differences compress (diminishing returns). A pointwise grade cannot undo that — any pointwise map of a Riemannian metric is still Riemannian — so this pass is spatial.
+Bujack et al. showed that perceived color difference is not a Riemannian metric: large differences compress (diminishing returns). A pointwise grade cannot undo that. Any pointwise map of a Riemannian metric is still Riemannian, so this pass is spatial.
 
 It works in **OkLab** on linear Rec.709-like RGB (RA-4 / FilmPrint u16 print RGB; Lut2383 Rec.709 is decoded to linear for the pass). Each pixel’s difference from an edge-aware local mean (bilateral) is pushed through the inverse of a saturating response `f(d) = k·d/(k+d)`, stretching large differences while leaving small ones alone. Out-of-gamut results are pulled toward their own luminance.
 
@@ -280,7 +300,7 @@ Implementation: [`src/bujack.rs`](src/bujack.rs), called from `pipeline::apply_b
 
 | Format | Flag | Notes |
 |--------|------|-------|
-| 16-bit TIFF (default with curve) | — | Uncompressed, u16 per channel via `write_tiff_u16`. |
+| 16-bit TIFF (default with curve) | - | Uncompressed, u16 per channel via `write_tiff_u16`. |
 | 32-bit float TIFF | `--format 32f` | Uncompressed, f32 per channel. Only with `--no-curve`. |
 | 16-bit integer TIFF | `--format 16` | Clamped and scaled. Only with `--no-curve`. |
 | OpenEXR | `--write-exr` | f32 or normalized u16, written via the `exr` crate. |
@@ -341,9 +361,9 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `--no-invert` | Skip `1-x` inversion (only relevant with `--no-curve`). |
 | `--wb-r/g/b` | Per-channel density scale factors (default 1.0). |
 | `--curve-offset` | Print exposure bias (log-domain shift). Default 0.0. |
-| `--curve-gamma` | Paper grade / contrast (0.5–5.0). Default 2.5. |
+| `--curve-gamma` | Paper grade / contrast (0.5-5.0). Default 2.5. |
 | `--curve-pivot` | Half-saturation exposure for Michaelis-Menten. Default 3.0. |
-| `--curve-white` | Code value [0–1] that maps to display white. Default 1.0. |
+| `--curve-white` | Code value [0-1] that maps to display white. Default 1.0. |
 | `--density-matrix C00,...,C22` | 3×3 density calibration matrix, row-major (9 values). |
 | `--flat-field PATH` | RAW or 32f TIFF flat-field for luminance calibration. |
 | `--export-aces-exr` | Write linear ACES2065-1 EXR alongside display output. |
@@ -362,13 +382,17 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/png_reader.rs` | `image` crate PNG loader → linear RGB `Array3<f32>`. |
 | `src/demosaic.rs` | Bayer and X-Trans demosaic: bilinear (fallback), edge-aware green, and quality (color-difference R/B). |
 | `src/dmin.rs` | D-min: rect sampling, fixed medians, auto-percentile, flat-field division. |
+| `src/dust.rs` | Dust mask, heal prep, Telea infill, soft-alpha composite. |
+| `src/dust_pm.rs` | PatchMatch infill (default): Barnes NN-field + statistical grain. |
+| `src/dust_wfc.rs` | Wave-function infill: structure-tensor flow + statistical grain. |
+| `src/dust_grain.rs` | Statistical film grain: NLM residual, NLF, 16×16 PSD, shaped noise. |
 | `src/curve.rs` | RA-4 Michaelis-Menten curve: 65 536-entry LUT generation, rayon-parallel apply, Film Print variant with per-channel curves and color bleed. |
 | `src/calibration.rs` | ColorChecker reference data, OLS 3×3 solver via `nalgebra`, `.oxid` profile load/save (zip). |
 | `src/lut3d.rs` | Density-domain 3D LUT: generate from 3×3 matrix, `.cube` file I/O, tetrahedral interpolation. |
 | `src/aces.rs` | ACEScg IDT and `linear_acescg_to_aces2065_1` matrix. |
 | `src/tiff_export.rs` | Uncompressed TIFF writer: `write_tiff_u16` (u16), `write_tiff` (f32 or u16). |
 | `src/exr_export.rs` | OpenEXR writer: f32, u16, and ACES2065-1 paths. |
-| `src/pipeline.rs` | Shared pipeline steps 3–6 used by both `process_files` and `process_one_to_preview`. |
+| `src/pipeline.rs` | Shared pipeline steps 3-6 used by both `process_files` and `process_one_to_preview`. |
 | `src/bujack.rs` | De-Bujack: non-local OkLab difference stretch after step 6 (optional, off by default). |
 | `src/pipeline_cache.rs` | Step-level cache for preview: reuse earlier stages when only later options change. |
 | `src/gpu/mod.rs` | wgpu initialization and `GpuContext` (optional, `--features gpu`). |
@@ -378,7 +402,9 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/gpu/flat_field.wgsl` | WGSL: per-pixel divide + clamp. |
 | `src/gpu/step3_dmin.rs` | GPU D-min divide: image /= (div_r, div_g, div_b). CPU does rect/percentile. |
 | `src/gpu/step3_dmin.wgsl` | WGSL: per-channel divide + clamp. |
-| `src/gpu/unified.rs` | Unified GPU pipeline: steps 3–6; Step3Gpu holds flat_field + step3_dmin. |
+| `src/gpu/unified.rs` | Unified GPU pipeline: steps 3-6; Step3Gpu holds flat_field + step3_dmin. |
+| `src/gpu/dust_wfc.rs` | GPU wave-function dust heal (structure-flow + residual). |
+| `src/gpu/dust_wfc.wgsl` | WGSL coherent exemplar copy for wave-function fill. |
 | `src/gpu/step4.rs` | GPU dispatch for step 4: T→D, WB, shadow cast. CPU precomputes auto-WB medians and shadow analysis. |
 | `src/gpu/step4.wgsl` | WGSL compute shader: T→D via hardware `log2`, per-channel scale+offset, shadow cast correction. |
 | `src/gpu/step5.rs` | GPU dispatch for step 5: density matrix, 3D LUT, saturation, zones. |
@@ -420,5 +446,5 @@ This program is free software: you can redistribute it and/or modify it under th
 
 Oxid is a port of, and is heavily inspired by:
 
-- **[Negadoctor](https://github.com/darktable-org/darktable/blob/master/src/iop/negadoctor.c)** — darktable’s film-negative inversion module, © darktable developers, GPL-3.0-or-later.
+- **[Negadoctor](https://github.com/darktable-org/darktable/blob/master/src/iop/negadoctor.c)**: darktable’s film-negative inversion module, © darktable developers, GPL-3.0-or-later.
 - **[NegPy](https://github.com/marcinz606/NegPy)** by Marcin Zawalski, GPL-3.0.
