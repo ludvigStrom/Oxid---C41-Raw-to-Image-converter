@@ -39,5 +39,9 @@ Cargo.lock
 # Local Apple / release IDs (see .env.example)
 .env
 
+# Local calibration profiles / LUTs (kept on disk, not shipped)
+/profiles/
+
 # macOS
 .DS_Store
+._*
