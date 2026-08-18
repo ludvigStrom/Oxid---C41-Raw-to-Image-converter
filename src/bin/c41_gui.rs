@@ -6198,7 +6198,7 @@ impl eframe::App for C41Gui {
                     theme::slider_row(ui, "Feather", &mut entry.dust_feather, 0.0..=12.0, 0);
                     theme::slider_row(ui, "Grain", &mut entry.dust_grain, 0.0..=3.0, 1);
                     theme::slider_row(ui, "Grain size", &mut entry.dust_grain_size, 0.6..=4.0, 1);
-                    ui.small("The pen is the hole. Detect can add more; it will not ignore the stroke.");
+                    ui.small("Detect tightens to the speck. If nothing is found, only the middle of the stroke is healed.");
                     ui.add_space(8.0);
                     let has_mask = !entry.dust_strokes.is_empty();
                     if ui

@@ -287,8 +287,8 @@ pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
     apply_dust_removal_with(image, mask, DustHealParams::default());
 }
 
-/// Replace dust in the painted stroke (detect may add pixels). Structure from
-/// punched Telea / H+V; grain from known film only.
+/// Replace dust: detect the speck inside the stroke, or the stroke middle if
+/// detect finds nothing. Punched Telea / H+V + grain from known film.
 pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     if mask.is_empty() {
         return;
@@ -320,18 +320,13 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
     }
 
     let detected = refine_speck_mask(image, &roi, w, h, params.detect);
-    let mut interior = erode(&roi, w, h, 1);
-    if !interior.iter().any(|&v| v) {
-        interior = roi.clone();
-    }
-    // Trust the stroke: heal the brush interior even when detect misses.
-    // Detect can only add pixels, not take the paint away.
-    let mut tight = interior;
-    for i in 0..n {
-        if detected[i] {
-            tight[i] = true;
-        }
-    }
+    // Detect when it fires (tight, nice). If it finds nothing, punch only
+    // the middle of the stroke — not the whole brush.
+    let tight = if detected.iter().any(|&v| v) {
+        detected
+    } else {
+        force_middle(&roi, w, h)
+    };
     if !tight.iter().any(|&v| v) {
         return;
     }
@@ -352,8 +347,8 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
         }
     }
 
-    let structure = fill_structure_telea(image, &dilated, w, h);
     let low = blur_rgb_masked(image, &dilated, grain_sigma);
+    let structure = fill_structure_telea(&low, &dilated, w, h);
     for component in connected_components(&dilated, w, h) {
         heal_component(
             image,
@@ -461,14 +456,28 @@ fn refine_speck_mask(
             }
         }
     }
-    if kept.iter().any(|&v| v) {
-        return kept;
+    kept
+}
+
+/// Inner ~3.5 px of the stroke (centroid via repeated erode). Used when detect
+/// finds no speck so a large search brush does not become the hole.
+fn force_middle(roi: &[bool], w: usize, h: usize) -> Vec<bool> {
+    let area = roi.iter().filter(|&&v| v).count() as f32;
+    if area < 1.0 {
+        return roi.to_vec();
     }
-    let fallback = erode(roi, w, h, 2);
-    if fallback.iter().any(|&v| v) {
-        fallback
+    let r = (area / std::f32::consts::PI).sqrt();
+    const KEEP_R: f32 = 3.5;
+    let erode_r = (r - KEEP_R).ceil().max(1.0) as i32;
+    let mid = erode(roi, w, h, erode_r);
+    if mid.iter().any(|&v| v) {
+        return mid;
+    }
+    let mid = erode(roi, w, h, 1);
+    if mid.iter().any(|&v| v) {
+        mid
     } else {
-        erode(roi, w, h, 1)
+        roi.to_vec()
     }
 }
 
@@ -825,29 +834,18 @@ fn heal_component(
     let residuals = ring_residuals(image, low, &ring);
 
     let mut fills = Vec::with_capacity(component.len());
-    for (k, &i) in component.iter().enumerate() {
+    for &i in component {
         let x = i % w;
         let y = i / w;
         let color = rgb_at(structure, x, y);
+        let hsh = pixel_hash(x, y);
+        let jx = (hsh % 3) as i32 - 1;
+        let jy = ((hsh / 3) % 3) as i32 - 1;
         let x = x as i32;
         let y = y as i32;
         let grain = if let Some((dx, dy)) = offset {
-            let sx = x + dx;
-            let sy = y + dy;
-            if sx >= 0 && sy >= 0 && sx < w as i32 && sy < h as i32 {
-                let si = sy as usize * w + sx as usize;
-                if !forbidden[si] {
-                    Some((
-                        image[(sy as usize, sx as usize, 0)] - low[(sy as usize, sx as usize, 0)],
-                        image[(sy as usize, sx as usize, 1)] - low[(sy as usize, sx as usize, 1)],
-                        image[(sy as usize, sx as usize, 2)] - low[(sy as usize, sx as usize, 2)],
-                    ))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            residual_at(image, low, forbidden, x + dx + jx, y + dy + jy, w, h)
+                .or_else(|| residual_at(image, low, forbidden, x + dx, y + dy, w, h))
         } else {
             None
         };
@@ -855,7 +853,7 @@ fn heal_component(
             if residuals.is_empty() {
                 (0.0, 0.0, 0.0)
             } else {
-                residuals[k % residuals.len()]
+                residuals[hsh as usize % residuals.len()]
             }
         });
         fills.push((
@@ -875,6 +873,41 @@ fn heal_component(
         image[(y, x, 1)] = image[(y, x, 1)] * (1.0 - a) + g * a;
         image[(y, x, 2)] = image[(y, x, 2)] * (1.0 - a) + b * a;
     }
+}
+
+fn pixel_hash(x: usize, y: usize) -> u32 {
+    let mut n = (x as u32)
+        .wrapping_mul(0x9E37_79B9)
+        ^ (y as u32).wrapping_mul(0x85EB_CA6B);
+    n ^= n >> 16;
+    n = n.wrapping_mul(0x7FEB_352D);
+    n ^= n >> 15;
+    n
+}
+
+fn residual_at(
+    image: &Array3<f32>,
+    low: &Array3<f32>,
+    forbidden: &[bool],
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+) -> Option<(f32, f32, f32)> {
+    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+        return None;
+    }
+    let i = y as usize * w + x as usize;
+    if forbidden[i] {
+        return None;
+    }
+    let x = x as usize;
+    let y = y as usize;
+    Some((
+        image[(y, x, 0)] - low[(y, x, 0)],
+        image[(y, x, 1)] - low[(y, x, 1)],
+        image[(y, x, 2)] - low[(y, x, 2)],
+    ))
 }
 
 fn rgb_at(img: &Array3<f32>, x: usize, y: usize) -> (f32, f32, f32) {
@@ -1314,9 +1347,9 @@ mod tests {
     }
 
     #[test]
-    fn heal_stays_inside_painted_and_feather() {
+    fn detect_hit_leaves_far_brush_pixels() {
         let mut img = gradient_image(48, 48);
-        let before = img[(24, 4, 0)];
+        let before = img[(24, 11, 0)];
         img[(24, 24, 0)] = 1.0;
         img[(24, 24, 1)] = 1.0;
         img[(24, 24, 2)] = 1.0;
@@ -1325,7 +1358,7 @@ mod tests {
         img[(25, 25, 0)] = 1.0;
 
         let mut mask = DustMask::new(48, 48);
-        stamp_disc(&mut mask, 24.0, 24.0, 8.0, DustTool::Pen);
+        stamp_disc(&mut mask, 24.0, 24.0, 16.0, DustTool::Pen);
         apply_dust_removal_with(
             &mut img,
             &mask,
@@ -1338,23 +1371,24 @@ mod tests {
         );
 
         assert!(
-            (img[(24, 4, 0)] - before).abs() < 1e-5,
-            "pixels outside the painted stroke must stay"
+            (img[(24, 11, 0)] - before).abs() < 1e-5,
+            "when detect hits, far pixels inside a large brush must stay"
         );
         assert!(img[(24, 24, 0)] < 0.85, "the white speck must be healed");
     }
 
     #[test]
-    fn painted_interior_heals_faint_speck() {
-        let mut img = Array3::<f32>::from_elem((36, 36, 3), 0.35);
-        img[(18, 18, 0)] = 0.39;
-        img[(18, 18, 1)] = 0.39;
-        img[(18, 18, 2)] = 0.39;
-        img[(18, 19, 0)] = 0.39;
-        img[(19, 18, 0)] = 0.39;
+    fn detect_miss_heals_stroke_middle() {
+        let mut img = Array3::<f32>::from_elem((40, 40, 3), 0.35);
+        img[(20, 20, 0)] = 0.37;
+        img[(20, 20, 1)] = 0.37;
+        img[(20, 20, 2)] = 0.37;
+        img[(20, 21, 0)] = 0.37;
+        img[(21, 20, 0)] = 0.37;
+        let far = img[(20, 10, 0)];
 
-        let mut mask = DustMask::new(36, 36);
-        stamp_disc(&mut mask, 18.0, 18.0, 4.0, DustTool::Pen);
+        let mut mask = DustMask::new(40, 40);
+        stamp_disc(&mut mask, 20.0, 20.0, 12.0, DustTool::Pen);
         apply_dust_removal_with(
             &mut img,
             &mask,
@@ -1366,9 +1400,13 @@ mod tests {
             },
         );
         assert!(
-            (img[(18, 18, 0)] - 0.35).abs() < 0.025,
-            "painted interior must be punched even when detect is weak (got {})",
-            img[(18, 18, 0)]
+            (img[(20, 20, 0)] - 0.35).abs() < 0.03,
+            "when detect misses, the stroke middle must still be punched (got {})",
+            img[(20, 20, 0)]
+        );
+        assert!(
+            (img[(20, 10, 0)] - far).abs() < 1e-5,
+            "a detect miss must not heal the whole large brush"
         );
     }
 
@@ -1693,6 +1731,56 @@ mod tests {
         assert!(
             (v - 0.2).abs() < 0.15 || (v - 0.8).abs() < 0.15,
             "Telea should stay on one side of the diagonal (got {v})"
+        );
+    }
+
+    fn plane_spread(img: &Array3<f32>, x0: usize, y0: usize, x1: usize, y1: usize) -> f32 {
+        let mut lo = 1.0f32;
+        let mut hi = 0.0f32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let v = img[(y, x, 0)];
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        hi - lo
+    }
+
+    #[test]
+    fn telea_on_low_does_not_drag_grain() {
+        let mut img = Array3::<f32>::from_elem((36, 36, 3), 0.4);
+        for y in 0..36 {
+            for x in 0..36 {
+                let n = ((x * 17 + y * 31) % 11) as f32 * 0.03 - 0.15;
+                img[(y, x, 0)] = (0.4 + n).clamp(0.0, 1.0);
+                img[(y, x, 1)] = (0.4 + n * 0.8).clamp(0.0, 1.0);
+                img[(y, x, 2)] = (0.4 + n * 0.6).clamp(0.0, 1.0);
+            }
+        }
+        let surround = plane_spread(&img, 2, 2, 8, 8);
+        img[(18, 18, 0)] = 1.0;
+        img[(18, 18, 1)] = 1.0;
+        img[(18, 18, 2)] = 1.0;
+        img[(18, 19, 0)] = 1.0;
+        img[(19, 18, 0)] = 1.0;
+
+        let mut mask = DustMask::new(36, 36);
+        stamp_disc(&mut mask, 18.0, 18.0, 4.0, DustTool::Pen);
+        apply_dust_removal_with(
+            &mut img,
+            &mask,
+            DustHealParams {
+                detect: 1.0,
+                feather: 2.0,
+                grain: 0.0,
+                grain_sigma: 2.0,
+            },
+        );
+        let hole = plane_spread(&img, 17, 17, 19, 19);
+        assert!(
+            hole < surround * 0.55,
+            "grain=0 should leave a smooth hole, not dragged edge grains (hole={hole}, surround={surround})"
         );
     }
 }
