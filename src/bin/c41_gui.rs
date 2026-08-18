@@ -5059,6 +5059,7 @@ impl eframe::App for C41Gui {
                 // SidePanel persists the content min-rect. Lock to the allocated
                 // width so sliders/paths/combos cannot snap the panel to max.
                 ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing = egui::vec2(5.0, 6.0);
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
