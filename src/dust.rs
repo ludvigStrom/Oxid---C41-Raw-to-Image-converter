@@ -710,14 +710,17 @@ fn heal_component(
     let span = (x1 - x0 + 1).max(y1 - y0 + 1).max(6) as i32;
 
     let ring = component_ring(component, forbidden, w, h);
-    let color = ring_median(image, &ring);
+    let fallback = ring_median(low, &ring);
     let offset = best_patch_offset(image, &ring, forbidden, w, h, span);
     let residuals = ring_residuals(image, low, &ring);
 
     let mut fills = Vec::with_capacity(component.len());
     for (k, &i) in component.iter().enumerate() {
-        let x = (i % w) as i32;
-        let y = (i / w) as i32;
+        let x = i % w;
+        let y = i / w;
+        let color = structure_hv(low, forbidden, x, y, w, h).unwrap_or(fallback);
+        let x = x as i32;
+        let y = y as i32;
         let grain = if let Some((dx, dy)) = offset {
             let sx = x + dx;
             let sy = y + dy;
@@ -761,6 +764,122 @@ fn heal_component(
         image[(y, x, 0)] = image[(y, x, 0)] * (1.0 - a) + r * a;
         image[(y, x, 1)] = image[(y, x, 1)] * (1.0 - a) + g * a;
         image[(y, x, 2)] = image[(y, x, 2)] * (1.0 - a) + b * a;
+    }
+}
+
+fn rgb_at(img: &Array3<f32>, x: usize, y: usize) -> (f32, f32, f32) {
+    (img[(y, x, 0)], img[(y, x, 1)], img[(y, x, 2)])
+}
+
+fn lerp3(a: (f32, f32, f32), b: (f32, f32, f32), t: f32) -> (f32, f32, f32) {
+    (
+        a.0 + (b.0 - a.0) * t,
+        a.1 + (b.1 - a.1) * t,
+        a.2 + (b.2 - a.2) * t,
+    )
+}
+
+fn hole_run_h(hole: &[bool], w: usize, x: usize, y: usize) -> (Option<usize>, Option<usize>) {
+    let row = y * w;
+    let mut left = None;
+    if x > 0 {
+        let mut xi = x;
+        while xi > 0 {
+            xi -= 1;
+            if !hole[row + xi] {
+                left = Some(xi);
+                break;
+            }
+        }
+    }
+    let mut right = None;
+    let mut xi = x + 1;
+    while xi < w {
+        if !hole[row + xi] {
+            right = Some(xi);
+            break;
+        }
+        xi += 1;
+    }
+    (left, right)
+}
+
+fn hole_run_v(hole: &[bool], w: usize, h: usize, x: usize, y: usize) -> (Option<usize>, Option<usize>) {
+    let mut top = None;
+    if y > 0 {
+        let mut yi = y;
+        while yi > 0 {
+            yi -= 1;
+            if !hole[yi * w + x] {
+                top = Some(yi);
+                break;
+            }
+        }
+    }
+    let mut bottom = None;
+    let mut yi = y + 1;
+    while yi < h {
+        if !hole[yi * w + x] {
+            bottom = Some(yi);
+            break;
+        }
+        yi += 1;
+    }
+    (top, bottom)
+}
+
+/// Lerp `low` from known endpoints. One-sided copies that edge with a large gap
+/// so a real two-sided lerp in the other axis wins the blend.
+fn interp_axis(
+    low: &Array3<f32>,
+    a: Option<usize>,
+    b: Option<usize>,
+    pos: usize,
+    fixed: usize,
+    horizontal: bool,
+) -> Option<((f32, f32, f32), f32)> {
+    let sample = |p: usize| {
+        if horizontal {
+            rgb_at(low, p, fixed)
+        } else {
+            rgb_at(low, fixed, p)
+        }
+    };
+    match (a, b) {
+        (Some(p0), Some(p1)) if p1 != p0 => {
+            let t = (pos as f32 - p0 as f32) / (p1 as f32 - p0 as f32);
+            Some((lerp3(sample(p0), sample(p1), t), (p1.abs_diff(p0)) as f32))
+        }
+        (Some(p0), Some(_)) => Some((sample(p0), 1.0)),
+        (Some(p0), None) => Some((sample(p0), 1.0e6)),
+        (None, Some(p1)) => Some((sample(p1), 1.0e6)),
+        (None, None) => None,
+    }
+}
+
+/// Weighted H+V lerp of `low` across the hole. Shorter span wins.
+fn structure_hv(
+    low: &Array3<f32>,
+    hole: &[bool],
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> Option<(f32, f32, f32)> {
+    let (xl, xr) = hole_run_h(hole, w, x, y);
+    let (yt, yb) = hole_run_v(hole, w, h, x, y);
+    let horiz = interp_axis(low, xl, xr, x, y, true);
+    let vert = interp_axis(low, yt, yb, y, x, false);
+    match (horiz, vert) {
+        (Some((hc, gap_h)), Some((vc, gap_v))) => {
+            let w_h = 1.0 / gap_h.max(1.0);
+            let w_v = 1.0 / gap_v.max(1.0);
+            let s = w_h + w_v;
+            Some(lerp3(hc, vc, w_v / s))
+        }
+        (Some((hc, _)), None) => Some(hc),
+        (None, Some((vc, _))) => Some(vc),
+        (None, None) => None,
     }
 }
 
@@ -1195,6 +1314,59 @@ mod tests {
         assert!(
             spread_heavy > spread_none + 0.008,
             "grain amount should scale residual (none={spread_none}, heavy={spread_heavy})"
+        );
+    }
+
+    #[test]
+    fn hv_lerp_follows_step_edge_not_ring_median() {
+        // Left 0.2 / right 0.8. A tall hole sits on the 0.8 side, touching the step.
+        // Short H span → H lerp ~0.5. A ring median would be ~0.8.
+        let mut low = Array3::<f32>::zeros((40, 40, 3));
+        for y in 0..40 {
+            for x in 0..40 {
+                let v = if x < 20 { 0.2 } else { 0.8 };
+                low[(y, x, 0)] = v;
+                low[(y, x, 1)] = v;
+                low[(y, x, 2)] = v;
+            }
+        }
+        let mut hole = vec![false; 40 * 40];
+        for y in 8..=32 {
+            for x in 20..=22 {
+                hole[y * 40 + x] = true;
+            }
+        }
+        let s = structure_hv(&low, &hole, 21, 20, 40, 40).expect("hole has endpoints");
+        assert!(
+            (s.0 - 0.54).abs() < 0.03,
+            "H+V should recover the step (weighted ~0.54), not a flat 0.8 ring (got {})",
+            s.0
+        );
+
+        let mut img = low.clone();
+        let mut mask = DustMask::new(40, 40);
+        for y in 8..=32 {
+            for x in 20..=22 {
+                img[(y, x, 0)] = 1.0;
+                img[(y, x, 1)] = 1.0;
+                img[(y, x, 2)] = 1.0;
+                mask.data[y * 40 + x] = 255;
+            }
+        }
+        apply_dust_removal_with(
+            &mut img,
+            &mask,
+            DustHealParams {
+                detect: 1.0,
+                feather: 0.0,
+                grain: 0.0,
+                grain_sigma: 0.6,
+            },
+        );
+        let healed = img[(20, 21, 0)];
+        assert!(
+            healed < 0.72 && healed > 0.35,
+            "heal should follow the step, not the 0.8 ring (got {healed})"
         );
     }
 }
