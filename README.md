@@ -121,6 +121,46 @@ This runs 25 tests across 4 test suites (`gpu_step4`, `gpu_step5`, `gpu_step6`, 
 
 ---
 
+## Shortcuts
+
+⌘ is Command on macOS and Ctrl on Windows/Linux. **Ctrl+Shift+D** always uses the Control key, including on macOS.
+
+### Project and edit
+
+| Shortcut | Action |
+|----------|--------|
+| ⌘S | Save project |
+| ⌘⇧S | Save project as |
+| ⌘O | Load project |
+| ⌘Z | Undo |
+| ⌘⇧Z | Redo |
+| Ctrl+Shift+D | Toggle Debug mode |
+
+### Preview
+
+| Shortcut | Action |
+|----------|--------|
+| Scroll | Zoom toward the pointer (1×–16×) |
+| Left-drag | Pan (not while painting dust, or dragging a crop / D-min handle) |
+| Middle-drag | Pan |
+| Space + left-drag | Pan |
+
+### Dust tab
+
+Only while **Process → Dust** is open.
+
+| Shortcut | Action |
+|----------|--------|
+| P | Pen |
+| E | Eraser |
+| Esc | Deselect pen and eraser |
+| [ / ] | Smaller / larger brush |
+| ⌘P | Process view (healed preview) |
+| ⌘E | Edit view (mask overlay) |
+| Space | Pan (hand cursor; does not paint) |
+
+---
+
 ## Pipeline: exact order of operations
 
 The steps below match the literal execution order in `process_files` and `process_one_to_preview` in `src/lib.rs`. `debug_pipeline_step` (default 6) can stop the pipeline early at any step for inspection.

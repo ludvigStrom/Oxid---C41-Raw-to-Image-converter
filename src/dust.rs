@@ -246,9 +246,9 @@ pub struct DustHealParams {
     pub detect: f32,
     /// Fade width in pixels *outside* the painted hole (0 = core only).
     pub feather: f32,
-    /// Scale on the high-pass residual (0 = color only, 1 = match surround).
+    /// Scale on nearby high-pass grain (0 = structure only, 1 = 1:1 copy).
     pub grain: f32,
-    /// Blur σ that splits low/high for grain (lower keeps finer texture).
+    /// Unused by heal (σ is estimated from nearby film). Kept for cache-hash compatibility.
     pub grain_sigma: f32,
 }
 
@@ -257,7 +257,7 @@ impl Default for DustHealParams {
         Self {
             detect: 1.0,
             feather: 6.0,
-            grain: 1.0,
+            grain: 1.5,
             grain_sigma: 2.0,
         }
     }
@@ -287,8 +287,8 @@ pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
     apply_dust_removal_with(image, mask, DustHealParams::default());
 }
 
-/// Replace dust in the painted stroke. Punched Telea / H+V on the masked
-/// low-pass, plus grain from known film.
+/// Replace dust in the painted stroke. Punched Telea / H+V on a masked
+/// low-pass; grain is the high-pass of nearby film.
 pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     if mask.is_empty() {
         return;
@@ -320,12 +320,12 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
     }
 
     let _ = params.detect;
+    let _ = params.grain_sigma;
     // The painted stroke is the hole. Detect is not a gate.
     let tight = roi;
 
     let feather = params.feather.clamp(0.0, 16.0);
     let grain_amount = params.grain.clamp(0.0, 3.0);
-    let grain_sigma = params.grain_sigma.clamp(0.6, 4.0);
     let dilate_r = feather.ceil() as i32;
     let dilated = dilate(&tight, w, h, dilate_r);
     let not_tight: Vec<bool> = tight.iter().map(|&t| !t).collect();
@@ -339,6 +339,7 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
         }
     }
 
+    let grain_sigma = estimate_grain_sigma(image, &dilated, w, h);
     let low = blur_rgb_masked(image, &dilated, grain_sigma);
     let structure = fill_structure_telea(&low, &dilated, w, h);
     for component in connected_components(&dilated, w, h) {
@@ -354,6 +355,91 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
             h,
         );
     }
+}
+
+/// Split frequency from film next to the hole: finer grain → smaller σ.
+fn estimate_grain_sigma(image: &Array3<f32>, hole: &[bool], w: usize, h: usize) -> f32 {
+    let outer = dilate(hole, w, h, 10);
+    let mut x0 = w;
+    let mut y0 = h;
+    let mut x1 = 0usize;
+    let mut y1 = 0usize;
+    let mut any = false;
+    for i in 0..w * h {
+        if outer[i] && !hole[i] {
+            any = true;
+            x0 = x0.min(i % w);
+            y0 = y0.min(i / w);
+            x1 = x1.max(i % w);
+            y1 = y1.max(i / w);
+        }
+    }
+    if !any {
+        return 1.6;
+    }
+
+    let luma = |x: usize, y: usize| {
+        0.2126 * image[(y, x, 0)] + 0.7152 * image[(y, x, 1)] + 0.0722 * image[(y, x, 2)]
+    };
+    let mut hp = vec![0.0f32; w * h];
+    let mut has_hp = vec![false; w * h];
+    let mut acc_var = 0.0f32;
+    let mut n_var = 0i32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let i = y * w + x;
+            if hole[i] || !outer[i] {
+                continue;
+            }
+            let mut s = 0.0f32;
+            let mut n = 0i32;
+            for dy in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    let ni = ny as usize * w + nx as usize;
+                    if hole[ni] {
+                        continue;
+                    }
+                    s += luma(nx as usize, ny as usize);
+                    n += 1;
+                }
+            }
+            if n < 4 {
+                continue;
+            }
+            let v = luma(x, y) - s / n as f32;
+            hp[i] = v;
+            has_hp[i] = true;
+            acc_var += v * v;
+            n_var += 1;
+        }
+    }
+    if n_var < 12 || acc_var < 1.0e-8 {
+        return 1.6;
+    }
+
+    let mut acc_c1 = 0.0f32;
+    let mut n_c1 = 0i32;
+    for y in y0..=y1 {
+        for x in x0..x1 {
+            let i = y * w + x;
+            if has_hp[i] && has_hp[i + 1] {
+                acc_c1 += hp[i] * hp[i + 1];
+                n_c1 += 1;
+            }
+        }
+    }
+    let var = acc_var / n_var as f32;
+    let c1 = if n_c1 > 0 { acc_c1 / n_c1 as f32 } else { 0.0 };
+    let corr = (c1 / var).clamp(0.0, 1.0);
+    (0.95 + 1.7 * corr).clamp(0.8, 2.6)
 }
 
 #[allow(dead_code)]
@@ -812,23 +898,14 @@ fn heal_component(
     if component.is_empty() {
         return;
     }
-    let mut x0 = w;
-    let mut y0 = h;
-    let mut x1 = 0usize;
-    let mut y1 = 0usize;
-    for &i in component {
-        let x = i % w;
-        let y = i / w;
-        x0 = x0.min(x);
-        y0 = y0.min(y);
-        x1 = x1.max(x);
-        y1 = y1.max(y);
-    }
-    let span = (x1 - x0 + 1).max(y1 - y0 + 1).max(6) as i32;
 
     let ring = component_ring(component, forbidden, w, h);
-    let offset = best_patch_offset(image, &ring, forbidden, w, h, span);
+    let offset = nearby_grain_offset(image, low, &ring, forbidden, w, h);
     let residuals = ring_residuals(image, low, &ring);
+    let ring_xy: Vec<(i32, i32)> = ring
+        .iter()
+        .map(|&i| ((i % w) as i32, (i / w) as i32))
+        .collect();
 
     let mut fills = Vec::with_capacity(component.len());
     for &i in component {
@@ -854,11 +931,7 @@ fn heal_component(
             None
         };
         let (gr, gg, gb) = grain.unwrap_or_else(|| {
-            if residuals.is_empty() {
-                (0.0, 0.0, 0.0)
-            } else {
-                residuals[hsh as usize % residuals.len()]
-            }
+            pick_nearby_ring_residual(x, y, hsh, &ring_xy, &residuals)
         });
         fills.push((
             color.0 + grain_amount * gr,
@@ -1188,67 +1261,84 @@ fn median_f32(v: &mut [f32]) -> f32 {
     }
 }
 
-fn best_patch_offset(
+fn pick_nearby_ring_residual(
+    x: i32,
+    y: i32,
+    hsh: u32,
+    ring_xy: &[(i32, i32)],
+    residuals: &[(f32, f32, f32)],
+) -> (f32, f32, f32) {
+    if residuals.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut best = [(i32::MAX, 0usize); 4];
+    for (k, &(rx, ry)) in ring_xy.iter().enumerate() {
+        let d = (rx - x) * (rx - x) + (ry - y) * (ry - y);
+        if d < best[3].0 {
+            best[3] = (d, k);
+            best.sort_unstable_by_key(|p| p.0);
+        }
+    }
+    let n = best.iter().filter(|p| p.0 < i32::MAX).count().max(1);
+    residuals[best[hsh as usize % n].1]
+}
+
+/// Copy a coherent grain patch from film just outside the hole.
+fn nearby_grain_offset(
     image: &Array3<f32>,
+    low: &Array3<f32>,
     ring: &[usize],
     forbidden: &[bool],
     w: usize,
     h: usize,
-    span: i32,
 ) -> Option<(i32, i32)> {
     if ring.is_empty() {
         return None;
     }
-    let r = span.max(4);
-    let candidates = [
-        (r, 0),
-        (-r, 0),
-        (0, r),
-        (0, -r),
-        (r, r),
-        (r, -r),
-        (-r, r),
-        (-r, -r),
-        (r + r / 2, 0),
-        (-(r + r / 2), 0),
-        (0, r + r / 2),
-        (0, -(r + r / 2)),
-        (r / 2, r),
-        (-r / 2, r),
-        (r / 2, -r),
-        (-r / 2, -r),
-        (r, r / 2),
-        (-r, r / 2),
-        (r, -r / 2),
-        (-r, -r / 2),
-    ];
-    let mut best: Option<(f32, (i32, i32))> = None;
-    for (dx, dy) in candidates {
-        if dx == 0 && dy == 0 {
-            continue;
+    let mut candidates = [(0i32, 0i32); 48];
+    let mut n = 0usize;
+    for r in 3i32..=8 {
+        for (dx, dy) in [
+            (r, 0),
+            (-r, 0),
+            (0, r),
+            (0, -r),
+            (r, r),
+            (r, -r),
+            (-r, r),
+            (-r, -r),
+        ] {
+            candidates[n] = (dx, dy);
+            n += 1;
         }
+    }
+    let mut best: Option<(f32, (i32, i32))> = None;
+    for &(dx, dy) in &candidates[..n] {
         let mut ssd = 0.0f32;
-        let mut n = 0i32;
+        let mut count = 0i32;
         for &i in ring {
             let x = (i % w) as i32 + dx;
             let y = (i / w) as i32 + dy;
             if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
                 continue;
             }
-            let si = y as usize * w + x as usize;
-            if forbidden[si] {
+            let sx = x as usize;
+            let sy = y as usize;
+            if forbidden[sy * w + sx] {
                 continue;
             }
-            let dx0 = image[(i / w, i % w, 0)] - image[(y as usize, x as usize, 0)];
-            let dx1 = image[(i / w, i % w, 1)] - image[(y as usize, x as usize, 1)];
-            let dx2 = image[(i / w, i % w, 2)] - image[(y as usize, x as usize, 2)];
-            ssd += dx0 * dx0 + dx1 * dx1 + dx2 * dx2;
-            n += 1;
+            let rx = i % w;
+            let ry = i / w;
+            let d0 = (image[(ry, rx, 0)] - low[(ry, rx, 0)]) - (image[(sy, sx, 0)] - low[(sy, sx, 0)]);
+            let d1 = (image[(ry, rx, 1)] - low[(ry, rx, 1)]) - (image[(sy, sx, 1)] - low[(sy, sx, 1)]);
+            let d2 = (image[(ry, rx, 2)] - low[(ry, rx, 2)]) - (image[(sy, sx, 2)] - low[(sy, sx, 2)]);
+            ssd += d0 * d0 + d1 * d1 + d2 * d2;
+            count += 1;
         }
-        if n < (ring.len() as i32 / 2).max(4) {
+        if count < (ring.len() as i32 / 2).max(4) {
             continue;
         }
-        let score = ssd / n as f32;
+        let score = ssd / count as f32;
         if best.map(|(b, _)| score < b).unwrap_or(true) {
             best = Some((score, (dx, dy)));
         }
@@ -1628,6 +1718,38 @@ mod tests {
         assert!(
             spread_heavy > spread_none + 0.008,
             "grain amount should scale residual (none={spread_none}, heavy={spread_heavy})"
+        );
+    }
+
+    #[test]
+    fn grain_comes_from_nearby_highpass() {
+        let mut img = Array3::<f32>::from_elem((48, 48, 3), 0.4);
+        for y in 0..48 {
+            for x in 0..48 {
+                let r = ((x as i32 - 24).pow(2) + (y as i32 - 24).pow(2)) as f32;
+                let r = r.sqrt();
+                if (6.0..14.0).contains(&r) {
+                    let n = ((x * 13 + y * 29) % 5) as f32 * 0.04 - 0.08;
+                    img[(y, x, 0)] = (0.4 + n).clamp(0.0, 1.0);
+                    img[(y, x, 1)] = (0.4 + n).clamp(0.0, 1.0);
+                    img[(y, x, 2)] = (0.4 + n).clamp(0.0, 1.0);
+                }
+            }
+        }
+        img[(24, 24, 0)] = 1.0;
+        img[(24, 24, 1)] = 1.0;
+        img[(24, 24, 2)] = 1.0;
+        img[(24, 25, 0)] = 1.0;
+        img[(25, 24, 0)] = 1.0;
+
+        let mut mask = DustMask::new(48, 48);
+        stamp_disc(&mut mask, 24.0, 24.0, 5.0, DustTool::Pen);
+        apply_dust_removal(&mut img, &mask);
+
+        let spread = heal_core_spread(&img, 24, 24);
+        assert!(
+            spread > 0.015,
+            "hole should inherit nearby high-pass grain (spread={spread})"
         );
     }
 

@@ -1950,7 +1950,7 @@ fn image_entry(
         dust_brush_radius: 8.0,
         dust_detect: 1.0,
         dust_feather: 6.0,
-        dust_grain: 1.0,
+        dust_grain: 1.5,
         dust_grain_size: 2.0,
         dust_overlay_texture: None,
         dust_overlay_dirty: true,
@@ -2121,11 +2121,12 @@ fn dust_mask_from_entry(entry: &ImageEntry) -> Option<Arc<DustMask>> {
 }
 
 fn entry_dust_heal(entry: &ImageEntry) -> DustHealParams {
+    let _ = entry.dust_grain_size;
     DustHealParams {
         detect: entry.dust_detect,
         feather: entry.dust_feather,
         grain: entry.dust_grain,
-        grain_sigma: entry.dust_grain_size,
+        grain_sigma: 2.0,
     }
 }
 
@@ -6399,7 +6400,7 @@ impl eframe::App for C41Gui {
                     ui.label(egui::RichText::new("Heal").strong());
                     theme::slider_row(ui, "Feather", &mut entry.dust_feather, 0.0..=12.0, 0);
                     theme::slider_row(ui, "Grain", &mut entry.dust_grain, 0.0..=3.0, 1);
-                    theme::slider_row(ui, "Grain size", &mut entry.dust_grain_size, 0.6..=4.0, 1);
+                    ui.small("Grain is the high-pass of film next to the stroke. 1.0 is a 1:1 copy; raise it if the hole looks too smooth.");
                     ui.small("The pen is the hole. Size the brush to the speck; feather fades the rim.");
                     ui.add_space(8.0);
                     let has_mask = !entry.dust_strokes.is_empty();
