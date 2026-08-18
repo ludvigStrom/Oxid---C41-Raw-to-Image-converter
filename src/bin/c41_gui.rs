@@ -72,18 +72,79 @@ const PROJECT_SAVE_AS_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut:
 );
 const PROJECT_LOAD_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+const RECENT_PROJECTS_MAX: usize = 5;
 const UNDO_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
 const REDO_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
     egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
     egui::Key::Z,
 );
+const DUST_PROCESS_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P);
+const DUST_EDIT_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::E);
 const ICON_LOGO_PATH: &str = "logo.png";
 /// Extensions accepted by Add image… and drag-and-drop.
 const IMPORT_EXTENSIONS: &[&str] = &[
     "arw", "nef", "nrw", "cr2", "cr3", "crw", "dng", "raf", "orf", "rw2", "png", "jpeg", "jpg",
     "tiff", "tif",
 ];
+
+fn recent_projects_file() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join("Library/Application Support/Oxid/recent_projects.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var_os("APPDATA")?;
+        Some(PathBuf::from(appdata).join("Oxid").join("recent_projects.json"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".config/oxid/recent_projects.json"))
+    }
+}
+
+fn load_recent_projects() -> Vec<PathBuf> {
+    let Some(path) = recent_projects_file() else {
+        return Vec::new();
+    };
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let paths: Vec<String> = serde_json::from_str(&data).unwrap_or_default();
+    paths
+        .into_iter()
+        .map(PathBuf::from)
+        .take(RECENT_PROJECTS_MAX)
+        .collect()
+}
+
+fn save_recent_projects(paths: &[PathBuf]) {
+    let Some(path) = recent_projects_file() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let strings: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&strings) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn recent_project_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
+}
 
 fn app_icon_data() -> Option<egui::IconData> {
     let bytes = include_bytes!("../img/logo.png");
@@ -201,7 +262,7 @@ struct ImageEntry {
     dust_mask: Vec<u8>,
     dust_mask_size: (u32, u32),
     dust_view: DustView,
-    dust_tool: DustTool,
+    dust_tool: Option<DustTool>,
     dust_brush_radius: f32,
     dust_detect: f32,
     dust_feather: f32,
@@ -625,6 +686,10 @@ struct C41Gui {
     pending_output_lut_browse: bool,
     pending_project_save_as: bool,
     pending_project_load: bool,
+    /// Deferred load from Archive → Recent (outside the menu render loop).
+    pending_recent_load: Option<PathBuf>,
+    /// Last successfully loaded or saved projects, newest first.
+    recent_projects: Vec<PathBuf>,
     /// When true, preview uses full resolution (export pipeline). Deactivates on option change or image switch.
     full_res_preview_active: bool,
     /// One-shot: set by the full-res button so we don't deactivate on the preview request it triggers.
@@ -694,6 +759,8 @@ impl Default for C41Gui {
             pending_output_lut_browse: false,
             pending_project_save_as: false,
             pending_project_load: false,
+            pending_recent_load: None,
+            recent_projects: load_recent_projects(),
             full_res_preview_active: false,
             full_res_preview_button_clicked: false,
             preview_canvas_size: None,
@@ -1879,7 +1946,7 @@ fn image_entry(
         dust_mask: Vec::new(),
         dust_mask_size: (0, 0),
         dust_view: DustView::Edit,
-        dust_tool: DustTool::Pen,
+        dust_tool: Some(DustTool::Pen),
         dust_brush_radius: 8.0,
         dust_detect: 1.0,
         dust_feather: 6.0,
@@ -2062,6 +2129,42 @@ fn entry_dust_heal(entry: &ImageEntry) -> DustHealParams {
     }
 }
 
+const DUST_ERASER_RED: egui::Color32 = egui::Color32::from_rgb(220, 64, 64);
+
+/// Classic block eraser (the icon font has no eraser glyph).
+fn paint_eraser_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
+    let s = size.max(8.0) * 0.5;
+    let (sin, cos) = 35.0_f32.to_radians().sin_cos();
+    let rot = |x: f32, y: f32| {
+        egui::pos2(
+            center.x + x * cos - y * sin,
+            center.y + x * sin + y * cos,
+        )
+    };
+    let body = [
+        rot(-s * 1.05, -s * 0.55),
+        rot(s * 0.85, -s * 0.55),
+        rot(s * 1.05, s * 0.55),
+        rot(-s * 0.85, s * 0.55),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        body.to_vec(),
+        color,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 16, 16)),
+    ));
+    let band = [
+        rot(s * 0.32, -s * 0.55),
+        rot(s * 0.58, -s * 0.55),
+        rot(s * 0.78, s * 0.55),
+        rot(s * 0.52, s * 0.55),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        band.to_vec(),
+        egui::Color32::from_rgb(236, 140, 140),
+        egui::Stroke::NONE,
+    ));
+}
+
 fn oriented_export_size(entry: &ImageEntry) -> Option<(u32, u32)> {
     let [w, h] = entry.raw_source_size?;
     Some(oriented_sensor_size(w, h, entry.options.rotation_degrees))
@@ -2205,6 +2308,7 @@ impl C41Gui {
         match save_project(&images, path) {
             Ok(()) => {
                 self.project_path = Some(path.to_path_buf());
+                self.remember_recent_project(path);
                 self.status = format!("Saved project: {}", path.display());
             }
             Err(e) => {
@@ -2252,11 +2356,35 @@ impl C41Gui {
             }
         }
         if let Some(path) = dialog.pick_file() {
-            match load_project(&path) {
-                Ok(loaded) => self.apply_loaded_project(path, loaded),
-                Err(e) => self.status = format!("Failed to load project: {e}"),
+            self.load_project_from_path(path);
+        }
+    }
+
+    fn load_project_from_path(&mut self, path: PathBuf) {
+        match load_project(&path) {
+            Ok(loaded) => self.apply_loaded_project(path, loaded),
+            Err(e) => {
+                if !path.exists() {
+                    self.forget_recent_project(&path);
+                }
+                self.status = format!("Failed to load project: {e}");
             }
         }
+    }
+
+    fn remember_recent_project(&mut self, path: &Path) {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.recent_projects.retain(|p| p != &path);
+        self.recent_projects.insert(0, path);
+        self.recent_projects.truncate(RECENT_PROJECTS_MAX);
+        save_recent_projects(&self.recent_projects);
+    }
+
+    fn forget_recent_project(&mut self, path: &Path) {
+        let canonical = path.canonicalize().ok();
+        self.recent_projects
+            .retain(|p| p != path && canonical.as_ref() != Some(p));
+        save_recent_projects(&self.recent_projects);
     }
 
     fn apply_loaded_project(&mut self, path: PathBuf, loaded: LoadedProject) {
@@ -2299,7 +2427,8 @@ impl C41Gui {
         } else {
             Some(0)
         };
-        self.project_path = Some(path);
+        self.project_path = Some(path.clone());
+        self.remember_recent_project(&path);
 
         if missing_count == 0 {
             self.status = format!("Loaded {} image(s)", self.images.len());
@@ -4154,6 +4283,9 @@ impl eframe::App for C41Gui {
             self.pending_project_load = false;
             self.run_project_load_dialog();
         }
+        if let Some(path) = self.pending_recent_load.take() {
+            self.load_project_from_path(path);
+        }
 
         if self.pending_output_lut_browse {
             self.pending_output_lut_browse = false;
@@ -4467,6 +4599,24 @@ impl eframe::App for C41Gui {
                         {
                             self.pending_project_load = true;
                             ui.close_menu();
+                        }
+                    });
+                    ui.menu_button(theme::icon_label(theme::HISTORY, "Recent"), |ui| {
+                        if self.recent_projects.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No recent projects"));
+                        } else {
+                            let recent = self.recent_projects.clone();
+                            for path in recent {
+                                let label = recent_project_label(&path);
+                                if ui
+                                    .button(label)
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    self.pending_recent_load = Some(path);
+                                    ui.close_menu();
+                                }
+                            }
                         }
                     });
                     ui.menu_button(theme::icon_label(theme::INVENTORY, "Batch"), |ui| {
@@ -6152,28 +6302,59 @@ impl eframe::App for C41Gui {
                             &mut entry.dust_view,
                             DustView::Edit,
                             theme::icon_label(theme::EDIT, "Edit"),
-                        );
+                        )
+                        .on_hover_text(format!(
+                            "Edit ({})",
+                            ui.ctx().format_shortcut(&DUST_EDIT_SHORTCUT)
+                        ));
                         ui.selectable_value(
                             &mut entry.dust_view,
                             DustView::Process,
                             theme::icon_label(theme::AUTO_FIX, "Process"),
-                        );
+                        )
+                        .on_hover_text(format!(
+                            "Process ({})",
+                            ui.ctx().format_shortcut(&DUST_PROCESS_SHORTCUT)
+                        ));
                     });
                     ui.add_space(8.0);
 
                     ui.add_enabled_ui(entry.dust_view == DustView::Edit, |ui| {
                         ui.label(egui::RichText::new("Tool").strong());
                         ui.horizontal(|ui| {
-                            ui.selectable_value(
-                                &mut entry.dust_tool,
-                                DustTool::Pen,
-                                theme::icon_label(theme::BRUSH, "Pen"),
+                            let pen_resp = ui
+                                .selectable_label(
+                                    entry.dust_tool == Some(DustTool::Pen),
+                                    "   Pen",
+                                )
+                                .on_hover_text("Pen (P)");
+                            ui.painter().circle_stroke(
+                                egui::pos2(pen_resp.rect.left() + 9.0, pen_resp.rect.center().y),
+                                4.5,
+                                egui::Stroke::new(1.25, egui::Color32::WHITE),
                             );
-                            ui.selectable_value(
-                                &mut entry.dust_tool,
-                                DustTool::Eraser,
-                                theme::icon_label(theme::CANCEL, "Eraser"),
+                            if pen_resp.clicked() {
+                                entry.dust_tool = Some(DustTool::Pen);
+                            }
+                            let eraser_sel = entry.dust_tool == Some(DustTool::Eraser);
+                            let eraser_resp = ui
+                                .selectable_label(
+                                    eraser_sel,
+                                    egui::RichText::new("   Eraser").color(DUST_ERASER_RED),
+                                )
+                                .on_hover_text("Eraser (E)");
+                            paint_eraser_icon(
+                                ui.painter(),
+                                egui::pos2(
+                                    eraser_resp.rect.left() + 9.0,
+                                    eraser_resp.rect.center().y,
+                                ),
+                                11.0,
+                                DUST_ERASER_RED,
                             );
+                            if eraser_resp.clicked() {
+                                entry.dust_tool = Some(DustTool::Eraser);
+                            }
                         });
                         ui.add_space(6.0);
                         theme::slider_row(
@@ -6191,14 +6372,35 @@ impl eframe::App for C41Gui {
                     if ui.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
                         entry.dust_brush_radius = (entry.dust_brush_radius + 1.0).min(80.0);
                     }
+                    if !ui.ctx().wants_keyboard_input() {
+                        if ui.input_mut(|i| i.consume_shortcut(&DUST_PROCESS_SHORTCUT)) {
+                            entry.dust_view = DustView::Process;
+                            self.dust_painting = false;
+                        }
+                        if ui.input_mut(|i| i.consume_shortcut(&DUST_EDIT_SHORTCUT)) {
+                            entry.dust_view = DustView::Edit;
+                            self.dust_painting = false;
+                        }
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+                        {
+                            entry.dust_tool = None;
+                            self.dust_painting = false;
+                        } else if !self.dust_painting {
+                            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
+                                entry.dust_tool = Some(DustTool::Pen);
+                            }
+                            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E)) {
+                                entry.dust_tool = Some(DustTool::Eraser);
+                            }
+                        }
+                    }
 
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("Heal").strong());
-                    theme::slider_row(ui, "Detect", &mut entry.dust_detect, 0.5..=2.5, 1);
                     theme::slider_row(ui, "Feather", &mut entry.dust_feather, 0.0..=12.0, 0);
                     theme::slider_row(ui, "Grain", &mut entry.dust_grain, 0.0..=3.0, 1);
                     theme::slider_row(ui, "Grain size", &mut entry.dust_grain_size, 0.6..=4.0, 1);
-                    ui.small("Detect tightens to the speck. If nothing is found, only the middle of the stroke is healed.");
+                    ui.small("The pen is the hole. Size the brush to the speck; feather fades the rim.");
                     ui.add_space(8.0);
                     let has_mask = !entry.dust_strokes.is_empty();
                     if ui
@@ -6214,7 +6416,11 @@ impl eframe::App for C41Gui {
                     } else {
                         ui.small("Paint over dust, then switch to Process.");
                     }
-                    ui.small("Hold Space or middle-drag to pan.");
+                    ui.small(format!(
+                        "P pen · E eraser · Esc deselect · {} process · {} edit · [ ] size · Space pan.",
+                        ui.ctx().format_shortcut(&DUST_PROCESS_SHORTCUT),
+                        ui.ctx().format_shortcut(&DUST_EDIT_SHORTCUT),
+                    ));
                 }
 
                 if self.mode == UIMode::Process && entry.process_tab == ProcessTab::Export {
@@ -6586,7 +6792,9 @@ impl eframe::App for C41Gui {
                         if dust_edit {
                             ensure_dust_working_mask(&mut self.images[idx], full_w, full_h);
                             let space_down = ui.input(|i| i.key_down(egui::Key::Space));
-                            let pointer_down = canvas_resp.is_pointer_button_down_on()
+                            let dust_tool = self.images[idx].dust_tool;
+                            let pointer_down = dust_tool.is_some()
+                                && canvas_resp.is_pointer_button_down_on()
                                 && ui.input(|i| i.pointer.primary_down())
                                 && !ui.input(|i| i.pointer.middle_down())
                                 && !space_down;
@@ -6615,9 +6823,10 @@ impl eframe::App for C41Gui {
                                                 })
                                             })
                                         };
+                                        let tool = dust_tool.expect("pointer_down requires a tool");
                                         if !self.dust_painting {
                                             entry.dust_strokes.push(DustStroke {
-                                                tool: entry.dust_tool,
+                                                tool,
                                                 radius: radius_ref,
                                                 points: vec![pt],
                                             });
@@ -6638,7 +6847,6 @@ impl eframe::App for C41Gui {
                                             height: entry.dust_mask_size.1,
                                             data: std::mem::take(&mut entry.dust_mask),
                                         };
-                                        let tool = entry.dust_tool;
                                         let (src_w, _) = dust_source_wh(entry, full_w, full_h);
                                         let radius = entry.dust_brush_radius
                                             * (full_w_f / src_w.max(1.0));
@@ -6721,23 +6929,49 @@ impl eframe::App for C41Gui {
                                 }
                             }
 
-                            if let Some(pos) = canvas_resp.hover_pos().filter(|p| {
-                                vir_rect.contains(*p) && canvas_rect.contains(*p)
-                            }) {
-                                let (src_w, _) =
-                                    dust_source_wh(&self.images[idx], full_w, full_h);
-                                let radius_screen = self.images[idx].dust_brush_radius
-                                    * (img_w / src_w.max(1.0));
-                                let color = if self.images[idx].dust_tool == DustTool::Eraser {
-                                    egui::Color32::from_rgb(220, 220, 220)
-                                } else {
-                                    egui::Color32::from_rgb(230, 70, 70)
-                                };
-                                canvas_painter.circle_stroke(
-                                    pos,
-                                    radius_screen.max(2.0),
-                                    egui::Stroke::new(1.5, color),
-                                );
+                            let hovering_canvas = canvas_resp.hovered();
+                            let tool_armed = dust_tool.is_some();
+                            if hovering_canvas {
+                                if space_down {
+                                    let grabbing = ui.input(|i| i.pointer.primary_down())
+                                        || ui.input(|i| i.pointer.middle_down());
+                                    ui.ctx().set_cursor_icon(if grabbing {
+                                        egui::CursorIcon::Grabbing
+                                    } else {
+                                        egui::CursorIcon::Grab
+                                    });
+                                } else if tool_armed {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                                }
+                            }
+                            if !space_down && tool_armed {
+                                if let Some(pos) = canvas_resp.hover_pos().filter(|p| {
+                                    vir_rect.contains(*p) && canvas_rect.contains(*p)
+                                }) {
+                                    let (src_w, _) =
+                                        dust_source_wh(&self.images[idx], full_w, full_h);
+                                    let radius_screen = self.images[idx].dust_brush_radius
+                                        * (img_w / src_w.max(1.0));
+                                    let eraser = dust_tool == Some(DustTool::Eraser);
+                                    let color = if eraser {
+                                        DUST_ERASER_RED
+                                    } else {
+                                        egui::Color32::WHITE
+                                    };
+                                    canvas_painter.circle_stroke(
+                                        pos,
+                                        radius_screen.max(2.0),
+                                        egui::Stroke::new(1.5, color),
+                                    );
+                                    if eraser {
+                                        paint_eraser_icon(
+                                            &canvas_painter,
+                                            pos + egui::vec2(14.0, -16.0),
+                                            15.0,
+                                            DUST_ERASER_RED,
+                                        );
+                                    }
+                                }
                             }
                         } else if self.dust_painting {
                             self.dust_painting = false;
@@ -6821,7 +7055,9 @@ impl eframe::App for C41Gui {
                         let left_drag = canvas_resp.dragged()
                             && !self.rect_dragging
                             && !self.dust_painting
-                            && (!dust_edit || space_down);
+                            && (!dust_edit
+                                || space_down
+                                || self.images[idx].dust_tool.is_none());
                         if middle_drag || space_drag || left_drag {
                             let delta = canvas_resp.drag_delta();
                             {

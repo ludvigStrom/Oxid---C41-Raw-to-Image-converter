@@ -239,12 +239,12 @@ pub fn crop_mask_uv(
 const MASK_ON: u8 = 16;
 const MIN_SPECK_AREA: usize = 2;
 
-/// Detection strength, rim fade, and grain for [`apply_dust_removal_with`].
+/// Rim fade and grain for [`apply_dust_removal_with`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DustHealParams {
-    /// Higher = pick up fainter specks inside the brush (0.5–2.5).
+    /// Unused by heal (the paint is the hole). Kept for cache-hash compatibility.
     pub detect: f32,
-    /// Fade width in pixels *outside* the tight speck (0 = core only).
+    /// Fade width in pixels *outside* the painted hole (0 = core only).
     pub feather: f32,
     /// Scale on the high-pass residual (0 = color only, 1 = match surround).
     pub grain: f32,
@@ -287,8 +287,8 @@ pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
     apply_dust_removal_with(image, mask, DustHealParams::default());
 }
 
-/// Replace dust: detect the speck inside the stroke, or the stroke middle if
-/// detect finds nothing. Punched Telea / H+V + grain from known film.
+/// Replace dust in the painted stroke. Punched Telea / H+V on the masked
+/// low-pass, plus grain from known film.
 pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     if mask.is_empty() {
         return;
@@ -319,17 +319,9 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
         return;
     }
 
-    let detected = refine_speck_mask(image, &roi, w, h, params.detect);
-    // Detect when it fires (tight, nice). If it finds nothing, punch only
-    // the middle of the stroke — not the whole brush.
-    let tight = if detected.iter().any(|&v| v) {
-        detected
-    } else {
-        force_middle(&roi, w, h)
-    };
-    if !tight.iter().any(|&v| v) {
-        return;
-    }
+    let _ = params.detect;
+    // The painted stroke is the hole. Detect is not a gate.
+    let tight = roi;
 
     let feather = params.feather.clamp(0.0, 16.0);
     let grain_amount = params.grain.clamp(0.0, 3.0);
@@ -364,6 +356,7 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
     }
 }
 
+#[allow(dead_code)]
 fn refine_speck_mask(
     image: &Array3<f32>,
     roi: &[bool],
@@ -461,6 +454,7 @@ fn refine_speck_mask(
 
 /// Inner ~3.5 px of the stroke (centroid via repeated erode). Used when detect
 /// finds no speck so a large search brush does not become the hole.
+#[allow(dead_code)]
 fn force_middle(roi: &[bool], w: usize, h: usize) -> Vec<bool> {
     let area = roi.iter().filter(|&&v| v).count() as f32;
     if area < 1.0 {
@@ -481,6 +475,7 @@ fn force_middle(roi: &[bool], w: usize, h: usize) -> Vec<bool> {
     }
 }
 
+#[allow(dead_code)]
 fn roi_is_ring(roi: &[bool], w: usize, h: usize, x: usize, y: usize) -> bool {
     let x = x as i32;
     let y = y as i32;
@@ -496,6 +491,7 @@ fn roi_is_ring(roi: &[bool], w: usize, h: usize, x: usize, y: usize) -> bool {
 }
 
 /// Drop the brightest residuals so a tight brush on the speck does not inflate MAD.
+#[allow(dead_code)]
 fn robust_interior(residuals: &[f32]) -> Vec<f32> {
     if residuals.len() < 12 {
         return residuals.to_vec();
@@ -507,6 +503,7 @@ fn robust_interior(residuals: &[f32]) -> Vec<f32> {
     s
 }
 
+#[allow(dead_code)]
 fn local_median(lum: &[f32], w: usize, h: usize, x: usize, y: usize, radius: i32) -> f32 {
     let mut vals = Vec::with_capacity(((2 * radius + 1) * (2 * radius + 1)) as usize);
     for dy in -radius..=radius {
@@ -839,8 +836,15 @@ fn heal_component(
         let y = i / w;
         let color = rgb_at(structure, x, y);
         let hsh = pixel_hash(x, y);
-        let jx = (hsh % 3) as i32 - 1;
-        let jy = ((hsh / 3) % 3) as i32 - 1;
+        // Cardinal ±1 on about half the pixels; the rest stay aligned so
+        // grain does not look fully scrambled.
+        let (jx, jy) = match hsh % 8 {
+            0 => (-1, 0),
+            1 => (1, 0),
+            2 => (0, -1),
+            3 => (0, 1),
+            _ => (0, 0),
+        };
         let x = x as i32;
         let y = y as i32;
         let grain = if let Some((dx, dy)) = offset {
@@ -1347,15 +1351,18 @@ mod tests {
     }
 
     #[test]
-    fn detect_hit_leaves_far_brush_pixels() {
+    fn painted_disc_is_the_hole() {
         let mut img = gradient_image(48, 48);
-        let before = img[(24, 11, 0)];
+        let outside = img[(24, 5, 0)];
         img[(24, 24, 0)] = 1.0;
         img[(24, 24, 1)] = 1.0;
         img[(24, 24, 2)] = 1.0;
         img[(24, 25, 0)] = 1.0;
         img[(25, 24, 0)] = 1.0;
         img[(25, 25, 0)] = 1.0;
+        img[(24, 11, 0)] = 0.95;
+        img[(24, 11, 1)] = 0.05;
+        img[(24, 11, 2)] = 0.05;
 
         let mut mask = DustMask::new(48, 48);
         stamp_disc(&mut mask, 24.0, 24.0, 16.0, DustTool::Pen);
@@ -1371,21 +1378,26 @@ mod tests {
         );
 
         assert!(
-            (img[(24, 11, 0)] - before).abs() < 1e-5,
-            "when detect hits, far pixels inside a large brush must stay"
+            (img[(24, 5, 0)] - outside).abs() < 1e-5,
+            "pixels outside the paint must stay"
         );
-        assert!(img[(24, 24, 0)] < 0.85, "the white speck must be healed");
+        assert!(img[(24, 24, 0)] < 0.85, "the painted core must be healed");
+        assert!(
+            img[(24, 11, 0)] < 0.7,
+            "interior of a large brush is now part of the hole (got {})",
+            img[(24, 11, 0)]
+        );
     }
 
     #[test]
-    fn detect_miss_heals_stroke_middle() {
+    fn faint_paint_is_healed_without_detect() {
         let mut img = Array3::<f32>::from_elem((40, 40, 3), 0.35);
         img[(20, 20, 0)] = 0.37;
         img[(20, 20, 1)] = 0.37;
         img[(20, 20, 2)] = 0.37;
         img[(20, 21, 0)] = 0.37;
         img[(21, 20, 0)] = 0.37;
-        let far = img[(20, 10, 0)];
+        let outside = img[(20, 4, 0)];
 
         let mut mask = DustMask::new(40, 40);
         stamp_disc(&mut mask, 20.0, 20.0, 12.0, DustTool::Pen);
@@ -1401,12 +1413,12 @@ mod tests {
         );
         assert!(
             (img[(20, 20, 0)] - 0.35).abs() < 0.03,
-            "when detect misses, the stroke middle must still be punched (got {})",
+            "faint specks must still be punched when the mask is trusted (got {})",
             img[(20, 20, 0)]
         );
         assert!(
-            (img[(20, 10, 0)] - far).abs() < 1e-5,
-            "a detect miss must not heal the whole large brush"
+            (img[(20, 4, 0)] - outside).abs() < 1e-5,
+            "pixels outside the paint must stay"
         );
     }
 
