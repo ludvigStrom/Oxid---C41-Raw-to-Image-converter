@@ -842,6 +842,8 @@ struct C41Gui {
     pending_preview_since: Option<Instant>,
     /// Path of the last saved/loaded project (Save writes here; Save As always prompts).
     project_path: Option<PathBuf>,
+    /// Persistable project state after the last successful load or save.
+    clean_project: Vec<ProjectImage>,
     /// Deferred file dialog flag: open the output LUT browser outside the egui render loop
     /// to avoid macOS NSOpenPanel re-entrance crashes.
     pending_output_lut_browse: bool,
@@ -849,7 +851,7 @@ struct C41Gui {
     pending_project_load: bool,
     /// Deferred load from Archive → Recent (outside the menu render loop).
     pending_recent_load: Option<PathBuf>,
-    /// Confirm save before Load, Recent, or Quit when the project is not empty.
+    /// Confirm save before Load, Recent, or Quit when the project has unsaved changes.
     save_before_leave: Option<PendingLeaveAction>,
     /// After Yes with no project path: proceed only if deferred Save As succeeds.
     pending_save_then_leave: Option<PendingLeaveAction>,
@@ -924,6 +926,7 @@ impl Default for C41Gui {
             pending_preview_key: None,
             pending_preview_since: None,
             project_path: None,
+            clean_project: Vec::new(),
             pending_output_lut_browse: false,
             pending_project_save_as: false,
             pending_project_load: false,
@@ -2290,6 +2293,45 @@ fn normalize_runtime_options(opts: &mut PipelineOptions) {
     opts.dust_mask = None;
 }
 
+fn normalize_persistable_options(opts: &mut PipelineOptions) {
+    normalize_runtime_options(opts);
+    opts.dust_mask_hash = 0;
+    opts.dust_mask = None;
+    opts.dust_strokes.clear();
+    opts.dust_reference_size = None;
+    opts.dust_uv = None;
+    opts.dust_heal = DustHealParams::default();
+}
+
+fn persistable_project_images(images: &[ImageEntry]) -> Vec<ProjectImage> {
+    images
+        .iter()
+        .map(|e| {
+            let mut options = e.options.clone();
+            normalize_persistable_options(&mut options);
+            let dust = {
+                let dust = ProjectDust {
+                    reference_size: e.dust_reference_size.unwrap_or(e.dust_mask_size),
+                    strokes: e.dust_strokes.clone(),
+                    heal: entry_dust_heal(e),
+                    brush_radius: e.dust_brush_radius,
+                };
+                if dust.is_empty() {
+                    None
+                } else {
+                    Some(dust)
+                }
+            };
+            ProjectImage {
+                path: e.path.clone(),
+                export_format: e.export_format.to_project(),
+                options,
+                dust,
+            }
+        })
+        .collect()
+}
+
 fn edit_snapshot(entry: &ImageEntry) -> EditSnapshot {
     let mut options = entry.options.clone();
     normalize_runtime_options(&mut options);
@@ -2561,12 +2603,24 @@ impl C41Gui {
         self.pending_project_save_as = true;
     }
 
+    fn persistable_project(&self) -> Vec<ProjectImage> {
+        persistable_project_images(&self.images)
+    }
+
+    fn mark_project_clean(&mut self) {
+        self.clean_project = self.persistable_project();
+    }
+
+    fn project_is_dirty(&self) -> bool {
+        self.persistable_project() != self.clean_project
+    }
+
     fn request_leave_current_project(
         &mut self,
         ctx: &egui::Context,
         action: PendingLeaveAction,
     ) {
-        if self.images.is_empty() {
+        if !self.project_is_dirty() {
             self.dispatch_leave_action(ctx, action);
             return;
         }
@@ -2600,31 +2654,11 @@ impl C41Gui {
     }
 
     fn write_project_to_path(&mut self, path: &Path) -> bool {
-        let images: Vec<ProjectImage> = self
-            .images
-            .iter()
-            .map(|e| ProjectImage {
-                path: e.path.clone(),
-                export_format: e.export_format.to_project(),
-                options: e.options.clone(),
-                dust: {
-                    let dust = ProjectDust {
-                        reference_size: e.dust_reference_size.unwrap_or(e.dust_mask_size),
-                        strokes: e.dust_strokes.clone(),
-                        heal: entry_dust_heal(e),
-                        brush_radius: e.dust_brush_radius,
-                    };
-                    if dust.is_empty() {
-                        None
-                    } else {
-                        Some(dust)
-                    }
-                },
-            })
-            .collect();
+        let images = self.persistable_project();
         match save_project(&images, path) {
             Ok(()) => {
                 self.project_path = Some(path.to_path_buf());
+                self.clean_project = images;
                 self.remember_recent_project(path);
                 self.status = format!("Saved project: {}", path.display());
                 true
@@ -2744,6 +2778,7 @@ impl C41Gui {
             Some(0)
         };
         self.project_path = Some(path.clone());
+        self.mark_project_clean();
         self.remember_recent_project(&path);
 
         if missing_count == 0 {
@@ -4636,7 +4671,7 @@ impl eframe::App for C41Gui {
         theme::apply(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed {
-            if !self.images.is_empty() {
+            if self.project_is_dirty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if self.pending_save_then_leave.is_none() {
                     self.request_leave_current_project(ctx, PendingLeaveAction::Quit);

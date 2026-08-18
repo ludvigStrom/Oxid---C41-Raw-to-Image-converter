@@ -31,7 +31,7 @@ pub enum ProjectExportFormat {
 }
 
 /// One image entry in a project file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectImage {
     pub path: PathBuf,
     #[serde(default)]
