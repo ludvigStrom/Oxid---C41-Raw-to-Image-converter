@@ -1882,9 +1882,9 @@ fn image_entry(
         dust_tool: DustTool::Pen,
         dust_brush_radius: 8.0,
         dust_detect: 1.0,
-        dust_feather: 4.0,
-        dust_grain: 1.5,
-        dust_grain_size: 0.8,
+        dust_feather: 6.0,
+        dust_grain: 1.0,
+        dust_grain_size: 2.0,
         dust_overlay_texture: None,
         dust_overlay_dirty: true,
     }
@@ -1995,9 +1995,23 @@ fn rebuild_dust_raster(entry: &mut ImageEntry) {
     entry.dust_overlay_dirty = true;
 }
 
+fn dust_source_wh(entry: &ImageEntry, preview_w: u32, preview_h: u32) -> (f32, f32) {
+    entry
+        .raw_source_size
+        .map(|[w, h]| (w as f32, h as f32))
+        .unwrap_or((preview_w.max(1) as f32, preview_h.max(1) as f32))
+}
+
 fn ensure_dust_working_mask(entry: &mut ImageEntry, w: u32, h: u32) {
     if w == 0 || h == 0 {
         return;
+    }
+    if entry.dust_strokes.is_empty() {
+        if let Some([sw, sh]) = entry.raw_source_size {
+            if sw > 0 && sh > 0 {
+                entry.dust_reference_size = Some((sw, sh));
+            }
+        }
     }
     if entry.dust_reference_size.is_none() {
         entry.dust_reference_size = Some((w, h));
@@ -6581,14 +6595,17 @@ impl eframe::App for C41Gui {
                                     if vir_rect.contains(pos) && canvas_rect.contains(pos) {
                                         let (ix, iy) = screen_to_image(pos.x, pos.y);
                                         let entry = &mut self.images[idx];
+                                        let (src_w, src_h) =
+                                            dust_source_wh(entry, full_w, full_h);
                                         let (rw, rh) = entry
                                             .dust_reference_size
-                                            .unwrap_or((full_w, full_h));
+                                            .unwrap_or((src_w as u32, src_h as u32));
                                         let sx = rw as f32 / full_w_f;
                                         let sy = rh as f32 / full_h_f;
                                         let pt = (ix * sx, iy * sy);
-                                        let radius_ref =
-                                            entry.dust_brush_radius * (sx + sy) * 0.5;
+                                        let radius_ref = entry.dust_brush_radius
+                                            * ((rw as f32 / src_w) + (rh as f32 / src_h))
+                                            * 0.5;
                                         let prev_img = if !self.dust_painting {
                                             None
                                         } else {
@@ -6622,7 +6639,9 @@ impl eframe::App for C41Gui {
                                             data: std::mem::take(&mut entry.dust_mask),
                                         };
                                         let tool = entry.dust_tool;
-                                        let radius = entry.dust_brush_radius;
+                                        let (src_w, _) = dust_source_wh(entry, full_w, full_h);
+                                        let radius = entry.dust_brush_radius
+                                            * (full_w_f / src_w.max(1.0));
                                         if let Some((ox, oy)) = prev_img {
                                             let dx = ix - ox;
                                             let dy = iy - oy;
@@ -6705,8 +6724,10 @@ impl eframe::App for C41Gui {
                             if let Some(pos) = canvas_resp.hover_pos().filter(|p| {
                                 vir_rect.contains(*p) && canvas_rect.contains(*p)
                             }) {
-                                let radius_screen =
-                                    self.images[idx].dust_brush_radius * (img_w / full_w_f);
+                                let (src_w, _) =
+                                    dust_source_wh(&self.images[idx], full_w, full_h);
+                                let radius_screen = self.images[idx].dust_brush_radius
+                                    * (img_w / src_w.max(1.0));
                                 let color = if self.images[idx].dust_tool == DustTool::Eraser {
                                     egui::Color32::from_rgb(220, 220, 220)
                                 } else {

@@ -256,9 +256,9 @@ impl Default for DustHealParams {
     fn default() -> Self {
         Self {
             detect: 1.0,
-            feather: 4.0,
-            grain: 1.5,
-            grain_sigma: 0.8,
+            feather: 6.0,
+            grain: 1.0,
+            grain_sigma: 2.0,
         }
     }
 }
