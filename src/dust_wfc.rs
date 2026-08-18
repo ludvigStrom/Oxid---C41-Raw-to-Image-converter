@@ -1,21 +1,17 @@
-//! Structure-tensor bridge + extracted film grain for dust holes.
+//! Structure-tensor bridge + statistical film grain for dust holes.
 //!
 //! Low-pass is smeared along the collar’s direction (or H+V when isotropic).
-//! High-pass residual is copied from film along that flow. No patch RGB,
-//! so mid-hole X seams cannot form.
+//! Grain is synthesized from a flat-region NLF + PSD (hole only).
 
 use ndarray::Array3;
 
-use crate::dust::{
-    blur_rgb_masked, connected_components, dilate, estimate_grain_sigma, rgb_at, structure_hv,
-};
+use crate::dust::{connected_components, dilate, rgb_at, structure_hv};
+use crate::dust_grain::{apply_statistical_grain, component_bbox, nlm_bbox, MARGIN};
 
 const RIM_R: i32 = 8;
-const DIRS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 
-fn tile_n(tile: u8) -> i32 {
-    (tile as i32).clamp(2, 5)
-}
+#[cfg(test)]
+const DIRS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 
 fn rgb_ssd(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
     let d0 = a.0 - b.0;
@@ -44,15 +40,7 @@ fn median_f32(mut v: Vec<f32>) -> f32 {
     v[v.len() / 2]
 }
 
-fn add3(a: (f32, f32, f32), b: (f32, f32, f32), s: f32) -> (f32, f32, f32) {
-    (
-        (a.0 + b.0 * s).clamp(0.0, 1.0),
-        (a.1 + b.1 * s).clamp(0.0, 1.0),
-        (a.2 + b.2 * s).clamp(0.0, 1.0),
-    )
-}
-
-/// Structure-flow fill on `tight`, then alpha composite. Grain scales residual.
+/// Structure-flow fill on `tight`, then alpha composite. Grain scales NLF.
 pub(crate) fn heal_wfc(
     image: &mut Array3<f32>,
     tight: &[bool],
@@ -65,15 +53,19 @@ pub(crate) fn heal_wfc(
     h: usize,
 ) {
     let n_pix = w * h;
-    let n = tile_n(tile);
+    let _ = tile;
     let loosen = match_loosen.clamp(1.0, 4.0);
     let grain = grain_amount.clamp(0.0, 3.0);
-    let sigma = estimate_grain_sigma(image, tight, w, h);
-    let low = blur_rgb_masked(image, tight, sigma);
+    let mut den = image.clone();
     let mut fill = vec![None; n_pix];
     for component in connected_components(tight, w, h) {
+        if component.is_empty() {
+            continue;
+        }
+        let (x0, y0, x1, y1) = component_bbox(&component, w, h, MARGIN);
+        nlm_bbox(&mut den, image, tight, x0, y0, x1, y1, w, h);
         fill_component(
-            image, &low, tight, &component, &mut fill, n, loosen, grain, w, h,
+            image, &den, tight, &component, &mut fill, loosen, grain, w, h,
         );
     }
     composite_alpha(image, &fill, alpha, w, h);
@@ -105,11 +97,10 @@ fn composite_alpha(
 
 fn fill_component(
     image: &Array3<f32>,
-    low: &Array3<f32>,
+    den: &Array3<f32>,
     tight: &[bool],
     component: &[usize],
     fill: &mut [Option<(f32, f32, f32)>],
-    tile: i32,
     loosen: f32,
     grain: f32,
     w: usize,
@@ -122,26 +113,21 @@ fn fill_component(
     for &i in component {
         hole[i] = true;
     }
-    let (rim_mean, color_gate, ring) = rim_stats(image, tight, &hole, w, h);
-    let (flow, coherence) = collar_tensor(low, tight, &hole, w, h);
+    let (rim_mean, color_gate, _) = rim_stats(image, tight, &hole, loosen, w, h);
+    let (flow, coherence) = collar_tensor(den, tight, &hole, w, h);
     let aniso = (coherence * loosen / 2.5).clamp(0.0, 1.0);
-    let use_flow = aniso > 0.30;
-    let offset = coherent_offset(tight, component, flow, use_flow, w, h);
 
     for &i in component {
         let x = i % w;
         let y = i / w;
-        let bridged = bridge_low(
-            low, tight, x, y, flow, aniso, rim_mean, w, h,
+        fill[i] = Some(bridge_low(
+            den, tight, x, y, flow, aniso, rim_mean, w, h,
+        ));
+    }
+    if grain > 1.0e-5 {
+        apply_statistical_grain(
+            image, den, &hole, component, fill, grain, rim_mean, color_gate, loosen, w, h,
         );
-        let residual = if grain <= 1.0e-5 {
-            (0.0, 0.0, 0.0)
-        } else {
-            residual_along(
-                image, low, tight, x, y, offset, flow, tile, rim_mean, color_gate, &ring, w, h,
-            )
-        };
-        fill[i] = Some(add3(bridged, residual, grain));
     }
 }
 
@@ -149,6 +135,7 @@ fn rim_stats(
     image: &Array3<f32>,
     tight: &[bool],
     hole: &[bool],
+    loosen: f32,
     w: usize,
     h: usize,
 ) -> ((f32, f32, f32), f32, Vec<usize>) {
@@ -179,7 +166,7 @@ fn rim_stats(
     } else {
         median_f32(colors.iter().map(|&c| rgb_ssd(c, rim_mean)).collect())
     };
-    (rim_mean, scale.max(1.0e-4) * 2.5, ring)
+    (rim_mean, scale.max(1.0e-4) * loosen, ring)
 }
 
 fn luma_at(low: &Array3<f32>, x: usize, y: usize) -> f32 {
@@ -335,162 +322,6 @@ fn bridge_low(
         (Some(a), None) => a,
         (None, Some(b)) => b,
         (None, None) => rim_mean,
-    }
-}
-
-fn coherent_offset(
-    tight: &[bool],
-    component: &[usize],
-    flow: (f32, f32),
-    use_flow: bool,
-    w: usize,
-    h: usize,
-) -> (i32, i32) {
-    let mut cx = 0i32;
-    let mut cy = 0i32;
-    for &i in component {
-        cx += (i % w) as i32;
-        cy += (i / w) as i32;
-    }
-    let n = component.len().max(1) as i32;
-    let cx = cx / n;
-    let cy = cy / n;
-    if use_flow {
-        let a = walk_to_known(tight, cx as f32, cy as f32, flow.0, flow.1, w, h);
-        let b = walk_to_known(tight, cx as f32, cy as f32, -flow.0, -flow.1, w, h);
-        if let Some((sx, sy, _)) = match (a, b) {
-            (Some(a), Some(b)) => Some(if a.2 <= b.2 { a } else { b }),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        } {
-            return (sx as i32 - cx, sy as i32 - cy);
-        }
-    }
-    nearest_known_offset(tight, cx, cy, w, h)
-}
-
-fn nearest_known_offset(tight: &[bool], cx: i32, cy: i32, w: usize, h: usize) -> (i32, i32) {
-    for r in 1..=24 {
-        for (dx, dy) in DIRS {
-            let x = cx + dx * r;
-            let y = cy + dy * r;
-            if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-                continue;
-            }
-            if !tight[y as usize * w + x as usize] {
-                return (dx * r, dy * r);
-            }
-        }
-    }
-    (1, 0)
-}
-
-fn residual_at(
-    image: &Array3<f32>,
-    low: &Array3<f32>,
-    tight: &[bool],
-    x: i32,
-    y: i32,
-    rim: (f32, f32, f32),
-    gate: f32,
-    w: usize,
-    h: usize,
-) -> Option<(f32, f32, f32)> {
-    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-        return None;
-    }
-    let x = x as usize;
-    let y = y as usize;
-    if tight[y * w + x] {
-        return None;
-    }
-    let c = rgb_at(image, x, y);
-    if rgb_ssd(c, rim) > gate {
-        return None;
-    }
-    let l = rgb_at(low, x, y);
-    Some((c.0 - l.0, c.1 - l.1, c.2 - l.2))
-}
-
-fn residual_along(
-    image: &Array3<f32>,
-    low: &Array3<f32>,
-    tight: &[bool],
-    x: usize,
-    y: usize,
-    offset: (i32, i32),
-    flow: (f32, f32),
-    tile: i32,
-    rim: (f32, f32, f32),
-    gate: f32,
-    ring: &[usize],
-    w: usize,
-    h: usize,
-) -> (f32, f32, f32) {
-    let (ox, oy) = offset;
-    let mut sx = x as i32 + ox;
-    let mut sy = y as i32 + oy;
-    let step_x = ox.signum();
-    let step_y = oy.signum();
-    for _ in 0..48 {
-        if let Some(r) = residual_at(image, low, tight, sx, sy, rim, gate, w, h) {
-            return r;
-        }
-        if step_x == 0 && step_y == 0 {
-            break;
-        }
-        if sx >= 0 && sy >= 0 && sx < w as i32 && sy < h as i32 && !tight[sy as usize * w + sx as usize]
-        {
-            break;
-        }
-        sx += step_x;
-        sy += step_y;
-    }
-
-    for k in 1..=tile {
-        for sign in [1, -1] {
-            let tx = x as i32 + ox + ((sign as f32) * (k as f32) * flow.0).round() as i32;
-            let ty = y as i32 + oy + ((sign as f32) * (k as f32) * flow.1).round() as i32;
-            if let Some(r) = residual_at(image, low, tight, tx, ty, rim, gate, w, h) {
-                return r;
-            }
-        }
-    }
-
-    nearest_ring_residual(image, low, x as i32, y as i32, rim, gate, ring, w)
-}
-
-fn nearest_ring_residual(
-    image: &Array3<f32>,
-    low: &Array3<f32>,
-    x: i32,
-    y: i32,
-    rim: (f32, f32, f32),
-    gate: f32,
-    ring: &[usize],
-    w: usize,
-) -> (f32, f32, f32) {
-    let mut best = (i32::MAX, (0.0, 0.0, 0.0));
-    let mut any = false;
-    for &i in ring {
-        let rx = (i % w) as i32;
-        let ry = (i / w) as i32;
-        let c = rgb_at(image, rx as usize, ry as usize);
-        if rgb_ssd(c, rim) > gate {
-            continue;
-        }
-        let d = (rx - x) * (rx - x) + (ry - y) * (ry - y);
-        if d < best.0 {
-            let l = rgb_at(low, rx as usize, ry as usize);
-            best = (d, (c.0 - l.0, c.1 - l.1, c.2 - l.2));
-            any = true;
-        }
-    }
-    if any {
-        best.1
-    } else {
-        (0.0, 0.0, 0.0)
     }
 }
 
@@ -734,6 +565,100 @@ mod tests {
         assert!(
             (right - left).abs() > 0.30,
             "the real vertical edge must remain (left={left}, right={right})"
+        );
+    }
+
+    fn axis_spreads(residual: &[f32], mask: &[bool], w: usize) -> (f32, f32) {
+        let h = mask.len() / w;
+        let mut x_acc = 0.0f32;
+        let mut x_n = 0.0f32;
+        for y in 0..h {
+            let mut lo = 1.0f32;
+            let mut hi = -1.0f32;
+            let mut any = false;
+            for x in 0..w {
+                if !mask[y * w + x] {
+                    continue;
+                }
+                let v = residual[y * w + x];
+                lo = lo.min(v);
+                hi = hi.max(v);
+                any = true;
+            }
+            if any {
+                x_acc += hi - lo;
+                x_n += 1.0;
+            }
+        }
+        let mut y_acc = 0.0f32;
+        let mut y_n = 0.0f32;
+        for x in 0..w {
+            let mut lo = 1.0f32;
+            let mut hi = -1.0f32;
+            let mut any = false;
+            for y in 0..h {
+                if !mask[y * w + x] {
+                    continue;
+                }
+                let v = residual[y * w + x];
+                lo = lo.min(v);
+                hi = hi.max(v);
+                any = true;
+            }
+            if any {
+                y_acc += hi - lo;
+                y_n += 1.0;
+            }
+        }
+        (
+            if x_n > 0.0 { x_acc / x_n } else { 0.0 },
+            if y_n > 0.0 { y_acc / y_n } else { 0.0 },
+        )
+    }
+
+    #[test]
+    fn statistical_grain_has_xy_variance() {
+        let img = grainy_field(48, 48);
+        let (tight, _) = hole_square(48, 16, 16, 8);
+        let smooth = run_fill(&img, &tight, 0.0, 3, 2.0, 48, 48);
+        let grained = run_fill(&img, &tight, 1.0, 3, 2.0, 48, 48);
+        let mut hole_res = vec![0.0f32; 48 * 48];
+        for i in 0..48 * 48 {
+            if !tight[i] {
+                continue;
+            }
+            let x = i % 48;
+            let y = i / 48;
+            hole_res[i] = luma(rgb_at(&grained, x, y)) - luma(rgb_at(&smooth, x, y));
+        }
+        let collar = {
+            let outer = dilate(&tight, 48, 48, 8);
+            outer
+                .iter()
+                .zip(tight.iter())
+                .map(|(&o, &t)| o && !t)
+                .collect::<Vec<_>>()
+        };
+        let mut collar_res = vec![0.0f32; 48 * 48];
+        for i in 0..48 * 48 {
+            if !collar[i] {
+                continue;
+            }
+            let x = i % 48;
+            let y = i / 48;
+            collar_res[i] = luma(rgb_at(&img, x, y)) - luma(rgb_at(&smooth, x, y));
+        }
+        let (hx, hy) = axis_spreads(&hole_res, &tight, 48);
+        let (cx, cy) = axis_spreads(&collar_res, &collar, 48);
+        assert!(
+            hx >= cx * 0.40 && hy >= cy * 0.40,
+            "statistical grain must keep 2D texture (hole x={hx} y={hy}, collar x={cx} y={cy})"
+        );
+        let lo = hx.min(hy);
+        let hi = hx.max(hy);
+        assert!(
+            lo >= hi * 0.40,
+            "neither axis may collapse to a streak (x={hx}, y={hy})"
         );
     }
 }

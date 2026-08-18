@@ -26,6 +26,7 @@ pub mod demosaic;
 pub mod density_ops;
 pub mod dmin;
 pub mod dust;
+pub(crate) mod dust_grain;
 pub(crate) mod dust_wfc;
 pub mod exr_export;
 pub mod flat_field;

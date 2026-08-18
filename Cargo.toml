@@ -15,6 +15,9 @@ ndarray = { version = "0.17.2", features = ["rayon"] }
 # Parallelism for batch processing (used later in the pipeline)
 rayon = "1.10.0"
 
+# 2-D FFT for statistical film-grain PSD
+rustfft = "6.2"
+
 # CLI argument parsing
 clap = { version = "4.5.4", features = ["derive"] }
 
