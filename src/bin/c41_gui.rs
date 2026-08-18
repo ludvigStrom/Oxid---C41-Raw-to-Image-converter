@@ -1976,11 +1976,11 @@ fn image_entry(
         dust_brush_radius: 8.0,
         dust_detect: 1.0,
         dust_feather: 6.0,
-        dust_grain: 1.5,
+        dust_grain: 1.0,
         dust_grain_size: 2.0,
-        dust_infill: DustInfill::Telea,
+        dust_infill: DustInfill::PatchMatch,
         dust_tile: 3,
-        dust_match: 2.5,
+        dust_match: 2.0,
         dust_overlay_texture: None,
         dust_overlay_dirty: true,
     }
@@ -2551,11 +2551,12 @@ impl C41Gui {
         if entry.dust_strokes.is_empty() {
             return false;
         }
-        if self.mode == UIMode::Process
-            && entry.process_tab == ProcessTab::Dust
-            && entry.dust_view == DustView::Edit
-        {
-            return false;
+        if self.mode == UIMode::Process {
+            return match entry.process_tab {
+                ProcessTab::Input | ProcessTab::Develop => false,
+                ProcessTab::Dust => entry.dust_view != DustView::Edit,
+                ProcessTab::Export => true,
+            };
         }
         true
     }
@@ -6526,9 +6527,9 @@ impl eframe::App for C41Gui {
                         .selected_text(entry.dust_infill.label())
                         .show_ui(ui, |ui| {
                             for value in [
-                                DustInfill::Telea,
-                                DustInfill::WaveFunction,
                                 DustInfill::PatchMatch,
+                                DustInfill::WaveFunction,
+                                DustInfill::Telea,
                             ] {
                                 ui.selectable_value(
                                     &mut entry.dust_infill,
@@ -7563,6 +7564,7 @@ impl eframe::App for C41Gui {
                                             // opaque panel-fill color so the area behaves like a hard crop.
                                             let overlay = if entry.process_tab == ProcessTab::Develop
                                                 || entry.process_tab == ProcessTab::Export
+                                                || entry.process_tab == ProcessTab::Dust
                                             {
                                                 ui.visuals().panel_fill
                                             } else {

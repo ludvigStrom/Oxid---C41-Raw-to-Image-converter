@@ -322,17 +322,17 @@ const MIN_SPECK_AREA: usize = 2;
 #[serde(rename_all = "snake_case")]
 pub enum DustInfill {
     #[default]
-    Telea,
-    WaveFunction,
     PatchMatch,
+    WaveFunction,
+    Telea,
 }
 
 impl DustInfill {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Telea => "Telea",
-            Self::WaveFunction => "Wave function",
             Self::PatchMatch => "PatchMatch",
+            Self::WaveFunction => "Wave function",
+            Self::Telea => "Telea",
         }
     }
 }
@@ -345,7 +345,7 @@ pub struct DustHealParams {
     pub detect: f32,
     /// Fade width in pixels *outside* the painted hole (0 = core only).
     pub feather: f32,
-    /// Telea and Wave-function: scale on nearby high-pass residual.
+    /// Grain amount: Telea high-pass, or WFC/PatchMatch NLF×PSD scale.
     pub grain: f32,
     /// Unused by heal (σ is estimated from nearby film). Kept for cache-hash compatibility.
     pub grain_sigma: f32,
@@ -362,11 +362,11 @@ impl Default for DustHealParams {
         Self {
             detect: 1.0,
             feather: 6.0,
-            grain: 1.5,
+            grain: 1.0,
             grain_sigma: 2.0,
-            infill: DustInfill::Telea,
+            infill: DustInfill::PatchMatch,
             tile: 3,
-            match_loosen: 2.5,
+            match_loosen: 2.0,
         }
     }
 }
@@ -2021,7 +2021,15 @@ mod tests {
 
         let mut mask = DustMask::new(48, 48);
         stamp_disc(&mut mask, 24.0, 24.0, 5.0, DustTool::Pen);
-        apply_dust_removal(&mut img, &mask);
+        apply_dust_removal_with(
+            &mut img,
+            &mask,
+            DustHealParams {
+                infill: DustInfill::Telea,
+                grain: 1.5,
+                ..DustHealParams::default()
+            },
+        );
 
         let spread = heal_core_spread(&img, 24, 24);
         assert!(
