@@ -17,11 +17,12 @@ use c41_raw_tool::apply_preview_from_cache;
 use c41_raw_tool::{apply_preview_from_cache_gpu, process_one_to_preview_with_cache_gpu};
 use c41_raw_tool::{
     apply_preview_from_cache_on_progress, auto_tune, blur_flat_field, cached_start_step,
-    calibration, color, compute_preview_scene_stats, crop_mask_uv, crop_sensor_for_oriented_rect,
+    calibration, color, compute_preview_scene_stats, crop_sensor_for_oriented_rect,
     demosaic, detect_crop, dmin, hash_dust, load_develop_preset, load_flat_field_linear,
     load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
-    process_export_jobs, process_one_to_preview, process_one_to_preview_with_cache,
-    process_one_to_preview_with_cache_on_progress, rasterize_strokes, raw_reader,
+    process_export_jobs,     process_one_to_preview, process_one_to_preview_with_cache,
+    process_one_to_preview_with_cache_on_progress, rasterize_strokes, rasterize_strokes_uv,
+    raw_reader,
     reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path, save_develop_preset,
     save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export, AutoCropResult, AutoTuneResult,
     CachedSensor, CropConfidence, DminMode, DustHealParams, DustInfill, DustMask, DustStroke,
@@ -2890,17 +2891,23 @@ impl C41Gui {
         );
         let mut options = self.bake_preview_options(entry);
         options.verbose_debug = false;
-        if let Some(mask) = options.dust_mask.take() {
-            let tw = (((crop.uv_right - crop.uv_left) * mask.width as f32).round() as u32).max(1);
-            let th = (((crop.uv_bottom - crop.uv_top) * mask.height as f32).round() as u32).max(1);
-            options.dust_mask = Some(Arc::new(crop_mask_uv(
-                &mask,
+        if self.dust_should_apply(entry) && !entry.dust_strokes.is_empty() {
+            let (fw, fh) = oriented_export_size(entry)
+                .or(entry.dust_reference_size)
+                .unwrap_or((ow, oh));
+            let pw = (((crop.uv_right - crop.uv_left) * fw as f32).round() as u32).max(1);
+            let ph = (((crop.uv_bottom - crop.uv_top) * fh as f32).round() as u32).max(1);
+            options.dust_heal = entry_dust_heal(entry);
+            options.dust_mask_hash = hash_dust(&entry.dust_strokes, options.dust_heal);
+            options.dust_mask = Some(Arc::new(rasterize_strokes_uv(
+                &entry.dust_strokes,
+                entry.dust_reference_size.unwrap_or((fw, fh)),
                 crop.uv_left,
                 crop.uv_top,
                 crop.uv_right,
                 crop.uv_bottom,
-                tw,
-                th,
+                pw,
+                ph,
             )));
         }
         // Same hash the cache lookup uses, so a finished tile is never "missing".

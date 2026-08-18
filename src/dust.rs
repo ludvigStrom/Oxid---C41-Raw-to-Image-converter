@@ -202,6 +202,63 @@ pub fn rasterize_strokes(
     mask
 }
 
+/// Replay strokes into a UV window at `out_w` × `out_h` (tile / crop space).
+///
+/// Unlike [`crop_mask_uv`], this stamps discs at the output resolution so a
+/// preview-sized paint is not nearest-upscaled into 8–16 px stairs.
+pub fn rasterize_strokes_uv(
+    strokes: &[DustStroke],
+    reference_size: (u32, u32),
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+    out_w: u32,
+    out_h: u32,
+) -> DustMask {
+    let mut mask = DustMask::new(out_w, out_h);
+    if out_w == 0 || out_h == 0 || reference_size.0 == 0 || reference_size.1 == 0 {
+        return mask;
+    }
+    let u0 = u0.clamp(0.0, 1.0);
+    let v0 = v0.clamp(0.0, 1.0);
+    let u1 = u1.clamp(u0, 1.0);
+    let v1 = v1.clamp(v0, 1.0);
+    let uv_w = (u1 - u0).max(1.0e-6);
+    let uv_h = (v1 - v0).max(1.0e-6);
+    let ref_w = reference_size.0 as f32;
+    let ref_h = reference_size.1 as f32;
+    let sx = out_w as f32 / (uv_w * ref_w);
+    let sy = out_h as f32 / (uv_h * ref_h);
+    let ox = u0 * out_w as f32 / uv_w;
+    let oy = v0 * out_h as f32 / uv_h;
+    for stroke in strokes {
+        if stroke.points.is_empty() || stroke.radius <= 0.0 {
+            continue;
+        }
+        let pr = stroke.radius * (sx + sy) * 0.5;
+        let mut prev: Option<(f32, f32)> = None;
+        for &(x, y) in &stroke.points {
+            let px = x * sx - ox;
+            let py = y * sy - oy;
+            if let Some((qx, qy)) = prev {
+                let dx = px - qx;
+                let dy = py - qy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let steps = (dist * 2.0).ceil().max(1.0) as i32;
+                for s in 1..=steps {
+                    let t = s as f32 / steps as f32;
+                    stamp_disc(&mut mask, qx + dx * t, qy + dy * t, pr, stroke.tool);
+                }
+            } else {
+                stamp_disc(&mut mask, px, py, pr, stroke.tool);
+            }
+            prev = Some((px, py));
+        }
+    }
+    mask
+}
+
 /// Nearest-neighbor scale. Used when the process buffer size differs from the mask.
 pub fn scale_mask(mask: &DustMask, new_w: u32, new_h: u32) -> DustMask {
     if mask.width == new_w && mask.height == new_h {
@@ -1501,6 +1558,21 @@ mod tests {
         assert!(small.data[8 * 16 + 8] > 200);
         assert!(big.data[16 * 32 + 16] > 200);
         assert_ne!(hash_strokes(&strokes), 0);
+    }
+
+    #[test]
+    fn rasterize_strokes_uv_keeps_soft_disc() {
+        let strokes = vec![DustStroke {
+            tool: DustTool::Pen,
+            radius: 2.0,
+            points: vec![(8.0, 8.0)],
+        }];
+        let replay = rasterize_strokes_uv(&strokes, (16, 16), 0.0, 0.0, 1.0, 1.0, 32, 32);
+        assert!(replay.data[16 * 32 + 16] > 200);
+        assert!(
+            replay.data.iter().any(|&v| (16..250).contains(&v)),
+            "replay at a higher res must stamp a soft rim, not a nearest block"
+        );
     }
 
     #[test]
