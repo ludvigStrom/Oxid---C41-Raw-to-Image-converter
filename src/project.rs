@@ -339,6 +339,7 @@ mod tests {
                         radius: 6.0,
                         points: vec![(10.0, 20.0), (12.0, 22.0)],
                     }],
+                    ..Default::default()
                 }),
             }],
             &project_path,
@@ -351,6 +352,82 @@ mod tests {
         assert_eq!(dust.strokes.len(), 1);
         assert_eq!(dust.strokes[0].tool, DustTool::Pen);
         assert_eq!(dust.strokes[0].points.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dust_settings_roundtrip() {
+        use crate::dust::{DustHealParams, DustInfill, ProjectDust};
+
+        let dir = temp_dir();
+        let img_path = dir.join("frame.arw");
+        std::fs::write(&img_path, b"not-a-real-raw").unwrap();
+
+        let heal = DustHealParams {
+            feather: 3.0,
+            grain: 0.8,
+            infill: DustInfill::WaveFunction,
+            tile: 4,
+            match_loosen: 1.5,
+            ..DustHealParams::default()
+        };
+        let project_path = dir.join("dust_settings.oxidProj");
+        save_project(
+            &[ProjectImage {
+                path: img_path,
+                export_format: ProjectExportFormat::Tiff16,
+                options: PipelineOptions::default(),
+                dust: Some(ProjectDust {
+                    reference_size: (0, 0),
+                    strokes: Vec::new(),
+                    heal,
+                    brush_radius: 12.0,
+                }),
+            }],
+            &project_path,
+        )
+        .unwrap();
+
+        let loaded = load_project(&project_path).unwrap();
+        let dust = loaded.images[0].dust.as_ref().unwrap();
+        assert_eq!(dust.heal, heal);
+        assert_eq!(dust.brush_radius, 12.0);
+        assert!(dust.strokes.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn old_dust_json_uses_default_settings() {
+        let dir = temp_dir();
+        let img_path = dir.join("frame.arw");
+        std::fs::write(&img_path, b"not-a-real-raw").unwrap();
+        let project_path = dir.join("old_dust.oxidProj");
+        std::fs::write(
+            &project_path,
+            r#"{
+                "version": 1,
+                "images": [{
+                    "path": "frame.arw",
+                    "dust": {
+                        "reference_size": [800, 600],
+                        "strokes": [{
+                            "tool": "pen",
+                            "radius": 6.0,
+                            "points": [[10.0, 20.0]]
+                        }]
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = load_project(&project_path).unwrap();
+        let dust = loaded.images[0].dust.as_ref().unwrap();
+        assert_eq!(dust.heal, crate::dust::DustHealParams::default());
+        assert_eq!(dust.brush_radius, 8.0);
+        assert_eq!(dust.strokes.len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

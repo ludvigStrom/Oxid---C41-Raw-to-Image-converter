@@ -22,17 +22,38 @@ pub struct DustStroke {
     pub points: Vec<(f32, f32)>,
 }
 
+fn default_dust_brush_radius() -> f32 {
+    8.0
+}
+
 /// Persisted dust state for a project image.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectDust {
     pub reference_size: (u32, u32),
     #[serde(default)]
     pub strokes: Vec<DustStroke>,
+    #[serde(default)]
+    pub heal: DustHealParams,
+    #[serde(default = "default_dust_brush_radius")]
+    pub brush_radius: f32,
+}
+
+impl Default for ProjectDust {
+    fn default() -> Self {
+        Self {
+            reference_size: (0, 0),
+            strokes: Vec::new(),
+            heal: DustHealParams::default(),
+            brush_radius: default_dust_brush_radius(),
+        }
+    }
 }
 
 impl ProjectDust {
     pub fn is_empty(&self) -> bool {
         self.strokes.is_empty()
+            && self.heal == DustHealParams::default()
+            && self.brush_radius == default_dust_brush_radius()
     }
 }
 
@@ -260,7 +281,8 @@ impl DustInfill {
 }
 
 /// Rim fade and grain for [`apply_dust_removal_with`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DustHealParams {
     /// Unused by heal (the paint is the hole). Kept for cache-hash compatibility.
     pub detect: f32,

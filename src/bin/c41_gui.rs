@@ -2145,6 +2145,22 @@ fn dust_mask_from_entry(entry: &ImageEntry) -> Option<Arc<DustMask>> {
     )))
 }
 
+fn apply_project_dust(entry: &mut ImageEntry, dust: ProjectDust) {
+    entry.dust_detect = dust.heal.detect;
+    entry.dust_feather = dust.heal.feather;
+    entry.dust_grain = dust.heal.grain;
+    entry.dust_grain_size = dust.heal.grain_sigma;
+    entry.dust_infill = dust.heal.infill;
+    entry.dust_tile = dust.heal.tile;
+    entry.dust_match = dust.heal.match_loosen;
+    entry.dust_brush_radius = dust.brush_radius;
+    if !dust.strokes.is_empty() {
+        entry.dust_strokes = dust.strokes;
+        entry.dust_reference_size = Some(dust.reference_size);
+        rebuild_dust_raster(entry);
+    }
+}
+
 fn entry_dust_heal(entry: &ImageEntry) -> DustHealParams {
     let _ = entry.dust_grain_size;
     DustHealParams {
@@ -2362,13 +2378,18 @@ impl C41Gui {
                 path: e.path.clone(),
                 export_format: e.export_format.to_project(),
                 options: e.options.clone(),
-                dust: if e.dust_strokes.is_empty() {
-                    None
-                } else {
-                    Some(ProjectDust {
+                dust: {
+                    let dust = ProjectDust {
                         reference_size: e.dust_reference_size.unwrap_or(e.dust_mask_size),
                         strokes: e.dust_strokes.clone(),
-                    })
+                        heal: entry_dust_heal(e),
+                        brush_radius: e.dust_brush_radius,
+                    };
+                    if dust.is_empty() {
+                        None
+                    } else {
+                        Some(dust)
+                    }
                 },
             })
             .collect();
@@ -2484,11 +2505,7 @@ impl C41Gui {
                 ExportFormat::from_project(img.export_format),
             );
             if let Some(dust) = img.dust {
-                if !dust.strokes.is_empty() {
-                    entry.dust_strokes = dust.strokes;
-                    entry.dust_reference_size = Some(dust.reference_size);
-                    rebuild_dust_raster(&mut entry);
-                }
+                apply_project_dust(&mut entry, dust);
             }
             self.images.push(entry);
         }
