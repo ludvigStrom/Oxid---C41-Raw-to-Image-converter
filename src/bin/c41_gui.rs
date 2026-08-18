@@ -6414,7 +6414,11 @@ impl eframe::App for C41Gui {
                     egui::ComboBox::from_label("Infill")
                         .selected_text(entry.dust_infill.label())
                         .show_ui(ui, |ui| {
-                            for value in [DustInfill::Telea, DustInfill::WaveFunction] {
+                            for value in [
+                                DustInfill::Telea,
+                                DustInfill::WaveFunction,
+                                DustInfill::PatchMatch,
+                            ] {
                                 ui.selectable_value(
                                     &mut entry.dust_infill,
                                     value,
@@ -6435,6 +6439,11 @@ impl eframe::App for C41Gui {
                             theme::slider_row(ui, "Match", &mut entry.dust_match, 1.0..=4.0, 1);
                             ui.small("Match is how strongly local direction is used for the structure fill.");
                             ui.small("Grain adds statistical film grain on the hole (NLF + clump spectrum). 1.0 matches measured σ.");
+                        }
+                        DustInfill::PatchMatch => {
+                            theme::slider_row(ui, "Match", &mut entry.dust_match, 1.0..=4.0, 1);
+                            ui.small("Match is how far and how loosely PatchMatch may search nearby film.");
+                            ui.small("Copies a 7×7-matched patch from a color-gated collar. Grain is unused.");
                         }
                     }
                     ui.small("The pen is the hole. Size the brush to the speck; feather fades the rim.");

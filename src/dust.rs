@@ -246,6 +246,7 @@ pub enum DustInfill {
     #[default]
     Telea,
     WaveFunction,
+    PatchMatch,
 }
 
 impl DustInfill {
@@ -253,6 +254,7 @@ impl DustInfill {
         match self {
             Self::Telea => "Telea",
             Self::WaveFunction => "Wave function",
+            Self::PatchMatch => "PatchMatch",
         }
     }
 }
@@ -270,9 +272,9 @@ pub struct DustHealParams {
     pub grain_sigma: f32,
     /// Infill algorithm.
     pub infill: DustInfill,
-    /// WFC tile edge length in pixels (2–5). Ignored by Telea.
+    /// WFC tile edge length in pixels (2–5). Ignored by Telea and PatchMatch.
     pub tile: u8,
-    /// Multiplier on harvest neighbor SSD (1–4). Ignored by Telea.
+    /// WFC / PatchMatch: search looseness (1–4). Ignored by Telea.
     pub match_loosen: f32,
 }
 
@@ -317,7 +319,7 @@ pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
     apply_dust_removal_with(image, mask, DustHealParams::default());
 }
 
-/// Replace dust in the painted stroke. Telea or wave-function infill,
+/// Replace dust in the painted stroke. Telea, wave-function, or PatchMatch,
 /// then a soft-alpha composite.
 pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     if mask.is_empty() {
@@ -425,6 +427,18 @@ fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) 
             &alpha,
             grain_amount,
             params.tile,
+            params.match_loosen,
+            w,
+            h,
+        );
+        return;
+    }
+    if params.infill == DustInfill::PatchMatch {
+        crate::dust_pm::heal_patchmatch(
+            image,
+            &tight,
+            &dilated,
+            &alpha,
             params.match_loosen,
             w,
             h,
@@ -2128,6 +2142,52 @@ mod tests {
         assert!(
             spread_heavy > spread_none + 0.004,
             "extracted residual should raise core spread (none={spread_none}, heavy={spread_heavy})"
+        );
+    }
+
+    fn pm_params(feather: f32) -> DustHealParams {
+        DustHealParams {
+            infill: DustInfill::PatchMatch,
+            feather,
+            grain: 0.0,
+            match_loosen: 2.0,
+            ..DustHealParams::default()
+        }
+    }
+
+    #[test]
+    fn pm_replaces_white_speck() {
+        let mut img = gradient_image(40, 40);
+        img[(20, 20, 0)] = 1.0;
+        img[(20, 20, 1)] = 1.0;
+        img[(20, 20, 2)] = 1.0;
+        img[(20, 21, 0)] = 1.0;
+        img[(21, 20, 0)] = 1.0;
+
+        let mut mask = DustMask::new(40, 40);
+        stamp_disc(&mut mask, 20.0, 20.0, 5.0, DustTool::Pen);
+        apply_dust_removal_with(&mut img, &mask, pm_params(2.0));
+        assert!(
+            img[(20, 20, 0)] < 0.85,
+            "PatchMatch (or H+V fallback) must replace the speck (got {})",
+            img[(20, 20, 0)]
+        );
+    }
+
+    #[test]
+    fn pm_leaves_outside_paint() {
+        let mut img = gradient_image(48, 48);
+        let outside = img[(24, 5, 0)];
+        img[(24, 24, 0)] = 1.0;
+        img[(24, 24, 1)] = 1.0;
+        img[(24, 24, 2)] = 1.0;
+
+        let mut mask = DustMask::new(48, 48);
+        stamp_disc(&mut mask, 24.0, 24.0, 8.0, DustTool::Pen);
+        apply_dust_removal_with(&mut img, &mask, pm_params(2.0));
+        assert!(
+            (img[(24, 5, 0)] - outside).abs() < 1e-5,
+            "pixels outside the paint must stay"
         );
     }
 }

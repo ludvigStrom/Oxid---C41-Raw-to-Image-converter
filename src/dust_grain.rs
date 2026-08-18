@@ -15,12 +15,14 @@ use crate::dust::{pixel_hash, rgb_at};
 
 pub const MARGIN: i32 = 48;
 pub const PSD_N: usize = 16;
-const SEARCH: i32 = 3;
+const SEARCH: i32 = 5;
 const PATCH: i32 = 1;
-const NLM_H: f32 = 0.06;
+const NLM_H: f32 = 0.14;
 const NLF_BINS: usize = 32;
 const MIN_BIN: usize = 16;
 const MIN_PATCHES: usize = 4;
+/// Floor so Grain=1 stays visible when NLM leaves a tiny residual.
+const NLF_FLOOR: f32 = 0.018;
 
 fn luma(c: (f32, f32, f32)) -> f32 {
     0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2
@@ -364,27 +366,30 @@ fn estimate(
                 continue;
             }
             let center = (i as f32 + 0.5) / NLF_BINS as f32;
-            nlf[ch].push((center, mad_sigma(bin.clone()).max(1.0e-5)));
+            nlf[ch].push((center, mad_sigma(bin.clone()).max(NLF_FLOOR)));
         }
     }
-    if nlf.iter().any(|c| c.is_empty()) {
-        let mut all = [Vec::new(), Vec::new(), Vec::new()];
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let i = y * w + x;
-                if hole[i] || rgb_ssd(rgb_at(image, x, y), rim) > gate {
-                    continue;
-                }
-                let d = rgb_at(den, x, y);
-                let r = rgb_at(image, x, y);
-                all[0].push(r.0 - d.0);
-                all[1].push(r.1 - d.1);
-                all[2].push(r.2 - d.2);
+    let mut all = [Vec::new(), Vec::new(), Vec::new()];
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let i = y * w + x;
+            if hole[i] || rgb_ssd(rgb_at(image, x, y), rim) > gate {
+                continue;
             }
+            let d = rgb_at(den, x, y);
+            let r = rgb_at(image, x, y);
+            all[0].push(r.0 - d.0);
+            all[1].push(r.1 - d.1);
+            all[2].push(r.2 - d.2);
         }
-        for ch in 0..3 {
-            if nlf[ch].is_empty() {
-                nlf[ch].push((0.5, mad_sigma(all[ch].clone()).max(0.015)));
+    }
+    for ch in 0..3 {
+        let floor = mad_sigma(all[ch].clone()).max(NLF_FLOOR);
+        if nlf[ch].is_empty() {
+            nlf[ch].push((0.5, floor));
+        } else {
+            for bin in &mut nlf[ch] {
+                bin.1 = bin.1.max(floor);
             }
         }
     }
