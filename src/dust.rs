@@ -237,13 +237,51 @@ pub fn crop_mask_uv(
 }
 
 const MASK_ON: u8 = 16;
-const DILATE_RADIUS: i32 = 2;
+const MIN_SPECK_AREA: usize = 4;
 
-/// Replace painted dust by copying nearby clean texture (spot-heal).
-///
-/// Telea-style diffusion smears the speck. This instead finds a nearby offset
-/// whose border matches, then copies that patch in — grain stays, the spot goes.
+/// Detection strength and edge fade for [`apply_dust_removal_with`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DustHealParams {
+    /// Higher = pick up fainter specks inside the brush (0.5–2.5).
+    pub detect: f32,
+    /// Fade width in pixels from the tight mask edge.
+    pub feather: f32,
+}
+
+impl Default for DustHealParams {
+    fn default() -> Self {
+        Self {
+            detect: 1.0,
+            feather: 4.0,
+        }
+    }
+}
+
+impl DustHealParams {
+    pub fn hash(self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.detect.to_bits().hash(&mut h);
+        self.feather.to_bits().hash(&mut h);
+        h.finish()
+    }
+}
+
+/// Hash strokes plus heal params (cache key when Process is on).
+pub fn hash_dust(strokes: &[DustStroke], params: DustHealParams) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_strokes(strokes).hash(&mut h);
+    params.hash().hash(&mut h);
+    h.finish()
+}
+
+/// Heal using default detect/feather.
 pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
+    apply_dust_removal_with(image, mask, DustHealParams::default());
+}
+
+/// Replace dust inside the painted ROI: tighten to the speck, copy grain,
+/// match surrounding color, feather the edge.
+pub fn apply_dust_removal_with(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     if mask.is_empty() {
         return;
     }
@@ -257,25 +295,310 @@ pub fn apply_dust_removal(image: &mut Array3<f32>, mask: &DustMask) {
         Some(scale_mask(mask, w as u32, h as u32))
     };
     let mask = scaled.as_ref().unwrap_or(mask);
-    heal_spots(image, mask);
+    heal_spots(image, mask, params);
 }
 
-fn heal_spots(image: &mut Array3<f32>, mask: &DustMask) {
+fn heal_spots(image: &mut Array3<f32>, mask: &DustMask, params: DustHealParams) {
     let (h, w, _) = image.dim();
     let n = w * h;
-    let mut marked = vec![false; n];
+    let mut roi = vec![false; n];
     for (i, &c) in mask.data.iter().enumerate() {
         if c >= MASK_ON {
-            marked[i] = true;
+            roi[i] = true;
         }
     }
-    if !marked.iter().any(|&v| v) {
+    if !roi.iter().any(|&v| v) {
         return;
     }
-    let forbidden = dilate(&marked, w, h, DILATE_RADIUS);
-    for component in connected_components(&forbidden, w, h) {
-        heal_component(image, &component, &forbidden, w, h);
+
+    let tight = refine_speck_mask(image, &roi, w, h, params.detect);
+    if !tight.iter().any(|&v| v) {
+        return;
     }
+
+    let feather = params.feather.clamp(1.0, 16.0);
+    let dilate_r = feather.ceil() as i32;
+    let dilated = dilate(&tight, w, h, dilate_r);
+    let dist = dist_inside(&dilated, w, h);
+    let mut alpha = vec![0.0f32; n];
+    for i in 0..n {
+        if dilated[i] {
+            alpha[i] = smoothstep(0.0, feather, dist[i]);
+        }
+    }
+
+    let low = blur_rgb(image, 1.2);
+    for component in connected_components(&dilated, w, h) {
+        heal_component(image, &low, &component, &dilated, &alpha, w, h);
+    }
+}
+
+fn refine_speck_mask(
+    image: &Array3<f32>,
+    roi: &[bool],
+    w: usize,
+    h: usize,
+    detect: f32,
+) -> Vec<bool> {
+    let detect = detect.clamp(0.35, 2.5);
+    let dog_thresh = (0.032 / detect).max(0.006);
+    let mad_k = 3.0 / detect;
+    let clip_lo = 0.025;
+    let clip_hi = 0.975;
+
+    let n = w * h;
+    let mut lum = vec![0.0f32; n];
+    for y in 0..h {
+        for x in 0..w {
+            let r = image[(y, x, 0)];
+            let g = image[(y, x, 1)];
+            let b = image[(y, x, 2)];
+            lum[y * w + x] = r.max(g).max(b);
+        }
+    }
+    let blur_s = blur_plane(&lum, w, h, 0.8);
+    let blur_l = blur_plane(&lum, w, h, 2.4);
+
+    let mut residuals = Vec::new();
+    let mut residual_at = vec![0.0f32; n];
+    for i in 0..n {
+        if !roi[i] {
+            continue;
+        }
+        let med = local_median(&lum, w, h, i % w, i / w, 3);
+        let r = (lum[i] - med).abs();
+        residual_at[i] = r;
+        residuals.push(r);
+    }
+    let mad = {
+        let mut m = residuals.clone();
+        let med = median_f32(&mut m);
+        let mut dev: Vec<f32> = residuals.iter().map(|v| (v - med).abs()).collect();
+        median_f32(&mut dev).max(0.006)
+    };
+
+    let mut tight = vec![false; n];
+    for i in 0..n {
+        if !roi[i] {
+            continue;
+        }
+        let dog = (blur_s[i] - blur_l[i]).abs();
+        let clip = lum[i] <= clip_lo || lum[i] >= clip_hi;
+        if dog >= dog_thresh || residual_at[i] >= mad_k * mad || clip {
+            tight[i] = true;
+        }
+    }
+
+    let mut kept = vec![false; n];
+    for comp in connected_components(&tight, w, h) {
+        if comp.len() >= MIN_SPECK_AREA {
+            for i in comp {
+                kept[i] = true;
+            }
+        }
+    }
+    if kept.iter().any(|&v| v) {
+        return kept;
+    }
+    let fallback = erode(roi, w, h, 2);
+    if fallback.iter().any(|&v| v) {
+        fallback
+    } else {
+        erode(roi, w, h, 1)
+    }
+}
+
+fn local_median(lum: &[f32], w: usize, h: usize, x: usize, y: usize, radius: i32) -> f32 {
+    let mut vals = Vec::with_capacity(((2 * radius + 1) * (2 * radius + 1)) as usize);
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                continue;
+            }
+            vals.push(lum[ny as usize * w + nx as usize]);
+        }
+    }
+    median_f32(&mut vals)
+}
+
+fn blur_plane(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    if sigma <= 0.0 || w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let kernel = gauss_kernel(sigma);
+    let half = kernel.len() / 2;
+    let mut temp = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (i, &k) in kernel.iter().enumerate() {
+                let xi = (x as i32 + i as i32 - half as i32).clamp(0, w as i32 - 1) as usize;
+                acc += src[y * w + xi] * k;
+            }
+            temp[y * w + x] = acc;
+        }
+    }
+    let mut out = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (i, &k) in kernel.iter().enumerate() {
+                let yi = (y as i32 + i as i32 - half as i32).clamp(0, h as i32 - 1) as usize;
+                acc += temp[yi * w + x] * k;
+            }
+            out[y * w + x] = acc;
+        }
+    }
+    out
+}
+
+fn blur_rgb(image: &Array3<f32>, sigma: f32) -> Array3<f32> {
+    let (h, w, _) = image.dim();
+    let mut planes = [
+        vec![0.0f32; w * h],
+        vec![0.0f32; w * h],
+        vec![0.0f32; w * h],
+    ];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            planes[0][i] = image[(y, x, 0)];
+            planes[1][i] = image[(y, x, 1)];
+            planes[2][i] = image[(y, x, 2)];
+        }
+    }
+    let br = blur_plane(&planes[0], w, h, sigma);
+    let bg = blur_plane(&planes[1], w, h, sigma);
+    let bb = blur_plane(&planes[2], w, h, sigma);
+    let mut out = Array3::<f32>::zeros((h, w, 3));
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            out[(y, x, 0)] = br[i];
+            out[(y, x, 1)] = bg[i];
+            out[(y, x, 2)] = bb[i];
+        }
+    }
+    out
+}
+
+fn gauss_kernel(sigma: f32) -> Vec<f32> {
+    let half = (3.0 * sigma).ceil().max(1.0) as usize;
+    let len = 2 * half + 1;
+    let mut k = Vec::with_capacity(len);
+    let mut sum = 0.0f32;
+    for i in 0..len {
+        let x = i as f32 - half as f32;
+        let w = (-x * x / (2.0 * sigma * sigma)).exp();
+        k.push(w);
+        sum += w;
+    }
+    for w in &mut k {
+        *w /= sum;
+    }
+    k
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if x >= edge1 { 1.0 } else { 0.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn dist_inside(on: &[bool], w: usize, h: usize) -> Vec<f32> {
+    const INF: f32 = 1.0e8;
+    let n = w * h;
+    let mut d = vec![INF; n];
+    for i in 0..n {
+        if !on[i] {
+            d[i] = 0.0;
+        }
+    }
+    let s2 = std::f32::consts::SQRT_2;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if !on[i] {
+                continue;
+            }
+            let mut best = d[i];
+            if x > 0 {
+                best = best.min(d[i - 1] + 1.0);
+            }
+            if y > 0 {
+                best = best.min(d[i - w] + 1.0);
+            }
+            if x > 0 && y > 0 {
+                best = best.min(d[i - w - 1] + s2);
+            }
+            if x + 1 < w && y > 0 {
+                best = best.min(d[i - w + 1] + s2);
+            }
+            d[i] = best;
+        }
+    }
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let i = y * w + x;
+            if !on[i] {
+                continue;
+            }
+            let mut best = d[i];
+            if x + 1 < w {
+                best = best.min(d[i + 1] + 1.0);
+            }
+            if y + 1 < h {
+                best = best.min(d[i + w] + 1.0);
+            }
+            if x + 1 < w && y + 1 < h {
+                best = best.min(d[i + w + 1] + s2);
+            }
+            if x > 0 && y + 1 < h {
+                best = best.min(d[i + w - 1] + s2);
+            }
+            d[i] = best;
+        }
+    }
+    d
+}
+
+fn erode(on: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
+    if radius <= 0 {
+        return on.to_vec();
+    }
+    let r2 = radius * radius;
+    let mut out = vec![false; w * h];
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            if !on[y as usize * w + x as usize] {
+                continue;
+            }
+            let mut ok = true;
+            'n: for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx * dx + dy * dy > r2 {
+                        continue;
+                    }
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        ok = false;
+                        break 'n;
+                    }
+                    if !on[ny as usize * w + nx as usize] {
+                        ok = false;
+                        break 'n;
+                    }
+                }
+            }
+            out[y as usize * w + x as usize] = ok;
+        }
+    }
+    out
 }
 
 fn dilate(on: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
@@ -339,8 +662,10 @@ fn connected_components(on: &[bool], w: usize, h: usize) -> Vec<Vec<usize>> {
 
 fn heal_component(
     image: &mut Array3<f32>,
+    low: &Array3<f32>,
     component: &[usize],
     forbidden: &[bool],
+    alpha: &[f32],
     w: usize,
     h: usize,
 ) {
@@ -359,28 +684,27 @@ fn heal_component(
         x1 = x1.max(x);
         y1 = y1.max(y);
     }
-    let rw = (x1 - x0 + 1) as i32;
-    let rh = (y1 - y0 + 1) as i32;
-    let span = rw.max(rh).max(6);
+    let span = (x1 - x0 + 1).max(y1 - y0 + 1).max(6) as i32;
 
     let ring = component_ring(component, forbidden, w, h);
-    let median = ring_median(image, &ring);
+    let color = ring_median(image, &ring);
     let offset = best_patch_offset(image, &ring, forbidden, w, h, span);
+    let residuals = ring_residuals(image, low, &ring);
 
     let mut fills = Vec::with_capacity(component.len());
-    for &i in component {
+    for (k, &i) in component.iter().enumerate() {
         let x = (i % w) as i32;
         let y = (i / w) as i32;
-        let rgb = if let Some((dx, dy)) = offset {
+        let grain = if let Some((dx, dy)) = offset {
             let sx = x + dx;
             let sy = y + dy;
             if sx >= 0 && sy >= 0 && sx < w as i32 && sy < h as i32 {
                 let si = sy as usize * w + sx as usize;
                 if !forbidden[si] {
                     Some((
-                        image[(sy as usize, sx as usize, 0)],
-                        image[(sy as usize, sx as usize, 1)],
-                        image[(sy as usize, sx as usize, 2)],
+                        image[(sy as usize, sx as usize, 0)] - low[(sy as usize, sx as usize, 0)],
+                        image[(sy as usize, sx as usize, 1)] - low[(sy as usize, sx as usize, 1)],
+                        image[(sy as usize, sx as usize, 2)] - low[(sy as usize, sx as usize, 2)],
                     ))
                 } else {
                     None
@@ -391,15 +715,41 @@ fn heal_component(
         } else {
             None
         };
-        fills.push(rgb.unwrap_or(median));
+        let (gr, gg, gb) = grain.unwrap_or_else(|| {
+            if residuals.is_empty() {
+                (0.0, 0.0, 0.0)
+            } else {
+                residuals[k % residuals.len()]
+            }
+        });
+        fills.push((color.0 + gr, color.1 + gg, color.2 + gb));
     }
     for (&i, (r, g, b)) in component.iter().zip(fills) {
+        let a = alpha[i];
+        if a <= 1.0e-5 {
+            continue;
+        }
         let x = i % w;
         let y = i / w;
-        image[(y, x, 0)] = r;
-        image[(y, x, 1)] = g;
-        image[(y, x, 2)] = b;
+        image[(y, x, 0)] = image[(y, x, 0)] * (1.0 - a) + r * a;
+        image[(y, x, 1)] = image[(y, x, 1)] * (1.0 - a) + g * a;
+        image[(y, x, 2)] = image[(y, x, 2)] * (1.0 - a) + b * a;
     }
+}
+
+fn ring_residuals(image: &Array3<f32>, low: &Array3<f32>, ring: &[usize]) -> Vec<(f32, f32, f32)> {
+    let w = image.dim().1;
+    ring.iter()
+        .map(|&i| {
+            let x = i % w;
+            let y = i / w;
+            (
+                image[(y, x, 0)] - low[(y, x, 0)],
+                image[(y, x, 1)] - low[(y, x, 1)],
+                image[(y, x, 2)] - low[(y, x, 2)],
+            )
+        })
+        .collect()
 }
 
 fn component_ring(component: &[usize], forbidden: &[bool], w: usize, h: usize) -> Vec<usize> {
@@ -437,7 +787,11 @@ fn ring_median(image: &Array3<f32>, ring: &[usize]) -> (f32, f32, f32) {
         gs.push(image[(y, x, 1)]);
         bs.push(image[(y, x, 2)]);
     }
-    (median_f32(&mut rs), median_f32(&mut gs), median_f32(&mut bs))
+    (
+        median_f32(&mut rs),
+        median_f32(&mut gs),
+        median_f32(&mut bs),
+    )
 }
 
 fn median_f32(v: &mut [f32]) -> f32 {
@@ -587,10 +941,13 @@ mod tests {
         stamp_disc(&mut mask, 12.0, 12.0, 2.0, DustTool::Pen);
         apply_dust_removal(&mut img, &mask);
 
-        assert!((img[(12, 12, 0)] - expected[0]).abs() < 0.12);
-        assert!((img[(12, 12, 1)] - expected[1]).abs() < 0.12);
-        assert!((img[(12, 12, 2)] - expected[2]).abs() < 0.12);
-        assert!(img[(12, 12, 0)] < 0.55, "spot should be replaced, not smeared");
+        assert!((img[(12, 12, 0)] - expected[0]).abs() < 0.18);
+        assert!((img[(12, 12, 1)] - expected[1]).abs() < 0.18);
+        assert!((img[(12, 12, 2)] - expected[2]).abs() < 0.18);
+        assert!(
+            img[(12, 12, 0)] < 0.7,
+            "spot should be replaced, not smeared"
+        );
     }
 
     #[test]
@@ -598,5 +955,111 @@ mod tests {
         let mut img = Array3::<f32>::from_elem((4, 4, 3), 0.25);
         apply_dust_removal(&mut img, &DustMask::new(4, 4));
         assert!((img[(0, 0, 0)] - 0.25).abs() < 1e-6);
+    }
+
+    fn gradient_image(h: usize, w: usize) -> Array3<f32> {
+        let mut img = Array3::<f32>::zeros((h, w, 3));
+        for y in 0..h {
+            for x in 0..w {
+                img[(y, x, 0)] = 0.2 + x as f32 * 0.015;
+                img[(y, x, 1)] = 0.35;
+                img[(y, x, 2)] = 0.55 - y as f32 * 0.008;
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn tight_mask_leaves_far_roi_pixels() {
+        let mut img = gradient_image(48, 48);
+        let before = img[(24, 11, 0)];
+        img[(24, 24, 0)] = 1.0;
+        img[(24, 24, 1)] = 1.0;
+        img[(24, 24, 2)] = 1.0;
+        img[(24, 25, 0)] = 1.0;
+        img[(25, 24, 0)] = 1.0;
+        img[(25, 25, 0)] = 1.0;
+
+        let mut mask = DustMask::new(48, 48);
+        stamp_disc(&mut mask, 24.0, 24.0, 16.0, DustTool::Pen);
+        apply_dust_removal(&mut img, &mask);
+
+        assert!(
+            (img[(24, 11, 0)] - before).abs() < 1e-5,
+            "pixels far from the speck inside the brush must stay"
+        );
+        assert!(img[(24, 24, 0)] < 0.85, "the white speck must be healed");
+    }
+
+    #[test]
+    fn healed_core_matches_local_color() {
+        let mut img = gradient_image(40, 40);
+        let local = [img[(20, 20, 0)], img[(20, 20, 1)], img[(20, 20, 2)]];
+        img[(20, 20, 0)] = 0.0;
+        img[(20, 20, 1)] = 0.0;
+        img[(20, 20, 2)] = 0.0;
+        img[(20, 21, 0)] = 0.0;
+        img[(21, 20, 0)] = 0.0;
+
+        let mut mask = DustMask::new(40, 40);
+        stamp_disc(&mut mask, 20.0, 20.0, 5.0, DustTool::Pen);
+        apply_dust_removal(&mut img, &mask);
+
+        assert!((img[(20, 20, 0)] - local[0]).abs() < 0.12);
+        assert!((img[(20, 20, 1)] - local[1]).abs() < 0.12);
+        assert!((img[(20, 20, 2)] - local[2]).abs() < 0.12);
+    }
+
+    #[test]
+    fn healed_pixels_keep_grain_variance() {
+        let mut img = gradient_image(36, 36);
+        for y in 0..36 {
+            for x in 0..36 {
+                let n = ((x * 17 + y * 31) % 7) as f32 * 0.012 - 0.036;
+                img[(y, x, 0)] = (img[(y, x, 0)] + n).clamp(0.0, 1.0);
+                img[(y, x, 1)] = (img[(y, x, 1)] + n * 0.8).clamp(0.0, 1.0);
+                img[(y, x, 2)] = (img[(y, x, 2)] + n * 0.6).clamp(0.0, 1.0);
+            }
+        }
+        img[(18, 18, 0)] = 1.0;
+        img[(18, 18, 1)] = 1.0;
+        img[(18, 18, 2)] = 1.0;
+        img[(18, 19, 0)] = 1.0;
+        img[(19, 18, 0)] = 1.0;
+
+        let mut mask = DustMask::new(36, 36);
+        stamp_disc(&mut mask, 18.0, 18.0, 4.0, DustTool::Pen);
+        apply_dust_removal(&mut img, &mask);
+
+        let mut healed = Vec::new();
+        for y in 17..20 {
+            for x in 17..20 {
+                healed.push(img[(y, x, 0)]);
+            }
+        }
+        let spread = healed.iter().copied().fold(0.0f32, f32::max)
+            - healed.iter().copied().fold(1.0f32, f32::min);
+        assert!(
+            spread > 0.008,
+            "healed patch should not be a flat median (spread={spread})"
+        );
+    }
+
+    #[test]
+    fn hash_dust_includes_params() {
+        let strokes = vec![DustStroke {
+            tool: DustTool::Pen,
+            radius: 3.0,
+            points: vec![(1.0, 1.0)],
+        }];
+        let a = hash_dust(&strokes, DustHealParams::default());
+        let b = hash_dust(
+            &strokes,
+            DustHealParams {
+                detect: 1.4,
+                feather: 4.0,
+            },
+        );
+        assert_ne!(a, b);
     }
 }

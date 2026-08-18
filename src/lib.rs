@@ -51,8 +51,8 @@ pub use auto_crop::{
     detect_crop, AutoCropResult, CropConfidence, FilmFormat, SurroundClass, CROP_PROXY_MAX_SIDE,
 };
 pub use dust::{
-    apply_dust_removal, crop_mask_uv, hash_strokes, rasterize_strokes, stamp_disc, DustMask,
-    DustStroke, DustTool, ProjectDust,
+    apply_dust_removal, apply_dust_removal_with, crop_mask_uv, hash_dust, hash_strokes,
+    rasterize_strokes, stamp_disc, DustHealParams, DustMask, DustStroke, DustTool, ProjectDust,
 };
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{
@@ -83,7 +83,7 @@ fn apply_optional_dust(image: &mut Array3<f32>, options: &PipelineOptions) {
         return;
     }
     if let Some(mask) = options.dust_mask.as_ref() {
-        dust::apply_dust_removal(image, mask);
+        dust::apply_dust_removal_with(image, mask, options.dust_heal);
     }
 }
 

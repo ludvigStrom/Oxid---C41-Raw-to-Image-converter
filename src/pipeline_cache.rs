@@ -84,6 +84,8 @@ pub fn hash_after_step3(
         .map(|p| p.display().to_string())
         .hash(&mut h);
     opts.dust_mask_hash.hash(&mut h);
+    opts.dust_heal.detect.to_bits().hash(&mut h);
+    opts.dust_heal.feather.to_bits().hash(&mut h);
     h.finish()
 }
 

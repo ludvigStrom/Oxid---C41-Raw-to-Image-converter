@@ -18,16 +18,17 @@ use c41_raw_tool::{apply_preview_from_cache_gpu, process_one_to_preview_with_cac
 use c41_raw_tool::{
     apply_preview_from_cache_on_progress, auto_tune, blur_flat_field, cached_start_step,
     calibration, color, compute_preview_scene_stats, crop_mask_uv, crop_sensor_for_oriented_rect,
-    demosaic, detect_crop, dmin, hash_strokes, load_develop_preset, load_flat_field_linear,
+    demosaic, detect_crop, dmin, hash_dust, load_develop_preset, load_flat_field_linear,
     load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
     process_export_jobs, process_one_to_preview, process_one_to_preview_with_cache,
     process_one_to_preview_with_cache_on_progress, rasterize_strokes, raw_reader,
     reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path, save_develop_preset,
     save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export, AutoCropResult, AutoTuneResult,
-    CachedSensor, CropConfidence, DminMode, DustMask, DustStroke, DustTool, ExportCancelled,
-    ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions,
-    PreviewSceneStats, PreviewStepCache, ProjectDust, ProjectExportFormat, ProjectImage, Rect,
-    TiffFormat, UndoManager, WbMode, PROJECT_EXTENSION, PROJECT_EXTENSION_LEGACY, UNDO_LIMIT,
+    CachedSensor, CropConfidence, DminMode, DustHealParams, DustMask, DustStroke, DustTool,
+    ExportCancelled, ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage,
+    PipelineOptions, PreviewSceneStats, PreviewStepCache, ProjectDust, ProjectExportFormat,
+    ProjectImage, Rect, TiffFormat, UndoManager, WbMode, PROJECT_EXTENSION,
+    PROJECT_EXTENSION_LEGACY, UNDO_LIMIT,
 };
 use eframe::egui;
 
@@ -202,6 +203,8 @@ struct ImageEntry {
     dust_view: DustView,
     dust_tool: DustTool,
     dust_brush_radius: f32,
+    dust_detect: f32,
+    dust_feather: f32,
     dust_overlay_texture: Option<egui::TextureHandle>,
     dust_overlay_dirty: bool,
 }
@@ -919,6 +922,7 @@ fn default_options() -> PipelineOptions {
         pinned_zone: None,
         dust_mask_hash: 0,
         dust_mask: None,
+        dust_heal: DustHealParams::default(),
     }
 }
 
@@ -1037,6 +1041,8 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.bujack_radius.to_bits().hash(&mut h);
     opts.bujack_edge.to_bits().hash(&mut h);
     opts.dust_mask_hash.hash(&mut h);
+    opts.dust_heal.detect.to_bits().hash(&mut h);
+    opts.dust_heal.feather.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -1871,6 +1877,8 @@ fn image_entry(
         dust_view: DustView::Edit,
         dust_tool: DustTool::Pen,
         dust_brush_radius: 8.0,
+        dust_detect: 1.0,
+        dust_feather: 4.0,
         dust_overlay_texture: None,
         dust_overlay_dirty: true,
     }
@@ -2025,6 +2033,13 @@ fn dust_mask_from_entry(entry: &ImageEntry) -> Option<Arc<DustMask>> {
     )))
 }
 
+fn entry_dust_heal(entry: &ImageEntry) -> DustHealParams {
+    DustHealParams {
+        detect: entry.dust_detect,
+        feather: entry.dust_feather,
+    }
+}
+
 fn oriented_export_size(entry: &ImageEntry) -> Option<(u32, u32)> {
     let [w, h] = entry.raw_source_size?;
     Some(oriented_sensor_size(w, h, entry.options.rotation_degrees))
@@ -2044,7 +2059,8 @@ fn attach_export_dust(opts: &mut PipelineOptions, entry: &ImageEntry) {
         opts.dust_mask = None;
         return;
     }
-    opts.dust_mask_hash = hash_strokes(&entry.dust_strokes);
+    opts.dust_heal = entry_dust_heal(entry);
+    opts.dust_mask_hash = hash_dust(&entry.dust_strokes, opts.dust_heal);
     opts.dust_mask = Some(Arc::new(rasterize_strokes(
         &entry.dust_strokes,
         fw,
@@ -2296,8 +2312,9 @@ impl C41Gui {
                 options.pinned_zone = stats.zone;
             }
         }
+        options.dust_heal = entry_dust_heal(entry);
         if self.dust_should_apply(entry) {
-            options.dust_mask_hash = hash_strokes(&entry.dust_strokes);
+            options.dust_mask_hash = hash_dust(&entry.dust_strokes, options.dust_heal);
             options.dust_mask = dust_mask_from_entry(entry);
         } else {
             options.dust_mask_hash = 0;
@@ -6154,6 +6171,11 @@ impl eframe::App for C41Gui {
                     }
 
                     ui.add_space(8.0);
+                    ui.label(egui::RichText::new("Heal").strong());
+                    theme::slider_row(ui, "Detect", &mut entry.dust_detect, 0.5..=2.5, 1);
+                    theme::slider_row(ui, "Feather", &mut entry.dust_feather, 1.0..=12.0, 0);
+                    ui.small("The pen marks where to look. Process heals the speck inside it.");
+                    ui.add_space(8.0);
                     let has_mask = !entry.dust_strokes.is_empty();
                     if ui
                         .add_enabled(has_mask, egui::Button::new("Clear mask"))
@@ -7630,8 +7652,9 @@ impl eframe::App for C41Gui {
                     {
                         let apply = self.dust_should_apply(&self.images[idx]);
                         let entry = &mut self.images[idx];
+                        entry.options.dust_heal = entry_dust_heal(entry);
                         entry.options.dust_mask_hash = if apply {
-                            hash_strokes(&entry.dust_strokes)
+                            hash_dust(&entry.dust_strokes, entry.options.dust_heal)
                         } else {
                             0
                         };

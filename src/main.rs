@@ -6,7 +6,8 @@ use clap::Parser;
 
 use c41_raw_tool::raw_reader;
 use c41_raw_tool::{
-    process_files, DminMode, OutputLutEncoding, OutputStage, PipelineOptions, Rect, TiffFormat,
+    process_files, DminMode, DustHealParams, OutputLutEncoding, OutputStage, PipelineOptions, Rect,
+    TiffFormat,
 };
 
 #[derive(Parser, Debug)]
@@ -366,6 +367,7 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         pinned_zone: None,
         dust_mask_hash: 0,
         dust_mask: None,
+        dust_heal: DustHealParams::default(),
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

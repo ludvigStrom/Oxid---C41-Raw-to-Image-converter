@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::dust::DustMask;
+use crate::dust::{DustHealParams, DustMask};
 use crate::tiff_export::TiffFormat;
 
 /// Rectangle for D-min sampling (pixel coordinates).
@@ -339,6 +339,9 @@ pub struct PipelineOptions {
     /// Working dust mask applied after load when `dust_mask_hash != 0`.
     #[serde(skip)]
     pub dust_mask: Option<Arc<DustMask>>,
+    /// Detect / feather used when applying `dust_mask`.
+    #[serde(skip)]
+    pub dust_heal: DustHealParams,
 }
 
 fn default_debug_pipeline_step() -> u32 {
@@ -441,6 +444,7 @@ impl Default for PipelineOptions {
             pinned_zone: None,
             dust_mask_hash: 0,
             dust_mask: None,
+            dust_heal: DustHealParams::default(),
         }
     }
 }
