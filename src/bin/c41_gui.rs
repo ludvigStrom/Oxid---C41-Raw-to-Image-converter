@@ -239,34 +239,86 @@ fn startup_project_from_args() -> Option<PathBuf> {
     }
 }
 
-/// Tag the native window as sRGB so the compositor converts to the display
-/// (P3 on current Macs) the same way Preview.app does for an sRGB file.
+/// Tag the native window / OpenGL layer as sRGB so the compositor converts to
+/// the display (P3 on current Macs) the same way Preview.app does for an sRGB file.
 ///
-/// egui already writes encoded pixels into a gamma-space Unorm surface.
-/// Do not enable `GL_FRAMEBUFFER_SRGB` or switch to an `*Srgb` texture.
-fn tag_native_window_srgb(_cc: &eframe::CreationContext<'_>) {
-    #[cfg(target_os = "macos")]
-    {
-        use objc2::rc::Retained;
-        use objc2_app_kit::{NSColorSpace, NSView};
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+/// `NSWindow.colorSpace` alone is not enough: glutin CGL draws into a
+/// layer-backed NSView, and that layer defaults to the display profile.
+/// Never call `setWantsLayer` here — glutin already did, and flipping it
+/// after the context exists aborts (`panic in a function that cannot unwind`).
+///
+/// egui already writes encoded pixels into a gamma-space Unorm surface —
+/// do not enable `GL_FRAMEBUFFER_SRGB` or switch to an `*Srgb` texture.
+#[cfg(target_os = "macos")]
+fn tag_native_window_srgb(handle: &impl raw_window_handle::HasWindowHandle) {
+    use std::ffi::c_void;
 
-        let Ok(handle) = _cc.window_handle() else {
-            return;
-        };
-        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-            return;
-        };
-        let ns_view = appkit.ns_view.as_ptr().cast::<NSView>();
-        // SAFETY: eframe's AppKit handle is a live NSView on the main thread.
-        let Some(view) = (unsafe { Retained::retain(ns_view) }) else {
-            return;
-        };
-        let Some(window) = view.window() else {
-            return;
-        };
-        unsafe {
-            window.setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
+    use objc2::rc::Retained;
+    use objc2::sel;
+    use objc2_app_kit::{NSColorSpace, NSView};
+    use raw_window_handle::RawWindowHandle;
+
+    let Ok(handle) = handle.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    let ns_view = appkit.ns_view.as_ptr().cast::<NSView>();
+    // SAFETY: eframe's AppKit handle is a live NSView on the main thread.
+    let Some(view) = (unsafe { Retained::retain(ns_view) }) else {
+        return;
+    };
+
+    let srgb = unsafe { NSColorSpace::sRGBColorSpace() };
+    unsafe {
+        view.window()
+            .as_ref()
+            .map(|w| w.setColorSpace(Some(&srgb)));
+    }
+
+    // Prefer CoreGraphics so we do not msg_send the skipped NSColorSpace getter.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        static kCGColorSpaceSRGB: *const c_void;
+        fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
+        fn CGColorSpaceRelease(space: *mut c_void);
+    }
+    let cg = unsafe { CGColorSpaceCreateWithName(kCGColorSpaceSRGB) };
+    if cg.is_null() {
+        return;
+    }
+    let set_cs = sel!(setContentsColorSpace:);
+    if let Some(content) = view.window().and_then(|w| w.contentView()) {
+        tag_existing_layer_srgb(&content, cg, set_cs, 0);
+    }
+    tag_existing_layer_srgb(&view, cg, set_cs, 0);
+    unsafe { CGColorSpaceRelease(cg) };
+}
+
+#[cfg(target_os = "macos")]
+fn tag_existing_layer_srgb(
+    view: &objc2_app_kit::NSView,
+    cg_srgb: *mut std::ffi::c_void,
+    set_cs: objc2::runtime::Sel,
+    depth: u8,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    // Do not create layers. glutin owns layer-backedness of the GL view.
+    let layer: *mut AnyObject = unsafe { msg_send![view, layer] };
+    if !layer.is_null() {
+        let class: *const AnyClass = unsafe { msg_send![layer, class] };
+        let responds = !class.is_null()
+            && unsafe { (*class).responds_to(set_cs) };
+        if responds {
+            let _: () = unsafe { msg_send![layer, setContentsColorSpace: cg_srgb] };
+        }
+    }
+    if depth < 8 {
+        if let Some(super_view) = unsafe { view.superview() } {
+            tag_existing_layer_srgb(&super_view, cg_srgb, set_cs, depth + 1);
         }
     }
 }
@@ -312,6 +364,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
+            #[cfg(target_os = "macos")]
             tag_native_window_srgb(cc);
             let mut app = C41Gui::default();
             if let Some(path) = startup_project {
@@ -4823,9 +4876,13 @@ impl C41Gui {
 }
 
 impl eframe::App for C41Gui {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Re-apply each frame so backends that reset visuals stay on the lab theme.
         theme::apply(ctx);
+        // OpenGL's backing layer is created after startup and can be recreated
+        // on resize / display change; keep the sRGB tag on it.
+        #[cfg(target_os = "macos")]
+        tag_native_window_srgb(frame);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed {
             if self.project_is_dirty() {

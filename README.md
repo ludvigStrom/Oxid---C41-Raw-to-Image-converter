@@ -6,6 +6,8 @@
 
 Import, develop, dust removal, and export of a 42 MB Sony ARW scan of a C-41 negative. [Watch on YouTube](https://youtu.be/zQfDPatA1Rs).
 
+![Oxid GUI: import, develop, dust, and export of a C-41 RAW scan](img/screen%20shot.png)
+
 **Supported cameras:** any `rawloader`-supported Bayer RAW (Sony `.arw`, Nikon `.nef`/`.nrw`, Canon `.cr2`/`.cr3`/`.crw`, Adobe `.dng`, Fujifilm `.raf`, Olympus `.orf`, Panasonic `.rw2`). PNG, JPEG (`.jpg`/`.jpeg`), and TIFF (`.tiff`/`.tif`) input are also accepted and run the same D-min / curve / export pipeline (skips raw decode and demosaic).
 
 Although supported in theory, it is only tested with Sony and Fujifilm cameras. This is a side project with limited resources.
@@ -199,6 +201,8 @@ Optional rotation (0°, 90°, 180°, 270°) is applied immediately after demosai
 
 Optional. Runs after load, demosaic, rotation, and IDT, before D-min. Paint on **Process → Dust**; the pen is the hole. Size the brush to the speck. Feather (default 6 px) fades the heal outside the stroke so the rim does not look cut out. Grain (default 1.0) puts film texture back so the fill does not look airbrushed.
 
+![Dust speck marked with the pen tool and healed with PatchMatch plus statistical grain](img/Dust%20Speck.png)
+
 Three infill algorithms (`DustInfill` in [`src/dust.rs`](src/dust.rs)). **PatchMatch with statistical grain is the default and the best result.**
 
 | Infill | What it does |
@@ -317,7 +321,7 @@ Implementation: [`src/bujack.rs`](src/bujack.rs), called from `pipeline::apply_b
 | JPEG | `--write-jpeg` | 8-bit sRGB OETF via `write_jpeg_srgb`, with an embedded sRGB ICC profile. |
 | ACES2065-1 EXR | `--export-aces-exr` | Linear AP0-primaries EXR via `linear_acescg_to_aces2065_1`. |
 
-On macOS the GUI window is tagged sRGB so the preview matches color-managed viewers of those ICC-tagged files. Do not treat the OpenGL framebuffer as an sRGB texture — egui already writes encoded pixels.
+On macOS the GUI window and the OpenGL backing layer are tagged sRGB so the preview matches color-managed viewers of those ICC-tagged files. Do not treat the OpenGL framebuffer as an sRGB texture — egui already writes encoded pixels.
 
 Output filenames are derived from the input stem: `frame_001.arw` → `frame_001.tiff`.
 
