@@ -1,6 +1,6 @@
 # Oxid
 
-**Oxid** is a GPU-accelerated GUI for **C-41 color-negative film**, written in Rust. It takes RAW camera captures and turns them into photographs by working in optical density, the space the dyes occupy, so color is treated as the film intended, not flipped as an RGB negative. White balance and film gamma are applied there; an RA-4 paper curve (Michaelis-Menten) forms the image. No hidden tone curves or auto-adjustments run unless you enable them.
+**Oxid** is a GPU-accelerated application for converting RAW captures of **C-41 color-negative film**, written in Rust. It takes RAW camera captures and turns them into photographs by working in optical density, the space the dyes occupy, so color is treated as the film intended, not flipped as an RGB negative. White balance and film gamma are applied there. An RA-4 paper curve (Hill / Michaelis-Menten) forms the image. No hidden tone curves or auto-adjustments run unless you enable them.
 
 [![Oxid: import, develop, dust removal, and export of a 42 MB Sony ARW C-41 scan](https://img.youtube.com/vi/zQfDPatA1Rs/maxresdefault.jpg)](https://youtu.be/zQfDPatA1Rs)
 
@@ -290,7 +290,7 @@ Post-curve operations applied after `Ra4` and `FilmPrint` (all operate on the u1
 
 ### De-Bujack (after step 6)
 
-Optional, **off by default**. Runs after the output transform and display-space looks, before grain / sharpen / encode. Skipped when the pipeline stopped before step 6, or when the buffer is still density (`output_stage = None`).
+Optional,  This is an experimental novel feature that is **off by default**. Runs after the output transform and display-space looks, before grain / sharpen / encode. Skipped when the pipeline stopped before step 6, or when the buffer is still density (`output_stage = None`).
 
 Bujack et al. showed that perceived color difference is not a Riemannian metric: large differences compress (diminishing returns). A pointwise grade cannot undo that. Any pointwise map of a Riemannian metric is still Riemannian, so this pass is spatial.
 
