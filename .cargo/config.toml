@@ -1,2 +1,4 @@
+# On Windows, use the MSVC toolchain (not GNU). GNU needs dlltool.exe from MinGW.
+#   rustup override set stable-x86_64-pc-windows-msvc
 [alias]
 guigpu = "run --release --bin Oxid --features gui,gpu"

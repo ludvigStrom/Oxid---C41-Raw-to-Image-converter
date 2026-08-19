@@ -42,6 +42,14 @@ This is the exact function in [`src/curve.rs`](src/curve.rs), computed once into
 
 - **Rust** 2021 edition. Install via [rustup](https://rustup.rs/).
 - No system libraries; `rawloader` is pure Rust.
+- **Windows:** use the MSVC toolchain, not GNU. GNU builds call `dlltool.exe` (MinGW) and fail if it is not on `PATH`. One-time setup:
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-msvc
+rustup override set stable-x86_64-pc-windows-msvc
+```
+
+You also need the MSVC linker from [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (Desktop development with C++).
 
 ---
 
@@ -53,7 +61,7 @@ Launch Oxid (GPU-accelerated GUI):
 cargo guigpu
 ```
 
-This is an alias for `cargo run --release --bin Oxid --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)).
+This is an alias for `cargo run --release --bin Oxid --features gui,gpu` (see [`.cargo/config.toml`](.cargo/config.toml)). On Windows, if you have not set the directory override above, use `cargo +stable-x86_64-pc-windows-msvc guigpu`.
 
 **Windows installer** (requires [Inno Setup 6](https://jrsoftware.org/isinfo.php); uses the MSVC Rust toolchain so the package does not need MinGW DLLs):
 
