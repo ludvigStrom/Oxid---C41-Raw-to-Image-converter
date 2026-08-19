@@ -1,6 +1,6 @@
 # Oxid
 
-**Oxid** is a GPU-accelerated GUI for **C-41 color-negative film**, written in Rust. It takes RAW camera captures and turns them into photographs by working in optical density, the space the dyes occupy, so color is treated as the film intended, not flipped as an RGB negative. White balance and film gamma are applied there; an RA-4 paper curve (Michaelis-Menten) forms the image. No hidden tone curves or auto-adjustments run unless you enable them.
+**Oxid** is a GPU-accelerated GUI for converting RAW captures of **C-41 color-negative film**, written in Rust. It takes RAW camera captures and turns them into photographs by working in optical density, the space the dyes occupy, so color is treated as the film intended, not flipped as an RGB negative. White balance and film gamma are applied there. An RA-4 paper curve (Hill / Michaelis-Menten) forms the image. No hidden tone curves or auto-adjustments run unless you enable them.
 
 [![Oxid: import, develop, dust removal, and export of a 42 MB Sony ARW C-41 scan](https://img.youtube.com/vi/zQfDPatA1Rs/maxresdefault.jpg)](https://youtu.be/zQfDPatA1Rs)
 
