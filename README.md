@@ -286,7 +286,7 @@ Post-curve operations applied after `Ra4` and `FilmPrint` (all operate on the u1
 
 ### De-Bujack (after step 6)
 
-Optional, **off by default**. Runs after the output transform and display-space looks, before grain / sharpen / encode. Skipped when the pipeline stopped before step 6, or when the buffer is still density (`output_stage = None`).
+Optional,  This is an experimental novel feature that is **off by default**. Runs after the output transform and display-space looks, before grain / sharpen / encode. Skipped when the pipeline stopped before step 6, or when the buffer is still density (`output_stage = None`).
 
 Bujack et al. showed that perceived color difference is not a Riemannian metric: large differences compress (diminishing returns). A pointwise grade cannot undo that. Any pointwise map of a Riemannian metric is still Riemannian, so this pass is spatial.
 
