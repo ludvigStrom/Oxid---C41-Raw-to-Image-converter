@@ -691,7 +691,10 @@ fn refine_speck_mask(
         let mg = local_median(&pg, w, h, x, y, 3);
         let mb = local_median(&pb, w, h, x, y, 3);
         let ml = local_median(&lum, w, h, x, y, 3);
-        let chan = (pr[i] - mr).abs().max((pg[i] - mg).abs()).max((pb[i] - mb).abs());
+        let chan = (pr[i] - mr)
+            .abs()
+            .max((pg[i] - mg).abs())
+            .max((pb[i] - mb).abs());
         let chroma = (pr[i] - mr).abs() + (pg[i] - mg).abs() + (pb[i] - mb).abs();
         let r = (lum[i] - ml).abs().max(chan).max(chroma * 0.45);
         residual_at[i] = r;
@@ -858,7 +861,11 @@ fn blur_plane_masked(src: &[f32], hole: &[bool], w: usize, h: usize, sigma: f32)
                 acc += src[y * w + xi] * k;
                 wsum += k;
             }
-            temp[y * w + x] = if wsum > 1.0e-8 { acc / wsum } else { src[y * w + x] };
+            temp[y * w + x] = if wsum > 1.0e-8 {
+                acc / wsum
+            } else {
+                src[y * w + x]
+            };
         }
     }
     let mut out = vec![0.0f32; w * h];
@@ -874,7 +881,11 @@ fn blur_plane_masked(src: &[f32], hole: &[bool], w: usize, h: usize, sigma: f32)
                 acc += temp[yi * w + x] * k;
                 wsum += k;
             }
-            out[y * w + x] = if wsum > 1.0e-8 { acc / wsum } else { temp[y * w + x] };
+            out[y * w + x] = if wsum > 1.0e-8 {
+                acc / wsum
+            } else {
+                temp[y * w + x]
+            };
         }
     }
     out
@@ -1132,9 +1143,8 @@ fn heal_component(
         } else {
             None
         };
-        let (gr, gg, gb) = grain.unwrap_or_else(|| {
-            pick_nearby_ring_residual(x, y, hsh, &ring_xy, &residuals)
-        });
+        let (gr, gg, gb) =
+            grain.unwrap_or_else(|| pick_nearby_ring_residual(x, y, hsh, &ring_xy, &residuals));
         fills.push((
             color.0 + grain_amount * gr,
             color.1 + grain_amount * gg,
@@ -1155,9 +1165,7 @@ fn heal_component(
 }
 
 pub(crate) fn pixel_hash(x: usize, y: usize) -> u32 {
-    let mut n = (x as u32)
-        .wrapping_mul(0x9E37_79B9)
-        ^ (y as u32).wrapping_mul(0x85EB_CA6B);
+    let mut n = (x as u32).wrapping_mul(0x9E37_79B9) ^ (y as u32).wrapping_mul(0x85EB_CA6B);
     n ^= n >> 16;
     n = n.wrapping_mul(0x7FEB_352D);
     n ^= n >> 15;
@@ -1226,7 +1234,13 @@ fn hole_run_h(hole: &[bool], w: usize, x: usize, y: usize) -> (Option<usize>, Op
     (left, right)
 }
 
-fn hole_run_v(hole: &[bool], w: usize, h: usize, x: usize, y: usize) -> (Option<usize>, Option<usize>) {
+fn hole_run_v(
+    hole: &[bool],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+) -> (Option<usize>, Option<usize>) {
     let mut top = None;
     if y > 0 {
         let mut yi = y;
@@ -1531,9 +1545,12 @@ fn nearby_grain_offset(
             }
             let rx = i % w;
             let ry = i / w;
-            let d0 = (image[(ry, rx, 0)] - low[(ry, rx, 0)]) - (image[(sy, sx, 0)] - low[(sy, sx, 0)]);
-            let d1 = (image[(ry, rx, 1)] - low[(ry, rx, 1)]) - (image[(sy, sx, 1)] - low[(sy, sx, 1)]);
-            let d2 = (image[(ry, rx, 2)] - low[(ry, rx, 2)]) - (image[(sy, sx, 2)] - low[(sy, sx, 2)]);
+            let d0 =
+                (image[(ry, rx, 0)] - low[(ry, rx, 0)]) - (image[(sy, sx, 0)] - low[(sy, sx, 0)]);
+            let d1 =
+                (image[(ry, rx, 1)] - low[(ry, rx, 1)]) - (image[(sy, sx, 1)] - low[(sy, sx, 1)]);
+            let d2 =
+                (image[(ry, rx, 2)] - low[(ry, rx, 2)]) - (image[(sy, sx, 2)] - low[(sy, sx, 2)]);
             ssd += d0 * d0 + d1 * d1 + d2 * d2;
             count += 1;
         }
@@ -1939,8 +1956,7 @@ mod tests {
                 vals.push(img[(y, x, 0)]);
             }
         }
-        vals.iter().copied().fold(0.0f32, f32::max)
-            - vals.iter().copied().fold(1.0f32, f32::min)
+        vals.iter().copied().fold(0.0f32, f32::max) - vals.iter().copied().fold(1.0f32, f32::min)
     }
 
     #[test]
@@ -2147,10 +2163,7 @@ mod tests {
         }
         let s = fill_structure_telea(&img, &hole, 40, 40);
         let v = s[(20, 18, 0)];
-        assert!(
-            v < 0.85,
-            "must not read the punched 1.0 hole (got {v})"
-        );
+        assert!(v < 0.85, "must not read the punched 1.0 hole (got {v})");
         assert!(
             (v - 0.2).abs() < 0.15 || (v - 0.8).abs() < 0.15,
             "Telea should stay on one side of the diagonal (got {v})"

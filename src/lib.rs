@@ -32,6 +32,7 @@ pub(crate) mod dust_wfc;
 pub mod exr_export;
 pub mod flat_field;
 pub mod inversion;
+pub mod jpeg_export;
 pub mod lut3d;
 pub mod options;
 pub mod pipeline;
@@ -56,8 +57,7 @@ pub use auto_crop::{
 pub use dust::{
     apply_dust_removal, apply_dust_removal_with, crop_mask_uv, hash_dust, hash_strokes,
     mask_at_image_size, rasterize_strokes, rasterize_strokes_uv, stamp_disc, DustHealParams,
-    DustInfill, DustMask, DustStroke, DustTool,
-    ProjectDust,
+    DustInfill, DustMask, DustStroke, DustTool, ProjectDust,
 };
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{
@@ -89,9 +89,7 @@ fn apply_optional_dust(image: &mut Array3<f32>, options: &PipelineOptions) {
     }
     let (h, w, _) = image.dim();
     if !options.dust_strokes.is_empty() {
-        let reference = options
-            .dust_reference_size
-            .unwrap_or((w as u32, h as u32));
+        let reference = options.dust_reference_size.unwrap_or((w as u32, h as u32));
         let mask = dust::mask_at_image_size(
             &options.dust_strokes,
             reference,
@@ -118,9 +116,7 @@ fn apply_optional_dust_gpu(
     }
     let (h, w, _) = image.dim();
     let owned = if !options.dust_strokes.is_empty() {
-        let reference = options
-            .dust_reference_size
-            .unwrap_or((w as u32, h as u32));
+        let reference = options.dust_reference_size.unwrap_or((w as u32, h as u32));
         Some(dust::mask_at_image_size(
             &options.dust_strokes,
             reference,
@@ -965,9 +961,7 @@ fn process_one_export(
                     .iter()
                     .map(|v| color_space::linear_to_srgb_u8(*v as f32 / 65535.0))
                     .collect();
-                let rgb = RgbImage::from_raw(width as u32, height as u32, buf)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                rgb.save(&jpg_path)?;
+                jpeg_export::write_jpeg_srgb(&jpg_path, width as u32, height as u32, &buf)?;
             }
         }
         pipeline::Step6Display::F32(img) => {
@@ -991,9 +985,7 @@ fn process_one_export(
                     .iter()
                     .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
                     .collect();
-                let rgb = RgbImage::from_raw(width as u32, height as u32, buf)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid JPEG dimensions"))?;
-                rgb.save(&jpg_path)?;
+                jpeg_export::write_jpeg_srgb(&jpg_path, width as u32, height as u32, &buf)?;
             }
         }
     }

@@ -17,20 +17,18 @@ use c41_raw_tool::apply_preview_from_cache;
 use c41_raw_tool::{apply_preview_from_cache_gpu, process_one_to_preview_with_cache_gpu};
 use c41_raw_tool::{
     apply_preview_from_cache_on_progress, auto_tune, blur_flat_field, cached_start_step,
-    calibration, color, compute_preview_scene_stats, crop_sensor_for_oriented_rect,
-    demosaic, detect_crop, dmin, hash_dust, load_develop_preset, load_flat_field_linear,
-    load_project, load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
-    process_export_jobs,     process_one_to_preview, process_one_to_preview_with_cache,
+    calibration, color, compute_preview_scene_stats, crop_sensor_for_oriented_rect, demosaic,
+    detect_crop, dmin, hash_dust, load_develop_preset, load_flat_field_linear, load_project,
+    load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
+    process_export_jobs, process_one_to_preview, process_one_to_preview_with_cache,
     process_one_to_preview_with_cache_on_progress, rasterize_strokes, rasterize_strokes_uv,
-    raw_reader,
-    reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path, save_develop_preset,
-    save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export, AutoCropResult, AutoTuneResult,
-    CachedSensor, CropConfidence, DminMode, DustHealParams, DustInfill, DustMask, DustStroke,
-    DustTool,
-    ExportCancelled, ExportControl, ExportJobSpec, LoadedProject, OutputLutEncoding, OutputStage,
-    PipelineOptions, PreviewSceneStats, PreviewStepCache, ProjectDust, ProjectExportFormat,
-    ProjectImage, Rect, TiffFormat, UndoManager, WbMode, PROJECT_EXTENSION,
-    PROJECT_EXTENSION_LEGACY, UNDO_LIMIT,
+    raw_reader, reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path,
+    save_develop_preset, save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export,
+    AutoCropResult, AutoTuneResult, CachedSensor, CropConfidence, DminMode, DustHealParams,
+    DustInfill, DustMask, DustStroke, DustTool, ExportCancelled, ExportControl, ExportJobSpec,
+    LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions, PreviewSceneStats,
+    PreviewStepCache, ProjectDust, ProjectExportFormat, ProjectImage, Rect, TiffFormat,
+    UndoManager, WbMode, PROJECT_EXTENSION, PROJECT_EXTENSION_LEGACY, UNDO_LIMIT,
 };
 use eframe::egui;
 
@@ -108,7 +106,11 @@ fn recent_projects_file() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var_os("APPDATA")?;
-        Some(PathBuf::from(appdata).join("Oxid").join("recent_projects.json"))
+        Some(
+            PathBuf::from(appdata)
+                .join("Oxid")
+                .join("recent_projects.json"),
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -237,6 +239,38 @@ fn startup_project_from_args() -> Option<PathBuf> {
     }
 }
 
+/// Tag the native window as sRGB so the compositor converts to the display
+/// (P3 on current Macs) the same way Preview.app does for an sRGB file.
+///
+/// egui already writes encoded pixels into a gamma-space Unorm surface.
+/// Do not enable `GL_FRAMEBUFFER_SRGB` or switch to an `*Srgb` texture.
+fn tag_native_window_srgb(_cc: &eframe::CreationContext<'_>) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::rc::Retained;
+        use objc2_app_kit::{NSColorSpace, NSView};
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Ok(handle) = _cc.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            return;
+        };
+        let ns_view = appkit.ns_view.as_ptr().cast::<NSView>();
+        // SAFETY: eframe's AppKit handle is a live NSView on the main thread.
+        let Some(view) = (unsafe { Retained::retain(ns_view) }) else {
+            return;
+        };
+        let Some(window) = view.window() else {
+            return;
+        };
+        unsafe {
+            window.setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let start_size = startup_window_size();
     let startup_project = startup_project_from_args();
@@ -278,6 +312,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx);
+            tag_native_window_srgb(cc);
             let mut app = C41Gui::default();
             if let Some(path) = startup_project {
                 app.pending_recent_load = Some(path);
@@ -467,7 +502,12 @@ fn scaled_crop_px(
         return None;
     }
     let rect = entry.options.crop_rect?;
-    let s = scale_rect_to_size(rect, entry.options.crop_rect_reference_size, current_w, current_h);
+    let s = scale_rect_to_size(
+        rect,
+        entry.options.crop_rect_reference_size,
+        current_w,
+        current_h,
+    );
     Some((s.x, s.y, s.width.max(1), s.height.max(1)))
 }
 
@@ -1869,7 +1909,12 @@ fn rgb_u8_to_color_image(w: u32, h: u32, rgb: &[u8]) -> egui::ColorImage {
 
 /// Crop RGB to `uv` (0–1 of the buffer) so mipmaps do not average in the halo.
 /// Halo pixels sit at the crop edge and C-41-invert into a saturated strip.
-fn crop_rgb_u8_to_uv(w: u32, h: u32, rgb: &[u8], uv: egui::Rect) -> (u32, u32, Vec<u8>, egui::Rect) {
+fn crop_rgb_u8_to_uv(
+    w: u32,
+    h: u32,
+    rgb: &[u8],
+    uv: egui::Rect,
+) -> (u32, u32, Vec<u8>, egui::Rect) {
     let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     if w == 0 || h == 0 || rgb.len() < w as usize * h as usize * 3 {
         return (w, h, rgb.to_vec(), uv);
@@ -2489,8 +2534,7 @@ fn dust_stamp_radius_display(
     disp_w: f32,
     crop: Option<(u32, u32, u32, u32)>,
 ) -> f32 {
-    let radius_ref =
-        brush * ((rw as f32 / src_w.max(1.0)) + (rh as f32 / src_h.max(1.0))) * 0.5;
+    let radius_ref = brush * ((rw as f32 / src_w.max(1.0)) + (rh as f32 / src_h.max(1.0))) * 0.5;
     let span = crop
         .map(|(_, _, cw, _)| cw as f32)
         .unwrap_or(rw as f32)
@@ -2577,12 +2621,8 @@ const DUST_ERASER_RED: egui::Color32 = egui::Color32::from_rgb(220, 64, 64);
 fn paint_eraser_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
     let s = size.max(8.0) * 0.5;
     let (sin, cos) = 35.0_f32.to_radians().sin_cos();
-    let rot = |x: f32, y: f32| {
-        egui::pos2(
-            center.x + x * cos - y * sin,
-            center.y + x * sin + y * cos,
-        )
-    };
+    let rot =
+        |x: f32, y: f32| egui::pos2(center.x + x * cos - y * sin, center.y + x * sin + y * cos);
     let body = [
         rot(-s * 1.05, -s * 0.55),
         rot(s * 0.85, -s * 0.55),
@@ -2737,11 +2777,7 @@ impl C41Gui {
         self.persistable_project() != self.clean_project
     }
 
-    fn request_leave_current_project(
-        &mut self,
-        ctx: &egui::Context,
-        action: PendingLeaveAction,
-    ) {
+    fn request_leave_current_project(&mut self, ctx: &egui::Context, action: PendingLeaveAction) {
         if !self.project_is_dirty() {
             self.dispatch_leave_action(ctx, action);
             return;
@@ -8664,8 +8700,8 @@ impl eframe::App for C41Gui {
                     let grid_now = self.visible_tile_grid(idx);
                     let proxy_soft = grid_now.as_ref().map(|g| g.proxy_soft).unwrap_or(false);
                     let tiles_fit = grid_now.as_ref().map(|g| g.tiles_fit).unwrap_or(false);
-                    let wfc_dust = apply
-                        && self.images[idx].dust_infill == DustInfill::WaveFunction;
+                    let wfc_dust =
+                        apply && self.images[idx].dust_infill == DustInfill::WaveFunction;
                     let (req_sw, req_sh) = self.images[idx].preview_screen_requested_wh;
                     // Do not compare CFA output size to the request cap — downsample often
                     // comes in smaller and that used to restart screen refine forever,
@@ -8893,7 +8929,10 @@ mod tile_grid_tests {
 
     #[test]
     fn tiles_off_when_minified_on_at_100_and_110_percent() {
-        assert!(!proxy_is_soft(0.25), "fit / zoom-out uses the mipmapped proxy");
+        assert!(
+            !proxy_is_soft(0.25),
+            "fit / zoom-out uses the mipmapped proxy"
+        );
         assert!(!proxy_is_soft(0.99));
         assert!(proxy_is_soft(1.0), "100% must request 1:1 tiles");
         assert!(proxy_is_soft(1.1), "110% must request 1:1 tiles");
@@ -8948,8 +8987,7 @@ mod tile_grid_tests {
     #[test]
     fn fit_view_always_includes_top_sensor_row() {
         // Simulates preview-UV mapping that skipped row 0 (iy0=1).
-        let (ix0, iy0, ix1, iy1) =
-            include_image_edge_tiles(0.0, 0.0, 1.0, 1.0, 12, 8, 0, 1, 11, 7);
+        let (ix0, iy0, ix1, iy1) = include_image_edge_tiles(0.0, 0.0, 1.0, 1.0, 12, 8, 0, 1, 11, 7);
         assert_eq!(iy0, 0, "image top must request sensor row 0");
         assert_eq!((ix0, ix1, iy1), (0, 11, 7));
     }
@@ -8969,7 +9007,10 @@ mod tile_grid_tests {
         let r_full = dust_stamp_radius_display(8.0, 2000.0, 2000.0, 2000, 2000, 800.0, None);
         let r_crop = dust_stamp_radius_display(8.0, 2000.0, 2000.0, 2000, 2000, 800.0, crop);
         assert!((r_full - 8.0 * 800.0 / 2000.0).abs() < 1e-4);
-        assert!((r_crop - 8.0).abs() < 1e-4, "crop view: 1 display px = 1 crop px");
+        assert!(
+            (r_crop - 8.0).abs() < 1e-4,
+            "crop view: 1 display px = 1 crop px"
+        );
     }
 
     #[test]

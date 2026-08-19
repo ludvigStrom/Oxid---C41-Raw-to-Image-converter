@@ -120,9 +120,7 @@ fn fill_component(
     for &i in component {
         let x = i % w;
         let y = i / w;
-        fill[i] = Some(bridge_low(
-            den, tight, x, y, flow, aniso, rim_mean, w, h,
-        ));
+        fill[i] = Some(bridge_low(den, tight, x, y, flow, aniso, rim_mean, w, h));
     }
     if grain > 1.0e-5 {
         apply_statistical_grain(

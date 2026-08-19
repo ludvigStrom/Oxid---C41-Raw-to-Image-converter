@@ -342,7 +342,11 @@ fn estimate(
         }
     }
 
-    let mut bins: [Vec<Vec<f32>>; 3] = [vec![Vec::new(); NLF_BINS], vec![Vec::new(); NLF_BINS], vec![Vec::new(); NLF_BINS]];
+    let mut bins: [Vec<Vec<f32>>; 3] = [
+        vec![Vec::new(); NLF_BINS],
+        vec![Vec::new(); NLF_BINS],
+        vec![Vec::new(); NLF_BINS],
+    ];
     for y in y0..=y1 {
         for x in x0..=x1 {
             let i = y * w + x;
@@ -401,9 +405,7 @@ fn estimate(
         let mut x = x0 as i32 + half;
         while x + half <= x1 as i32 {
             if patch_is_flat(&flat, x, y, patch, w, h) {
-                let spec = fft2_residual(
-                    image, den, &nlf, x as usize, y as usize, patch, &fft, w,
-                );
+                let spec = fft2_residual(image, den, &nlf, x as usize, y as usize, patch, &fft, w);
                 for (p, c) in psd.iter_mut().zip(spec) {
                     *p += c.re * c.re + c.im * c.im;
                 }
@@ -557,9 +559,7 @@ pub(crate) fn apply_statistical_grain(
         return;
     }
     let (x0, y0, x1, y1) = component_bbox(component, w, h, MARGIN);
-    let model = estimate(
-        image, den, hole, x0, y0, x1, y1, rim, gate, loosen, w, h,
-    );
+    let model = estimate(image, den, hole, x0, y0, x1, y1, rim, gate, loosen, w, h);
     let n = model.patch;
     let step = (n / 2).max(1);
     let win = hann(n);
@@ -573,9 +573,8 @@ pub(crate) fn apply_statistical_grain(
         let mut tx = x0 as i32 - n as i32 / 2;
         while tx <= x_end {
             for ch in 0..3 {
-                let salt = 0xA5A5_A5A5u32.wrapping_mul(ch as u32 + 1)
-                    ^ ((tx as u32) << 8)
-                    ^ (ty as u32);
+                let salt =
+                    0xA5A5_A5A5u32.wrapping_mul(ch as u32 + 1) ^ ((tx as u32) << 8) ^ (ty as u32);
                 let mut noise = vec![0.0f32; n * n];
                 for py in 0..n {
                     for px in 0..n {
@@ -586,9 +585,7 @@ pub(crate) fn apply_statistical_grain(
                         );
                     }
                 }
-                let shaped = filter_spectrum(
-                    &noise, &model.psd_sqrt, n, &model.fft, &model.ifft,
-                );
+                let shaped = filter_spectrum(&noise, &model.psd_sqrt, n, &model.fft, &model.ifft);
                 for py in 0..n {
                     for px in 0..n {
                         let hx = tx + px as i32;

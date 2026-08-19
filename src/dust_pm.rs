@@ -68,7 +68,17 @@ pub(crate) fn heal_patchmatch(
         }
     }
     if grain > 1.0e-5 {
-        grain_fill(image, tight, dilated, &components, &mut fill, grain, loosen, w, h);
+        grain_fill(
+            image,
+            tight,
+            dilated,
+            &components,
+            &mut fill,
+            grain,
+            loosen,
+            w,
+            h,
+        );
     }
     for i in 0..n_pix {
         let a = alpha[i];
@@ -113,9 +123,7 @@ fn fill_component(
     }
     if sources.is_empty() {
         for &i in &tight_in {
-            color_at[i] = Some(
-                structure_hv(image, &hole, i % w, i / w, w, h).unwrap_or(rim_mean),
-            );
+            color_at[i] = Some(structure_hv(image, &hole, i % w, i / w, w, h).unwrap_or(rim_mean));
         }
     } else {
         let (x0, y0, x1, y1) = bbox_of(&sources, &tight_in, w);
@@ -512,9 +520,7 @@ fn upsample_nn(coarse: &Level, fine: &mut Level) {
             if let Some((sx, sy)) = coarse.nn[cy * coarse.w + cx] {
                 let fx = ((sx as usize) * 2 + x % 2).min(fine.w.saturating_sub(1));
                 let fy = ((sy as usize) * 2 + y % 2).min(fine.h.saturating_sub(1));
-                if fine.source[fy * fine.w + fx]
-                    && source_near(x, y, fx, fy, fine.src_rad)
-                {
+                if fine.source[fy * fine.w + fx] && source_near(x, y, fx, fy, fine.src_rad) {
                     fine.nn[i] = Some((fx as u16, fy as u16));
                     continue;
                 }
@@ -589,7 +595,10 @@ fn patch_ssd(level: &Level, x: usize, y: usize, sx: usize, sy: usize, best: f32)
             if level.hole[pi] || level.hole[qi] {
                 continue;
             }
-            s += rgb_ssd(rgb_at_level(level, px as usize, py as usize), rgb_at_level(level, qx as usize, qy as usize));
+            s += rgb_ssd(
+                rgb_at_level(level, px as usize, py as usize),
+                rgb_at_level(level, qx as usize, qy as usize),
+            );
             n += 1.0;
             if n > 0.0 && s / n >= best {
                 return s / n;
@@ -667,14 +676,7 @@ fn propagate(level: &mut Level, forward: bool) {
                 let Some((sx, sy)) = level.nn[ny as usize * level.w + nx as usize] else {
                     continue;
                 };
-                try_assign(
-                    level,
-                    x,
-                    y,
-                    sx as i32 - dx,
-                    sy as i32 - dy,
-                    &mut best,
-                );
+                try_assign(level, x, y, sx as i32 - dx, sy as i32 - dy, &mut best);
             }
         }
     }
@@ -699,14 +701,7 @@ fn random_search(level: &mut Level) {
                 let range = (2 * rad + 1) as u32;
                 let jx = (hx % range) as i32 - rad;
                 let jy = (hy % range) as i32 - rad;
-                try_assign(
-                    level,
-                    x,
-                    y,
-                    sx0 as i32 + jx,
-                    sy0 as i32 + jy,
-                    &mut best,
-                );
+                try_assign(level, x, y, sx0 as i32 + jx, sy0 as i32 + jy, &mut best);
                 rad = (rad / 2).max(0);
                 if rad == 0 {
                     break;

@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use ndarray::Array3;
 use serde::{Deserialize, Serialize};
 use tiff::encoder::{colortype::RGB32Float, colortype::RGB16, TiffEncoder};
+use tiff::tags::Tag;
 
 /// Output bit depth / format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -73,11 +74,30 @@ pub fn write_tiff(image: &Array3<f32>, path: &Path, format: TiffFormat) -> Resul
                     buf.push(f32_to_u16(pixel[2]));
                 }
             }
-            tiff.write_image::<RGB16>(width_u, height_u, &buf)
+            write_rgb16_with_srgb_icc(&mut tiff, width_u, height_u, &buf)
                 .with_context(|| format!("Failed to write 16-bit TIFF to {}", path.display()))?;
         }
     }
 
+    Ok(())
+}
+
+fn write_rgb16_with_srgb_icc<W: std::io::Write + std::io::Seek>(
+    tiff: &mut TiffEncoder<W>,
+    width: u32,
+    height: u32,
+    buf: &[u16],
+) -> Result<()> {
+    let mut image = tiff
+        .new_image::<RGB16>(width, height)
+        .context("Failed to create 16-bit TIFF image")?;
+    image
+        .encoder()
+        .write_tag(Tag::IccProfile, crate::color_space::SRGB_ICC)
+        .context("Failed to write sRGB ICC profile")?;
+    image
+        .write_data(buf)
+        .context("Failed to write 16-bit TIFF image data")?;
     Ok(())
 }
 
@@ -114,8 +134,74 @@ pub fn write_tiff_u16(image: &Array3<u16>, path: &Path) -> Result<()> {
         File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
     let writer = BufWriter::new(file);
     let mut tiff = TiffEncoder::new(writer).with_context(|| "Failed to create TIFF encoder")?;
-    tiff.write_image::<RGB16>(width_u, height_u, &buf)
+    write_rgb16_with_srgb_icc(&mut tiff, width_u, height_u, &buf)
         .with_context(|| format!("Failed to write 16-bit TIFF to {}", path.display()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array3;
+    use tiff::decoder::Decoder;
+    use tiff::tags::Tag;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "oxid-icc-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn tiff16_embeds_srgb_icc() {
+        let img = Array3::<u16>::from_elem((2, 2, 3), 32768);
+        let path = temp_path("u16.tiff");
+        write_tiff_u16(&img, &path).expect("write");
+        let file = File::open(&path).expect("open");
+        let mut dec = Decoder::new(file).expect("decode");
+        let icc = dec
+            .find_tag(Tag::IccProfile)
+            .expect("tag")
+            .expect("icc present")
+            .into_u8_vec()
+            .expect("bytes");
+        assert_eq!(icc, crate::color_space::SRGB_ICC);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tiff16_from_f32_embeds_srgb_icc() {
+        let img = Array3::<f32>::from_elem((2, 2, 3), 0.5);
+        let path = temp_path("f32u16.tiff");
+        write_tiff(&img, &path, TiffFormat::U16).expect("write");
+        let file = File::open(&path).expect("open");
+        let mut dec = Decoder::new(file).expect("decode");
+        let icc = dec
+            .find_tag(Tag::IccProfile)
+            .expect("tag")
+            .expect("icc present")
+            .into_u8_vec()
+            .expect("bytes");
+        assert_eq!(icc, crate::color_space::SRGB_ICC);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tiff32_has_no_icc() {
+        let img = Array3::<f32>::from_elem((2, 2, 3), 0.5);
+        let path = temp_path("f32.tiff");
+        write_tiff(&img, &path, TiffFormat::Float32).expect("write");
+        let file = File::open(&path).expect("open");
+        let mut dec = Decoder::new(file).expect("decode");
+        let icc = dec.find_tag(Tag::IccProfile).expect("tag");
+        assert!(icc.is_none(), "linear float TIFF must stay untagged");
+        let _ = std::fs::remove_file(&path);
+    }
 }

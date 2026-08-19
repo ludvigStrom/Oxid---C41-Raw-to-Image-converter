@@ -22,6 +22,10 @@ use ndarray::Array3;
 
 use crate::aces;
 
+/// Compact IEC 61966-2.1 sRGB ICC v2 (monitor, perceptual, D50-adapted primaries).
+/// Embedded in JPEG and 16-bit display TIFF so viewers do not guess the space.
+pub const SRGB_ICC: &[u8] = include_bytes!("data/srgb-iec61966-2.1.icc");
+
 /// What the sample values represent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorDomain {
@@ -175,6 +179,15 @@ pub fn apply_input_idt_to_working_space(image: &mut Array3<f32>, idt: &[[f32; 3]
 mod tests {
     use super::*;
     use crate::aces::{ACESCG_TO_LINEAR_SRGB, IDT_IDENTITY};
+
+    #[test]
+    fn srgb_icc_is_icc_v2() {
+        assert!(SRGB_ICC.len() >= 128);
+        assert_eq!(&SRGB_ICC[36..40], b"acsp");
+        assert_eq!(&SRGB_ICC[16..20], b"RGB ");
+        let size = u32::from_be_bytes(SRGB_ICC[0..4].try_into().unwrap()) as usize;
+        assert_eq!(size, SRGB_ICC.len());
+    }
 
     #[test]
     fn oetf_roundtrip_mid_gray() {

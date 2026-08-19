@@ -310,12 +310,14 @@ Implementation: [`src/bujack.rs`](src/bujack.rs), called from `pipeline::apply_b
 
 | Format | Flag | Notes |
 |--------|------|-------|
-| 16-bit TIFF (default with curve) | - | Uncompressed, u16 per channel via `write_tiff_u16`. |
-| 32-bit float TIFF | `--format 32f` | Uncompressed, f32 per channel. Only with `--no-curve`. |
-| 16-bit integer TIFF | `--format 16` | Clamped and scaled. Only with `--no-curve`. |
+| 16-bit TIFF (default with curve) | - | Uncompressed, u16 per channel via `write_tiff_u16`. Embeds an sRGB ICC profile. |
+| 32-bit float TIFF | `--format 32f` | Uncompressed, f32 per channel. Only with `--no-curve`. Untagged linear (no ICC). |
+| 16-bit integer TIFF | `--format 16` | Clamped and scaled. Only with `--no-curve`. Embeds an sRGB ICC profile. |
 | OpenEXR | `--write-exr` | f32 or normalized u16, written via the `exr` crate. |
-| JPEG | `--write-jpeg` | 8-bit: top byte of each u16 value. |
+| JPEG | `--write-jpeg` | 8-bit sRGB OETF via `write_jpeg_srgb`, with an embedded sRGB ICC profile. |
 | ACES2065-1 EXR | `--export-aces-exr` | Linear AP0-primaries EXR via `linear_acescg_to_aces2065_1`. |
+
+On macOS the GUI window is tagged sRGB so the preview matches color-managed viewers of those ICC-tagged files. Do not treat the OpenGL framebuffer as an sRGB texture — egui already writes encoded pixels.
 
 Output filenames are derived from the input stem: `frame_001.arw` → `frame_001.tiff`.
 
@@ -400,7 +402,8 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/calibration.rs` | ColorChecker reference data, OLS 3×3 solver via `nalgebra`, `.oxid` profile load/save (zip). |
 | `src/lut3d.rs` | Density-domain 3D LUT: generate from 3×3 matrix, `.cube` file I/O, tetrahedral interpolation. |
 | `src/aces.rs` | ACEScg IDT and `linear_acescg_to_aces2065_1` matrix. |
-| `src/tiff_export.rs` | Uncompressed TIFF writer: `write_tiff_u16` (u16), `write_tiff` (f32 or u16). |
+| `src/tiff_export.rs` | Uncompressed TIFF writer: `write_tiff_u16` (u16), `write_tiff` (f32 or u16). 16-bit paths embed sRGB ICC. |
+| `src/jpeg_export.rs` | 8-bit JPEG writer with embedded sRGB ICC (`write_jpeg_srgb`). |
 | `src/exr_export.rs` | OpenEXR writer: f32, u16, and ACES2065-1 paths. |
 | `src/pipeline.rs` | Shared pipeline steps 3-6 used by both `process_files` and `process_one_to_preview`. |
 | `src/bujack.rs` | De-Bujack: non-local OkLab difference stretch after step 6 (optional, off by default). |

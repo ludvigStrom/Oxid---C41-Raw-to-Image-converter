@@ -39,9 +39,7 @@ impl DustWfcPipeline {
             w,
             h,
         } = prep;
-        crate::dust_wfc::heal_wfc(
-            image, &tight, &dilated, &alpha, grain, tile, loosen, w, h,
-        );
+        crate::dust_wfc::heal_wfc(image, &tight, &dilated, &alpha, grain, tile, loosen, w, h);
         Ok(())
     }
 }
