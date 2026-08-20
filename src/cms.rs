@@ -2,7 +2,8 @@
 //!
 //! Working space is linear Rec.709 print RGB. This module does not change
 //! pipeline steps 4–6. sRGB export keeps the existing OETF + IEC profile so
-//! current files stay bit-identical.
+//! current files stay bit-identical. Preview uses that same encode unless
+//! soft proof is on (paper → monitor).
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -337,7 +338,6 @@ fn display_u8_from_linear(linear: &[f32], options: &PipelineOptions) -> Result<V
     match options.cms_target {
         CmsTarget::Export => Ok(export_u8_from_linear(linear, options)?.0),
         CmsTarget::Display => {
-            let monitor = options.preview_monitor_icc.as_deref().map(|v| v.as_slice());
             if options.soft_proof {
                 let paper_path = options
                     .proof_icc_path
@@ -346,7 +346,7 @@ fn display_u8_from_linear(linear: &[f32], options: &PipelineOptions) -> Result<V
                 let paper = std::fs::read(paper_path).with_context(|| {
                     format!("Failed to read proof ICC {}", paper_path.display())
                 })?;
-                let dest = match monitor {
+                let dest = match options.preview_monitor_icc.as_deref() {
                     Some(m) if !m.is_empty() => m.to_vec(),
                     _ => color_space::SRGB_ICC.to_vec(),
                 };
@@ -359,20 +359,8 @@ fn display_u8_from_linear(linear: &[f32], options: &PipelineOptions) -> Result<V
                     options.proof_gamut_warning,
                 );
             }
-            if let Some(monitor) = monitor {
-                if !monitor.is_empty() {
-                    return transform_linear_to_u8(
-                        linear,
-                        monitor,
-                        CmsIntent::Relative,
-                        true,
-                    );
-                }
-            }
-            Ok(linear
-                .iter()
-                .map(|v| color_space::linear_to_srgb_u8(*v))
-                .collect())
+            // Same 8-bit encode as TIFF/JPEG so the viewer matches the file.
+            Ok(export_u8_from_linear(linear, options)?.0)
         }
     }
 }
@@ -411,16 +399,7 @@ fn encode_preview_inner(display: &Step6Display, options: &PipelineOptions) -> Re
 }
 
 fn needs_cms_preview(options: &PipelineOptions) -> bool {
-    match options.cms_target {
-        CmsTarget::Export => uses_output_cms(options),
-        CmsTarget::Display => {
-            options.soft_proof
-                || options
-                    .preview_monitor_icc
-                    .as_ref()
-                    .is_some_and(|m| !m.is_empty())
-        }
-    }
+    options.soft_proof || uses_output_cms(options)
 }
 
 /// Export a RA-4 / FilmPrint u16 buffer through the output ICC.
@@ -494,6 +473,24 @@ mod tests {
         // Neutral mid-gray should stay roughly neutral.
         let max = rgb.iter().copied().max().unwrap().saturating_sub(rgb.iter().copied().min().unwrap());
         assert!(max < 8, "neutral drifted {rgb:?}");
+    }
+
+    #[test]
+    fn preview_matches_srgb_export_even_with_monitor_icc() {
+        let mut img = ndarray::Array3::<u16>::zeros((1, 1, 3));
+        img[[0, 0, 0]] = (0.18_f32 * 65535.0).round() as u16;
+        img[[0, 0, 1]] = img[[0, 0, 0]];
+        img[[0, 0, 2]] = img[[0, 0, 0]];
+        let mut opts = PipelineOptions::default();
+        opts.preview_monitor_icc = Some(std::sync::Arc::new(color_space::SRGB_ICC.to_vec()));
+        opts.cms_target = CmsTarget::Display;
+        let preview = encode_preview(&Step6Display::U16(img.clone()), &opts);
+        let (exported, _) = export_u8_from_linear(
+            &img.iter().map(|v| *v as f32 / 65535.0).collect::<Vec<_>>(),
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(preview, exported);
     }
 
     #[test]

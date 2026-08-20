@@ -406,7 +406,7 @@ pub struct PipelineOptions {
     /// Detect / feather / grain used when applying `dust_mask`.
     #[serde(skip)]
     pub dust_heal: DustHealParams,
-    /// Monitor ICC bytes for display encode. Session-only; set by the GUI.
+    /// Monitor ICC bytes for soft-proof display encode. Session-only; set by the GUI.
     #[serde(skip)]
     pub preview_monitor_icc: Option<Arc<Vec<u8>>>,
     /// Preview encode target. Session-only.

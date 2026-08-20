@@ -3328,12 +3328,31 @@ impl C41Gui {
             options.dust_reference_size = None;
             options.dust_uv = None;
         }
-        options.preview_monitor_icc = self.monitor.as_ref().map(|m| m.icc.clone());
         options.cms_target = CmsTarget::Display;
         if entry.process_tab == ProcessTab::Export && entry.compare_export_before {
             options.soft_proof = false;
         }
+        // Monitor ICC is only for soft proof. Normal preview uses the same
+        // encode as export so the viewer matches the file.
+        options.preview_monitor_icc = if options.soft_proof {
+            self.monitor.as_ref().map(|m| m.icc.clone())
+        } else {
+            None
+        };
         options
+    }
+
+    fn preview_uses_srgb_window(&self) -> bool {
+        let Some(idx) = self.selected_index else {
+            return true;
+        };
+        let Some(entry) = self.images.get(idx) else {
+            return true;
+        };
+        if entry.process_tab == ProcessTab::Export && entry.compare_export_before {
+            return true;
+        }
+        !entry.options.soft_proof
     }
 
     fn refresh_monitor_profile(&mut self, ctx: &egui::Context) {
@@ -3347,10 +3366,12 @@ impl C41Gui {
         let old_hash = self.monitor.as_ref().map(|m| m.hash());
         if new_hash != old_hash {
             self.monitor = detected;
-            self.preview_gen = self.preview_gen.wrapping_add(1);
-            for img in &mut self.images {
-                img.preview_hash = 0;
-                img.preview_options_hash = 0;
+            if self.images.iter().any(|e| e.options.soft_proof) {
+                self.preview_gen = self.preview_gen.wrapping_add(1);
+                for img in &mut self.images {
+                    img.preview_hash = 0;
+                    img.preview_options_hash = 0;
+                }
             }
         }
     }
@@ -5358,11 +5379,11 @@ impl eframe::App for C41Gui {
         // Re-apply each frame so backends that reset visuals stay on the lab theme.
         theme::apply(ctx);
         // OpenGL's backing layer is created after startup and can be recreated
-        // on resize / display change. sRGB tag only when preview is sRGB-encoded
-        // (no monitor ICC). Monitor-encoded preview leaves the layer native.
+        // on resize / display change. Preview is sRGB-encoded like export unless
+        // soft proof is converting to the monitor; tag the layer to match.
         self.refresh_monitor_profile(ctx);
         #[cfg(target_os = "macos")]
-        if self.monitor.is_none() {
+        if self.preview_uses_srgb_window() {
             tag_native_window_srgb(frame);
         }
 

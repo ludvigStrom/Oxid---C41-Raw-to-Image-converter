@@ -329,7 +329,7 @@ Implementation: [`src/bujack.rs`](src/bujack.rs), called from `pipeline::apply_b
 | JPEG | `--write-jpeg` | 8-bit sRGB OETF via `write_jpeg_srgb`, with an embedded sRGB ICC profile. |
 | ACES2065-1 EXR | `--export-aces-exr` | Linear AP0-primaries EXR via `linear_acescg_to_aces2065_1`. |
 
-On macOS the GUI window and the OpenGL backing layer are tagged sRGB when no monitor ICC is available, so the preview matches color-managed viewers of sRGB-tagged files. When a display profile is detected, preview pixels are converted to that profile and the layer is left in the display space. Do not treat the OpenGL framebuffer as an sRGB texture — egui already writes encoded pixels.
+On macOS the GUI window and the OpenGL backing layer are tagged sRGB so the preview matches color-managed viewers of sRGB-tagged exports. The preview uses the same encode as TIFF/JPEG (sRGB OETF by default, or the selected output ICC). Soft proof is the exception: it converts through the paper ICC onto the detected monitor. Do not treat the OpenGL framebuffer as an sRGB texture — egui already writes encoded pixels.
 
 ### Color management (ICC)
 
@@ -338,7 +338,7 @@ ICC is a **post-step-6 encode**, separate from `.oxid` density-matrix “color p
 | Piece | Where | What it does |
 |-------|--------|----------------|
 | Output ICC | Export tab / `--output-icc` | Convert linear Rec.709 print RGB to sRGB (default), Display P3, Adobe RGB, or a custom RGB `.icc`, then embed that profile in 16-bit TIFF and JPEG. |
-| Monitor ICC | Auto-detected (macOS / Windows) | Preview hops working RGB → display. Falls back to sRGB encode + sRGB window tag. |
+| Monitor ICC | Auto-detected (macOS / Windows) | Used only for soft proof (paper → monitor). Normal preview matches the export encode. |
 | Soft proof | Export tab + preview **Proof** toggle | Simulate a paper/printer RGB ICC on the detected monitor (intent, paper white, optional gamut warning). Export stays RGB — not CMYK. |
 | Filename template | Export tab / `--filename-template` | Tokens `{stem}` `{index}` `{index:03}` `{date}` `{time}` `{preset}` `{profile}` `{w}` `{h}`. Default `{stem}` keeps `frame_001.arw` → `frame_001.tiff`. |
 | Export preset | Export tab Save/Load | Format, JPEG sidecar/quality, output ICC, intent, filename. Not a Develop look preset. |
