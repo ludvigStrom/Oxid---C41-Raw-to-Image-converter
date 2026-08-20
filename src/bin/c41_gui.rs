@@ -387,6 +387,8 @@ struct ImageEntry {
     preview_texture: Option<egui::TextureHandle>,
     /// Whether `preview_texture` was uploaded with NEAREST (magnified) vs LINEAR (fit / minified).
     preview_texture_nearest: bool,
+    /// Crop-viewport layout baked into `preview_texture` (re-upload when tab/crop changes).
+    preview_texture_layout: u64,
     /// `rotation_degrees` baked into `preview_texture` / `preview_full_rgb`.
     preview_texture_rotation: i32,
     /// `flip_horizontal` baked into `preview_texture` / `preview_full_rgb`.
@@ -439,15 +441,15 @@ struct ImageEntry {
     tile_cache: Vec<PreviewTile>,
     /// Process tab (Input/Develop/Export) — persists per image when switching.
     process_tab: ProcessTab,
-    /// Before/After switch, stored per Process tab.
+    /// Before/After switch, stored per Process tab (not Dust).
     compare_input_before: bool,
     compare_develop_before: bool,
-    compare_dust_before: bool,
     compare_export_before: bool,
     /// Encoded alternate preview (raw or inverted) for the Before/After switch.
     compare_full_rgb: Option<(u32, u32, Vec<u8>)>,
     compare_texture: Option<egui::TextureHandle>,
     compare_texture_nearest: bool,
+    compare_texture_layout: u64,
     compare_kind: Option<CompareKind>,
     dust_strokes: Vec<DustStroke>,
     dust_reference_size: Option<(u32, u32)>,
@@ -589,7 +591,7 @@ impl ImageEntry {
         match self.process_tab {
             ProcessTab::Input => self.compare_input_before,
             ProcessTab::Develop => self.compare_develop_before,
-            ProcessTab::Dust => self.compare_dust_before,
+            ProcessTab::Dust => false,
             ProcessTab::Export => self.compare_export_before,
         }
     }
@@ -612,11 +614,10 @@ fn compare_kind_for(entry: &ImageEntry) -> Option<CompareKind> {
 fn compare_hint_for(tab: ProcessTab, before: bool) -> &'static str {
     match (tab, before) {
         (ProcessTab::Input, true) => "Raw scan (demosaic only)",
-        (ProcessTab::Input, false) => "Inverted and cropped",
+        (ProcessTab::Input, false) => "Inverted, same crop controls",
         (ProcessTab::Develop, true) => "Before processing (inverted input)",
         (ProcessTab::Develop, false) => "After processing",
-        (ProcessTab::Dust, true) => "Before dust heal",
-        (ProcessTab::Dust, false) => "After dust heal",
+        (ProcessTab::Dust, _) => "",
         (ProcessTab::Export, true) => "Before soft proof",
         (ProcessTab::Export, false) => "After export view",
     }
@@ -709,16 +710,13 @@ fn preview_draw_rgb(entry: &ImageEntry) -> Option<(u32, u32, &Vec<u8>)> {
     }
 }
 
-/// True when the preview is cropped to the frame (Develop / Dust / Export, or
-/// Input After). Input Before keeps the full frame so crop handles stay editable.
+/// True when the preview is cropped to the frame (Develop / Dust / Export).
+/// Input always keeps the full frame so crop handles stay editable on Before and After.
 fn preview_uses_crop_viewport(entry: &ImageEntry) -> bool {
     if !entry.options.apply_crop || entry.options.crop_rect.is_none() {
         return false;
     }
-    match entry.process_tab {
-        ProcessTab::Input => !entry.compare_input_before,
-        _ => true,
-    }
+    !matches!(entry.process_tab, ProcessTab::Input)
 }
 
 /// Tile grid origin and size in oriented-sensor pixels.
@@ -2201,6 +2199,23 @@ fn sample_array3_4x4(buf: &ndarray::Array3<f32>, cx: usize, cy: usize) -> (f32, 
     }
 }
 
+fn preview_texture_layout_key(entry: &ImageEntry) -> u64 {
+    let mut h = DefaultHasher::new();
+    preview_uses_crop_viewport(entry).hash(&mut h);
+    crop_histogram_hash(&entry.options).hash(&mut h);
+    h.finish()
+}
+
+/// Crop the upload when the viewport is the frame so mipmaps do not average in the rebate.
+fn color_image_for_preview(entry: &ImageEntry, w: u32, h: u32, rgb: &[u8]) -> egui::ColorImage {
+    if let Some(uv) = preview_crop_uv(entry, w, h) {
+        let (cw, ch, cropped, _) = crop_rgb_u8_to_uv(w, h, rgb, uv);
+        rgb_u8_to_color_image(cw, ch, &cropped)
+    } else {
+        rgb_u8_to_color_image(w, h, rgb)
+    }
+}
+
 fn rgb_u8_to_color_image(w: u32, h: u32, rgb: &[u8]) -> egui::ColorImage {
     let size = [w as usize, h as usize];
     let pixels: Vec<egui::Color32> = rgb
@@ -2561,10 +2576,10 @@ fn entry_preview_hash(entry: &ImageEntry, full_res: bool) -> u64 {
     let mut hh = DefaultHasher::new();
     preview_options_hash(&entry.path, &entry.options, full_res).hash(&mut hh);
     entry.process_tab.hash(&mut hh);
-    // Input / Develop swap cached RGB. Dust / Export change the bake.
+    // Input / Develop swap cached RGB. Export Before/After changes the bake.
     match entry.process_tab {
-        ProcessTab::Dust | ProcessTab::Export => entry.compare_before().hash(&mut hh),
-        ProcessTab::Input | ProcessTab::Develop => {}
+        ProcessTab::Export => entry.compare_before().hash(&mut hh),
+        ProcessTab::Input | ProcessTab::Develop | ProcessTab::Dust => {}
     }
     hh.finish()
 }
@@ -2593,6 +2608,7 @@ fn image_entry(
         options,
         preview_texture: None,
         preview_texture_nearest: false,
+        preview_texture_layout: 0,
         preview_texture_rotation: 0,
         preview_texture_flip_h: false,
         preview_texture_flip_v: false,
@@ -2621,11 +2637,11 @@ fn image_entry(
         process_tab: ProcessTab::Input,
         compare_input_before: false,
         compare_develop_before: false,
-        compare_dust_before: false,
         compare_export_before: false,
         compare_full_rgb: None,
         compare_texture: None,
         compare_texture_nearest: false,
+        compare_texture_layout: 0,
         compare_kind: None,
         dust_strokes: Vec::new(),
         dust_reference_size: None,
@@ -3346,9 +3362,7 @@ impl C41Gui {
         if self.mode == UIMode::Process {
             return match entry.process_tab {
                 ProcessTab::Input | ProcessTab::Develop => false,
-                ProcessTab::Dust => {
-                    !entry.compare_dust_before && entry.dust_view == DustView::Process
-                }
+                ProcessTab::Dust => entry.dust_view == DustView::Process,
                 ProcessTab::Export => true,
             };
         }
@@ -5502,8 +5516,15 @@ impl eframe::App for C41Gui {
                     self.preview_job_live = false;
                     if job.gen == self.preview_gen && job.index < self.images.len() {
                         let idx = job.index;
-                        // Fit / first frame: LINEAR + mipmaps. Draw path recreates if pixel scale needs NEAREST.
-                        let image = rgb_u8_to_color_image(job.w, job.h, &job.rgb);
+                        // Fit / first frame: LINEAR + mipmaps. Crop first so mips
+                        // do not average rebate into the frame. Draw path recreates
+                        // if pixel scale needs NEAREST or the crop viewport changes.
+                        let image = color_image_for_preview(
+                            &self.images[idx],
+                            job.w,
+                            job.h,
+                            &job.rgb,
+                        );
                         let tex = ctx.load_texture(
                             format!("preview_full_{}", idx),
                             image,
@@ -5511,6 +5532,8 @@ impl eframe::App for C41Gui {
                         );
                         self.images[idx].preview_texture = Some(tex);
                         self.images[idx].preview_texture_nearest = false;
+                        self.images[idx].preview_texture_layout =
+                            preview_texture_layout_key(&self.images[idx]);
                         self.images[idx].preview_hash = job.options_hash;
                         self.images[idx].preview_options_hash = job.options_hash;
                         if self.auto_waiting_preview() == Some(idx) {
@@ -6202,25 +6225,27 @@ impl eframe::App for C41Gui {
                             theme::icon_label(theme::DOWNLOAD, "Export"),
                         );
                     });
-                    ui.add_space(4.0);
-                    {
-                        let tab = entry.process_tab;
-                        let before = match tab {
-                            ProcessTab::Input => &mut entry.compare_input_before,
-                            ProcessTab::Develop => &mut entry.compare_develop_before,
-                            ProcessTab::Dust => &mut entry.compare_dust_before,
-                            ProcessTab::Export => &mut entry.compare_export_before,
-                        };
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(
-                                before,
-                                true,
-                                theme::icon_label(theme::COMPARE, "Before"),
-                            )
-                            .on_hover_text(compare_hint_for(tab, true));
-                            ui.selectable_value(before, false, "After")
-                                .on_hover_text(compare_hint_for(tab, false));
-                        });
+                    if entry.process_tab != ProcessTab::Dust {
+                        ui.add_space(4.0);
+                        {
+                            let tab = entry.process_tab;
+                            let before = match tab {
+                                ProcessTab::Input => &mut entry.compare_input_before,
+                                ProcessTab::Develop => &mut entry.compare_develop_before,
+                                ProcessTab::Dust => unreachable!("Dust has no Before/After"),
+                                ProcessTab::Export => &mut entry.compare_export_before,
+                            };
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    before,
+                                    true,
+                                    theme::icon_label(theme::COMPARE, "Before"),
+                                )
+                                .on_hover_text(compare_hint_for(tab, true));
+                                ui.selectable_value(before, false, "After")
+                                    .on_hover_text(compare_hint_for(tab, false));
+                            });
+                        }
                     }
                     ui.add_space(6.0);
                     ui.separator();
@@ -8104,14 +8129,21 @@ impl eframe::App for C41Gui {
 
                         // Recreate texture only when LINEAR/NEAREST must flip (pixel scale crosses 1×).
                         let want_nearest = want_nearest_filter(pixel_scale);
+                        let layout_key = preview_texture_layout_key(&self.images[idx]);
                         let tex_opt = if showing_compare {
                             let need_upload = self.images[idx].compare_texture.is_none()
-                                || self.images[idx].compare_texture_nearest != want_nearest;
+                                || self.images[idx].compare_texture_nearest != want_nearest
+                                || self.images[idx].compare_texture_layout != layout_key;
                             if need_upload {
                                 if let Some((fw, fh, rgb)) =
                                     self.images[idx].compare_full_rgb.as_ref()
                                 {
-                                    let image = rgb_u8_to_color_image(*fw, *fh, rgb);
+                                    let image = color_image_for_preview(
+                                        &self.images[idx],
+                                        *fw,
+                                        *fh,
+                                        rgb,
+                                    );
                                     let tex_opts = if want_nearest {
                                         egui::TextureOptions::NEAREST
                                     } else {
@@ -8124,17 +8156,24 @@ impl eframe::App for C41Gui {
                                     );
                                     self.images[idx].compare_texture = Some(tex);
                                     self.images[idx].compare_texture_nearest = want_nearest;
+                                    self.images[idx].compare_texture_layout = layout_key;
                                 }
                             }
                             self.images[idx].compare_texture.clone()
                         } else {
-                            if self.images[idx].preview_texture.is_some()
-                                && self.images[idx].preview_texture_nearest != want_nearest
-                            {
+                            let need_upload = self.images[idx].preview_texture.is_some()
+                                && (self.images[idx].preview_texture_nearest != want_nearest
+                                    || self.images[idx].preview_texture_layout != layout_key);
+                            if need_upload {
                                 if let Some((fw, fh, rgb)) =
                                     self.images[idx].preview_full_rgb.as_ref()
                                 {
-                                    let image = rgb_u8_to_color_image(*fw, *fh, rgb);
+                                    let image = color_image_for_preview(
+                                        &self.images[idx],
+                                        *fw,
+                                        *fh,
+                                        rgb,
+                                    );
                                     let tex_opts = if want_nearest {
                                         egui::TextureOptions::NEAREST
                                     } else {
@@ -8147,6 +8186,7 @@ impl eframe::App for C41Gui {
                                     );
                                     self.images[idx].preview_texture = Some(tex);
                                     self.images[idx].preview_texture_nearest = want_nearest;
+                                    self.images[idx].preview_texture_layout = layout_key;
                                 }
                             }
                             self.images[idx].preview_texture.clone()
@@ -8196,22 +8236,8 @@ impl eframe::App for C41Gui {
                                     egui::pos2(uv_l, uv_t),
                                     egui::pos2(uv_r, uv_b),
                                 );
-                                let uv = if let Some((tw, th, _)) = preview_draw_rgb(&self.images[idx]) {
-                                    preview_crop_uv(&self.images[idx], tw, th).map(|c| {
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(
-                                                c.min.x + display_uv.min.x * (c.max.x - c.min.x),
-                                                c.min.y + display_uv.min.y * (c.max.y - c.min.y),
-                                            ),
-                                            egui::pos2(
-                                                c.min.x + display_uv.max.x * (c.max.x - c.min.x),
-                                                c.min.y + display_uv.max.y * (c.max.y - c.min.y),
-                                            ),
-                                        )
-                                    }).unwrap_or(display_uv)
-                                } else {
-                                    display_uv
-                                };
+                                // Texture is already cropped to the viewport; UVs are 0–1 of that crop.
+                                let uv = display_uv;
                                 paint_preview_image(
                                     &canvas_painter,
                                     tex.id(),
