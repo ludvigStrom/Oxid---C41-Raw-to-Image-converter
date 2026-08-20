@@ -3339,6 +3339,9 @@ impl C41Gui {
             if let Some(dust) = img.dust {
                 apply_project_dust(&mut entry, dust);
             }
+            // First view after opening a project: Export / After (final result).
+            entry.process_tab = ProcessTab::Export;
+            entry.compare_export_before = false;
             self.images.push(entry);
         }
         self.selected_index = if self.images.is_empty() {
