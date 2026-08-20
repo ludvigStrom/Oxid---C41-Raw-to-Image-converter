@@ -6556,13 +6556,14 @@ impl eframe::App for C41Gui {
                         |ui| {
                         ui.add_space(4.0);
                         theme::slider_row(ui, "Toe", &mut opts.toe_strength, -0.5..=0.5, 2);
-                        theme::slider_row(
-                            ui,
-                            "Shoulder",
-                            &mut opts.shoulder_strength,
-                            -0.5..=0.5,
-                            2,
-                        );
+                        {
+                            let mut shoulder_ui = -opts.shoulder_strength;
+                            if theme::slider_row(ui, "Shoulder", &mut shoulder_ui, -0.5..=0.5, 2)
+                                .changed()
+                            {
+                                opts.shoulder_strength = -shoulder_ui;
+                            }
+                        }
                         theme::slider_row(
                             ui,
                             "Shadow cast",
