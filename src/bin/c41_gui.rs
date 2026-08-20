@@ -597,7 +597,11 @@ impl ImageEntry {
     }
 }
 
-fn compare_kind_for(entry: &ImageEntry) -> Option<CompareKind> {
+fn compare_kind_for(entry: &ImageEntry, wb_picker_armed: bool) -> Option<CompareKind> {
+    // Picker must see inverted T (no WB / curve / sat), not the processed look.
+    if wb_picker_armed {
+        return Some(CompareKind::Inverted);
+    }
     match entry.process_tab {
         ProcessTab::Input => {
             if entry.compare_input_before {
@@ -669,8 +673,8 @@ fn encode_compare_from_cache(
     }
 }
 
-fn sync_compare_preview(entry: &mut ImageEntry) {
-    let Some(kind) = compare_kind_for(entry) else {
+fn sync_compare_preview(entry: &mut ImageEntry, wb_picker_armed: bool) {
+    let Some(kind) = compare_kind_for(entry, wb_picker_armed) else {
         entry.compare_kind = None;
         return;
     };
@@ -692,12 +696,12 @@ fn sync_compare_preview(entry: &mut ImageEntry) {
     }
 }
 
-fn showing_compare_preview(entry: &ImageEntry) -> bool {
-    compare_kind_for(entry).is_some() && entry.compare_full_rgb.is_some()
+fn showing_compare_preview(entry: &ImageEntry, wb_picker_armed: bool) -> bool {
+    compare_kind_for(entry, wb_picker_armed).is_some() && entry.compare_full_rgb.is_some()
 }
 
-fn preview_draw_rgb(entry: &ImageEntry) -> Option<(u32, u32, &Vec<u8>)> {
-    if showing_compare_preview(entry) {
+fn preview_draw_rgb(entry: &ImageEntry, wb_picker_armed: bool) -> Option<(u32, u32, &Vec<u8>)> {
+    if showing_compare_preview(entry, wb_picker_armed) {
         entry
             .compare_full_rgb
             .as_ref()
@@ -2135,40 +2139,6 @@ fn make_thumbnail_from_rgb(
 
 const WB_PICKER_SAMPLE: usize = 4;
 
-fn sample_rgb_u8_4x4(rgb: &[u8], w: u32, h: u32, cx: u32, cy: u32) -> [u8; 3] {
-    let w = w as usize;
-    let h = h as usize;
-    if w == 0 || h == 0 {
-        return [128, 128, 128];
-    }
-    let cx = (cx as usize).min(w - 1);
-    let cy = (cy as usize).min(h - 1);
-    let x0 = cx.saturating_sub(1);
-    let y0 = cy.saturating_sub(1);
-    let x1 = (x0 + WB_PICKER_SAMPLE).min(w);
-    let y1 = (y0 + WB_PICKER_SAMPLE).min(h);
-    let mut sr = 0u32;
-    let mut sg = 0u32;
-    let mut sb = 0u32;
-    let mut n = 0u32;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let i = (y * w + x) * 3;
-            if i + 2 < rgb.len() {
-                sr += rgb[i] as u32;
-                sg += rgb[i + 1] as u32;
-                sb += rgb[i + 2] as u32;
-                n += 1;
-            }
-        }
-    }
-    if n == 0 {
-        [128, 128, 128]
-    } else {
-        [(sr / n) as u8, (sg / n) as u8, (sb / n) as u8]
-    }
-}
-
 fn sample_array3_4x4(buf: &ndarray::Array3<f32>, cx: usize, cy: usize) -> (f32, f32, f32) {
     let (h, w, _) = buf.dim();
     if w == 0 || h == 0 {
@@ -2197,6 +2167,38 @@ fn sample_array3_4x4(buf: &ndarray::Array3<f32>, cx: usize, cy: usize) -> (f32, 
     } else {
         (sr / n, sg / n, sb / n)
     }
+}
+
+fn after_step3_image(entry: &ImageEntry) -> Option<&ndarray::Array3<f32>> {
+    entry
+        .preview_step_cache
+        .as_ref()
+        .and_then(|c| c.after_step3.as_ref().map(|(_, buf)| buf))
+        .or_else(|| {
+            entry
+                .screen_step_cache
+                .as_ref()
+                .and_then(|c| c.after_step3.as_ref().map(|(_, buf)| buf))
+        })
+        .or_else(|| {
+            entry
+                .draft_step_cache
+                .as_ref()
+                .and_then(|c| c.after_step3.as_ref().map(|(_, buf)| buf))
+        })
+}
+
+fn inverted_t_to_srgb_u8(t: f32) -> u8 {
+    c41_raw_tool::color_space::linear_to_srgb_u8((1.0 - t.clamp(0.0, 1.0)).clamp(0.0, 1.0))
+}
+
+fn sample_inverted_u8_4x4(buf: &ndarray::Array3<f32>, cx: usize, cy: usize) -> [u8; 3] {
+    let (tr, tg, tb) = sample_array3_4x4(buf, cx, cy);
+    [
+        inverted_t_to_srgb_u8(tr),
+        inverted_t_to_srgb_u8(tg),
+        inverted_t_to_srgb_u8(tb),
+    ]
 }
 
 fn preview_texture_layout_key(entry: &ImageEntry) -> u64 {
@@ -2407,6 +2409,41 @@ fn display_to_tex_px(
     (
         tx.clamp(0, tex_w.saturating_sub(1) as i32) as u32,
         ty.clamp(0, tex_h.saturating_sub(1) as i32) as u32,
+    )
+}
+
+/// Preview-display pixel → full-frame buffer pixel (crop origin + orientation).
+fn display_px_to_buffer_px(
+    entry: &ImageEntry,
+    disp_x: f32,
+    disp_y: f32,
+    buf_w: u32,
+    buf_h: u32,
+    desired: ViewOrient,
+    baked: ViewOrient,
+) -> (u32, u32) {
+    let view_rot = (desired.rot - baked.rot).rem_euclid(360);
+    let (fw, fh) = if view_rot == 90 || view_rot == 270 {
+        (buf_h, buf_w)
+    } else {
+        (buf_w, buf_h)
+    };
+    let (fx, fy) = if preview_uses_crop_viewport(entry) {
+        if let Some((cx, cy, _, _)) = scaled_crop_px(entry, fw, fh) {
+            (cx as f32 + disp_x, cy as f32 + disp_y)
+        } else {
+            (disp_x, disp_y)
+        }
+    } else {
+        (disp_x, disp_y)
+    };
+    display_to_tex_px(
+        fx.floor().max(0.0) as u32,
+        fy.floor().max(0.0) as u32,
+        buf_w,
+        buf_h,
+        desired,
+        baked,
     )
 }
 
@@ -2881,6 +2918,7 @@ fn display_to_dust_ref(
 }
 
 /// Inverse of [`display_to_dust_ref`].
+#[cfg(test)]
 fn dust_ref_to_display(
     px: f32,
     py: f32,
@@ -5611,7 +5649,7 @@ impl eframe::App for C41Gui {
                         self.images[idx].compare_full_rgb = None;
                         self.images[idx].compare_texture = None;
                         self.images[idx].compare_kind = None;
-                        sync_compare_preview(&mut self.images[idx]);
+                        sync_compare_preview(&mut self.images[idx], self.wb_picker_armed);
                         self.images[idx].preview_input_size = Some([job.w, job.h]);
                         if job.input_w > 0 && job.input_h > 0 {
                             self.images[idx].raw_source_size = Some([job.input_w, job.input_h]);
@@ -6703,7 +6741,7 @@ impl eframe::App for C41Gui {
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(
-                                                "Click the preview to sample a 4×4 neutral.",
+                                                "Click a neutral on the inverted (unprocessed) preview.",
                                             )
                                             .small()
                                             .color(egui::Color32::from_rgb(180, 220, 120)),
@@ -8106,7 +8144,7 @@ impl eframe::App for C41Gui {
 
             if let Some(idx) = self.selected_index {
                 if idx < self.images.len() {
-                    sync_compare_preview(&mut self.images[idx]);
+                    sync_compare_preview(&mut self.images[idx], self.wb_picker_armed);
                     {
                         let available = ui.available_rect_before_wrap();
                         const CONTROL_ROW_HEIGHT: f32 = 28.0;
@@ -8146,8 +8184,11 @@ impl eframe::App for C41Gui {
                         let desired_orient = preview_desired_orient(&self.images[idx]);
                         let baked_orient = preview_baked_orient(&self.images[idx]);
                         let geometry_pending = preview_view_geometry_pending(&self.images[idx]);
-                        let showing_compare = showing_compare_preview(&self.images[idx]);
-                        let (full_w, full_h) = if let Some((w, h, _)) = preview_draw_rgb(&self.images[idx]) {
+                        let showing_compare =
+                            showing_compare_preview(&self.images[idx], self.wb_picker_armed);
+                        let (full_w, full_h) = if let Some((w, h, _)) =
+                            preview_draw_rgb(&self.images[idx], self.wb_picker_armed)
+                        {
                             preview_display_wh(&self.images[idx], w, h)
                         } else {
                             self.images[idx].preview_input_size
@@ -8716,7 +8757,7 @@ impl eframe::App for C41Gui {
                             self.mark_preview_view_changed();
                         }
 
-                        // White balance picker: 4×4 loupe + click to set gains.
+                        // White balance picker: 4×4 loupe + click on inverted (pre-WB) T.
                         let picker_armed = self.wb_picker_armed
                             && self.images[idx].options.wb_mode == WbMode::Picker;
                         if picker_armed {
@@ -8725,21 +8766,19 @@ impl eframe::App for C41Gui {
                                 .filter(|p| vir_rect.contains(*p) && canvas_rect.contains(*p))
                             {
                                 let (px_f, py_f) = screen_to_image(pos.x, pos.y);
-                                let px = (px_f as u32).min(full_w.saturating_sub(1));
-                                let py = (py_f as u32).min(full_h.saturating_sub(1));
-                                let [sr, sg, sb] = self.images[idx]
-                                    .preview_full_rgb
-                                    .as_ref()
-                                    .map(|(w, h, rgb)| {
-                                        let (tx, ty) = display_to_tex_px(
-                                            px,
-                                            py,
-                                            *w,
-                                            *h,
+                                let [sr, sg, sb] = after_step3_image(&self.images[idx])
+                                    .map(|buf| {
+                                        let (bh, bw, _) = buf.dim();
+                                        let (tx, ty) = display_px_to_buffer_px(
+                                            &self.images[idx],
+                                            px_f,
+                                            py_f,
+                                            bw as u32,
+                                            bh as u32,
                                             desired_orient,
                                             baked_orient,
                                         );
-                                        sample_rgb_u8_4x4(rgb, *w, *h, tx, ty)
+                                        sample_inverted_u8_4x4(buf, tx as usize, ty as usize)
                                     })
                                     .unwrap_or([128, 128, 128]);
                                 let radius = 16.0;
@@ -8767,59 +8806,40 @@ impl eframe::App for C41Gui {
                             if canvas_resp.clicked() {
                                 if let Some(pos) = canvas_resp.interact_pointer_pos() {
                                     let (px_f, py_f) = screen_to_image(pos.x, pos.y);
-                                    if let Some(ref cache) = self.images[idx].preview_step_cache {
-                                        if let Some((_, ref buf)) = cache.after_step3 {
-                                            let (bh, bw, _) = buf.dim();
-                                            let (tex_w, tex_h) = self.images[idx]
-                                                .preview_full_rgb
-                                                .as_ref()
-                                                .map(|(w, h, _)| (*w, *h))
-                                                .unwrap_or((full_w, full_h));
-                                            let px = (px_f as u32).min(full_w.saturating_sub(1));
-                                            let py = (py_f as u32).min(full_h.saturating_sub(1));
-                                            let (tx, ty) = display_to_tex_px(
-                                                px,
-                                                py,
-                                                tex_w,
-                                                tex_h,
-                                                desired_orient,
-                                                baked_orient,
-                                            );
-                                            let x = ((tx as f32 + 0.5) / tex_w.max(1) as f32
-                                                * bw as f32)
-                                                .floor()
-                                                .clamp(0.0, bw.saturating_sub(1) as f32)
-                                                as usize;
-                                            let y = ((ty as f32 + 0.5) / tex_h.max(1) as f32
-                                                * bh as f32)
-                                                .floor()
-                                                .clamp(0.0, bh.saturating_sub(1) as f32)
-                                                as usize;
-                                            let (tr, tg, tb) = sample_array3_4x4(buf, x, y);
-                                            let dr = -(tr.max(1e-10) as f64).log10() as f32;
-                                            let dg = -(tg.max(1e-10) as f64).log10() as f32;
-                                            let db = -(tb.max(1e-10) as f64).log10() as f32;
-                                            let (wb_r, wb_g, wb_b) =
-                                                color::density_to_wb_gains(dr, dg, db);
-                                            let opts = &mut self.images[idx].options;
-                                            opts.wb_r = wb_r;
-                                            opts.wb_g = wb_g;
-                                            opts.wb_b = wb_b;
-                                            opts.apply_white_balance = true;
-                                            opts.auto_wb = false;
-                                            self.wb_picker_armed = false;
-                                            self.status = format!(
-                                                "WB set from 4×4 sample (R={:.3} G={:.3} B={:.3})",
-                                                wb_r, wb_g, wb_b
-                                            );
-                                        } else {
-                                            self.status =
-                                                "WB picker: no cache (re-run preview first)."
-                                                    .to_string();
-                                        }
+                                    let sample = after_step3_image(&self.images[idx]).map(|buf| {
+                                        let (bh, bw, _) = buf.dim();
+                                        let (tx, ty) = display_px_to_buffer_px(
+                                            &self.images[idx],
+                                            px_f,
+                                            py_f,
+                                            bw as u32,
+                                            bh as u32,
+                                            desired_orient,
+                                            baked_orient,
+                                        );
+                                        sample_array3_4x4(buf, tx as usize, ty as usize)
+                                    });
+                                    if let Some((tr, tg, tb)) = sample {
+                                        let dr = -(tr.max(1e-10) as f64).log10() as f32;
+                                        let dg = -(tg.max(1e-10) as f64).log10() as f32;
+                                        let db = -(tb.max(1e-10) as f64).log10() as f32;
+                                        let (wb_r, wb_g, wb_b) =
+                                            color::density_to_wb_gains(dr, dg, db);
+                                        let opts = &mut self.images[idx].options;
+                                        opts.wb_r = wb_r;
+                                        opts.wb_g = wb_g;
+                                        opts.wb_b = wb_b;
+                                        opts.apply_white_balance = true;
+                                        opts.auto_wb = false;
+                                        self.wb_picker_armed = false;
+                                        self.status = format!(
+                                            "WB set from inverted 4×4 (R={:.3} G={:.3} B={:.3})",
+                                            wb_r, wb_g, wb_b
+                                        );
                                     } else {
                                         self.status =
-                                            "WB picker: no cache (re-run preview first).".to_string();
+                                            "WB picker: no cache (re-run preview first)."
+                                                .to_string();
                                     }
                                 }
                             }
@@ -9728,7 +9748,7 @@ impl eframe::App for C41Gui {
                     // Wait for slider release so the live backdrop is committed first.
                     // Over-cap views still fetch a center-first window of PREVIEW_TILE_MAX.
                     if proxy_soft
-                        && !showing_compare_preview(&self.images[idx])
+                        && !showing_compare_preview(&self.images[idx], self.wb_picker_armed)
                         && self.preview_receiver.is_none()
                         && self.tile_receiver.is_none()
                         && have_current
@@ -9799,12 +9819,12 @@ impl eframe::App for C41Gui {
 #[cfg(test)]
 mod tile_grid_tests {
     use super::{
-        adopt_dust_output_reference, crop_rgb_u8_to_uv, default_options, display_to_dust_ref,
-        dust_output_reference, dust_ref_to_display, dust_stamp_radius_display, egui,
-        image_entry, include_image_edge_tiles, preview_minify_texture_options, preview_pixel_scale,
-        proxy_is_soft, tile_draw_rect, tile_range_intersecting, tile_texture_options,
-        want_nearest_filter, DustStroke, DustTool, ExportFormat, VisibleTileGrid,
-        PREVIEW_TILE_MAX, PREVIEW_TILE_SIZE,
+        adopt_dust_output_reference, crop_rgb_u8_to_uv, default_options, display_px_to_buffer_px,
+        display_to_dust_ref, dust_output_reference, dust_ref_to_display, dust_stamp_radius_display,
+        egui, image_entry, include_image_edge_tiles, preview_minify_texture_options,
+        preview_pixel_scale, proxy_is_soft, tile_draw_rect, tile_range_intersecting,
+        tile_texture_options, want_nearest_filter, DustStroke, DustTool, ExportFormat, ProcessTab,
+        Rect, ViewOrient, VisibleTileGrid, PREVIEW_TILE_MAX, PREVIEW_TILE_SIZE,
     };
     use std::path::PathBuf;
 
@@ -9962,6 +9982,31 @@ mod tile_grid_tests {
         adopt_dust_output_reference(&mut entry);
         assert_eq!(entry.dust_strokes[0].points[0], (1000.0, 500.0));
         assert_eq!(entry.dust_strokes[0].radius, 10.0);
+    }
+
+    #[test]
+    fn wb_picker_maps_crop_display_into_full_buffer() {
+        let mut entry = image_entry(
+            1,
+            PathBuf::from("test.dng"),
+            default_options(),
+            ExportFormat::Tiff16,
+        );
+        entry.process_tab = ProcessTab::Develop;
+        entry.options.apply_crop = true;
+        entry.options.crop_rect = Some(Rect {
+            x: 100,
+            y: 50,
+            width: 200,
+            height: 100,
+        });
+        entry.options.crop_rect_reference_size = Some((400, 300));
+        let ident = ViewOrient::from_parts(0, false, false);
+        let (tx, ty) = display_px_to_buffer_px(&entry, 10.0, 20.0, 400, 300, ident, ident);
+        assert_eq!((tx, ty), (110, 70));
+        entry.process_tab = ProcessTab::Input;
+        let (tx, ty) = display_px_to_buffer_px(&entry, 10.0, 20.0, 400, 300, ident, ident);
+        assert_eq!((tx, ty), (10, 20), "Input keeps full-frame display coords");
     }
 
     #[test]
