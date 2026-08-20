@@ -36,6 +36,10 @@ Cargo.lock
 *.rw2
 *.rw1
 
+# UI reference stills (override *.png)
+!/img/Dust Speck.png
+!/img/screen shot.png
+
 # Local Apple / release IDs (see .env.example)
 .env
 
