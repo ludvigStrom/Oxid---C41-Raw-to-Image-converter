@@ -2786,10 +2786,8 @@ fn restore_edit_snapshot(entry: &mut ImageEntry, snap: &EditSnapshot) {
 }
 
 fn rebuild_dust_raster(entry: &mut ImageEntry) {
-    let (w, h) = entry
-        .dust_reference_size
-        .or_else(|| entry.preview_input_size.map(|s| (s[0], s[1])))
-        .unwrap_or((0, 0));
+    adopt_dust_output_reference(entry);
+    let (w, h) = entry.dust_reference_size.unwrap_or((0, 0));
     if w == 0 || h == 0 {
         entry.dust_mask.clear();
         entry.dust_mask_size = (0, 0);
@@ -2797,22 +2795,66 @@ fn rebuild_dust_raster(entry: &mut ImageEntry) {
         entry.dust_overlay_dirty = true;
         return;
     }
-    let mask = rasterize_strokes(
-        &entry.dust_strokes,
-        w,
-        h,
-        entry.dust_reference_size.unwrap_or((w, h)),
-    );
-    entry.dust_mask = mask.data;
-    entry.dust_mask_size = (w, h);
-    entry.dust_mask_crop = None;
-    entry.dust_overlay_dirty = true;
+    ensure_dust_working_mask(entry, w, h);
+}
+
+/// Oriented full-frame size strokes should live in (export resolution, not preview cache).
+fn dust_output_reference(entry: &ImageEntry) -> Option<(u32, u32)> {
+    if let Some(sensor) = entry.cached_sensor.as_ref() {
+        let (sw, sh) = sensor.dimensions();
+        if sw > 0 && sh > 0 {
+            return Some(oriented_sensor_size(
+                sw,
+                sh,
+                entry.options.rotation_degrees,
+            ));
+        }
+    }
+    entry
+        .raw_source_size
+        .filter(|s| s[0] > 0 && s[1] > 0)
+        .map(|s| (s[0], s[1]))
+}
+
+/// Upgrade a preview-sized reference to the real source, remapping existing strokes.
+fn adopt_dust_output_reference(entry: &mut ImageEntry) {
+    let Some(new_ref) = dust_output_reference(entry) else {
+        return;
+    };
+    match entry.dust_reference_size {
+        None => entry.dust_reference_size = Some(new_ref),
+        Some(old) if old == new_ref => {}
+        Some(old) if old.0 > 0 && old.1 > 0 => {
+            let sx = new_ref.0 as f32 / old.0 as f32;
+            let sy = new_ref.1 as f32 / old.1 as f32;
+            // Preview-cache → output: both axes grow at nearly the same scale.
+            // Rotation swaps axes and must not stretch existing strokes.
+            let aspect = if sx > sy { sx / sy } else { sy / sx.max(1e-6) };
+            if sx > 1.01 && sy > 1.01 && aspect < 1.05 {
+                let sr = (sx + sy) * 0.5;
+                for stroke in &mut entry.dust_strokes {
+                    stroke.radius *= sr;
+                    for p in &mut stroke.points {
+                        p.0 *= sx;
+                        p.1 *= sy;
+                    }
+                }
+                entry.dust_mask_size = (0, 0);
+            }
+            entry.dust_reference_size = Some(new_ref);
+        }
+        Some(_) => entry.dust_reference_size = Some(new_ref),
+    }
 }
 
 fn dust_source_wh(entry: &ImageEntry, preview_w: u32, preview_h: u32) -> (f32, f32) {
-    entry
-        .raw_source_size
-        .map(|[w, h]| (w as f32, h as f32))
+    dust_output_reference(entry)
+        .map(|(w, h)| (w as f32, h as f32))
+        .or_else(|| {
+            entry
+                .raw_source_size
+                .map(|[w, h]| (w as f32, h as f32))
+        })
         .unwrap_or((preview_w.max(1) as f32, preview_h.max(1) as f32))
 }
 
@@ -2881,22 +2923,20 @@ fn dust_stamp_radius_display(
     radius_ref * disp_w.max(1.0) / span
 }
 
-fn ensure_dust_working_mask(entry: &mut ImageEntry, w: u32, h: u32) {
-    if w == 0 || h == 0 {
+fn ensure_dust_working_mask(entry: &mut ImageEntry, fallback_w: u32, fallback_h: u32) {
+    adopt_dust_output_reference(entry);
+    if entry.dust_reference_size.is_none() && fallback_w > 0 && fallback_h > 0 {
+        entry.dust_reference_size = Some((fallback_w, fallback_h));
+    }
+    let ref_size = entry.dust_reference_size.unwrap_or((fallback_w, fallback_h));
+    if ref_size.0 == 0 || ref_size.1 == 0 {
         return;
     }
-    if entry.dust_strokes.is_empty() {
-        if let Some([sw, sh]) = entry.raw_source_size {
-            if sw > 0 && sh > 0 {
-                entry.dust_reference_size = Some((sw, sh));
-            }
-        }
-    }
-    if entry.dust_reference_size.is_none() {
-        entry.dust_reference_size = Some((w, h));
-    }
-    let ref_size = entry.dust_reference_size.unwrap_or((w, h));
     let want_crop = scaled_crop_px(entry, ref_size.0, ref_size.1);
+    // Rasterize at output/crop resolution, not the preview cache size.
+    let (w, h) = want_crop
+        .map(|(_, _, cw, ch)| (cw.max(1), ch.max(1)))
+        .unwrap_or(ref_size);
     if entry.dust_mask_size == (w, h)
         && entry.dust_mask.len() == w as usize * h as usize
         && entry.dust_mask_crop == want_crop
@@ -2986,11 +3026,6 @@ fn paint_eraser_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, col
     ));
 }
 
-fn oriented_export_size(entry: &ImageEntry) -> Option<(u32, u32)> {
-    let [w, h] = entry.raw_source_size?;
-    Some(oriented_sensor_size(w, h, entry.options.rotation_degrees))
-}
-
 fn attach_export_dust(opts: &mut PipelineOptions, entry: &ImageEntry) {
     if entry.dust_strokes.is_empty() {
         opts.dust_mask_hash = 0;
@@ -3003,9 +3038,8 @@ fn attach_export_dust(opts: &mut PipelineOptions, entry: &ImageEntry) {
     opts.dust_heal = entry_dust_heal(entry);
     opts.dust_mask_hash = hash_dust(&entry.dust_strokes, opts.dust_heal);
     opts.dust_strokes = entry.dust_strokes.clone();
-    opts.dust_reference_size = entry
-        .dust_reference_size
-        .or(oriented_export_size(entry))
+    opts.dust_reference_size = dust_output_reference(entry)
+        .or(entry.dust_reference_size)
         .filter(|(w, h)| *w > 0 && *h > 0);
     opts.dust_mask = None;
     opts.dust_uv = None;
@@ -3315,9 +3349,8 @@ impl C41Gui {
         if self.dust_should_apply(entry) {
             options.dust_mask_hash = hash_dust(&entry.dust_strokes, options.dust_heal);
             options.dust_strokes = entry.dust_strokes.clone();
-            options.dust_reference_size = entry
-                .dust_reference_size
-                .or(Some(entry.dust_mask_size))
+            options.dust_reference_size = dust_output_reference(entry)
+                .or(entry.dust_reference_size)
                 .filter(|(w, h)| *w > 0 && *h > 0);
             options.dust_mask = None;
             options.dust_uv = None;
@@ -3413,6 +3446,7 @@ impl C41Gui {
             match load_sensor_from_path(&path) {
                 Ok(sensor) => {
                     self.images[index].cached_sensor = Some(Arc::new(sensor));
+                    adopt_dust_output_reference(&mut self.images[index]);
                 }
                 Err(e) => {
                     self.status = format!("Failed to load sensor data: {}", e);
@@ -5582,6 +5616,7 @@ impl eframe::App for C41Gui {
                         if job.input_w > 0 && job.input_h > 0 {
                             self.images[idx].raw_source_size = Some([job.input_w, job.input_h]);
                         }
+                        adopt_dust_output_reference(&mut self.images[idx]);
                         self.images[idx].preview_texture_rotation =
                             self.images[idx].options.rotation_degrees;
                         self.images[idx].preview_texture_flip_h =
@@ -8381,6 +8416,7 @@ impl eframe::App for C41Gui {
                                     if vir_rect.contains(pos) && canvas_rect.contains(pos) {
                                         let (ix, iy) = screen_to_image(pos.x, pos.y);
                                         let entry = &mut self.images[idx];
+                                        adopt_dust_output_reference(entry);
                                         let (src_w, src_h) =
                                             dust_source_wh(entry, full_w, full_h);
                                         let (rw, rh) = entry
@@ -8393,14 +8429,21 @@ impl eframe::App for C41Gui {
                                         let radius_ref = entry.dust_brush_radius
                                             * ((rw as f32 / src_w) + (rh as f32 / src_h))
                                             * 0.5;
-                                        let prev_img = if !self.dust_painting {
+                                        let mask_pt = if let Some((cx, cy, _, _)) = crop {
+                                            (pt.0 - cx as f32, pt.1 - cy as f32)
+                                        } else {
+                                            pt
+                                        };
+                                        let prev_mask = if !self.dust_painting {
                                             None
                                         } else {
                                             entry.dust_strokes.last().and_then(|s| {
                                                 s.points.last().copied().map(|(px, py)| {
-                                                    dust_ref_to_display(
-                                                        px, py, full_w_f, full_h_f, rw, rh, crop,
-                                                    )
+                                                    if let Some((cx, cy, _, _)) = crop {
+                                                        (px - cx as f32, py - cy as f32)
+                                                    } else {
+                                                        (px, py)
+                                                    }
                                                 })
                                             })
                                         };
@@ -8428,18 +8471,9 @@ impl eframe::App for C41Gui {
                                             height: entry.dust_mask_size.1,
                                             data: std::mem::take(&mut entry.dust_mask),
                                         };
-                                        let radius = dust_stamp_radius_display(
-                                            entry.dust_brush_radius,
-                                            src_w,
-                                            src_h,
-                                            rw,
-                                            rh,
-                                            full_w_f,
-                                            crop,
-                                        );
-                                        if let Some((ox, oy)) = prev_img {
-                                            let dx = ix - ox;
-                                            let dy = iy - oy;
+                                        if let Some((ox, oy)) = prev_mask {
+                                            let dx = mask_pt.0 - ox;
+                                            let dy = mask_pt.1 - oy;
                                             let dist = (dx * dx + dy * dy).sqrt();
                                             let steps = (dist * 2.0).ceil().max(1.0) as i32;
                                             for s in 1..=steps {
@@ -8448,12 +8482,18 @@ impl eframe::App for C41Gui {
                                                     &mut working,
                                                     ox + dx * t,
                                                     oy + dy * t,
-                                                    radius,
+                                                    radius_ref,
                                                     tool,
                                                 );
                                             }
                                         } else {
-                                            stamp_disc(&mut working, ix, iy, radius, tool);
+                                            stamp_disc(
+                                                &mut working,
+                                                mask_pt.0,
+                                                mask_pt.1,
+                                                radius_ref,
+                                                tool,
+                                            );
                                         }
                                         entry.dust_mask = working.data;
                                         entry.dust_overlay_dirty = true;
@@ -9759,11 +9799,14 @@ impl eframe::App for C41Gui {
 #[cfg(test)]
 mod tile_grid_tests {
     use super::{
-        crop_rgb_u8_to_uv, display_to_dust_ref, dust_ref_to_display, dust_stamp_radius_display,
-        egui, include_image_edge_tiles, preview_minify_texture_options, preview_pixel_scale,
+        adopt_dust_output_reference, crop_rgb_u8_to_uv, default_options, display_to_dust_ref,
+        dust_output_reference, dust_ref_to_display, dust_stamp_radius_display, egui,
+        image_entry, include_image_edge_tiles, preview_minify_texture_options, preview_pixel_scale,
         proxy_is_soft, tile_draw_rect, tile_range_intersecting, tile_texture_options,
-        want_nearest_filter, VisibleTileGrid, PREVIEW_TILE_MAX, PREVIEW_TILE_SIZE,
+        want_nearest_filter, DustStroke, DustTool, ExportFormat, VisibleTileGrid,
+        PREVIEW_TILE_MAX, PREVIEW_TILE_SIZE,
     };
+    use std::path::PathBuf;
 
     #[test]
     fn exclusive_end_on_tile_boundary_does_not_drop_previous_tile() {
@@ -9876,6 +9919,49 @@ mod tile_grid_tests {
             (r_crop - 8.0).abs() < 1e-4,
             "crop view: 1 display px = 1 crop px"
         );
+    }
+
+    #[test]
+    fn adopt_dust_reference_upgrades_preview_cache_strokes() {
+        let mut entry = image_entry(
+            1,
+            PathBuf::from("test.dng"),
+            default_options(),
+            ExportFormat::Tiff16,
+        );
+        entry.dust_reference_size = Some((1000, 800));
+        entry.dust_strokes.push(DustStroke {
+            tool: DustTool::Pen,
+            radius: 8.0,
+            points: vec![(250.0, 200.0)],
+        });
+        entry.raw_source_size = Some([4000, 3200]);
+        adopt_dust_output_reference(&mut entry);
+        assert_eq!(dust_output_reference(&entry), Some((4000, 3200)));
+        assert_eq!(entry.dust_reference_size, Some((4000, 3200)));
+        assert!((entry.dust_strokes[0].points[0].0 - 1000.0).abs() < 1e-3);
+        assert!((entry.dust_strokes[0].points[0].1 - 800.0).abs() < 1e-3);
+        assert!((entry.dust_strokes[0].radius - 32.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn adopt_dust_reference_does_not_stretch_on_axis_swap() {
+        let mut entry = image_entry(
+            1,
+            PathBuf::from("test.dng"),
+            default_options(),
+            ExportFormat::Tiff16,
+        );
+        entry.dust_reference_size = Some((4000, 3000));
+        entry.dust_strokes.push(DustStroke {
+            tool: DustTool::Pen,
+            radius: 10.0,
+            points: vec![(1000.0, 500.0)],
+        });
+        entry.raw_source_size = Some([3000, 4000]);
+        adopt_dust_output_reference(&mut entry);
+        assert_eq!(entry.dust_strokes[0].points[0], (1000.0, 500.0));
+        assert_eq!(entry.dust_strokes[0].radius, 10.0);
     }
 
     #[test]
