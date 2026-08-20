@@ -12,7 +12,7 @@ use crate::options::PipelineOptions;
 
 /// Current project schema version. Bump when the JSON shape changes in a way
 /// that needs a migration in [`load_project`].
-pub const PROJECT_VERSION: u32 = 1;
+pub const PROJECT_VERSION: u32 = 2;
 /// On-disk project extension (without the dot).
 pub const PROJECT_EXTENSION: &str = "oxidProj";
 /// Previous project extension; still accepted when opening files.
@@ -88,6 +88,16 @@ pub fn save_project(images: &[ProjectImage], path: &Path) -> anyhow::Result<()> 
                     .lut3d_path
                     .as_ref()
                     .map(|p| relativize(p, project_dir));
+                img.options.output_icc_path = img
+                    .options
+                    .output_icc_path
+                    .as_ref()
+                    .map(|p| relativize(p, project_dir));
+                img.options.proof_icc_path = img
+                    .options
+                    .proof_icc_path
+                    .as_ref()
+                    .map(|p| relativize(p, project_dir));
                 img
             })
             .collect(),
@@ -119,6 +129,16 @@ pub fn load_project(path: &Path) -> anyhow::Result<LoadedProject> {
         img.options.lut3d_path = img
             .options
             .lut3d_path
+            .as_ref()
+            .map(|p| resolve_project_path(p, project_dir));
+        img.options.output_icc_path = img
+            .options
+            .output_icc_path
+            .as_ref()
+            .map(|p| resolve_project_path(p, project_dir));
+        img.options.proof_icc_path = img
+            .options
+            .proof_icc_path
             .as_ref()
             .map(|p| resolve_project_path(p, project_dir));
         if img.path.exists() {

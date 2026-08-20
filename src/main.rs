@@ -110,6 +110,22 @@ struct ConvertArgs {
     /// Also write linear ACES2065-1 EXR (e.g. image_aces2065-1.exr) for VFX/archival.
     #[arg(long = "export-aces-exr", action = clap::ArgAction::SetTrue)]
     export_aces_exr: bool,
+
+    /// Output RGB ICC for 16-bit TIFF / JPEG: srgb, display-p3, adobe-rgb, or a .icc path.
+    #[arg(long = "output-icc", default_value = "srgb")]
+    output_icc: String,
+
+    /// Rendering intent: perceptual, relative, absolute.
+    #[arg(long = "export-intent", default_value = "relative")]
+    export_intent: String,
+
+    /// Disable black-point compensation on the output ICC hop.
+    #[arg(long = "no-export-bpc", action = clap::ArgAction::SetTrue)]
+    no_export_bpc: bool,
+
+    /// Filename template without extension. Default `{stem}`.
+    #[arg(long = "filename-template", default_value = "{stem}")]
+    filename_template: String,
 }
 
 fn parse_rect(s: &str) -> Result<Rect, String> {
@@ -155,6 +171,32 @@ fn parse_curve_gamma(s: &str) -> Result<f32, String> {
         return Err("curve-gamma must be between 0.5 and 5.0".to_string());
     }
     Ok(g)
+}
+
+fn parse_output_icc(
+    s: &str,
+) -> anyhow::Result<(c41_raw_tool::OutputIcc, Option<PathBuf>)> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "srgb" | "s-rgb" => Ok((c41_raw_tool::OutputIcc::Srgb, None)),
+        "display-p3" | "p3" | "display_p3" => Ok((c41_raw_tool::OutputIcc::DisplayP3, None)),
+        "adobe-rgb" | "adobe_rgb" | "adobergb" => Ok((c41_raw_tool::OutputIcc::AdobeRgb, None)),
+        other => {
+            let path = PathBuf::from(other);
+            if !path.exists() {
+                anyhow::bail!("output-icc must be srgb, display-p3, adobe-rgb, or an ICC file");
+            }
+            Ok((c41_raw_tool::OutputIcc::Custom, Some(path)))
+        }
+    }
+}
+
+fn parse_cms_intent(s: &str) -> anyhow::Result<c41_raw_tool::CmsIntent> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "perceptual" => Ok(c41_raw_tool::CmsIntent::Perceptual),
+        "relative" | "relativecolorimetric" | "rel" => Ok(c41_raw_tool::CmsIntent::Relative),
+        "absolute" | "absolutecolorimetric" | "abs" => Ok(c41_raw_tool::CmsIntent::Absolute),
+        _ => anyhow::bail!("export-intent must be perceptual, relative, or absolute"),
+    }
 }
 
 fn parse_format(s: &str) -> Result<TiffFormat, String> {
@@ -210,6 +252,9 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
     println!("Density matrix:  {:?}", cli.density_matrix);
     println!("Flat field:      {:?}", cli.flat_field);
     println!("Export ACES2065-1 EXR: {}", cli.export_aces_exr);
+
+    let (output_icc, output_icc_path) = parse_output_icc(&cli.output_icc)?;
+    let export_intent = parse_cms_intent(&cli.export_intent)?;
 
     let paths: Vec<PathBuf> = fs::read_dir(&cli.input_dir)
         .with_context(|| format!("Failed to read input directory {}", cli.input_dir.display()))?
@@ -268,6 +313,18 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         write_exr: cli.write_exr,
         write_jpeg: false,
         write_jpeg_only: false,
+        jpeg_quality: 75,
+        output_icc,
+        output_icc_path,
+        export_intent,
+        export_bpc: !cli.no_export_bpc,
+        filename_template: cli.filename_template,
+        export_preset_name: String::new(),
+        soft_proof: false,
+        proof_icc_path: None,
+        proof_intent: c41_raw_tool::CmsIntent::Relative,
+        proof_paper_white: true,
+        proof_gamut_warning: false,
         no_invert: cli.no_invert,
         no_curve: cli.no_curve,
         synthetic_negative_input: cli.synthetic_negative,
@@ -371,6 +428,8 @@ fn run_convert(cli: ConvertArgs) -> anyhow::Result<()> {
         dust_reference_size: None,
         dust_uv: None,
         dust_heal: DustHealParams::default(),
+        preview_monitor_icc: None,
+        cms_target: c41_raw_tool::CmsTarget::Display,
     };
 
     process_files(&paths, &cli.output_dir, &options)?;

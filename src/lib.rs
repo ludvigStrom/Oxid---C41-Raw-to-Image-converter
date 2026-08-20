@@ -19,8 +19,12 @@ pub mod auto;
 pub mod auto_crop;
 pub mod bujack;
 pub mod calibration;
+pub mod cms;
 pub mod color;
 pub mod color_space;
+pub mod contact_sheet;
+pub mod export_preset;
+pub mod filename;
 pub mod curve;
 pub mod demosaic;
 pub mod density_ops;
@@ -34,6 +38,7 @@ pub mod flat_field;
 pub mod inversion;
 pub mod jpeg_export;
 pub mod lut3d;
+pub mod monitor;
 pub mod options;
 pub mod pipeline;
 pub mod pipeline_cache;
@@ -61,12 +66,15 @@ pub use dust::{
 };
 pub use flat_field::{blur_flat_field, load_flat_field_linear};
 pub use options::{
-    reset_wb_for_picker, sync_wb_flags_from_mode, DminMode, OutputLutEncoding, OutputStage,
-    PipelineOptions, Rect, WbMode,
+    reset_wb_for_picker, sync_wb_flags_from_mode, CmsIntent, CmsTarget, DminMode, OutputIcc,
+    OutputLutEncoding, OutputStage, PipelineOptions, Rect, WbMode,
 };
 pub use pipeline_cache::{
     cached_start_step, hash_after_load, hash_after_step3, hash_after_step4, hash_after_step5,
     PreviewStepCache,
+};
+pub use export_preset::{
+    load_export_preset, save_export_preset, ExportPreset, ExportPresetFormat, EXPORT_PRESET_VERSION,
 };
 pub use preset::{load_develop_preset, save_develop_preset, DevelopPreset, PRESET_VERSION};
 pub use project::{
@@ -564,6 +572,8 @@ pub struct ExportJobSpec {
     pub options: PipelineOptions,
     /// Native width × height when known (GUI preview). Used for the RAM cap.
     pub source_size: Option<(u32, u32)>,
+    /// 1-based index in the batch (`{index}` / `{index:03}`).
+    pub index: usize,
 }
 
 /// Shared LUTs / flat-field, loaded once per unique path for a batch.
@@ -738,10 +748,12 @@ pub fn process_files_with_control(
 ) -> anyhow::Result<()> {
     let jobs: Vec<ExportJobSpec> = paths
         .iter()
-        .map(|path| ExportJobSpec {
+        .enumerate()
+        .map(|(i, path)| ExportJobSpec {
             path: path.clone(),
             options: options.clone(),
             source_size: None,
+            index: i + 1,
         })
         .collect();
     process_export_jobs(&jobs, output_dir, control)
@@ -783,7 +795,14 @@ pub fn process_export_jobs(
                     .unwrap_or("image");
                 c.begin_file(i, total, name);
             }
-            process_one_export(&job.path, &output_dir, &job.options, &assets, control)?;
+            process_one_export(
+                &job.path,
+                &output_dir,
+                &job.options,
+                job.index,
+                &assets,
+                control,
+            )?;
             if let Some(c) = control {
                 c.mark_completed();
             }
@@ -815,7 +834,14 @@ pub fn process_export_jobs(
                         .unwrap_or("image");
                     c.begin_file(i, total, name);
                 }
-                match process_one_export(&job.path, &output_dir, &job.options, &assets, control) {
+                match process_one_export(
+                    &job.path,
+                    &output_dir,
+                    &job.options,
+                    job.index,
+                    &assets,
+                    control,
+                ) {
                     Ok(()) => {
                         if let Some(c) = control {
                             c.mark_completed();
@@ -848,6 +874,7 @@ fn process_one_export(
     path: &Path,
     output_dir: &Path,
     options: &PipelineOptions,
+    index: usize,
     assets: &ExportAssets,
     control: Option<&ExportControl>,
 ) -> anyhow::Result<()> {
@@ -908,10 +935,30 @@ fn process_one_export(
     }
 
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
-    let out_path = output_dir.join(format!("{}.tiff", stem));
-    let jpg_path = output_dir.join(format!("{}.jpg", stem));
-    let exr_path = output_dir.join(format!("{}.exr", stem));
-    let aces_exr_path = output_dir.join(format!("{}_aces2065-1.exr", stem));
+    let (date, time) = filename::local_stamp().unwrap_or_else(|_| {
+        ("1970-01-01".to_string(), "000000".to_string())
+    });
+    let profile_label =
+        cms::output_icc_label(options.output_icc, options.output_icc_path.as_deref());
+    let (img_h, img_w, _) = image.dim();
+    let expanded = filename::expand(
+        &options.filename_template,
+        &filename::FilenameContext {
+            stem,
+            index,
+            date: &date,
+            time: &time,
+            preset: &options.export_preset_name,
+            profile: &profile_label,
+            width: img_w as u32,
+            height: img_h as u32,
+        },
+    );
+    let out_path = filename::unique_path(output_dir, &expanded, "tiff");
+    let jpg_path = filename::unique_path(output_dir, &expanded, "jpg");
+    let exr_path = filename::unique_path(output_dir, &expanded, "exr");
+    let aces_exr_path =
+        filename::unique_path(output_dir, &format!("{expanded}_aces2065-1"), "exr");
 
     let ra4_params = curve::PrintCurveParams {
         offset: options.curve_offset,
@@ -949,43 +996,92 @@ fn process_one_export(
             }
         }
         pipeline::Step6Display::U16(img) => {
+            let (height, width, _) = img.dim();
+            let (enc16, icc) = cms::export_from_u16(img, options)?;
             if !options.write_jpeg_only {
-                tiff_export::write_tiff_u16(img, &out_path)?;
+                tiff_export::write_tiff_rgb16_with_icc(
+                    &enc16,
+                    width as u32,
+                    height as u32,
+                    &out_path,
+                    &icc,
+                )?;
             }
             if options.write_exr {
                 exr_export::write_exr_u16(img, &exr_path)?;
             }
             if write_jpeg_this {
-                let (height, width, _) = img.dim();
-                let buf: Vec<u8> = img
-                    .iter()
-                    .map(|v| color_space::linear_to_srgb_u8(*v as f32 / 65535.0))
-                    .collect();
-                jpeg_export::write_jpeg_srgb(&jpg_path, width as u32, height as u32, &buf)?;
+                let (jpg, jpg_icc) = cms::export_u8_from_linear(
+                    &img.iter().map(|v| *v as f32 / 65535.0).collect::<Vec<_>>(),
+                    options,
+                )?;
+                jpeg_export::write_jpeg_with_icc(
+                    &jpg_path,
+                    width as u32,
+                    height as u32,
+                    &jpg,
+                    &jpg_icc,
+                    options.jpeg_quality,
+                )?;
             }
         }
         pipeline::Step6Display::F32(img) => {
             if !options.write_jpeg_only {
-                tiff_export::write_tiff(
-                    img,
-                    &out_path,
-                    if options.output_stage == OutputStage::None {
-                        options.format
-                    } else {
-                        TiffFormat::U16
-                    },
-                )?;
+                if options.output_stage == OutputStage::None || !cms::uses_output_cms(options) {
+                    tiff_export::write_tiff(
+                        img,
+                        &out_path,
+                        if options.output_stage == OutputStage::None {
+                            options.format
+                        } else {
+                            TiffFormat::U16
+                        },
+                    )?;
+                } else {
+                    let (enc8, icc) = cms::export_from_encoded_f32(img, options)?;
+                    let enc16: Vec<u16> = enc8
+                        .iter()
+                        .map(|v| ((*v as u16) << 8) | *v as u16)
+                        .collect();
+                    let (height, width, _) = img.dim();
+                    tiff_export::write_tiff_rgb16_with_icc(
+                        &enc16,
+                        width as u32,
+                        height as u32,
+                        &out_path,
+                        &icc,
+                    )?;
+                }
             }
             if options.write_exr {
                 exr_export::write_exr_f32(img, &exr_path)?;
             }
             if write_jpeg_this {
                 let (height, width, _) = img.dim();
-                let buf: Vec<u8> = img
-                    .iter()
-                    .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
-                    .collect();
-                jpeg_export::write_jpeg_srgb(&jpg_path, width as u32, height as u32, &buf)?;
+                if cms::uses_output_cms(options) && options.output_stage != OutputStage::None {
+                    let (jpg, icc) = cms::export_from_encoded_f32(img, options)?;
+                    jpeg_export::write_jpeg_with_icc(
+                        &jpg_path,
+                        width as u32,
+                        height as u32,
+                        &jpg,
+                        &icc,
+                        options.jpeg_quality,
+                    )?;
+                } else {
+                    let buf: Vec<u8> = img
+                        .iter()
+                        .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+                        .collect();
+                    jpeg_export::write_jpeg_with_icc(
+                        &jpg_path,
+                        width as u32,
+                        height as u32,
+                        &buf,
+                        crate::color_space::SRGB_ICC,
+                        options.jpeg_quality,
+                    )?;
+                }
             }
         }
     }
@@ -1404,7 +1500,7 @@ pub fn process_one_to_preview(
         let _ = writeln!(dbg, "Steps 1-5 only: density → display");
     }
 
-    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    let rgb_u8 = cms::encode_preview(&display, options);
 
     let _ = writeln!(dbg);
     let _ = writeln!(dbg, "=== end pipeline debug ===");
@@ -1602,7 +1698,7 @@ pub fn process_one_to_preview_with_cache_on_progress(
     let mut display =
         pipeline::step_6_render(&image, options, &ra4_params, output_lut_preview.as_ref());
     pipeline::apply_bujack(&mut display, options);
-    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    let rgb_u8 = cms::encode_preview(&display, options);
     on_progress("Preview ready", 1.0);
 
     let _ = writeln!(dbg, "=== end pipeline debug ===");
@@ -1696,7 +1792,7 @@ fn apply_preview_from_cache_cpu(
     on_progress("Print curve…", 0.99);
     let (orig_h, orig_w, _) = image.dim();
     let display = pipeline::step_6_render(&image, options, &ra4_params, output_lut.as_ref());
-    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    let rgb_u8 = cms::encode_preview(&display, options);
     on_progress("Preview ready", 1.0);
     Some((
         true_src_w,
@@ -1800,7 +1896,7 @@ pub fn apply_preview_from_cache_gpu(
         }
         pipeline::Step6Display::U16(img) => img.dim(),
     };
-    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    let rgb_u8 = cms::encode_preview(&display, options);
     Some((
         true_src_w,
         true_src_h,
@@ -2172,7 +2268,7 @@ pub fn process_one_to_preview_with_cache_gpu(
     let (orig_h, orig_w, _) = image.dim();
     let orig_w = orig_w as u32;
     let orig_h = orig_h as u32;
-    let rgb_u8 = pipeline::step6_display_to_u8(&display);
+    let rgb_u8 = cms::encode_preview(&display, options);
 
     let _ = writeln!(dbg, "GPU steps {}-6 complete", gpu_start);
     let _ = writeln!(dbg, "=== end pipeline debug ===");

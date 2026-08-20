@@ -74,7 +74,7 @@ pub fn write_tiff(image: &Array3<f32>, path: &Path, format: TiffFormat) -> Resul
                     buf.push(f32_to_u16(pixel[2]));
                 }
             }
-            write_rgb16_with_srgb_icc(&mut tiff, width_u, height_u, &buf)
+            write_rgb16_with_icc(&mut tiff, width_u, height_u, &buf, crate::color_space::SRGB_ICC)
                 .with_context(|| format!("Failed to write 16-bit TIFF to {}", path.display()))?;
         }
     }
@@ -82,19 +82,20 @@ pub fn write_tiff(image: &Array3<f32>, path: &Path, format: TiffFormat) -> Resul
     Ok(())
 }
 
-fn write_rgb16_with_srgb_icc<W: std::io::Write + std::io::Seek>(
+fn write_rgb16_with_icc<W: std::io::Write + std::io::Seek>(
     tiff: &mut TiffEncoder<W>,
     width: u32,
     height: u32,
     buf: &[u16],
+    icc: &[u8],
 ) -> Result<()> {
     let mut image = tiff
         .new_image::<RGB16>(width, height)
         .context("Failed to create 16-bit TIFF image")?;
     image
         .encoder()
-        .write_tag(Tag::IccProfile, crate::color_space::SRGB_ICC)
-        .context("Failed to write sRGB ICC profile")?;
+        .write_tag(Tag::IccProfile, icc)
+        .context("Failed to write ICC profile")?;
     image
         .write_data(buf)
         .context("Failed to write 16-bit TIFF image data")?;
@@ -134,10 +135,38 @@ pub fn write_tiff_u16(image: &Array3<u16>, path: &Path) -> Result<()> {
         File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
     let writer = BufWriter::new(file);
     let mut tiff = TiffEncoder::new(writer).with_context(|| "Failed to create TIFF encoder")?;
-    write_rgb16_with_srgb_icc(&mut tiff, width_u, height_u, &buf)
+    write_rgb16_with_icc(&mut tiff, width_u, height_u, &buf, crate::color_space::SRGB_ICC)
         .with_context(|| format!("Failed to write 16-bit TIFF to {}", path.display()))?;
 
     Ok(())
+}
+
+/// Write already-encoded 16-bit RGB and embed `icc`.
+pub fn write_tiff_rgb16_with_icc(
+    buf: &[u16],
+    width: u32,
+    height: u32,
+    path: &Path,
+    icc: &[u8],
+) -> Result<()> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(3))
+        .context("TIFF dimensions overflow")?;
+    if buf.len() != expected {
+        bail!(
+            "TIFF RGB buffer length {} does not match {}x{}x3",
+            buf.len(),
+            width,
+            height
+        );
+    }
+    let file =
+        File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
+    let writer = BufWriter::new(file);
+    let mut tiff = TiffEncoder::new(writer).with_context(|| "Failed to create TIFF encoder")?;
+    write_rgb16_with_icc(&mut tiff, width, height, buf, icc)
+        .with_context(|| format!("Failed to write 16-bit TIFF to {}", path.display()))
 }
 
 #[cfg(test)]
@@ -190,6 +219,24 @@ mod tests {
             .into_u8_vec()
             .expect("bytes");
         assert_eq!(icc, crate::color_space::SRGB_ICC);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tiff16_embeds_custom_icc() {
+        let icc = crate::cms::output_icc_bytes(crate::options::OutputIcc::DisplayP3, None).unwrap();
+        let buf = [1000u16, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 1000, 2000, 3000];
+        let path = temp_path("p3.tiff");
+        write_tiff_rgb16_with_icc(&buf, 2, 2, &path, &icc).expect("write");
+        let file = File::open(&path).expect("open");
+        let mut dec = Decoder::new(file).expect("decode");
+        let got = dec
+            .find_tag(Tag::IccProfile)
+            .expect("tag")
+            .expect("icc present")
+            .into_u8_vec()
+            .expect("bytes");
+        assert_eq!(got, icc);
         let _ = std::fs::remove_file(&path);
     }
 

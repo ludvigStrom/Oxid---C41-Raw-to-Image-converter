@@ -48,6 +48,7 @@ pub const BLUR: &str = "\u{e3a5}";
 pub const HEALING: &str = "\u{e3f3}";
 pub const MOVIE: &str = "\u{e02c}";
 pub const HD: &str = "\u{e052}";
+pub const COMPARE: &str = "\u{e3b9}";
 
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();

@@ -18,15 +18,18 @@ use c41_raw_tool::{apply_preview_from_cache_gpu, process_one_to_preview_with_cac
 use c41_raw_tool::{
     apply_preview_from_cache_on_progress, auto_tune, blur_flat_field, cached_start_step,
     calibration, color, compute_preview_scene_stats, crop_sensor_for_oriented_rect, demosaic,
-    detect_crop, dmin, hash_dust, load_develop_preset, load_flat_field_linear, load_project,
+    cms, contact_sheet, detect_crop, dmin, filename, hash_dust, load_develop_preset,
+    load_export_preset, load_flat_field_linear, load_project, monitor,
     load_sensor_from_path, oriented_sensor_size, png_reader, preview_scene_stats_key,
     process_export_jobs, process_one_to_preview, process_one_to_preview_with_cache,
     process_one_to_preview_with_cache_on_progress, rasterize_strokes, rasterize_strokes_uv,
     raw_reader, reset_wb_for_picker, run_auto_crop_for_path, run_auto_for_path,
-    save_develop_preset, save_project, stamp_disc, sync_wb_flags_from_mode, tiff_export,
+    save_develop_preset, save_export_preset, save_project, stamp_disc, sync_wb_flags_from_mode,
+    tiff_export,
     AutoCropResult, AutoTuneResult, CachedSensor, CropConfidence, DminMode, DustHealParams,
     DustInfill, DustMask, DustStroke, DustTool, ExportCancelled, ExportControl, ExportJobSpec,
-    LoadedProject, OutputLutEncoding, OutputStage, PipelineOptions, PreviewSceneStats,
+    CmsIntent, CmsTarget, LoadedProject, OutputIcc, OutputLutEncoding, OutputStage,
+    PipelineOptions, PreviewSceneStats,
     PreviewStepCache, ProjectDust, ProjectExportFormat, ProjectImage, Rect, TiffFormat,
     UndoManager, WbMode, PROJECT_EXTENSION, PROJECT_EXTENSION_LEGACY, UNDO_LIMIT,
 };
@@ -436,6 +439,16 @@ struct ImageEntry {
     tile_cache: Vec<PreviewTile>,
     /// Process tab (Input/Develop/Export) — persists per image when switching.
     process_tab: ProcessTab,
+    /// Before/After switch, stored per Process tab.
+    compare_input_before: bool,
+    compare_develop_before: bool,
+    compare_dust_before: bool,
+    compare_export_before: bool,
+    /// Encoded alternate preview (raw or inverted) for the Before/After switch.
+    compare_full_rgb: Option<(u32, u32, Vec<u8>)>,
+    compare_texture: Option<egui::TextureHandle>,
+    compare_texture_nearest: bool,
+    compare_kind: Option<CompareKind>,
     dust_strokes: Vec<DustStroke>,
     dust_reference_size: Option<(u32, u32)>,
     dust_mask: Vec<u8>,
@@ -564,12 +577,148 @@ fn scaled_crop_px(
     Some((s.x, s.y, s.width.max(1), s.height.max(1)))
 }
 
-/// True when the preview is cropped to the frame (Develop / Dust / Export).
-/// Input keeps the full frame so crop handles stay editable.
+/// Which alternate buffer the Before/After switch is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompareKind {
+    Raw,
+    Inverted,
+}
+
+impl ImageEntry {
+    fn compare_before(&self) -> bool {
+        match self.process_tab {
+            ProcessTab::Input => self.compare_input_before,
+            ProcessTab::Develop => self.compare_develop_before,
+            ProcessTab::Dust => self.compare_dust_before,
+            ProcessTab::Export => self.compare_export_before,
+        }
+    }
+}
+
+fn compare_kind_for(entry: &ImageEntry) -> Option<CompareKind> {
+    match entry.process_tab {
+        ProcessTab::Input => {
+            if entry.compare_input_before {
+                Some(CompareKind::Raw)
+            } else {
+                Some(CompareKind::Inverted)
+            }
+        }
+        ProcessTab::Develop if entry.compare_develop_before => Some(CompareKind::Inverted),
+        _ => None,
+    }
+}
+
+fn compare_hint_for(tab: ProcessTab, before: bool) -> &'static str {
+    match (tab, before) {
+        (ProcessTab::Input, true) => "Raw scan (demosaic only)",
+        (ProcessTab::Input, false) => "Inverted and cropped",
+        (ProcessTab::Develop, true) => "Before processing (inverted input)",
+        (ProcessTab::Develop, false) => "After processing",
+        (ProcessTab::Dust, true) => "Before dust heal",
+        (ProcessTab::Dust, false) => "After dust heal",
+        (ProcessTab::Export, true) => "Before soft proof",
+        (ProcessTab::Export, false) => "After export view",
+    }
+}
+
+fn encode_linear_normalized(img: &ndarray::Array3<f32>) -> Option<(u32, u32, Vec<u8>)> {
+    let (h, w, c) = img.dim();
+    if c != 3 || w == 0 || h == 0 {
+        return None;
+    }
+    let max = img.iter().copied().fold(0.0_f32, f32::max).max(1.0e-6);
+    let rgb: Vec<u8> = img
+        .iter()
+        .map(|v| c41_raw_tool::color_space::linear_to_srgb_u8((v / max).clamp(0.0, 1.0)))
+        .collect();
+    Some((w as u32, h as u32, rgb))
+}
+
+fn encode_inverted_transmittance(img: &ndarray::Array3<f32>) -> Option<(u32, u32, Vec<u8>)> {
+    let (h, w, c) = img.dim();
+    if c != 3 || w == 0 || h == 0 {
+        return None;
+    }
+    let rgb: Vec<u8> = img
+        .iter()
+        .map(|v| c41_raw_tool::color_space::linear_to_srgb_u8((1.0 - v.clamp(0.0, 1.0)).clamp(0.0, 1.0)))
+        .collect();
+    Some((w as u32, h as u32, rgb))
+}
+
+fn encode_compare_from_cache(
+    entry: &ImageEntry,
+    kind: CompareKind,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let cache = entry
+        .preview_step_cache
+        .as_ref()
+        .or(entry.screen_step_cache.as_ref())
+        .or(entry.draft_step_cache.as_ref())?;
+    match kind {
+        CompareKind::Raw => cache
+            .after_load
+            .as_ref()
+            .and_then(|(_, img, _, _)| encode_linear_normalized(img)),
+        CompareKind::Inverted => cache
+            .after_step3
+            .as_ref()
+            .and_then(|(_, img)| encode_inverted_transmittance(img)),
+    }
+}
+
+fn sync_compare_preview(entry: &mut ImageEntry) {
+    let Some(kind) = compare_kind_for(entry) else {
+        entry.compare_kind = None;
+        return;
+    };
+    if entry.compare_kind == Some(kind) && entry.compare_full_rgb.is_some() {
+        return;
+    }
+    match encode_compare_from_cache(entry, kind) {
+        Some(rgb) => {
+            entry.compare_full_rgb = Some(rgb);
+            entry.compare_texture = None;
+            entry.compare_texture_nearest = false;
+            entry.compare_kind = Some(kind);
+        }
+        None => {
+            entry.compare_kind = None;
+            entry.compare_full_rgb = None;
+            entry.compare_texture = None;
+        }
+    }
+}
+
+fn showing_compare_preview(entry: &ImageEntry) -> bool {
+    compare_kind_for(entry).is_some() && entry.compare_full_rgb.is_some()
+}
+
+fn preview_draw_rgb(entry: &ImageEntry) -> Option<(u32, u32, &Vec<u8>)> {
+    if showing_compare_preview(entry) {
+        entry
+            .compare_full_rgb
+            .as_ref()
+            .map(|(w, h, rgb)| (*w, *h, rgb))
+    } else {
+        entry
+            .preview_full_rgb
+            .as_ref()
+            .map(|(w, h, rgb)| (*w, *h, rgb))
+    }
+}
+
+/// True when the preview is cropped to the frame (Develop / Dust / Export, or
+/// Input After). Input Before keeps the full frame so crop handles stay editable.
 fn preview_uses_crop_viewport(entry: &ImageEntry) -> bool {
-    entry.process_tab != ProcessTab::Input
-        && entry.options.apply_crop
-        && entry.options.crop_rect.is_some()
+    if !entry.options.apply_crop || entry.options.crop_rect.is_none() {
+        return false;
+    }
+    match entry.process_tab {
+        ProcessTab::Input => !entry.compare_input_before,
+        _ => true,
+    }
 }
 
 /// Tile grid origin and size in oriented-sensor pixels.
@@ -779,6 +928,54 @@ fn apply_export_format_to_options(opts: &mut PipelineOptions, format: ExportForm
     }
 }
 
+fn output_icc_combo(ui: &mut egui::Ui, kind: &mut OutputIcc, custom_path: &Option<PathBuf>) {
+    let label = cms::output_icc_label(*kind, custom_path.as_deref());
+    egui::ComboBox::from_id_salt("output_icc")
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            for (value, text) in [
+                (OutputIcc::Srgb, "sRGB"),
+                (OutputIcc::DisplayP3, "Display P3"),
+                (OutputIcc::AdobeRgb, "Adobe RGB"),
+                (OutputIcc::Custom, "Custom ICC…"),
+            ] {
+                if ui.selectable_label(*kind == value, text).clicked() {
+                    *kind = value;
+                }
+            }
+        });
+}
+
+fn cms_intent_combo(ui: &mut egui::Ui, id: &str, intent: &mut CmsIntent) {
+    let label = match *intent {
+        CmsIntent::Perceptual => "Perceptual",
+        CmsIntent::Relative => "Relative",
+        CmsIntent::Absolute => "Absolute",
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(*intent == CmsIntent::Perceptual, "Perceptual")
+                .clicked()
+            {
+                *intent = CmsIntent::Perceptual;
+            }
+            if ui
+                .selectable_label(*intent == CmsIntent::Relative, "Relative")
+                .clicked()
+            {
+                *intent = CmsIntent::Relative;
+            }
+            if ui
+                .selectable_label(*intent == CmsIntent::Absolute, "Absolute")
+                .clicked()
+            {
+                *intent = CmsIntent::Absolute;
+            }
+        });
+}
+
 fn export_format_combo(ui: &mut egui::Ui, format: &mut ExportFormat) {
     egui::ComboBox::from_label("Output format")
         .selected_text(format.label())
@@ -800,6 +997,9 @@ fn export_format_combo(ui: &mut egui::Ui, format: &mut ExportFormat) {
 struct BatchExportDialog {
     format: ExportFormat,
     write_jpeg: bool,
+    output_icc: OutputIcc,
+    filename_template: String,
+    jpeg_quality: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -810,7 +1010,7 @@ enum UIMode {
     Debug,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ProcessTab {
     Input,
     Develop,
@@ -1018,6 +1218,15 @@ struct C41Gui {
     right_panel_width: f32,
     #[cfg(feature = "gpu")]
     gpu_pipeline: Option<std::sync::Arc<c41_raw_tool::gpu::unified::GpuPipeline>>,
+    /// Detected display ICC (session). `None` = sRGB preview + sRGB window tag.
+    monitor: Option<monitor::MonitorProfile>,
+    pending_output_icc_browse: bool,
+    pending_proof_icc_browse: bool,
+    contact_columns: u32,
+    contact_cell_long: u32,
+    contact_gap: u32,
+    contact_caption: String,
+    last_monitor_screen: Option<egui::Rect>,
 }
 
 impl Default for C41Gui {
@@ -1082,6 +1291,14 @@ impl Default for C41Gui {
             #[cfg(feature = "gpu")]
             gpu_pipeline: c41_raw_tool::gpu::unified::GpuPipeline::try_new()
                 .map(std::sync::Arc::new),
+            monitor: monitor::detect(),
+            pending_output_icc_browse: false,
+            pending_proof_icc_browse: false,
+            contact_columns: 4,
+            contact_cell_long: 400,
+            contact_gap: 16,
+            contact_caption: "{stem}".to_string(),
+            last_monitor_screen: None,
         }
     }
 }
@@ -1219,6 +1436,18 @@ fn default_options() -> PipelineOptions {
         write_exr: false,
         write_jpeg: false,
         write_jpeg_only: false,
+        jpeg_quality: 75,
+        output_icc: OutputIcc::Srgb,
+        output_icc_path: None,
+        export_intent: CmsIntent::Relative,
+        export_bpc: true,
+        filename_template: "{stem}".to_string(),
+        export_preset_name: String::new(),
+        soft_proof: false,
+        proof_icc_path: None,
+        proof_intent: CmsIntent::Relative,
+        proof_paper_white: true,
+        proof_gamut_warning: false,
         no_invert: false,
         no_curve: false,
         wb_r: 1.0,
@@ -1299,6 +1528,8 @@ fn default_options() -> PipelineOptions {
         dust_reference_size: None,
         dust_uv: None,
         dust_heal: DustHealParams::default(),
+        preview_monitor_icc: None,
+        cms_target: CmsTarget::Display,
     }
 }
 
@@ -1424,6 +1655,25 @@ fn options_hash_for(path: &PathBuf, opts: &PipelineOptions) -> u64 {
     opts.dust_heal.infill.hash(&mut h);
     opts.dust_heal.tile.hash(&mut h);
     opts.dust_heal.match_loosen.to_bits().hash(&mut h);
+    opts.output_icc.hash(&mut h);
+    opts.output_icc_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .hash(&mut h);
+    opts.export_intent.hash(&mut h);
+    opts.export_bpc.hash(&mut h);
+    opts.soft_proof.hash(&mut h);
+    opts.proof_icc_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .hash(&mut h);
+    opts.proof_intent.hash(&mut h);
+    opts.proof_paper_white.hash(&mut h);
+    opts.proof_gamut_warning.hash(&mut h);
+    opts.cms_target.hash(&mut h);
+    if let Some(icc) = &opts.preview_monitor_icc {
+        icc.hash(&mut h);
+    }
     h.finish()
 }
 
@@ -2307,6 +2557,18 @@ fn preview_options_hash(path: &PathBuf, options: &PipelineOptions, full_res: boo
     preview_invalidation_hash(path, options, full_res, 0, 0)
 }
 
+fn entry_preview_hash(entry: &ImageEntry, full_res: bool) -> u64 {
+    let mut hh = DefaultHasher::new();
+    preview_options_hash(&entry.path, &entry.options, full_res).hash(&mut hh);
+    entry.process_tab.hash(&mut hh);
+    // Input / Develop swap cached RGB. Dust / Export change the bake.
+    match entry.process_tab {
+        ProcessTab::Dust | ProcessTab::Export => entry.compare_before().hash(&mut hh),
+        ProcessTab::Input | ProcessTab::Develop => {}
+    }
+    hh.finish()
+}
+
 fn preview_draft_limits() -> (u32, u32) {
     (PREVIEW_DRAFT_MAX, PREVIEW_DRAFT_MAX)
 }
@@ -2357,6 +2619,14 @@ fn image_entry(
         scene_stats: None,
         preview_step_cache: None,
         process_tab: ProcessTab::Input,
+        compare_input_before: false,
+        compare_develop_before: false,
+        compare_dust_before: false,
+        compare_export_before: false,
+        compare_full_rgb: None,
+        compare_texture: None,
+        compare_texture_nearest: false,
+        compare_kind: None,
         dust_strokes: Vec::new(),
         dust_reference_size: None,
         dust_mask: Vec::new(),
@@ -3042,7 +3312,31 @@ impl C41Gui {
             options.dust_reference_size = None;
             options.dust_uv = None;
         }
+        options.preview_monitor_icc = self.monitor.as_ref().map(|m| m.icc.clone());
+        options.cms_target = CmsTarget::Display;
+        if entry.process_tab == ProcessTab::Export && entry.compare_export_before {
+            options.soft_proof = false;
+        }
         options
+    }
+
+    fn refresh_monitor_profile(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        if self.last_monitor_screen == Some(screen) {
+            return;
+        }
+        self.last_monitor_screen = Some(screen);
+        let detected = monitor::detect();
+        let new_hash = detected.as_ref().map(|m| m.hash());
+        let old_hash = self.monitor.as_ref().map(|m| m.hash());
+        if new_hash != old_hash {
+            self.monitor = detected;
+            self.preview_gen = self.preview_gen.wrapping_add(1);
+            for img in &mut self.images {
+                img.preview_hash = 0;
+                img.preview_options_hash = 0;
+            }
+        }
     }
 
     fn dust_should_apply(&self, entry: &ImageEntry) -> bool {
@@ -3052,7 +3346,9 @@ impl C41Gui {
         if self.mode == UIMode::Process {
             return match entry.process_tab {
                 ProcessTab::Input | ProcessTab::Develop => false,
-                ProcessTab::Dust => entry.dust_view == DustView::Process,
+                ProcessTab::Dust => {
+                    !entry.compare_dust_before && entry.dust_view == DustView::Process
+                }
                 ProcessTab::Export => true,
             };
         }
@@ -3128,6 +3424,9 @@ impl C41Gui {
             entry.screen_step_cache = None;
             entry.tile_cache.clear();
             entry.preview_full_rgb = None;
+            entry.compare_full_rgb = None;
+            entry.compare_texture = None;
+            entry.compare_kind = None;
         }
     }
 
@@ -3169,11 +3468,7 @@ impl C41Gui {
         if lod == PreviewLod::Screen {
             self.images[index].preview_screen_requested_wh = (max_width, max_height);
         }
-        let options_hash = preview_options_hash(
-            &path,
-            &self.images[index].options,
-            self.full_res_preview_active,
-        );
+        let options_hash = entry_preview_hash(&self.images[index], self.full_res_preview_active);
         self.preview_job_hash = Some(options_hash);
         self.preview_job_live = false;
 
@@ -3269,11 +3564,7 @@ impl C41Gui {
         let path = self.images[index].path.clone();
         let options = self.bake_preview_options(&self.images[index]);
         let (max_width, max_height) = self.live_cache_limits(index, ctx);
-        let options_hash = preview_options_hash(
-            &path,
-            &self.images[index].options,
-            self.full_res_preview_active,
-        );
+        let options_hash = entry_preview_hash(&self.images[index], self.full_res_preview_active);
         self.preview_job_hash = Some(options_hash);
         self.preview_job_live = true;
         let gen = self.preview_gen;
@@ -3644,8 +3935,7 @@ impl C41Gui {
         let Some(entry) = self.images.get(idx) else {
             return false;
         };
-        let hash_now =
-            preview_options_hash(&entry.path, &entry.options, self.full_res_preview_active);
+        let hash_now = entry_preview_hash(entry, self.full_res_preview_active);
         entry.preview_options_hash != hash_now
     }
 
@@ -3777,6 +4067,7 @@ impl C41Gui {
                         path: img.path.clone(),
                         options: opts,
                         source_size: img.raw_source_size.map(|[w, h]| (w, h)),
+                        index: idx + 1,
                     }]
                 }
                 _ => return,
@@ -3784,7 +4075,8 @@ impl C41Gui {
         } else {
             self.images
                 .iter()
-                .map(|img| {
+                .enumerate()
+                .map(|(i, img)| {
                     let mut opts = img.options.clone();
                     opts.flat_field_path = self.flat_field_path.clone();
                     attach_export_dust(&mut opts, img);
@@ -3794,10 +4086,18 @@ impl C41Gui {
                     opts.write_jpeg_only = export_template.write_jpeg_only;
                     opts.export_aces_exr = export_template.export_aces_exr;
                     opts.write_aces2065_only = export_template.write_aces2065_only;
+                    opts.output_icc = export_template.output_icc;
+                    opts.output_icc_path = export_template.output_icc_path.clone();
+                    opts.export_intent = export_template.export_intent;
+                    opts.export_bpc = export_template.export_bpc;
+                    opts.filename_template = export_template.filename_template.clone();
+                    opts.jpeg_quality = export_template.jpeg_quality;
+                    opts.export_preset_name = export_template.export_preset_name.clone();
                     ExportJobSpec {
                         path: img.path.clone(),
                         options: opts,
                         source_size: img.raw_source_size.map(|[w, h]| (w, h)),
+                        index: i + 1,
                     }
                 })
                 .collect()
@@ -3840,6 +4140,167 @@ impl C41Gui {
         } else {
             format!("Exporting {} images…", total)
         };
+        ctx.request_repaint();
+    }
+
+    fn start_contact_sheet(&mut self, ctx: &egui::Context, selected_only: bool) {
+        if self.heavy_job_running() {
+            return;
+        }
+        let Some(output_dir) = self.output_dir.clone() else {
+            return;
+        };
+        let entries: Vec<(PathBuf, PipelineOptions, usize)> = if selected_only {
+            match self.selected_index {
+                Some(idx) if idx < self.images.len() => {
+                    let img = &self.images[idx];
+                    let mut opts = img.options.clone();
+                    opts.flat_field_path = self.flat_field_path.clone();
+                    attach_export_dust(&mut opts, img);
+                    vec![(img.path.clone(), opts, idx + 1)]
+                }
+                _ => return,
+            }
+        } else {
+            self.images
+                .iter()
+                .enumerate()
+                .map(|(i, img)| {
+                    let mut opts = img.options.clone();
+                    opts.flat_field_path = self.flat_field_path.clone();
+                    attach_export_dust(&mut opts, img);
+                    (img.path.clone(), opts, i + 1)
+                })
+                .collect()
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        let layout = contact_sheet::ContactSheetLayout {
+            columns: self.contact_columns.max(1),
+            cell_long: self.contact_cell_long.max(64),
+            gap: self.contact_gap,
+            caption_height: 18,
+            background: [18, 18, 20],
+        };
+        let caption_tmpl = self.contact_caption.clone();
+        let first_opts = entries[0].1.clone();
+        let (date, time) =
+            filename::local_stamp().unwrap_or_else(|_| ("1970-01-01".into(), "000000".into()));
+        let sheet_name = filename::expand(
+            if first_opts.filename_template.contains("{stem}") {
+                "{date}_contact"
+            } else {
+                first_opts.filename_template.as_str()
+            },
+            &filename::FilenameContext {
+                stem: "contact",
+                index: 1,
+                date: &date,
+                time: &time,
+                preset: &first_opts.export_preset_name,
+                profile: &cms::output_icc_label(
+                    first_opts.output_icc,
+                    first_opts.output_icc_path.as_deref(),
+                ),
+                width: 0,
+                height: 0,
+            },
+        );
+
+        self.release_heavy_caches();
+        let total = entries.len();
+        let control = Arc::new(ExportControl::new(total));
+        let (tx, rx) = mpsc::channel();
+        let control_thread = control.clone();
+        thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut cells = Vec::with_capacity(entries.len());
+                let (date, time) = filename::local_stamp()
+                    .unwrap_or_else(|_| ("1970-01-01".into(), "000000".into()));
+                for (i, (path, mut opts, index)) in entries.into_iter().enumerate() {
+                    if control_thread.is_cancelled() {
+                        return Err(anyhow::Error::new(ExportCancelled));
+                    }
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image");
+                    control_thread.begin_file(i, total, name);
+                    opts.cms_target = CmsTarget::Export;
+                    opts.preview_monitor_icc = None;
+                    opts.soft_proof = false;
+                    let (_, _, w, h, rgb, _) = process_one_to_preview(
+                        &path,
+                        &opts,
+                        layout.cell_long,
+                        layout.cell_long,
+                    )?;
+                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+                    let caption = filename::expand(
+                        &caption_tmpl,
+                        &filename::FilenameContext {
+                            stem,
+                            index,
+                            date: &date,
+                            time: &time,
+                            preset: &opts.export_preset_name,
+                            profile: &cms::output_icc_label(
+                                opts.output_icc,
+                                opts.output_icc_path.as_deref(),
+                            ),
+                            width: w,
+                            height: h,
+                        },
+                    );
+                    cells.push(contact_sheet::ContactSheetCell {
+                        width: w,
+                        height: h,
+                        rgb,
+                        caption,
+                    });
+                    control_thread.mark_completed();
+                }
+                let (sw, sh, sheet) = contact_sheet::compose(&cells, &layout)?;
+                let icc = cms::output_icc_bytes(
+                    first_opts.output_icc,
+                    first_opts.output_icc_path.as_deref(),
+                )?;
+                let out = filename::unique_path(&output_dir, &sheet_name, "jpg");
+                contact_sheet::write_jpeg(
+                    &out,
+                    sw,
+                    sh,
+                    &sheet,
+                    &icc,
+                    first_opts.jpeg_quality,
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(ExportJobOutcome::Done {
+                        count: control_thread.completed(),
+                    });
+                }
+                Err(e) if e.downcast_ref::<ExportCancelled>().is_some() => {
+                    let _ = tx.send(ExportJobOutcome::Cancelled {
+                        completed: control_thread.completed(),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ExportJobOutcome::Error(e.to_string()));
+                }
+            }
+        });
+
+        self.export_job = Some(ExportJob {
+            receiver: rx,
+            started_at: Instant::now(),
+            control,
+        });
+        self.status = "Exporting contact sheet…".to_string();
         ctx.request_repaint();
     }
 
@@ -3956,6 +4417,9 @@ impl C41Gui {
         self.batch_export_dialog = Some(BatchExportDialog {
             format: img.export_format,
             write_jpeg: img.options.write_jpeg && img.export_format != ExportFormat::Jpeg,
+            output_icc: img.options.output_icc,
+            filename_template: img.options.filename_template.clone(),
+            jpeg_quality: img.options.jpeg_quality,
         });
     }
 
@@ -3972,6 +4436,9 @@ impl C41Gui {
         if dialog.format != ExportFormat::Jpeg {
             img.options.write_jpeg = dialog.write_jpeg;
         }
+        img.options.output_icc = dialog.output_icc;
+        img.options.filename_template = dialog.filename_template.clone();
+        img.options.jpeg_quality = dialog.jpeg_quality.clamp(1, 100);
     }
 
     fn show_batch_export_dialog(&mut self, ctx: &egui::Context) {
@@ -4003,6 +4470,11 @@ impl C41Gui {
                     dialog.format != ExportFormat::Jpeg,
                     egui::Checkbox::new(&mut dialog.write_jpeg, "Also export JPG"),
                 );
+                output_icc_combo(ui, &mut dialog.output_icc, &None);
+                ui.horizontal(|ui| {
+                    ui.label("Filename");
+                    ui.text_edit_singleline(&mut dialog.filename_template);
+                });
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -4282,11 +4754,7 @@ impl C41Gui {
         }
         let path = self.images[index].path.clone();
         let options = self.bake_preview_options(&self.images[index]);
-        let options_hash = preview_options_hash(
-            &path,
-            &self.images[index].options,
-            self.full_res_preview_active,
-        );
+        let options_hash = entry_preview_hash(&self.images[index], self.full_res_preview_active);
         let (max_width, max_height) =
             preview_working_limits(self.preview_canvas_size, ctx.pixels_per_point(), false);
         let cache = self.live_preview_cache(index).cloned();
@@ -4383,11 +4851,7 @@ impl C41Gui {
             self.auto_job = None;
             return;
         }
-        let hash_now = preview_options_hash(
-            &self.images[idx].path,
-            &self.images[idx].options,
-            self.full_res_preview_active,
-        );
+        let hash_now = entry_preview_hash(&self.images[idx], self.full_res_preview_active);
         let progress_done = self
             .auto_job
             .as_ref()
@@ -4880,9 +5344,13 @@ impl eframe::App for C41Gui {
         // Re-apply each frame so backends that reset visuals stay on the lab theme.
         theme::apply(ctx);
         // OpenGL's backing layer is created after startup and can be recreated
-        // on resize / display change; keep the sRGB tag on it.
+        // on resize / display change. sRGB tag only when preview is sRGB-encoded
+        // (no monitor ICC). Monitor-encoded preview leaves the layer native.
+        self.refresh_monitor_profile(ctx);
         #[cfg(target_os = "macos")]
-        tag_native_window_srgb(frame);
+        if self.monitor.is_none() {
+            tag_native_window_srgb(frame);
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed {
             if self.project_is_dirty() {
@@ -4942,6 +5410,46 @@ impl eframe::App for C41Gui {
         }
         if let Some(path) = self.pending_recent_load.take() {
             self.load_project_from_path(path);
+        }
+
+        if self.pending_output_icc_browse {
+            self.pending_output_icc_browse = false;
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("ICC profile", &["icc", "icm", "ICC", "ICM"])
+                .pick_file()
+            {
+                match cms::validate_icc_file(&path) {
+                    Ok(name) => {
+                        if let Some(idx) = self.selected_index {
+                            if idx < self.images.len() {
+                                self.images[idx].options.output_icc = OutputIcc::Custom;
+                                self.images[idx].options.output_icc_path = Some(path);
+                                self.status = format!("Output ICC: {name}");
+                            }
+                        }
+                    }
+                    Err(e) => self.status = format!("Output ICC: {e}"),
+                }
+            }
+        }
+        if self.pending_proof_icc_browse {
+            self.pending_proof_icc_browse = false;
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("ICC profile", &["icc", "icm", "ICC", "ICM"])
+                .pick_file()
+            {
+                match cms::validate_icc_file(&path) {
+                    Ok(name) => {
+                        if let Some(idx) = self.selected_index {
+                            if idx < self.images.len() {
+                                self.images[idx].options.proof_icc_path = Some(path);
+                                self.status = format!("Proof ICC: {name}");
+                            }
+                        }
+                    }
+                    Err(e) => self.status = format!("Proof ICC: {e}"),
+                }
+            }
         }
 
         if self.pending_output_lut_browse {
@@ -5022,6 +5530,10 @@ impl eframe::App for C41Gui {
                         }
                         self.images[idx].preview_full_rgb = Some((job.w, job.h, job.rgb.clone()));
                         self.images[idx].preview_step_cache = Some(job.new_cache);
+                        self.images[idx].compare_full_rgb = None;
+                        self.images[idx].compare_texture = None;
+                        self.images[idx].compare_kind = None;
+                        sync_compare_preview(&mut self.images[idx]);
                         self.images[idx].preview_input_size = Some([job.w, job.h]);
                         if job.input_w > 0 && job.input_h > 0 {
                             self.images[idx].raw_source_size = Some([job.input_w, job.input_h]);
@@ -5690,6 +6202,26 @@ impl eframe::App for C41Gui {
                             theme::icon_label(theme::DOWNLOAD, "Export"),
                         );
                     });
+                    ui.add_space(4.0);
+                    {
+                        let tab = entry.process_tab;
+                        let before = match tab {
+                            ProcessTab::Input => &mut entry.compare_input_before,
+                            ProcessTab::Develop => &mut entry.compare_develop_before,
+                            ProcessTab::Dust => &mut entry.compare_dust_before,
+                            ProcessTab::Export => &mut entry.compare_export_before,
+                        };
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                before,
+                                true,
+                                theme::icon_label(theme::COMPARE, "Before"),
+                            )
+                            .on_hover_text(compare_hint_for(tab, true));
+                            ui.selectable_value(before, false, "After")
+                                .on_hover_text(compare_hint_for(tab, false));
+                        });
+                    }
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(4.0);
@@ -7166,7 +7698,61 @@ impl eframe::App for C41Gui {
                 ui.heading("Export");
                 ui.add_space(8.0);
 
-                // Per-image export options
+                ui.horizontal(|ui| {
+                    ui.label("Preset");
+                    ui.text_edit_singleline(&mut opts.export_preset_name);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(theme::icon_label(theme::DOWNLOAD, "Save…"))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Export preset", &["json"])
+                            .set_file_name("export.json")
+                            .save_file()
+                        {
+                            match save_export_preset(opts, &path) {
+                                Ok(()) => self.status = format!("Saved {}", path.display()),
+                                Err(e) => self.status = format!("Save failed: {e}"),
+                            }
+                        }
+                    }
+                    if ui
+                        .button(theme::icon_label(theme::UPLOAD, "Load…"))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Export preset", &["json"])
+                            .pick_file()
+                        {
+                            match load_export_preset(&path) {
+                                Ok(preset) => {
+                                    preset.apply_to(opts);
+                                    entry.export_format = match preset.format {
+                                        c41_raw_tool::ExportPresetFormat::Tiff16 => {
+                                            ExportFormat::Tiff16
+                                        }
+                                        c41_raw_tool::ExportPresetFormat::Tiff32 => {
+                                            ExportFormat::Tiff32
+                                        }
+                                        c41_raw_tool::ExportPresetFormat::Exr => ExportFormat::Exr,
+                                        c41_raw_tool::ExportPresetFormat::Jpeg => {
+                                            ExportFormat::Jpeg
+                                        }
+                                        c41_raw_tool::ExportPresetFormat::ExrAces2065 => {
+                                            ExportFormat::ExrAces2065
+                                        }
+                                    };
+                                    self.status = format!("Loaded {}", path.display());
+                                }
+                                Err(e) => self.status = format!("Load failed: {e}"),
+                            }
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+
                 export_format_combo(ui, &mut entry.export_format);
                 apply_export_format_to_options(opts, entry.export_format);
 
@@ -7174,6 +7760,118 @@ impl eframe::App for C41Gui {
                     entry.export_format != ExportFormat::Jpeg,
                     egui::Checkbox::new(&mut opts.write_jpeg, "Also export JPG"),
                 );
+                if opts.write_jpeg || opts.write_jpeg_only {
+                    ui.horizontal(|ui| {
+                        ui.label("JPEG quality");
+                        ui.add(egui::Slider::new(&mut opts.jpeg_quality, 1..=100));
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Output ICC").strong());
+                output_icc_combo(ui, &mut opts.output_icc, &opts.output_icc_path);
+                if opts.output_icc == OutputIcc::Custom {
+                    let path_label = opts
+                        .output_icc_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "No custom ICC".to_string());
+                    if ui.button("Choose ICC…").clicked() {
+                        self.pending_output_icc_browse = true;
+                    }
+                    ui.label(egui::RichText::new(path_label).small());
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Intent");
+                    cms_intent_combo(ui, "export_intent", &mut opts.export_intent);
+                });
+                ui.checkbox(&mut opts.export_bpc, "Black-point compensation");
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Soft proof").strong());
+                ui.checkbox(&mut opts.soft_proof, "Proof paper / printer");
+                let proof_label = opts
+                    .proof_icc_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "No paper/printer ICC".to_string());
+                if ui.button("Paper / printer ICC…").clicked() {
+                    self.pending_proof_icc_browse = true;
+                }
+                ui.label(egui::RichText::new(proof_label).small());
+                ui.horizontal(|ui| {
+                    ui.label("Proof intent");
+                    cms_intent_combo(ui, "proof_intent", &mut opts.proof_intent);
+                });
+                ui.checkbox(&mut opts.proof_paper_white, "Simulate paper white");
+                ui.checkbox(&mut opts.proof_gamut_warning, "Gamut warning");
+                let monitor_name = self
+                    .monitor
+                    .as_ref()
+                    .map(|m| m.name.as_str())
+                    .unwrap_or("sRGB (no monitor ICC)");
+                ui.label(
+                    egui::RichText::new(format!("Monitor: {monitor_name}"))
+                        .small()
+                        .color(egui::Color32::from_gray(140)),
+                );
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Filename").strong());
+                ui.text_edit_singleline(&mut opts.filename_template);
+                let example_stem = entry
+                    .path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("frame");
+                let (date, time) = filename::local_stamp()
+                    .unwrap_or_else(|_| ("2026-01-01".into(), "000000".into()));
+                let example = filename::expand(
+                    &opts.filename_template,
+                    &filename::FilenameContext {
+                        stem: example_stem,
+                        index: self.selected_index.map(|i| i + 1).unwrap_or(1),
+                        date: &date,
+                        time: &time,
+                        preset: &opts.export_preset_name,
+                        profile: &cms::output_icc_label(
+                            opts.output_icc,
+                            opts.output_icc_path.as_deref(),
+                        ),
+                        width: entry.raw_source_size.map(|s| s[0]).unwrap_or(0),
+                        height: entry.raw_source_size.map(|s| s[1]).unwrap_or(0),
+                    },
+                );
+                ui.label(
+                    egui::RichText::new(format!("{example}.tiff"))
+                        .small()
+                        .color(egui::Color32::from_gray(140)),
+                );
+                ui.label(
+                    egui::RichText::new("{stem} {index} {index:03} {date} {time} {preset} {profile} {w} {h}")
+                        .small()
+                        .color(egui::Color32::from_gray(110)),
+                );
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Contact sheet").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Columns");
+                    ui.add(egui::DragValue::new(&mut self.contact_columns).range(1..=12));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Cell");
+                    ui.add(egui::DragValue::new(&mut self.contact_cell_long).range(64..=1200));
+                    ui.label("px");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Gap");
+                    ui.add(egui::DragValue::new(&mut self.contact_gap).range(0..=80));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Caption");
+                    ui.text_edit_singleline(&mut self.contact_caption);
+                });
 
                 ui.add_space(8.0);
 
@@ -7222,6 +7920,25 @@ impl eframe::App for C41Gui {
                         .clicked()
                     {
                         self.start_export(ui.ctx(), true);
+                    }
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new("Contact sheet…"),
+                        )
+                        .on_hover_text("Export a JPEG grid of all frames using the output ICC")
+                        .clicked()
+                    {
+                        self.start_contact_sheet(ui.ctx(), false);
+                    }
+                    if ui
+                        .add_enabled(
+                            selected_ready,
+                            egui::Button::new("Sheet selected"),
+                        )
+                        .clicked()
+                    {
+                        self.start_contact_sheet(ui.ctx(), true);
                     }
                 });
 
@@ -7307,6 +8024,7 @@ impl eframe::App for C41Gui {
 
             if let Some(idx) = self.selected_index {
                 if idx < self.images.len() {
+                    sync_compare_preview(&mut self.images[idx]);
                     {
                         let available = ui.available_rect_before_wrap();
                         const CONTROL_ROW_HEIGHT: f32 = 28.0;
@@ -7346,8 +8064,9 @@ impl eframe::App for C41Gui {
                         let desired_orient = preview_desired_orient(&self.images[idx]);
                         let baked_orient = preview_baked_orient(&self.images[idx]);
                         let geometry_pending = preview_view_geometry_pending(&self.images[idx]);
-                        let (full_w, full_h) = if let Some((w, h, _)) = &self.images[idx].preview_full_rgb {
-                            preview_display_wh(&self.images[idx], *w, *h)
+                        let showing_compare = showing_compare_preview(&self.images[idx]);
+                        let (full_w, full_h) = if let Some((w, h, _)) = preview_draw_rgb(&self.images[idx]) {
+                            preview_display_wh(&self.images[idx], w, h)
                         } else {
                             self.images[idx].preview_input_size
                                 .map(|s| (s[0], s[1]))
@@ -7384,26 +8103,53 @@ impl eframe::App for C41Gui {
 
                         // Recreate texture only when LINEAR/NEAREST must flip (pixel scale crosses 1×).
                         let want_nearest = want_nearest_filter(pixel_scale);
-                        if self.images[idx].preview_texture.is_some()
-                            && self.images[idx].preview_texture_nearest != want_nearest
-                        {
-                            if let Some((fw, fh, rgb)) = self.images[idx].preview_full_rgb.as_ref() {
-                                let image = rgb_u8_to_color_image(*fw, *fh, rgb);
-                                let tex_opts = if want_nearest {
-                                    egui::TextureOptions::NEAREST
-                                } else {
-                                    preview_minify_texture_options()
-                                };
-                                let tex = ui.ctx().load_texture(
-                                    format!("preview_full_{}", idx),
-                                    image,
-                                    tex_opts,
-                                );
-                                self.images[idx].preview_texture = Some(tex);
-                                self.images[idx].preview_texture_nearest = want_nearest;
+                        let tex_opt = if showing_compare {
+                            let need_upload = self.images[idx].compare_texture.is_none()
+                                || self.images[idx].compare_texture_nearest != want_nearest;
+                            if need_upload {
+                                if let Some((fw, fh, rgb)) =
+                                    self.images[idx].compare_full_rgb.as_ref()
+                                {
+                                    let image = rgb_u8_to_color_image(*fw, *fh, rgb);
+                                    let tex_opts = if want_nearest {
+                                        egui::TextureOptions::NEAREST
+                                    } else {
+                                        preview_minify_texture_options()
+                                    };
+                                    let tex = ui.ctx().load_texture(
+                                        format!("preview_compare_{}", idx),
+                                        image,
+                                        tex_opts,
+                                    );
+                                    self.images[idx].compare_texture = Some(tex);
+                                    self.images[idx].compare_texture_nearest = want_nearest;
+                                }
                             }
-                        }
-                        let tex_opt = self.images[idx].preview_texture.clone();
+                            self.images[idx].compare_texture.clone()
+                        } else {
+                            if self.images[idx].preview_texture.is_some()
+                                && self.images[idx].preview_texture_nearest != want_nearest
+                            {
+                                if let Some((fw, fh, rgb)) =
+                                    self.images[idx].preview_full_rgb.as_ref()
+                                {
+                                    let image = rgb_u8_to_color_image(*fw, *fh, rgb);
+                                    let tex_opts = if want_nearest {
+                                        egui::TextureOptions::NEAREST
+                                    } else {
+                                        preview_minify_texture_options()
+                                    };
+                                    let tex = ui.ctx().load_texture(
+                                        format!("preview_full_{}", idx),
+                                        image,
+                                        tex_opts,
+                                    );
+                                    self.images[idx].preview_texture = Some(tex);
+                                    self.images[idx].preview_texture_nearest = want_nearest;
+                                }
+                            }
+                            self.images[idx].preview_texture.clone()
+                        };
 
                         // Pan: which image-normalized point sits at canvas center.
                         let pan_x = self.images[idx].preview_pan.x.clamp(0.0, 1.0);
@@ -7424,7 +8170,8 @@ impl eframe::App for C41Gui {
                                 || canvas_resp.dragged();
                             let grid_now = self.visible_tile_grid(idx);
                             let proxy_soft = grid_now.as_ref().map(|g| g.proxy_soft).unwrap_or(false);
-                            let hide_tiles = !proxy_soft
+                            let hide_tiles = showing_compare
+                                || !proxy_soft
                                 || self.preview_options_dirty(idx)
                                 || geometry_pending;
                             let opt_hash = self.images[idx].preview_options_hash;
@@ -7448,7 +8195,7 @@ impl eframe::App for C41Gui {
                                     egui::pos2(uv_l, uv_t),
                                     egui::pos2(uv_r, uv_b),
                                 );
-                                let uv = if let Some((tw, th, _)) = self.images[idx].preview_full_rgb {
+                                let uv = if let Some((tw, th, _)) = preview_draw_rgb(&self.images[idx]) {
                                     preview_crop_uv(&self.images[idx], tw, th).map(|c| {
                                         egui::Rect::from_min_max(
                                             egui::pos2(
@@ -8087,7 +8834,10 @@ impl eframe::App for C41Gui {
                         }
 
                         // D-min overlay: project image-space rect through camera.
-                        if self.mode == UIMode::Process {
+                        // Full-frame only (Input Before). Cropped views use crop-relative coords.
+                        if self.mode == UIMode::Process
+                            && self.images.get(idx).is_some_and(|e| !preview_uses_crop_viewport(e))
+                        {
                             if let Some(entry) = self.images.get_mut(idx) {
                                 let opts = &mut entry.options;
                                 if opts.dmin_mode == DminMode::SampleRegion && self.flat_field_path.is_none() {
@@ -8506,6 +9256,18 @@ impl eframe::App for C41Gui {
                                 )
                                 .on_hover_text("Use full resolution export pipeline for preview. Deactivates when adjusting settings or switching images.")
                                 .clicked();
+                            let proof_on = self.images[idx].options.soft_proof;
+                            let proof_clicked = ui
+                                .add(
+                                    egui::Button::new("Proof")
+                                        .selected(proof_on),
+                                )
+                                .on_hover_text("Soft-proof the paper/printer ICC on this display")
+                                .clicked();
+                            if proof_clicked {
+                                self.images[idx].options.soft_proof =
+                                    !self.images[idx].options.soft_proof;
+                            }
                             if full_res_clicked {
                                 self.full_res_preview_active = !self.full_res_preview_active;
                                 if self.full_res_preview_active {
@@ -8741,11 +9503,8 @@ impl eframe::App for C41Gui {
                         };
                         entry.options.dust_mask = None;
                     }
-                    let hash_now = preview_options_hash(
-                        &self.images[idx].path,
-                        &self.images[idx].options,
-                        self.full_res_preview_active,
-                    );
+                    let hash_now =
+                        entry_preview_hash(&self.images[idx], self.full_res_preview_active);
                     if self.capture_pipeline_debug_next {
                         self.images[idx].preview_options_hash = 0;
                     }
@@ -8881,6 +9640,7 @@ impl eframe::App for C41Gui {
                     // Wait for slider release so the live backdrop is committed first.
                     // Over-cap views still fetch a center-first window of PREVIEW_TILE_MAX.
                     if proxy_soft
+                        && !showing_compare_preview(&self.images[idx])
                         && self.preview_receiver.is_none()
                         && self.tile_receiver.is_none()
                         && have_current

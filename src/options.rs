@@ -127,6 +127,37 @@ pub enum OutputLutEncoding {
     LinearDensity,
 }
 
+/// RGB ICC used for TIFF/JPEG encode and embed. Not the `.oxid` density matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputIcc {
+    /// IEC 61966-2.1 sRGB (default; matches current files).
+    #[default]
+    Srgb,
+    DisplayP3,
+    AdobeRgb,
+    /// Load `output_icc_path`.
+    Custom,
+}
+
+/// LittleCMS rendering intent for output / soft proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CmsIntent {
+    Perceptual,
+    #[default]
+    Relative,
+    Absolute,
+}
+
+/// Whether preview encode should go to the monitor (or proof) or the export ICC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CmsTarget {
+    #[default]
+    Display,
+    Export,
+}
+
 /// All pipeline options (CLI flags / GUI state).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -163,6 +194,30 @@ pub struct PipelineOptions {
     pub write_jpeg: bool,
     /// When true, output is JPEG only (no TIFF). Implies JPEG write; "Also export JPG" is irrelevant.
     pub write_jpeg_only: bool,
+    /// JPEG quality 1–100. Default 75 (matches the previous hardcoded writer).
+    pub jpeg_quality: u8,
+    /// Output RGB ICC for 16-bit TIFF and JPEG. Ignored for float EXR / ACES.
+    pub output_icc: OutputIcc,
+    /// Path for [`OutputIcc::Custom`].
+    pub output_icc_path: Option<PathBuf>,
+    /// Rendering intent for the output ICC hop.
+    pub export_intent: CmsIntent,
+    /// Black-point compensation on the output hop (Relative intent).
+    pub export_bpc: bool,
+    /// Export filename without extension. Tokens: `{stem}` `{index}` `{index:03}` `{date}` `{time}` `{preset}` `{profile}` `{w}` `{h}`.
+    pub filename_template: String,
+    /// Export-preset name used by `{preset}` (not a look preset).
+    pub export_preset_name: String,
+    /// Soft-proof the paper/printer ICC on preview (Display target only).
+    pub soft_proof: bool,
+    /// Paper / printer RGB ICC used when `soft_proof` is on.
+    pub proof_icc_path: Option<PathBuf>,
+    /// Intent for working → paper.
+    pub proof_intent: CmsIntent,
+    /// Simulate paper white (absolute colorimetric display hop).
+    pub proof_paper_white: bool,
+    /// Mark out-of-paper-gamut pixels (magenta alarm).
+    pub proof_gamut_warning: bool,
     pub no_invert: bool,
     pub no_curve: bool,
     pub wb_r: f32,
@@ -351,6 +406,12 @@ pub struct PipelineOptions {
     /// Detect / feather / grain used when applying `dust_mask`.
     #[serde(skip)]
     pub dust_heal: DustHealParams,
+    /// Monitor ICC bytes for display encode. Session-only; set by the GUI.
+    #[serde(skip)]
+    pub preview_monitor_icc: Option<Arc<Vec<u8>>>,
+    /// Preview encode target. Session-only.
+    #[serde(skip)]
+    pub cms_target: CmsTarget,
 }
 
 fn default_debug_pipeline_step() -> u32 {
@@ -377,6 +438,18 @@ impl Default for PipelineOptions {
             write_exr: false,
             write_jpeg: false,
             write_jpeg_only: false,
+            jpeg_quality: 75,
+            output_icc: OutputIcc::Srgb,
+            output_icc_path: None,
+            export_intent: CmsIntent::Relative,
+            export_bpc: true,
+            filename_template: "{stem}".to_string(),
+            export_preset_name: String::new(),
+            soft_proof: false,
+            proof_icc_path: None,
+            proof_intent: CmsIntent::Relative,
+            proof_paper_white: true,
+            proof_gamut_warning: false,
             no_invert: false,
             no_curve: false,
             wb_r: 1.0,
@@ -457,6 +530,8 @@ impl Default for PipelineOptions {
             dust_reference_size: None,
             dust_uv: None,
             dust_heal: DustHealParams::default(),
+            preview_monitor_icc: None,
+            cms_target: CmsTarget::Display,
         }
     }
 }

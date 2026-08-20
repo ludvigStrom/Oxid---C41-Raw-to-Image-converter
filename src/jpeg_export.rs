@@ -9,10 +9,29 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 
 /// Default quality matches `image` crate `RgbImage::save` (75).
-const JPEG_QUALITY: u8 = 75;
+pub const JPEG_QUALITY: u8 = 75;
 
 /// Write sRGB-encoded 8-bit RGB as JPEG with an IEC 61966-2.1 ICC profile.
 pub fn write_jpeg_srgb(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<()> {
+    write_jpeg_with_icc(
+        path,
+        width,
+        height,
+        rgb,
+        crate::color_space::SRGB_ICC,
+        JPEG_QUALITY,
+    )
+}
+
+/// Write 8-bit RGB JPEG with an embedded ICC profile.
+pub fn write_jpeg_with_icc(
+    path: &Path,
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    icc: &[u8],
+    quality: u8,
+) -> Result<()> {
     let expected = (width as usize)
         .checked_mul(height as usize)
         .and_then(|n| n.checked_mul(3))
@@ -28,10 +47,10 @@ pub fn write_jpeg_srgb(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Resu
 
     let file =
         File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
-    let mut encoder = JpegEncoder::new_with_quality(BufWriter::new(file), JPEG_QUALITY);
+    let mut encoder = JpegEncoder::new_with_quality(BufWriter::new(file), quality.clamp(1, 100));
     encoder
-        .set_icc_profile(crate::color_space::SRGB_ICC.to_vec())
-        .map_err(|e| anyhow::anyhow!("JPEG encoder rejected sRGB ICC: {e}"))?;
+        .set_icc_profile(icc.to_vec())
+        .map_err(|e| anyhow::anyhow!("JPEG encoder rejected ICC: {e}"))?;
     encoder
         .encode(rgb, width, height, ExtendedColorType::Rgb8)
         .with_context(|| format!("Failed to write JPEG to {}", path.display()))?;

@@ -329,9 +329,24 @@ Implementation: [`src/bujack.rs`](src/bujack.rs), called from `pipeline::apply_b
 | JPEG | `--write-jpeg` | 8-bit sRGB OETF via `write_jpeg_srgb`, with an embedded sRGB ICC profile. |
 | ACES2065-1 EXR | `--export-aces-exr` | Linear AP0-primaries EXR via `linear_acescg_to_aces2065_1`. |
 
-On macOS the GUI window and the OpenGL backing layer are tagged sRGB so the preview matches color-managed viewers of those ICC-tagged files. Do not treat the OpenGL framebuffer as an sRGB texture — egui already writes encoded pixels.
+On macOS the GUI window and the OpenGL backing layer are tagged sRGB when no monitor ICC is available, so the preview matches color-managed viewers of sRGB-tagged files. When a display profile is detected, preview pixels are converted to that profile and the layer is left in the display space. Do not treat the OpenGL framebuffer as an sRGB texture — egui already writes encoded pixels.
 
-Output filenames are derived from the input stem: `frame_001.arw` → `frame_001.tiff`.
+### Color management (ICC)
+
+ICC is a **post-step-6 encode**, separate from `.oxid` density-matrix “color profiles”.
+
+| Piece | Where | What it does |
+|-------|--------|----------------|
+| Output ICC | Export tab / `--output-icc` | Convert linear Rec.709 print RGB to sRGB (default), Display P3, Adobe RGB, or a custom RGB `.icc`, then embed that profile in 16-bit TIFF and JPEG. |
+| Monitor ICC | Auto-detected (macOS / Windows) | Preview hops working RGB → display. Falls back to sRGB encode + sRGB window tag. |
+| Soft proof | Export tab + preview **Proof** toggle | Simulate a paper/printer RGB ICC on the detected monitor (intent, paper white, optional gamut warning). Export stays RGB — not CMYK. |
+| Filename template | Export tab / `--filename-template` | Tokens `{stem}` `{index}` `{index:03}` `{date}` `{time}` `{preset}` `{profile}` `{w}` `{h}`. Default `{stem}` keeps `frame_001.arw` → `frame_001.tiff`. |
+| Export preset | Export tab Save/Load | Format, JPEG sidecar/quality, output ICC, intent, filename. Not a Develop look preset. |
+| Contact sheet | Export tab | JPEG grid of selected/all frames, same output ICC. |
+
+Default output is still the compact IEC 61966-2.1 sRGB profile, so existing sRGB files stay bit-identical.
+
+Output filenames are derived from the template (default `{stem}`): `frame_001.arw` → `frame_001.tiff`.
 
 ---
 
@@ -392,6 +407,10 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `--flat-field PATH` | RAW or 32f TIFF flat-field for luminance calibration. |
 | `--export-aces-exr` | Write linear ACES2065-1 EXR alongside display output. |
 | `--idt-matrix M00,...,M22` | 3×3 IDT matrix (camera linear → working space), row-major. |
+| `--output-icc srgb\|display-p3\|adobe-rgb\|PATH` | Output RGB ICC for 16-bit TIFF / JPEG. Default `srgb`. |
+| `--export-intent perceptual\|relative\|absolute` | Output ICC rendering intent. Default `relative`. |
+| `--no-export-bpc` | Disable black-point compensation on the output hop. |
+| `--filename-template STR` | Output name without extension. Default `{stem}`. |
 
 ---
 
@@ -415,7 +434,12 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `src/lut3d.rs` | Density-domain 3D LUT: generate from 3×3 matrix, `.cube` file I/O, tetrahedral interpolation. |
 | `src/aces.rs` | ACEScg IDT and `linear_acescg_to_aces2065_1` matrix. |
 | `src/tiff_export.rs` | Uncompressed TIFF writer: `write_tiff_u16` (u16), `write_tiff` (f32 or u16). 16-bit paths embed sRGB ICC. |
-| `src/jpeg_export.rs` | 8-bit JPEG writer with embedded sRGB ICC (`write_jpeg_srgb`). |
+| `src/jpeg_export.rs` | 8-bit JPEG writer with embedded ICC (`write_jpeg_srgb` / `write_jpeg_with_icc`). |
+| `src/cms.rs` | LittleCMS post-step-6 ICC: output encode, monitor display, paper soft proof. |
+| `src/monitor.rs` | Detect display ICC (macOS / Windows). |
+| `src/filename.rs` | Export filename templates + collision suffixes. |
+| `src/export_preset.rs` | Export-tab JSON presets (format, ICC, intent, template). |
+| `src/contact_sheet.rs` | Contact-sheet grid layout + JPEG write. |
 | `src/exr_export.rs` | OpenEXR writer: f32, u16, and ACES2065-1 paths. |
 | `src/pipeline.rs` | Shared pipeline steps 3-6 used by both `process_files` and `process_one_to_preview`. |
 | `src/bujack.rs` | De-Bujack: non-local OkLab difference stretch after step 6 (optional, off by default). |
@@ -454,6 +478,7 @@ c41-raw-tool convert [OPTIONS] --input-dir <PATH> --output-dir <PATH>
 | `nalgebra` | 0.34 | OLS solver for 3×3 calibration matrix |
 | `serde` / `serde_json` | 1.0 | Calibration profile JSON |
 | `zip` | 2.2 | `.oxid` profile format (zip of JSON + LUT) |
+| `lcms2` | 6 | ICC CMM (output profiles, soft proof, embed) |
 | `eframe` | 0.29 | GUI (optional, `--features gui`) |
 | `rfd` | 0.15 | Native file dialogs (optional) |
 | `arboard` | 3 | Clipboard (optional) |
